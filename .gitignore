@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environments
+venv/
+.venv/
+ENV/
+
+# Project Specific
+chroma_data/
+integration_test_output/
+qa_test_output/
+quality_assurance_reports/
+qwen2_comprehensive_analysis/
+qwen2_quality_validation/
+test_validation/
+demo_direct_graphs/
+*.onnx
+*.json
+!chunk_verification_results.json # Keep this as an example if small
+!qwen2_simplified_conversion_analytics.json
+# Actually, better to ignore all large json and onnx files
+*.onnx
+*.json
+
+# IDEs
+.vscode/
+.idea/
+.claude/
+.gemini/
+
+# Logs
+*.log
