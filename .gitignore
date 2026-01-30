@@ -41,6 +41,11 @@ demo_direct_graphs/
 # Actually, better to ignore all large json and onnx files
 *.onnx
 *.json
+!MASTER-POC.md
+!WALKTHROUGH.md
+!model_info.json
+!genai_config.json
+!MASTER_POC/
 
 # IDEs
 .vscode/
