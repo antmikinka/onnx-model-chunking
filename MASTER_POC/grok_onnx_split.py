@@ -256,10 +256,37 @@ def extract_components(model: onnx.ModelProto) -> Dict[str, ComponentInfo]:
                     components["embedding"].initializer_names.add(inp)
             continue
         
-        # Check for layer pattern (e.g., /model/layers.0/, layers.5/)
-        layer_match = re.search(r'layers[./](\d+)', node_name_lower)
-        if layer_match:
-            layer_id = int(layer_match.group(1))
+        # Check for layer pattern using architecture-specific prefix
+        # This handles 'model.layers.0' (Llama) and 'transformer.h.0' (GPT2)
+        # We try the specific prefix first, then a generic fallback
+        layer_id = None
+        
+        # 1. Try architecture-specific prefix
+        if layer_prefix.lower() in node_name_lower:
+            # Extract number after prefix
+            # e.g. prefix="/model/layers.", node="/model/layers.5/..."
+            try:
+                # Find the part after the prefix
+                suffix = node_name_lower.split(layer_prefix.lower())[-1]
+                # The next characters should be the ID
+                match = re.match(r'^(\d+)', suffix)
+                if match:
+                    layer_id = int(match.group(1))
+            except Exception:
+                pass
+        
+        # 2. Fallback to generic "layers" regex if specific prefix didn't match
+        if layer_id is None:
+            layer_match = re.search(r'layers[./](\d+)', node_name_lower)
+            if layer_match:
+                layer_id = int(layer_match.group(1))
+            # 3. Fallback for GPT2 style "h.N" if not caught above
+            elif "h." in node_name_lower:
+                 h_match = re.search(r'h[./](\d+)', node_name_lower)
+                 if h_match:
+                     layer_id = int(h_match.group(1))
+
+        if layer_id is not None:
             layer_key = f"layer_{layer_id}"
             
             if layer_key not in components:

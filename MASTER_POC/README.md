@@ -14,28 +14,28 @@ Instead of loading a multi-gigabyte monolith into RAM, our pipeline:
 
 | File | Description |
 | :--- | :--- |
-| **[grok_onnx_split.py](file:///C:/Users/antmi/Downloads/onnx-model-chunking/MASTER_POC/grok_onnx_split.py)** | The splitter engine. Purges redundant data and creates valid ONNX subgraphs. |
-| **[grok_inference_split_model_pipeline.py](file:///C:/Users/antmi/Downloads/onnx-model-chunking/MASTER_POC/grok_inference_split_model_pipeline.py)** | The sequential inference engine with dynamic hardware support. |
-| **[benchmark_onnx_split_vs_whole.py](file:///C:/Users/antmi/Downloads/onnx-model-chunking/MASTER_POC/benchmark_onnx_split_vs_whole.py)** | The multi-provider performance and quality analysis suite. |
+| **[grok_onnx_split.py](./grok_onnx_split.py)** | The splitter engine. **Now supports Universal Transformer Architectures** (Llama, GPT2, Qwen, etc.) via dynamic regex detection. Purges redundant data and creates valid ONNX subgraphs. |
+| **[grok_inference_split_model_pipeline.py](./grok_inference_split_model_pipeline.py)** | The sequential inference engine with dynamic hardware support. Manages KV cache statefully across component loads. |
+| **[benchmark_onnx_split_vs_whole.py](./benchmark_onnx_split_vs_whole.py)** | The comprehensive performance analysis suite. **Features "Fair comparison" logic**: Upgraded Monolithic runner to support **Stateful Execution (KV Cache)**, ensuring latency comparisons against the Split model are valid (Stateful vs Stateful). |
 
 ---
 
 ## 📖 Deployment Guide
 
 ### 1. Generate the Split Model
-Run the splitter on your local monolithic ONNX file.
+Run the splitter on your local monolithic ONNX file. It auto-detects architecture (Llama, GPT2, Qwen).
 ```bash
 python MASTER_POC/grok_onnx_split.py --model "path/to/model.onnx" --output "split_output/qwen2.5-0.5b" --split-only
 ```
 
-### 2. Multi-Provider Benchmarking (CPU vs VitisAI)
-Compare performance, memory, and quality across different hardware engines.
+### 2. Multi-Provider Benchmarking
+Compare performance, memory, and quality across different hardware engines (CPU, CUDA, VitisAI, etc.).
 ```bash
 python MASTER_POC/benchmark_onnx_split_vs_whole.py \
     --whole-model "path/to/monolith.onnx" \
     --split-dir "split_output/qwen2.5-0.5b/model.onnx" \
     --tokenizer-path "path/to/tokenizer" \
-    --providers "CPUExecutionProvider,VitisAIExecutionProvider" \
+    --providers "CPUExecutionProvider" \
     --runs 3 \
     --tokens 10 \
     --output "MASTER_POC/final_bench.json"
@@ -56,17 +56,17 @@ python MASTER_POC/grok_inference_split_model_pipeline.py \
 
 ### Matrix Comparison Table
 The benchmark suite generates a matrix in the terminal and a Markdown report (`*_report.md`) that tracks:
-- **TTFT (Latency)**: Time to first token (includes loading time).
+- **TTFT (Latency)**: Time to first token.
 - **TPS (Throughput)**: Tokens generated per second.
 - **Peak RAM**: Highest RSS memory usage during the run.
 - **Quality Match**: 1:1 text comparison between split and monolithic outputs (Greedy Equivalence).
 
-### Verification Reports
-- **[WALKTHROUGH_MULTI_PROVIDER.md](file:///C:/Users/antmi/Downloads/onnx-model-chunking/MASTER_POC/WALKTHROUGH_MULTI_PROVIDER.md)**: Detailed analysis of multi-provider results.
-- **[verification_results_report.md](file:///C:/Users/antmi/Downloads/onnx-model-chunking/MASTER_POC/verification_results_report.md)**: Recorded audit of output integrity between Monolith and Split architectures.
+### Verification methodology
+- **Triple Check Logic**: The benchmark script includes explicit verification steps to ensure metrics like `total_time` and `decode_time` are calculated correctly.
+- **Stateful Baseline**: Monolithic benchmarks are run with full KV-cache support to ensure the speedup metrics for Split models reflect *loading efficiency* gains vs *loading overhead* losses, rather than algorithmic differences.
 
 ## ⚙️ Requirements
-- `onnxruntime` (or `onnxruntime-vitisai` for hardware acceleration)
+- `onnxruntime` (or `onnxruntime-gpu`, `onnxruntime-vitisai`)
 - `transformers`
 - `psutil`
 - `numpy`

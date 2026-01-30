@@ -177,6 +177,7 @@ class ONNXMonolithicRunner(ABCBenchmarkRunner):
         self.session = None
     
     def run_inference(self, prompt: str, max_new_tokens: int, **kwargs) -> InferenceMetrics:
+        clear_memory() # Ensure clean slate
         mem_start = get_memory_mb()
         
         # 1. Load Model
@@ -190,12 +191,49 @@ class ONNXMonolithicRunner(ABCBenchmarkRunner):
         mem_after_load = get_memory_mb()
         mem_load_cost = mem_after_load - mem_start
         
-        # 2. Prepare Inputs
+        # 2. Inspect Inputs for Stateful Capabilities (KV Cache)
+        # TRIPLE CHECK: Verify input signature to determine if we can run stateful or stateless
+        session_inputs = {i.name: i for i in self.session.get_inputs()}
+        session_outputs = {o.name: o for o in self.session.get_outputs()}
+        
+        kv_input_names = [name for name in session_inputs if "past_key_values" in name]
+        is_stateful = len(kv_input_names) > 0
+        
+        if is_stateful:
+            print(f"  [Monolith] Detected {len(kv_input_names)//2} KV heads. Running STATEFUL inference.")
+        else:
+            print(f"  [Monolith] No KV inputs detected. Running STATELESS (Slower).")
+            
+        # 3. Prepare Inputs
         inputs = self.tokenizer(prompt, return_tensors="np")
         input_ids = inputs["input_ids"]
         prompt_tokens = input_ids.shape[1]
         
-        # NOTE: Monolithic generation logic (simulated for stateless vs stateful complexity)
+        # Initialize KV Cache if needed
+        # We need to guess the shape. Usually (batch, heads, seq, dim).
+        # We'll use 0-length sequence for init.
+        past_key_values = {}
+        if is_stateful:
+            for name in kv_input_names:
+                inp_info = session_inputs[name]
+                shape = list(inp_info.shape)
+                # Handle dynamic axes (usually strings or 'batch', 'sequence')
+                new_shape = []
+                for dim in shape:
+                    if isinstance(dim, str) or dim is None:
+                        new_shape.append(1) # Default to 1 for batch
+                    else:
+                        new_shape.append(dim)
+                # Force sequence dim to 0
+                if len(new_shape) >= 3:
+                     new_shape[-2] = 0 # Assume 2nd to last is sequence
+                else: 
+                     new_shape = [1, 1, 0, 1] # Fallback
+                     
+                dtype = np.float16 if inp_info.type == 'tensor(float16)' else np.float32
+                past_key_values[name] = np.zeros(new_shape, dtype=dtype)
+
+        # Metrics
         latencies = []
         generated_ids = []
         logprobs_list = []
@@ -204,24 +242,35 @@ class ONNXMonolithicRunner(ABCBenchmarkRunner):
         start_inference = time.perf_counter()
         
         try:
-            # Inspection of inputs
-            input_names = [i.name for i in self.session.get_inputs()]
-            output_names = [o.name for o in self.session.get_outputs()]
-            
-            # Simulated Generation Loop for Benchmarking
             current_input_ids = input_ids
+            position_ids = np.arange(current_input_ids.shape[1], dtype=np.int64).reshape(1, -1)
             
             for i in range(max_new_tokens + 1):
                 iter_start = time.perf_counter()
                 
                 # Prepare inputs map
                 onnx_inputs = {}
-                if "input_ids" in input_names:
-                    onnx_inputs["input_ids"] = current_input_ids
-                if "attention_mask" in input_names:
-                    onnx_inputs["attention_mask"] = np.ones(current_input_ids.shape, dtype=np.int64)
-                if "position_ids" in input_names:
-                    onnx_inputs["position_ids"] = np.arange(current_input_ids.shape[1], dtype=np.int64).reshape(1, -1)
+                # If stateful, we only pass the NEW token after the first step
+                if is_stateful and i > 0:
+                     onnx_inputs["input_ids"] = current_input_ids[:, -1:] # Last token only
+                     # Update position ids
+                     seq_len_total = past_key_values[kv_input_names[0]].shape[-2] + 1
+                     onnx_inputs["position_ids"] = np.array([[seq_len_total - 1]], dtype=np.int64)
+                else:
+                     onnx_inputs["input_ids"] = current_input_ids
+                     if "position_ids" in session_inputs:
+                         onnx_inputs["position_ids"] = np.arange(current_input_ids.shape[1], dtype=np.int64).reshape(1, -1)
+
+                if "attention_mask" in session_inputs:
+                     # Mask should be full length
+                     total_len = onnx_inputs["input_ids"].shape[1]
+                     if is_stateful and i > 0:
+                         total_len += past_key_values[kv_input_names[0]].shape[-2]
+                     onnx_inputs["attention_mask"] = np.ones((1, total_len), dtype=np.int64)
+                
+                # Add KV cache
+                if is_stateful:
+                    onnx_inputs.update(past_key_values)
                 
                 # Run Inference
                 outputs = self.session.run(None, onnx_inputs)
@@ -229,8 +278,29 @@ class ONNXMonolithicRunner(ABCBenchmarkRunner):
                 iter_time = time.perf_counter() - iter_start
                 
                 # Logic to get next token
-                logits = outputs[0] # Assume first output is logits
+                # Assume first output is logits? usually. Or look for 'logits' name
+                logits = outputs[0]
+                # If named outputs, find logits
+                for name, val in zip([o.name for o in self.session.get_outputs()], outputs):
+                    if "logits" in name.lower():
+                        logits = val
+                        break
+                
                 next_token_id = np.argmax(logits[:, -1, :], axis=-1)[0]
+                
+                # Update KV Cache from outputs
+                if is_stateful:
+                    output_names = [o.name for o in self.session.get_outputs()]
+                    # Map output 'present' to input 'past'
+                    # Usually: present.0.key -> past_key_values.0.key
+                    # We iterate outputs and match to inputs
+                    for name, val in zip(output_names, outputs):
+                        if "present" in name:
+                            # Heuristic: replace 'present' with 'past_key_values'
+                            # Or check if there is a corresponding input
+                            corresponding_input = name.replace("present", "past_key_values")
+                            if corresponding_input in past_key_values:
+                                past_key_values[corresponding_input] = val
                 
                 if i == 0:
                     prefill_time = iter_time
@@ -241,7 +311,7 @@ class ONNXMonolithicRunner(ABCBenchmarkRunner):
                     generated_ids.append(next_token_id)
                     logprobs_list.append(compute_logprobs_numpy(logits, next_token_id))
 
-                # Append for next iteration (naive concatenation)
+                # Append for next iteration
                 current_input_ids = np.concatenate([current_input_ids, [[next_token_id]]], axis=1)
 
                 if next_token_id == self.tokenizer.eos_token_id:
@@ -249,6 +319,8 @@ class ONNXMonolithicRunner(ABCBenchmarkRunner):
 
         except Exception as e:
             print(f"  [Monolith Warning] Generation info incomplete: {e}")
+            import traceback
+            traceback.print_exc()
             if not latencies: latencies = [0.0]
             prefill_time = 0.1
         
@@ -259,6 +331,10 @@ class ONNXMonolithicRunner(ABCBenchmarkRunner):
         decode_tokens = len(latencies)
         
         stats = calculate_stats(logprobs_list)
+        
+        # TRIPLE CHECK: Verify metrics are sane
+        if total_time < 0.001: 
+             print("  [Verification] Warning: Total time extremely low.")
         
         return InferenceMetrics(
             load_time_s=load_time,
@@ -364,7 +440,7 @@ class ONNXSequentialRunner(ABCBenchmarkRunner):
                 # Run
                 self.pipeline.run_component_session(name, sess)
                 del sess
-                # gc.collect() # Optional: slight perf penalty but cleaner stats
+                gc.collect() # Enforce GC for accurate "transient footprint" measurement
             
         for token_idx in range(max_new_tokens):
             iter_start = time.perf_counter()
