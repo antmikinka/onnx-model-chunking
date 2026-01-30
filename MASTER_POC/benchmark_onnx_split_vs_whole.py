@@ -561,7 +561,7 @@ def main():
     parser.add_argument("--prompts", help="Multiple prompts: comma-separated or path to .txt file")
     parser.add_argument("--tokens", type=int, default=10, help="Max new tokens")
     parser.add_argument("--runs", type=int, default=3, help="Number of runs to average")
-    parser.add_argument("--output", default="benchmark_onnx_results.json", help="Output JSON file")
+    parser.add_argument("--output", default="MASTER_POC/benchmark_results.json", help="Output JSON file")
     
     args = parser.parse_args()
     
@@ -621,10 +621,20 @@ def main():
                 # Compare
                 comparison = calculate_speedups(mono_results, split_results)
                 
+                # Quality Verification
+                mono_text = mono_results.get('generated_text', "").strip()
+                split_text = split_results.get('generated_text', "").strip()
+                quality_match = (mono_text == split_text) if mono_text else True
+                
                 prompt_provider_results[provider] = {
                     "split": split_results,
                     "monolith": mono_results,
-                    "comparison": comparison
+                    "comparison": comparison,
+                    "verification": {
+                        "quality_match": quality_match,
+                        "mono_sample": mono_text,
+                        "split_sample": split_text
+                    }
                 }
 
             # Store Entry
@@ -679,6 +689,10 @@ def save_results(output_path, structure, run_entries, config):
 
     history["benchmark_runs"].append(session_data)
     
+    # Write to file
+    out_dir = os.path.dirname(output_path)
+    if out_dir: os.makedirs(out_dir, exist_ok=True)
+    
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(history, f, indent=2)
         
@@ -691,12 +705,15 @@ def print_matrix_summary(prompt, provider_results):
     print(f"MATRIX COMPARISON Summary")
     print("="*80)
     
-    headers = ["Config", "EP", "TTFT (s)", "TPS", "Peak RAM", "Max Layer"]
-    print(f"{headers[0]:<12} | {headers[1]:<15} | {headers[2]:<10} | {headers[3]:<10} | {headers[4]:<12} | {headers[5]:<12}")
+    headers = ["Config", "EP", "TTFT (s)", "TPS", "Peak RAM", "Quality"]
+    print(f"{headers[0]:<12} | {headers[1]:<15} | {headers[2]:<10} | {headers[3]:<10} | {headers[4]:<12} | {headers[5]:<10}")
     print("-" * 80)
     
     rows = []
     for ep, results in provider_results.items():
+        v = results.get('verification', {})
+        q_match = "MATCH ✅" if v.get('quality_match', True) else "DIFF ⚠️"
+        
         # Monolith
         m = results['monolith']
         if m:
@@ -706,8 +723,8 @@ def print_matrix_summary(prompt, provider_results):
                 "TTFT": m.get('ttft_s', 0),
                 "TPS": m.get('tokens_per_second', 0),
                 "Peak": m.get('memory_peak_mb', 0),
-                "Max": 0.0, # N/A
-                "Color": ""
+                "Max": 0.0,
+                "Quality": "N/A"
             })
         
         # Split
@@ -722,13 +739,12 @@ def print_matrix_summary(prompt, provider_results):
                 "TPS": s.get('tokens_per_second', 0),
                 "Peak": s.get('memory_peak_mb', 0),
                 "Max": max_comp,
-                "Color": ""
+                "Quality": q_match
             })
             
     # Print Rows
     for r in rows:
-        max_str = f"{r['Max']:.1f} MB" if r['Max'] > 0 else "N/A"
-        print(f"{r['Arch']:<12} | {r['EP']:<15} | {r['TTFT']:<10.4f} | {r['TPS']:<10.2f} | {r['Peak']:<8.1f} MB | {max_str}")
+        print(f"{r['Arch']:<12} | {r['EP']:<15} | {r['TTFT']:<10.4f} | {r['TPS']:<10.2f} | {r['Peak']:<8.1f} MB | {r['Quality']}")
 
     print("-" * 80)
     
@@ -756,20 +772,28 @@ def generate_markdown_report(session, report_path):
     lines.append(f"- **Tokens generated:** {session['config']['tokens']}")
     
     lines.append(f"\n## Results Matrix")
-    lines.append("\n| Arch | Provider | TTFT | TPS | Peak RAM | Max Layer RAM |")
-    lines.append("| :--- | :--- | :--- | :--- | :--- | :--- |")
     
     for b in session['benchmarks']:
         lines.append(f"\n### Prompt: \"{b['prompt']}\"")
+        lines.append("\n| Arch | Provider | TTFT | TPS | Peak RAM | Quality |")
+        lines.append("| :--- | :--- | :--- | :--- | :--- | :--- |")
+        
         for ep, results in b['providers'].items():
             m = results['monolith']
             s = results['split']
+            v = results.get('verification', {})
+            q_match = "MATCH ✅" if v.get('quality_match', True) else "DIFF ⚠️"
+            
             if m:
                 lines.append(f"| Monolith | {ep} | {m.get('ttft_s',0):.4f}s | {m.get('tokens_per_second',0):.2f}/s | {m.get('memory_peak_mb',0):.1f}MB | N/A |")
             if s:
-                layer_mem = s.get('layer_memory_peak_mb', {})
-                max_comp = max(layer_mem.values()) if layer_mem else 0
-                lines.append(f"| Split | {ep} | {s.get('ttft_s',0):.4f}s | {s.get('tokens_per_second',0):.2f}/s | {s.get('memory_peak_mb',0):.1f}MB | {max_comp:.1f}MB |")
+                lines.append(f"| Split | {ep} | {s.get('ttft_s',0):.4f}s | {s.get('tokens_per_second',0):.2f}/s | {s.get('memory_peak_mb',0):.1f}MB | {q_match} |")
+            
+            if not v.get('quality_match', True):
+                lines.append(f"\n> [!WARNING]")
+                lines.append(f"> Output mismatch detected for `{ep}`.")
+                lines.append(f"> **Monolith:** `{v.get('mono_sample')}`")
+                lines.append(f"> **Split:** `{v.get('split_sample')}`")
         
         # Add a 1:1 Winner analysis for this prompt
         lines.append("\n#### Comparisons (Efficiency vs Performance)")
