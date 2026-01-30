@@ -35,15 +35,17 @@ class SequentialModelPipeline:
     Inference pipeline that loads and unloads ONNX components sequentially.
     """
     
-    def __init__(self, model_dir: str, tokenizer_path: Optional[str] = None):
+    def __init__(self, model_dir: str, tokenizer_path: Optional[str] = None, providers: Optional[List[str]] = None):
         """
         Initialize the pipeline.
         
         Args:
             model_dir: Directory containing the split ONNX components and model_info.json
             tokenizer_path: Optional path to the tokenizer (defaults to the original model directory)
+            providers: List of execution providers to try (e.g., ['VitisAIExecutionProvider', 'CPUExecutionProvider'])
         """
         self.model_dir = model_dir
+        self.providers = providers or ['CPUExecutionProvider']
         self.info_path = os.path.join(model_dir, "model_info.json")
         
         if not os.path.exists(self.info_path):
@@ -87,35 +89,47 @@ class SequentialModelPipeline:
             except Exception as e:
                 print(f"  [Warning] Could not parse genai_config.json: {e}")
         
-    def _run_component(self, component_name: str) -> None:
+    def load_component_session(self, component_name: str) -> Optional[ort.InferenceSession]:
         """
-        Load, run, and unload a specific ONNX component.
-        
-        Args:
-            component_name: Key in model_info['components']
+        Load the ONNX session for a specific component.
+        Returns None if component/file missing.
         """
         comp_info = self.model_info["components"].get(component_name)
         if not comp_info:
             print(f"  Warning: Component {component_name} not found in model_info, skipping.")
-            return
+            return None
             
         filename = comp_info["file"]
         filepath = os.path.join(self.model_dir, filename)
         
         if not os.path.exists(filepath):
             print(f"  Warning: Component file {filename} not found, skipping.")
-            return
+            return None
 
-        # Load session first to get expected input types
-        print(f"  [Pipeline] Running {component_name} ({filename})...")
-        start_time = time.time()
+        print(f"  [Pipeline] Loading {component_name} ({filename})...")
         
         # Create session options to handle dynamic shapes
         sess_options = ort.SessionOptions()
         sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
         sess_options.add_session_config_entry("session.disable_node_shape_check", "1")
         
-        session = ort.InferenceSession(filepath, sess_options=sess_options, providers=['VitisAIExecutionProvider'])
+        try:
+            session = ort.InferenceSession(filepath, sess_options=sess_options, providers=self.providers)
+            return session
+        except Exception as e:
+            print(f"  [Error] Failed to load session {filename} with providers {self.providers}: {e}")
+            return None
+
+    def run_component_session(self, component_name: str, session: ort.InferenceSession) -> None:
+        """
+        Run inference on a loaded session using inputs from the registry.
+        Updates registry with outputs.
+        """
+        if session is None:
+            return
+
+        comp_info = self.model_info["components"].get(component_name)
+        start_time = time.time()
         
         # Build expected input type map
         expected_types = {}
@@ -148,11 +162,10 @@ class SequentialModelPipeline:
                 if name in expected_types:
                     target_dtype = onnx_type_to_numpy(expected_types[name])
                     if target_dtype and val.dtype != target_dtype:
-                        print(f"    [Casting] {name}: {val.dtype} -> {target_dtype}")
+                        # print(f"    [Casting] {name}: {val.dtype} -> {target_dtype}")
                         val = val.astype(target_dtype)
                 session_inputs[name] = val
             else:
-                # print(f"    [Warning] Missing input: {name}")
                 pass
         
         # Only run if we have inputs (some components like 'other' may need all inputs)
@@ -168,11 +181,17 @@ class SequentialModelPipeline:
         for name, val in zip(actual_output_names, outputs):
             self.tensor_registry[name] = val
             
-        # Unload immediately
-        del session
-        gc.collect()
-        
-        print(f"  [Pipeline] {component_name} finished in {elapsed:.3f}s")
+        print(f"  [Pipeline] {component_name} ran in {elapsed:.3f}s")
+
+    def _run_component(self, component_name: str) -> None:
+        """
+        Load, run, and unload a specific ONNX component.
+        """
+        session = self.load_component_session(component_name)
+        if session:
+            self.run_component_session(component_name, session)
+            del session
+            gc.collect()
         
     def generate(self, prompt: str, max_new_tokens: int = 20) -> str:
         """
