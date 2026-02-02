@@ -134,12 +134,15 @@ def detect_architecture_from_onnx(graph) -> str:
             sample_names.append(init.name)
     
     # Check for architecture patterns
-    if any("/model/layers." in n or "model.layers." in n for n in sample_names):
-        # Check for Qwen3 specific patterns
-        if any("q_norm" in n or "k_norm" in n for n in sample_names):
+    # Increase sample size or look for specific RyzenAI ops
+    all_names = sample_names
+    
+    if any("/model/layers." in n or "model.layers." in n or "MatMulNBits" in n for n in all_names):
+        # Check for Qwen3 specific patterns (q_norm or the custom MatMulNBits suffix numbering)
+        if any("q_norm" in n or "k_norm" in n or "gqo_" in n or "ssmlp_" in n for n in all_names):
             return "qwen3"
         return "llama"
-    elif any("/transformer/h." in n or "transformer.h." in n for n in sample_names):
+    elif any("/transformer/h." in n or "transformer.h." in n for n in all_names):
         return "gpt2"
     
     return "llama"  # Default
@@ -243,12 +246,17 @@ def extract_components(model: onnx.ModelProto) -> Dict[str, ComponentInfo]:
     initializer_names = {init.name for init in graph.initializer}
     
     # Classify each node
+    print(f"DEBUG: Starting classification of {len(graph.node)} nodes...")
     for i, node in enumerate(graph.node):
         node_name = node.name or ""
         node_name_lower = node_name.lower()
         
+        if i < 10:
+             print(f"  DEBUG: Node {i}: '{node_name}' (Type: {node.op_type})")
+        
         # Check for embedding
         if embed_prefix.lower() in node_name_lower or "embed_tokens" in node_name_lower:
+            if i < 50: print(f"    DEBUG: Node {i} matched EMBEDDING")
             components["embedding"].node_indices.append(i)
             components["embedding"].node_names.append(node_name)
             for inp in node.input:
@@ -285,6 +293,29 @@ def extract_components(model: onnx.ModelProto) -> Dict[str, ComponentInfo]:
                  h_match = re.search(r'h[./](\d+)', node_name_lower)
                  if h_match:
                      layer_id = int(h_match.group(1))
+        
+        # 4. RyzenAI/AWQ optimized operator patterns
+        # These custom ops have layer index as suffix: MatMulNBits_k_6_0, gqo_8_1_0, ssmlp_3_0_0
+        if layer_id is None:
+            ryzenai_patterns = [
+                r'^matmulnbits_[a-z]_\d+_(\d+)$',   # MatMulNBits_k_6_0
+                r'^gqo_\d+_\d+_(\d+)$',             # gqo_8_1_0
+                r'^ssmlp_\d+_\d+_(\d+)$',           # ssmlp_3_0_0
+            ]
+            for pattern in ryzenai_patterns:
+                match = re.match(pattern, node_name_lower)
+                if match:
+                    layer_id = int(match.group(1))
+                    break
+        
+        # 5. Fallback: Check initializer names for layer association
+        if layer_id is None:
+            for inp in node.input:
+                if inp in initializer_names:
+                    init_match = re.search(r'\.layers\.(\d+)\.', inp)
+                    if init_match:
+                        layer_id = int(init_match.group(1))
+                        break
 
         if layer_id is not None:
             layer_key = f"layer_{layer_id}"
@@ -329,11 +360,74 @@ def extract_components(model: onnx.ModelProto) -> Dict[str, ComponentInfo]:
             if inp in initializer_names:
                 components["other"].initializer_names.add(inp)
     
+    # Phase 2: Connectivity-based assignment for 'other' nodes
+    # If a node is 'other' but its inputs primarily come from a specific layer,
+    # assign it to that layer to avoid dependency cycles.
+    print("DEBUG: Starting connectivity-based assignment pass...")
+    
+    # Map output names to the component they belong to
+    output_to_comp = {}
+    for comp_name, info in components.items():
+        for node_idx in info.node_indices:
+            node = graph.node[node_idx]
+            for out in node.output:
+                output_to_comp[out] = comp_name
+                
+    # Also include graph inputs (e.g. input_ids -> embedding)
+    for inp in graph.input:
+        if "/model/embed" in inp.name or "input_ids" in inp.name:
+            output_to_comp[inp.name] = "embedding"
+
+    # Iterate through 'other' nodes and try to assign them
+    changed = True
+    iterations = 0
+    while changed and iterations < 3:  # Limit iterations
+        changed = False
+        iterations += 1
+        other_node_indices = list(components["other"].node_indices)
+        
+        for idx in other_node_indices:
+            node = graph.node[idx]
+            
+            # Skip assignment if the node is already in a core component
+            current_comp = output_to_comp.get(node.output[0]) if node.output else "other"
+            if current_comp in ["embedding", "norm", "lm_head"]:
+                continue
+
+            # See where inputs come from
+            input_comps = set()
+            for inp in node.input:
+                if inp in output_to_comp:
+                    input_comps.add(output_to_comp[inp])
+            
+            # If all inputs (that we know) come from one component, assign to it
+            if len(input_comps) == 1:
+                target_comp = list(input_comps)[0]
+                if target_comp != "other" and target_comp != current_comp:
+                    # Reassign
+                    if current_comp == "other":
+                        components["other"].node_indices.remove(idx)
+                        if node.name in components["other"].node_names:
+                             components["other"].node_names.remove(node.name)
+                    
+                    components[target_comp].node_indices.append(idx)
+                    components[target_comp].node_names.append(node.name)
+                    for inp_name in node.input:
+                        if inp_name in initializer_names:
+                            components[target_comp].initializer_names.add(inp_name)
+                    
+                    # Update output mapping
+                    for out in node.output:
+                        output_to_comp[out] = target_comp
+                    
+                    changed = True
+                    if idx < 50: print(f"    DEBUG: Node {idx} ('{node.name}') re-assigned from '{current_comp}' to '{target_comp}'")
+
     # Remove empty components
     components = {k: v for k, v in components.items() if v.node_indices}
     
     # Print summary
-    print(f"\nExtracted {len(components)} components:")
+    print(f"\nExtracted {len(components)} components (after connectivity pass):")
     layer_count = 0
     for name, info in sorted(components.items()):
         if info.component_type == "layer":
@@ -538,12 +632,19 @@ def create_component_onnx(
     # Create the model
     component_model = helper.make_model(
         component_graph,
-        producer_name=f"grok_onnx_split_{component_name}",
-        opset_imports=list(model.opset_import)
+        producer_name=model.producer_name,      # CRITICAL: Preserve producer (e.g., onnxruntime-genai)
+        producer_version=model.producer_version, # CRITICAL: Preserve version
+        opset_imports=list(model.opset_import),
+        functions=model.functions,              # CRITICAL: Preserve function definitions
+        doc_string=model.doc_string
     )
     
     # Copy IR version
     component_model.ir_version = model.ir_version
+    
+    # Preserve Metadata Props (e.g., for custom EP config)
+    if hasattr(model, "metadata_props"):
+        component_model.metadata_props.extend(model.metadata_props)
     
     return component_model
 
@@ -576,12 +677,12 @@ def split_onnx_model(params) -> SplitResult:
     # Static Shape Propagation: Run shape inference to enrich the graph metadata.
     # This ensures that intermediate tensors have rank and shape information,
     # which is critical for operators like 'Reshape' in the split subgraphs.
-    print("Running static shape inference on the master model...")
-    try:
-        model = shape_inference.infer_shapes(model)
-        print("  Shape inference successful.")
-    except Exception as e:
-        print(f"  Warning: Shape inference failed: {e}. Subgraphs may have unknown shapes.")
+    # print("Running static shape inference on the master model...")
+    # try:
+    #     model = shape_inference.infer_shapes(model)
+    #     print("  Shape inference successful.")
+    # except Exception as e:
+    #     print(f"  Warning: Shape inference failed: {e}. Subgraphs may have unknown shapes.")
     
     # Extract components
     components = extract_components(model)

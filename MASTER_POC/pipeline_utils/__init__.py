@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""
+pipeline_utils - Modular Utilities for ONNX Inference Pipelines
+
+This package provides reusable components for ONNX model inference:
+- dtypes: Comprehensive ONNX data type handling
+- kv_cache: KV cache management for incremental decoding
+- config_loader: Model configuration loading and validation
+- session_manager: ONNX session lifecycle and persistence
+- io_binding: Zero-copy inference with device-resident buffers
+
+Usage:
+    from pipeline_utils import KVCacheManager, safe_cast, load_model_config
+    from pipeline_utils import SessionManager, SessionConfig
+    from pipeline_utils import IOBindingManager, MemoryMode
+    from pipeline_utils.dtypes import ONNX_DTYPE_MAP, get_numpy_dtype
+"""
+
+from .dtypes import (
+    ONNX_DTYPE_MAP,
+    SHORT_DTYPE_MAP,
+    SPECIAL_TYPES,
+    get_numpy_dtype,
+    safe_cast,
+    get_dtype_info,
+    supports_bfloat16,
+    get_bfloat16_dtype,
+)
+
+from .kv_cache import KVCacheManager
+
+from .config_loader import (
+    ModelConfig,
+    load_model_config,
+    get_dtype_from_config,
+)
+
+from .session_manager import (
+    SessionManager,
+    SessionConfig,
+    SessionInfo,
+    get_available_providers,
+    get_provider_for_device,
+    SUPPORTED_PROVIDERS,
+    PROVIDER_CATEGORIES,
+)
+
+from .io_binding import (
+    IOBindingManager,
+    DeviceBuffer,
+    MemoryMode,
+    get_supported_devices,
+    get_onnx_element_type,
+    create_ortvalue_from_numpy,
+    NUMPY_TO_ONNX_ELEMENT_TYPE,
+)
+
+from .backend import (
+    BackendType,
+    DeviceType,
+    ModelFormat,
+    BackendConfig,
+    InferenceBackend,
+    OnnxRuntimeBackend,
+    LlamaCppBackend,
+    get_backend,
+    detect_model_format,
+    get_backend_for_model,
+)
+
+from .dtypes import GGUF_DTYPE_MAP, AWQ_DTYPE_MAP
+
+
+__version__ = "2.2.0"
+
+__all__ = [
+    # dtypes exports
+    "ONNX_DTYPE_MAP",
+    "SHORT_DTYPE_MAP", 
+    "SPECIAL_TYPES",
+    "GGUF_DTYPE_MAP",
+    "AWQ_DTYPE_MAP",
+    "get_numpy_dtype",
+    "safe_cast",
+    "get_dtype_info",
+    "supports_bfloat16",
+    "get_bfloat16_dtype",
+    # kv_cache exports
+    "KVCacheManager",
+    # config_loader exports
+    "ModelConfig",
+    "load_model_config",
+    "get_dtype_from_config",
+    # session_manager exports
+    "SessionManager",
+    "SessionConfig",
+    "SessionInfo",
+    "get_available_providers",
+    "get_provider_for_device",
+    "SUPPORTED_PROVIDERS",
+    "PROVIDER_CATEGORIES",
+    # io_binding exports
+    "IOBindingManager",
+    "DeviceBuffer",
+    "MemoryMode",
+    "get_supported_devices",
+    "get_onnx_element_type",
+    "create_ortvalue_from_numpy",
+    "NUMPY_TO_ONNX_ELEMENT_TYPE",
+    # backend exports
+    "BackendType",
+    "DeviceType",
+    "ModelFormat",
+    "BackendConfig",
+    "InferenceBackend",
+    "OnnxRuntimeBackend",
+    "LlamaCppBackend",
+    "get_backend",
+    "detect_model_format",
+    "get_backend_for_model",
+]
