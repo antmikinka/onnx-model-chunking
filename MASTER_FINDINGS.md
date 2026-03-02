@@ -654,6 +654,30 @@ To package this concept into a lovable, memorable library that fits perfectly in
 
 ---
 
+## 🌍 Open Source PR Strategy: How to Upstream This
+
+To get this methodology adopted by the broader ecosystem, we need to target the tools developers already use. The strategy is split into two phases: **The Split (Export)** and **The Run (Inference)**.
+
+### Target 1: Hugging Face Optimum (`huggingface/optimum`)
+* **Role:** The Exporter / Splitting Engine
+* **The PR Idea:** `Feature: Semantic Splitting for ONNX Export`
+* **What it does:** Add a `--semantic-split` flag to `optimum-cli export onnx`. Instead of tracing the entire `model.forward()` into one massive 50GB file, it traces each `model.layers[i].forward()` individually, outputting `layer_N.onnx`.
+* **The Pitch:** *"Exporting 70B models to ONNX currently OOMs most machines because it holds the entire graph in RAM during serialization. Semantic splitting allows exporting layer-by-layer, dramatically reducing exporter RAM requirements and outputting portable chunks."*
+
+### Target 2: Microsoft ONNX Runtime GenAI (`microsoft/onnxruntime-genai`)
+* **Role:** The Core Inference Engine
+* **The PR Idea:** `Feature: Sharded/Component Model Loading for Memory-Constrained Devices`
+* **What it does:** Update the OGA `Model` class to accept a directory of semantic ONNX chunks instead of a single file. Implement an internal pipeline that loads/runs/unloads the chunks sequentially, passing tensor pointers (zero-copy) between them.
+* **The Pitch:** *"Currently, OGA requires the entire model to fit in physical RAM/VRAM. Supporting sharded sequential loading allows OGA to run massive models on minimal RAM via the Transient Session pattern, bringing 30B+ models to consumer hardware."*
+
+### Target 3: AMD Lemonade SDK (`amd/lemonade`)
+* **Role:** The Developer SDK & Hardware Integrator
+* **The PR Idea:** `Feature: LemonSlice Fallback Mode`
+* **What it does:** When a developer calls `lemonade.serve(model="llama-3-70b")` on a 32GB RAM machine, instead of crashing with an OutOfMemory error, the SDK automatically downloads/creates the LemonSliced version and uses sequential execution.
+* **The Pitch:** *"Ensure no developer ever hits an OOM error on Ryzen AI. If the model doesn't fit in VRAM/NPU, smoothly degrade to LemonSlice sequential execution instead of crashing. This makes Ryzen AI PCs capable of running models 2-4x larger than their physical RAM."*
+
+---
+
 ## 📁 Repo Map
 
 ```
