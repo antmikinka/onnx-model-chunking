@@ -49,13 +49,17 @@ from .session_manager import (
 
 from .io_binding import (
     IOBindingManager,
+    HeterogeneousIOBindingManager,
     DeviceBuffer,
+    SharedBuffer,
     MemoryMode,
     MemoryPlacement,
+    SharedAllocationKind,
     get_supported_devices,
     get_onnx_element_type,
     create_ortvalue_from_numpy,
     ort_memory_candidates,
+    allocate_os_shared_memory,
     NUMPY_TO_ONNX_ELEMENT_TYPE,
     VALID_ORTVALUE_DEVICES,
 )
@@ -119,13 +123,17 @@ __all__ = [
     "PROVIDER_CATEGORIES",
     # io_binding exports
     "IOBindingManager",
+    "HeterogeneousIOBindingManager",
     "DeviceBuffer",
+    "SharedBuffer",
     "MemoryMode",
     "MemoryPlacement",
+    "SharedAllocationKind",
     "get_supported_devices",
     "get_onnx_element_type",
     "create_ortvalue_from_numpy",
     "ort_memory_candidates",
+    "allocate_os_shared_memory",
     "NUMPY_TO_ONNX_ELEMENT_TYPE",
     "VALID_ORTVALUE_DEVICES",
     # backend exports

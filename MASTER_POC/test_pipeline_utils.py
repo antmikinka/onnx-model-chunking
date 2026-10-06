@@ -340,6 +340,126 @@ def test_io_binding():
     cpu_value = create_ortvalue_from_numpy(np.arange(3, dtype=np.float32), device_type="cpu")
     assert cpu_value.numpy().tolist() == [0.0, 1.0, 2.0]
 
+    from pipeline_utils.io_binding import (
+        HeterogeneousIOBindingManager,
+        SharedAllocationKind,
+        SharedBuffer,
+        OsSharedAllocation,
+        allocate_os_shared_memory,
+    )
+
+    class _FakeBinding:
+        def __init__(self):
+            self.events = []
+
+        def bind_output(self, name, device_type="cpu", device_id=0, element_type=None, shape=None, buffer_ptr=None):
+            self.events.append(("output-ptr", name, device_type, buffer_ptr, tuple(shape)))
+
+        def bind_input(self, name, device_type, device_id, element_type, shape, buffer_ptr):
+            self.events.append(("input-ptr", name, device_type, buffer_ptr, tuple(shape)))
+
+        def bind_ortvalue_output(self, name, value):
+            self.events.append(("output-ort", name, value, int(value.data_ptr())))
+
+        def bind_ortvalue_input(self, name, value):
+            self.events.append(("input-ort", name, value, int(value.data_ptr())))
+
+    bridge = HeterogeneousIOBindingManager(npu_device_type="vitisai", igpu_device_type="rocm")
+    assert bridge.prefill.device_type == "vitisai"
+    assert bridge.decode.device_type == "rocm"
+    kv = np.arange(24, dtype=np.float32).reshape(1, 2, 3, 4)
+    with warnings.catch_warnings(record=True) as shared_warnings:
+        warnings.simplefilter("always")
+        shared = bridge.allocate_shared_buffer("past_key", kv.shape, np.float32, kv)
+    assert shared.data_ptr == int(shared.ort_value.data_ptr())
+    assert np.array_equal(shared.to_numpy(), kv)
+    assert shared.allocation_kind in (
+        SharedAllocationKind.UNIFIED,
+        SharedAllocationKind.PINNED_HOST,
+        SharedAllocationKind.CPU,
+    )
+    if shared.allocation_kind == SharedAllocationKind.CPU:
+        assert any(item.category is RuntimeWarning for item in shared_warnings)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        private = bridge.prefill.allocate_buffer("weight", (4,), np.float32, np.ones(4, np.float32))
+    assert int(private.ort_value.data_ptr()) != shared.data_ptr
+
+    prefill_io = _FakeBinding()
+    decode_io = _FakeBinding()
+    bridge.bind_phase_bridge(prefill_io, decode_io, "past_key", "past_key")
+    assert prefill_io.events[0][0] == "output-ptr"
+    assert decode_io.events[0][0] == "input-ptr"
+    assert prefill_io.events[0][3] == decode_io.events[0][3] == shared.data_ptr
+    assert prefill_io.events[0][2] == "cpu"
+    assert decode_io.events[0][2] == "cpu"
+    try:
+        bridge.bind_shared_pointer(prefill_io, "past_key", "past_key", as_output=True, device_type="vitisai")
+        raise AssertionError("vitisai was accepted as the shared pointer device")
+    except ValueError:
+        pass
+
+    pinned_value = shared.ort_value
+    pinned_buffer = SharedBuffer(
+        name="past_value",
+        shape=kv.shape,
+        dtype=np.dtype(np.float32),
+        ort_value=pinned_value,
+        allocation_kind=SharedAllocationKind.PINNED_HOST,
+        data_ptr=shared.data_ptr,
+        nbytes=kv.nbytes,
+        npu_device_type="vitisai",
+        igpu_device_type="rocm",
+        bind_device_type="hip_pinned",
+    )
+    bridge._shared["past_value"] = pinned_buffer
+    pinned_prefill = _FakeBinding()
+    pinned_decode = _FakeBinding()
+    bridge.bind_phase_bridge(pinned_prefill, pinned_decode, "past_value", "past_value")
+    assert pinned_prefill.events[0][0] == "output-ort"
+    assert pinned_decode.events[0][0] == "input-ort"
+    assert pinned_prefill.events[0][2] is pinned_decode.events[0][2]
+    assert pinned_prefill.events[0][3] == pinned_decode.events[0][3] == shared.data_ptr
+
+    backing = np.zeros(kv.nbytes, dtype=np.uint8)
+    os_calls = {"count": 0}
+
+    def _fake_unified(nbytes):
+        os_calls["count"] += 1
+        assert nbytes == kv.nbytes
+        return OsSharedAllocation(
+            ptr=int(backing.ctypes.data),
+            kind=SharedAllocationKind.UNIFIED,
+            release=lambda: None,
+            keepalive=backing,
+        )
+
+    original_os_alloc = io_binding_module.allocate_os_shared_memory
+    io_binding_module.allocate_os_shared_memory = _fake_unified
+    try:
+        unified_bridge = HeterogeneousIOBindingManager()
+        with warnings.catch_warnings(record=True) as unified_warnings:
+            warnings.simplefilter("always")
+            unified = unified_bridge.allocate_shared_buffer("past_key", kv.shape, np.float32, kv)
+        assert os_calls["count"] == 1
+        assert unified.allocation_kind == SharedAllocationKind.UNIFIED
+        assert unified.data_ptr == int(backing.ctypes.data)
+        assert unified.data_ptr == int(unified.ort_value.data_ptr())
+        assert np.array_equal(unified.to_numpy(), kv)
+        assert not any(item.category is RuntimeWarning for item in unified_warnings)
+        unified_prefill = _FakeBinding()
+        unified_decode = _FakeBinding()
+        unified_bridge.bind_phase_bridge(unified_prefill, unified_decode, "past_key", "past_key")
+        assert unified_prefill.events[0][3] == unified_decode.events[0][3] == int(backing.ctypes.data)
+        assert unified_bridge.deallocate_shared_buffer("past_key") is True
+        assert unified.ort_value is None
+    finally:
+        io_binding_module.allocate_os_shared_memory = original_os_alloc
+
+    assert allocate_os_shared_memory(0) is None
+    assert bridge.deallocate_shared() >= 1
+    print(f"  shared bridge kind: {shared.allocation_kind.value}, ptr={shared.data_ptr:#x}")
+
     print("io_binding module: OK\n")
     return True
 

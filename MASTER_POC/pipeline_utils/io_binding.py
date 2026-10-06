@@ -19,6 +19,17 @@ AMD memory placement:
   then a HOST_ACCESSIBLE OrtMemoryInfo (HipPinned / CudaPinned).
 - Pageable "cpu" memory is only the last candidate.
 
+Heterogeneous prefill/decode:
+- IOBindingManager is one device. Splitting prefill onto the NPU and
+  decode onto the iGPU needs one buffer both sessions bind.
+- HeterogeneousIOBindingManager.allocate_shared_buffer() allocates that
+  crossing buffer (KV cache, hidden states, logits) once: hipMallocManaged
+  when the Ryzen AI driver provides it, otherwise page-locked host memory,
+  otherwise one CPU OrtValue.
+- bind_phase_bridge() binds that same address as the NPU prefill output
+  and the iGPU decode input. Private weights stay on the prefill and
+  decode managers.
+
 IMPORTANT MEMORY TRADEOFF CLARIFICATION:
 - I/O Binding does NOT reduce RAM usage
 - It reduces DATA COPY latency between CPU and device
@@ -37,12 +48,13 @@ Usage:
     outputs = manager.run_with_binding(session, {"input_ids": input_ids})
 """
 
+import ctypes
 import os
 import threading
 import warnings
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional, Sequence, Tuple, Any, Union
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Any, Union
 import numpy as np
 
 import onnxruntime as ort
@@ -1152,6 +1164,573 @@ class IOBindingManager:
 
 
 # =============================================================================
+# HETEROGENEOUS NPU / iGPU BRIDGE
+# =============================================================================
+
+class SharedAllocationKind(Enum):
+    """How a buffer shared by the NPU and the iGPU was allocated."""
+
+    UNIFIED = "unified"
+    PINNED_HOST = "pinned_host"
+    CPU = "cpu"
+
+
+# hipMemAttachGlobal: managed memory is visible to every device in the process.
+_HIP_MEM_ATTACH_GLOBAL = 0x01
+# Portable, device-mapped, and coherent page-locked host memory.
+_HIP_HOST_MALLOC_SHARED = 1 | 2 | 16
+_HIP_LIB_NAMES = (
+    "libamdhip64.so.6",
+    "libamdhip64.so.5",
+    "libamdhip64.so",
+    "amdhip64.dll",
+)
+# Device strings that name private EP memory. A shared host pointer must
+# not be bound under these names.
+_PRIVATE_EP_DEVICES = AMD_NPU_DEVICES | AMD_GPU_DEVICES | frozenset({
+    "cuda",
+    "gpu",
+    "npu",
+})
+
+_hip_library_lock = threading.Lock()
+_hip_library_handle: Any = None
+_hip_library_probed = False
+
+
+@dataclass
+class OsSharedAllocation:
+    """One OS allocation whose address both the NPU and the iGPU can use."""
+
+    ptr: int
+    kind: SharedAllocationKind
+    release: Callable[[], None]
+    keepalive: Any = None
+
+
+def _load_hip_library() -> Any:
+    """Return the HIP runtime library, or None when this process has no APU driver."""
+    global _hip_library_handle, _hip_library_probed
+    with _hip_library_lock:
+        if _hip_library_probed:
+            return _hip_library_handle
+        _hip_library_probed = True
+        for name in _HIP_LIB_NAMES:
+            try:
+                library = ctypes.CDLL(name)
+            except OSError:
+                continue
+            _configure_hip_library(library)
+            _hip_library_handle = library
+            return library
+        return None
+
+
+def _configure_hip_library(library: Any) -> None:
+    if hasattr(library, "hipMallocManaged"):
+        library.hipMallocManaged.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_size_t,
+            ctypes.c_uint,
+        ]
+        library.hipMallocManaged.restype = ctypes.c_int
+    if hasattr(library, "hipHostMalloc"):
+        library.hipHostMalloc.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_size_t,
+            ctypes.c_uint,
+        ]
+        library.hipHostMalloc.restype = ctypes.c_int
+    if hasattr(library, "hipFree"):
+        library.hipFree.argtypes = [ctypes.c_void_p]
+        library.hipFree.restype = ctypes.c_int
+    if hasattr(library, "hipHostFree"):
+        library.hipHostFree.argtypes = [ctypes.c_void_p]
+        library.hipHostFree.restype = ctypes.c_int
+
+
+def _hip_allocate(
+    library: Any,
+    symbol: str,
+    nbytes: int,
+    flags: int,
+    free_symbol: str,
+    kind: SharedAllocationKind,
+) -> Optional[OsSharedAllocation]:
+    allocator = getattr(library, symbol, None)
+    freer = getattr(library, free_symbol, None)
+    if allocator is None or freer is None:
+        return None
+    holder = ctypes.c_void_p()
+    status = allocator(
+        ctypes.byref(holder),
+        ctypes.c_size_t(nbytes),
+        ctypes.c_uint(flags),
+    )
+    if status != 0 or not holder.value:
+        return None
+    address = int(holder.value)
+
+    def release(addr: int = address, free_fn: Any = freer) -> None:
+        free_fn(ctypes.c_void_p(addr))
+
+    return OsSharedAllocation(ptr=address, kind=kind, release=release, keepalive=holder)
+
+
+def allocate_os_shared_memory(nbytes: int) -> Optional[OsSharedAllocation]:
+    """
+    Allocate memory the NPU DMA engine and the iGPU can both address.
+
+    Prefers hipMallocManaged (APU unified memory). Falls back to
+    hipHostMalloc page-locked memory. Returns None when the HIP runtime
+    is not installed; the caller then uses an OrtValue allocator.
+    """
+    if nbytes <= 0:
+        return None
+    library = _load_hip_library()
+    if library is None:
+        return None
+    managed = _hip_allocate(
+        library,
+        "hipMallocManaged",
+        nbytes,
+        _HIP_MEM_ATTACH_GLOBAL,
+        "hipFree",
+        SharedAllocationKind.UNIFIED,
+    )
+    if managed is not None:
+        return managed
+    return _hip_allocate(
+        library,
+        "hipHostMalloc",
+        nbytes,
+        _HIP_HOST_MALLOC_SHARED,
+        "hipHostFree",
+        SharedAllocationKind.PINNED_HOST,
+    )
+
+
+def _array_from_pointer(
+    ptr: int,
+    shape: Tuple[int, ...],
+    dtype: np.dtype,
+) -> Tuple[np.ndarray, Any]:
+    """Writable numpy view of an externally owned address. The view does not free it."""
+    dtype = np.dtype(dtype)
+    nbytes = int(dtype.itemsize)
+    for dim in shape:
+        nbytes *= int(dim)
+    raw = (ctypes.c_byte * nbytes).from_address(int(ptr))
+    array = np.ndarray(shape, dtype=dtype, buffer=raw)
+    return array, raw
+
+
+@dataclass
+class SharedBuffer:
+    """
+    One tensor address shared by NPU prefill and iGPU decode.
+
+    prefill binds it as an output. decode binds it as an input.
+    Both bindings use this OrtValue and this data_ptr.
+    """
+
+    name: str
+    shape: Tuple[int, ...]
+    dtype: np.dtype
+    ort_value: Optional[ort.OrtValue]
+    allocation_kind: SharedAllocationKind
+    data_ptr: int
+    nbytes: int
+    npu_device_type: str
+    igpu_device_type: str
+    bind_device_type: str = "cpu"
+    _release: Optional[Callable[[], None]] = None
+    _keepalive: Any = None
+    _closed: bool = False
+
+    def __post_init__(self) -> None:
+        if isinstance(self.dtype, str):
+            self.dtype = np.dtype(self.dtype)
+
+    @property
+    def crosses_devices(self) -> bool:
+        """True when the allocation is unified or page-locked, not pageable CPU."""
+        return self.allocation_kind in (
+            SharedAllocationKind.UNIFIED,
+            SharedAllocationKind.PINNED_HOST,
+        )
+
+    def to_numpy(self) -> np.ndarray:
+        if self.ort_value is None:
+            raise RuntimeError(f"Shared buffer '{self.name}' is closed")
+        return self.ort_value.numpy()
+
+    def close(self) -> None:
+        """Drop the OrtValue alias, then free an OS allocation once."""
+        if self._closed:
+            return
+        self._closed = True
+        self.ort_value = None
+        self._keepalive = None
+        release = self._release
+        self._release = None
+        if release is not None:
+            release()
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "shape": list(self.shape),
+            "dtype": str(self.dtype),
+            "allocation_kind": self.allocation_kind.value,
+            "data_ptr": self.data_ptr,
+            "nbytes": self.nbytes,
+            "npu_device_type": self.npu_device_type,
+            "igpu_device_type": self.igpu_device_type,
+            "bind_device_type": self.bind_device_type,
+            "crosses_devices": self.crosses_devices,
+            "closed": self._closed,
+        }
+
+
+class HeterogeneousIOBindingManager:
+    """
+    Prefill on the NPU and decode on the iGPU, with one shared KV address.
+
+    ``prefill`` and ``decode`` are single-device managers for tensors that
+    stay on one execution provider (weights, private activations).
+    Tensors that cross the phase boundary are allocated only through
+    ``allocate_shared_buffer``. Two private managers must not each allocate
+    a copy of the KV cache.
+    """
+
+    def __init__(
+        self,
+        npu_device_type: str = "vitisai",
+        npu_device_id: int = 0,
+        igpu_device_type: str = "rocm",
+        igpu_device_id: int = 0,
+    ):
+        self.npu_device_type = (npu_device_type or "vitisai").lower()
+        self.npu_device_id = npu_device_id
+        self.igpu_device_type = (igpu_device_type or "rocm").lower()
+        self.igpu_device_id = igpu_device_id
+        self.prefill = IOBindingManager(self.npu_device_type, npu_device_id)
+        self.decode = IOBindingManager(self.igpu_device_type, igpu_device_id)
+        self._shared: Dict[str, SharedBuffer] = {}
+        self._lock = threading.RLock()
+
+    def allocate_shared_buffer(
+        self,
+        name: str,
+        shape: Tuple[int, ...],
+        dtype: np.dtype,
+        data: Optional[np.ndarray] = None,
+    ) -> SharedBuffer:
+        """
+        Allocate one buffer both the NPU prefill session and the iGPU decode
+        session bind.
+
+        Order:
+        1. hipMallocManaged unified memory, when the Ryzen AI HIP driver is present
+        2. hipHostMalloc page-locked host memory
+        3. One pinned OrtValue (hip_pinned, rocm_pinned, cuda_pinned, or HOST_ACCESSIBLE)
+        4. One pageable CPU OrtValue, reported as allocation_kind ``cpu``
+
+        The OrtValue aliases the OS address. A device copy is discarded.
+        """
+        with self._lock:
+            if name in self._shared:
+                raise ValueError(f"Shared buffer '{name}' already exists")
+            if isinstance(dtype, str):
+                dtype = np.dtype(dtype)
+            else:
+                dtype = np.dtype(dtype)
+            parsed_shape = tuple(int(dim) for dim in shape)
+            if not parsed_shape or any(dim <= 0 for dim in parsed_shape):
+                raise ValueError(f"Shared buffer '{name}' needs a positive shape, got {shape}")
+
+            source: Optional[np.ndarray] = None
+            if data is not None:
+                source = np.ascontiguousarray(data, dtype=dtype)
+                if tuple(source.shape) != parsed_shape:
+                    raise ValueError(
+                        f"Shared buffer '{name}' data shape {source.shape} "
+                        f"does not match {parsed_shape}"
+                    )
+
+            nbytes = int(dtype.itemsize)
+            for dim in parsed_shape:
+                nbytes *= dim
+
+            buffer = self._buffer_from_os_memory(name, parsed_shape, dtype, source, nbytes)
+            if buffer is None:
+                buffer = self._buffer_from_pinned_ortvalue(name, parsed_shape, dtype, source)
+            if buffer.allocation_kind == SharedAllocationKind.CPU:
+                warnings.warn(
+                    f"Shared buffer '{name}' is one pageable CPU allocation at "
+                    f"{buffer.data_ptr:#x}. hipMallocManaged and page-locked "
+                    f"host memory are unavailable in this process. Prefill and "
+                    f"decode still bind this same address.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            self._shared[name] = buffer
+            return buffer
+
+    def _buffer_from_os_memory(
+        self,
+        name: str,
+        shape: Tuple[int, ...],
+        dtype: np.dtype,
+        data: Optional[np.ndarray],
+        nbytes: int,
+    ) -> Optional[SharedBuffer]:
+        os_alloc = allocate_os_shared_memory(nbytes)
+        if os_alloc is None:
+            return None
+        array = None
+        raw = None
+        ort_value = None
+        try:
+            array, raw = _array_from_pointer(os_alloc.ptr, shape, dtype)
+            if data is not None:
+                np.copyto(array, data)
+            else:
+                array.fill(0)
+            # CPU OrtValue aliases the numpy view. A non-CPU device would copy
+            # and drop the unified address.
+            ort_value = ort.OrtValue.ortvalue_from_numpy(array, "cpu", 0)
+            if int(ort_value.data_ptr()) != int(array.ctypes.data):
+                ort_value = None
+                array = None
+                raw = None
+                os_alloc.release()
+                return None
+        except Exception:
+            ort_value = None
+            array = None
+            raw = None
+            try:
+                os_alloc.release()
+            except Exception:
+                pass
+            return None
+        return SharedBuffer(
+            name=name,
+            shape=shape,
+            dtype=dtype,
+            ort_value=ort_value,
+            allocation_kind=os_alloc.kind,
+            data_ptr=int(ort_value.data_ptr()),
+            nbytes=nbytes,
+            npu_device_type=self.npu_device_type,
+            igpu_device_type=self.igpu_device_type,
+            bind_device_type="cpu",
+            _release=os_alloc.release,
+            _keepalive=(array, raw, os_alloc.keepalive),
+        )
+
+    def _buffer_from_pinned_ortvalue(
+        self,
+        name: str,
+        shape: Tuple[int, ...],
+        dtype: np.dtype,
+        data: Optional[np.ndarray],
+    ) -> SharedBuffer:
+        source = data if data is not None else np.zeros(shape, dtype=dtype)
+        pinned = IOBindingManager(device_type="hip_pinned", device_id=0)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            ort_value = pinned._create_ort_value(source)
+        if pinned.memory_placement == MemoryPlacement.PINNED_HOST:
+            kind = SharedAllocationKind.PINNED_HOST
+            bind_device = pinned.ortvalue_device
+            if bind_device in _PRIVATE_EP_DEVICES or bind_device not in {
+                "cpu",
+                "cuda_pinned",
+                "hip_pinned",
+                "rocm_pinned",
+            }:
+                bind_device = "cpu"
+        else:
+            kind = SharedAllocationKind.CPU
+            bind_device = "cpu"
+        return SharedBuffer(
+            name=name,
+            shape=shape,
+            dtype=dtype,
+            ort_value=ort_value,
+            allocation_kind=kind,
+            data_ptr=int(ort_value.data_ptr()),
+            nbytes=int(source.nbytes),
+            npu_device_type=self.npu_device_type,
+            igpu_device_type=self.igpu_device_type,
+            bind_device_type=bind_device,
+            _keepalive=(ort_value, source, pinned),
+        )
+
+    def get_shared_buffer(self, name: str) -> SharedBuffer:
+        with self._lock:
+            buffer = self._shared.get(name)
+        if buffer is None:
+            raise KeyError(f"Shared buffer '{name}' is not allocated")
+        return buffer
+
+    def bind_shared_pointer(
+        self,
+        io_binding: ort.IOBinding,
+        tensor_name: str,
+        buffer_name: str,
+        *,
+        as_output: bool,
+        device_type: Optional[str] = None,
+        device_id: int = 0,
+    ) -> SharedBuffer:
+        """
+        Bind ``data_ptr`` of a shared buffer.
+
+        ``device_type`` describes the memory (``cpu`` or a pinned-host alias).
+        It is not the execution provider. ``vitisai`` and ``rocm`` name private
+        device memory and are rejected here.
+        """
+        buffer = self.get_shared_buffer(buffer_name)
+        if buffer.ort_value is None:
+            raise RuntimeError(f"Shared buffer '{buffer_name}' is closed")
+        bind_device = (device_type or buffer.bind_device_type).lower()
+        if bind_device in _PRIVATE_EP_DEVICES:
+            raise ValueError(
+                f"Shared buffer '{buffer_name}' lives at {buffer.data_ptr:#x} "
+                f"({buffer.allocation_kind.value}). Bind that address as "
+                f"'{buffer.bind_device_type}', not as '{bind_device}'."
+            )
+        element_type = get_onnx_element_type(buffer.dtype)
+        shape = list(buffer.shape)
+        if as_output:
+            io_binding.bind_output(
+                tensor_name,
+                device_type=bind_device,
+                device_id=device_id,
+                element_type=element_type,
+                shape=shape,
+                buffer_ptr=buffer.data_ptr,
+            )
+        else:
+            io_binding.bind_input(
+                tensor_name,
+                bind_device,
+                device_id,
+                element_type,
+                shape,
+                buffer.data_ptr,
+            )
+        return buffer
+
+    def bind_prefill_output(
+        self,
+        io_binding: ort.IOBinding,
+        tensor_name: str,
+        buffer_name: str,
+    ) -> SharedBuffer:
+        """Bind the shared address as an output of the NPU prefill session."""
+        return self._bind_role(io_binding, tensor_name, buffer_name, as_output=True)
+
+    def bind_decode_input(
+        self,
+        io_binding: ort.IOBinding,
+        tensor_name: str,
+        buffer_name: str,
+    ) -> SharedBuffer:
+        """Bind the shared address as an input of the iGPU decode session."""
+        return self._bind_role(io_binding, tensor_name, buffer_name, as_output=False)
+
+    def bind_phase_bridge(
+        self,
+        prefill_binding: ort.IOBinding,
+        decode_binding: ort.IOBinding,
+        tensor_name: str,
+        buffer_name: str,
+    ) -> SharedBuffer:
+        """
+        Bind one shared buffer as the prefill output and the decode input.
+
+        Pinned OrtValues are bound as OrtValues so the pinned memory info is
+        preserved. Unified and CPU buffers are bound by the same ``data_ptr``.
+        """
+        buffer = self.get_shared_buffer(buffer_name)
+        if buffer.allocation_kind == SharedAllocationKind.PINNED_HOST:
+            if buffer.ort_value is None:
+                raise RuntimeError(f"Shared buffer '{buffer_name}' is closed")
+            prefill_binding.bind_ortvalue_output(tensor_name, buffer.ort_value)
+            decode_binding.bind_ortvalue_input(tensor_name, buffer.ort_value)
+            return buffer
+        self.bind_shared_pointer(prefill_binding, tensor_name, buffer_name, as_output=True)
+        self.bind_shared_pointer(decode_binding, tensor_name, buffer_name, as_output=False)
+        return buffer
+
+    def _bind_role(
+        self,
+        io_binding: ort.IOBinding,
+        tensor_name: str,
+        buffer_name: str,
+        *,
+        as_output: bool,
+    ) -> SharedBuffer:
+        buffer = self.get_shared_buffer(buffer_name)
+        if buffer.allocation_kind == SharedAllocationKind.PINNED_HOST:
+            if buffer.ort_value is None:
+                raise RuntimeError(f"Shared buffer '{buffer_name}' is closed")
+            if as_output:
+                io_binding.bind_ortvalue_output(tensor_name, buffer.ort_value)
+            else:
+                io_binding.bind_ortvalue_input(tensor_name, buffer.ort_value)
+            return buffer
+        return self.bind_shared_pointer(
+            io_binding,
+            tensor_name,
+            buffer_name,
+            as_output=as_output,
+        )
+
+    def deallocate_shared_buffer(self, name: str) -> bool:
+        with self._lock:
+            buffer = self._shared.pop(name, None)
+        if buffer is None:
+            return False
+        buffer.close()
+        return True
+
+    def deallocate_shared(self) -> int:
+        with self._lock:
+            buffers = list(self._shared.values())
+            self._shared.clear()
+        for buffer in buffers:
+            buffer.close()
+        return len(buffers)
+
+    def shared_memory_usage(self) -> Dict[str, Any]:
+        with self._lock:
+            buffers = dict(self._shared)
+        total = sum(buffer.nbytes for buffer in buffers.values())
+        return {
+            "buffer_count": len(buffers),
+            "total_bytes": total,
+            "total_mb": round(total / (1024 * 1024), 3),
+            "npu_device_type": self.npu_device_type,
+            "igpu_device_type": self.igpu_device_type,
+            "buffers": {name: buffer.to_dict() for name, buffer in buffers.items()},
+        }
+
+    def __repr__(self) -> str:
+        usage = self.shared_memory_usage()
+        return (
+            f"HeterogeneousIOBindingManager(npu={self.npu_device_type}:{self.npu_device_id}, "
+            f"igpu={self.igpu_device_type}:{self.igpu_device_id}, "
+            f"shared={usage['buffer_count']}, shared_mb={usage['total_mb']})"
+        )
+
+
+# =============================================================================
 # UTILITY FUNCTIONS
 # =============================================================================
 
@@ -1205,15 +1784,20 @@ def create_ortvalue_from_numpy(
 __all__ = [
     # Classes
     "IOBindingManager",
+    "HeterogeneousIOBindingManager",
     "DeviceBuffer",
+    "SharedBuffer",
     "MemoryMode",
     "MemoryPlacement",
+    "SharedAllocationKind",
     "OrtMemoryTarget",
+    "OsSharedAllocation",
     # Functions
     "get_supported_devices",
     "get_onnx_element_type",
     "create_ortvalue_from_numpy",
     "ort_memory_candidates",
+    "allocate_os_shared_memory",
     # Constants
     "NUMPY_TO_ONNX_ELEMENT_TYPE",
     "ONNX_ELEMENT_TYPE_NAMES",
