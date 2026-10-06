@@ -395,6 +395,31 @@ def _coerce_quantization_info(value: Any) -> Optional[QuantizationInfo]:
     )
 
 
+# Metadata generation written into model_info.json by OnnxSplitResult.
+SCHEMA_VERSION = "2.0.0"
+
+
+def _coerce_schema_version(value: Any) -> str:
+    """A schema version is major.minor.patch and matches this metadata generation."""
+    if isinstance(value, bool) or not isinstance(value, str) or not value.strip():
+        raise ValueError(f"schema_version must be a non-empty string, got {value!r}")
+    text = value.strip()
+    parts = text.split(".")
+    if (
+        len(parts) != 3
+        or any(
+            not part.isdigit() or (len(part) > 1 and part.startswith("0"))
+            for part in parts
+        )
+    ):
+        raise ValueError(f"schema_version must be major.minor.patch, got {text!r}")
+    if text != SCHEMA_VERSION:
+        raise ValueError(
+            f"schema_version {text!r} does not match {SCHEMA_VERSION}"
+        )
+    return text
+
+
 @dataclass
 class OnnxSplitResult(SplitResult):
     """
@@ -413,12 +438,15 @@ class OnnxSplitResult(SplitResult):
         components: Dictionary of ComponentInfo objects.
         quantization: MatMulNBits, AWQ, or GPTQ contract for this split.
         kv_cache: Past and present key and value patterns for this split.
+        schema_version: Metadata generation for model_info.json. The current
+            generation is 2.0.0.
     """
     ir_version: int = 0
     producer: str = ""
     components: Dict[str, ComponentInfo] = field(default_factory=dict)
     quantization: Optional[QuantizationInfo] = None
     kv_cache: Optional[KVCacheContract] = None
+    schema_version: str = SCHEMA_VERSION
 
     def __post_init__(self):
         """Validate boundary tensors, keep this result on ONNX, and copy contracts."""
@@ -431,14 +459,16 @@ class OnnxSplitResult(SplitResult):
                 f"kv_cache num_layers {self.kv_cache.num_layers} does not match "
                 f"split num_layers {self.num_layers!r}"
             )
+        self.schema_version = _coerce_schema_version(self.schema_version)
 
     def to_dict(self) -> Dict[str, Any]:
-        """Copy the split result and include the quantization and KV cache records."""
+        """Copy the split result and include the quantization, KV cache, and schema version."""
         recorded = super().to_dict()
         recorded["quantization"] = (
             None if self.quantization is None else self.quantization.to_dict()
         )
         recorded["kv_cache"] = None if self.kv_cache is None else self.kv_cache.to_dict()
+        recorded["schema_version"] = self.schema_version
         return recorded
 
 

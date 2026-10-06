@@ -15299,6 +15299,109 @@ def test_execution_plan_type():
     return True
 
 
+def test_schema_version():
+    """An ONNX split records the metadata generation for model_info.json."""
+    print("=" * 50)
+    print("Testing schema version...")
+    print("=" * 50)
+
+    import sys
+    import types
+
+    try:
+        from chunking_utils.onnx.types import SCHEMA_VERSION, OnnxSplitResult
+        import chunking_utils.onnx as onnx_pkg
+    except ModuleNotFoundError:
+        for name in list(sys.modules):
+            if name == "chunking_utils.onnx" or name.startswith("chunking_utils.onnx."):
+                del sys.modules[name]
+        onnx_stub = types.ModuleType("onnx")
+        onnx_stub.ModelProto = type("ModelProto", (), {})
+        onnx_stub.numpy_helper = types.SimpleNamespace()
+        onnx_stub.helper = types.SimpleNamespace()
+        onnx_stub.TensorProto = types.SimpleNamespace()
+        onnx_stub.shape_inference = types.SimpleNamespace()
+        sys.modules["onnx"] = onnx_stub
+        from chunking_utils.onnx.types import SCHEMA_VERSION, OnnxSplitResult
+        import chunking_utils.onnx as onnx_pkg
+
+    assert "SCHEMA_VERSION" not in onnx_pkg.__all__
+    assert SCHEMA_VERSION == "2.0.0"
+
+    def expect_value_error(callable_check, text):
+        try:
+            callable_check()
+            raise AssertionError(text)
+        except ValueError:
+            return
+
+    bare = OnnxSplitResult(
+        output_dir="out",
+        num_layers=1,
+        component_files={},
+        model_info={},
+    )
+    assert bare.schema_version == "2.0.0"
+    assert bare.to_dict()["schema_version"] == "2.0.0"
+
+    pinned = OnnxSplitResult(
+        output_dir="out",
+        num_layers=1,
+        component_files={},
+        model_info={},
+        schema_version=" 2.0.0 ",
+    )
+    assert pinned.schema_version == "2.0.0"
+    recorded = pinned.to_dict()
+    recorded["schema_version"] = "1.0.0"
+    assert pinned.schema_version == "2.0.0"
+
+    expect_value_error(
+        lambda: OnnxSplitResult(
+            output_dir="out",
+            num_layers=1,
+            component_files={},
+            model_info={},
+            schema_version=" ",
+        ),
+        "a blank version was accepted",
+    )
+    expect_value_error(
+        lambda: OnnxSplitResult(
+            output_dir="out",
+            num_layers=1,
+            component_files={},
+            model_info={},
+            schema_version=True,
+        ),
+        "a bool version was accepted",
+    )
+    expect_value_error(
+        lambda: OnnxSplitResult(
+            output_dir="out",
+            num_layers=1,
+            component_files={},
+            model_info={},
+            schema_version="1.0.0",
+        ),
+        "a different version was accepted",
+    )
+    expect_value_error(
+        lambda: OnnxSplitResult(
+            output_dir="out",
+            num_layers=1,
+            component_files={},
+            model_info={},
+            schema_version="2.0",
+        ),
+        "a short version was accepted",
+    )
+
+    print("schema version: OK")
+    print("  2.0.0 stays the schema version, a copied record does not change the field, and a blank version raises")
+    return True
+
+
 def test_path_manager():
     """ONNX discovery, external data, split directories, and NPU cache paths."""
     print("=" * 50)
@@ -15735,6 +15838,12 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"execution_plan_type: FAILED - {e}")
         results.append(("execution_plan_type", False))
+
+    try:
+        results.append(("schema_version", test_schema_version()))
+    except Exception as e:
+        print(f"schema_version: FAILED - {e}")
+        results.append(("schema_version", False))
 
     try:
         results.append(("path_manager", test_path_manager()))
