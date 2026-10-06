@@ -35,6 +35,13 @@ def test_dtypes():
         get_recommended_quantized_dtype,
         resolve_preferred_dtype,
         PROVIDER_DTYPE_POLICY,
+        supports_float8,
+        get_float8_dtype,
+        float8_storage_dtype,
+        quantize_float8,
+        dequantize_float8,
+        FP8_E4M3,
+        FP8_E5M2,
         supports_bfloat16,
         get_bfloat16_dtype,
         get_dtype_info
@@ -287,6 +294,51 @@ def test_dtypes():
     except ValueError as exc:
         assert "logits" in str(exc)
     print("  provider dtype policy: CPU, ROCm, VitisAI, DirectML")
+
+    assert supports_float8() is False
+    assert FP8_E4M3 is None
+    assert FP8_E5M2 is None
+    assert get_float8_dtype("e4m3fn") is None
+    assert get_float8_dtype("e5m2") is None
+    assert float8_storage_dtype("e4m3fn") == np.dtype(np.uint8)
+    assert float8_storage_dtype("e5m2") == np.dtype(np.float16)
+    with warnings.catch_warnings(record=True) as float8_warnings:
+        warnings.simplefilter("always")
+        assert get_numpy_dtype("tensor(float8e4m3fn)") == np.float16
+        assert get_numpy_dtype("float8e5m2") == np.float16
+        assert numpy_dtype_from_onnx_element_type(17) == np.float16
+        assert numpy_dtype_from_onnx_element_type(19) == np.float16
+    assert any("float8e4m3fn" in str(item.message) for item in float8_warnings)
+    fp8_values = np.array([0, 1, -1, 2, 4, 16, 32, 448], dtype=np.float32)
+    fp8_stored = quantize_float8(fp8_values, scale=1.0, kind="e4m3fn")
+    assert fp8_stored.dtype == np.dtype(np.uint8)
+    fp8_restored = dequantize_float8(fp8_stored, scale=1.0)
+    assert np.allclose(fp8_restored, fp8_values, rtol=0, atol=0)
+    import pipeline_utils.dtypes as dtypes_mod
+    saved_fp8 = (dtypes_mod.FP8_E4M3, dtypes_mod.FP8_E5M2)
+    try:
+        dtypes_mod.FP8_E4M3 = np.float16
+        dtypes_mod.FP8_E5M2 = np.float16
+        assert dtypes_mod.supports_float8() is True
+        assert dtypes_mod.get_float8_dtype("e5m2") is np.float16
+        with warnings.catch_warnings(record=True) as native_warnings:
+            warnings.simplefilter("always")
+            assert get_numpy_dtype("tensor(float8e4m3fn)") == np.float16
+        assert not any("falling back to float16" in str(item.message) for item in native_warnings)
+        native_stored = quantize_float8(np.array([1.0, -2.0], dtype=np.float32), scale=1.0)
+        assert native_stored.dtype == np.dtype(np.float16)
+        assert np.allclose(dequantize_float8(native_stored), np.array([1.0, -2.0], dtype=np.float32))
+    finally:
+        dtypes_mod.FP8_E4M3, dtypes_mod.FP8_E5M2 = saved_fp8
+    assert supports_float8() is False
+    assert pipeline_utils.supports_float8 is supports_float8
+    assert pipeline_utils.quantize_float8 is quantize_float8
+    try:
+        quantize_float8(np.array([1.0]), scale=0.0)
+        raise AssertionError("a zero float8 scale should be rejected")
+    except ValueError as exc:
+        assert "scale" in str(exc)
+    print("  float8: ml_dtypes when present, E4M3 codes otherwise")
     
     print("dtypes module: OK\n")
     return True
@@ -880,7 +932,8 @@ def test_kv_cache():
     fp8_cache.update_from_present(0, fp8_src, fp8_src)
     fp8_cache.quantize_kv(0)
     assert fp8_cache.kv_quantization == "fp8"
-    assert fp8_cache.cache_dtype == np.dtype(np.uint8)
+    from pipeline_utils.dtypes import float8_storage_dtype as fp8_storage
+    assert fp8_cache.cache_dtype == fp8_storage("e4m3fn")
     fp8_key, _ = fp8_cache.dequantize_kv(0)
     assert np.all(np.isfinite(fp8_key))
     assert np.allclose(fp8_key, fp8_src, rtol=0, atol=0)

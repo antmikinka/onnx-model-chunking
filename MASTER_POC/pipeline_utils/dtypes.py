@@ -42,6 +42,165 @@ def get_bfloat16_dtype():
 
 
 # =============================================================================
+# FLOAT8 SUPPORT DETECTION
+# =============================================================================
+
+try:
+    import ml_dtypes
+    FP8_E4M3 = getattr(ml_dtypes, "float8_e4m3fn", None)
+    FP8_E5M2 = getattr(ml_dtypes, "float8_e5m2", None)
+    FP8_E4M3FNUZ = getattr(ml_dtypes, "float8_e4m3fnuz", None)
+    FP8_E5M2FNUZ = getattr(ml_dtypes, "float8_e5m2fnuz", None)
+except ImportError:
+    FP8_E4M3 = None
+    FP8_E5M2 = None
+    FP8_E4M3FNUZ = None
+    FP8_E5M2FNUZ = None
+
+_FLOAT8_BY_KIND = {
+    "e4m3": "e4m3fn",
+    "e4m3fn": "e4m3fn",
+    "float8e4m3fn": "e4m3fn",
+    "e5m2": "e5m2",
+    "float8e5m2": "e5m2",
+    "e4m3fnuz": "e4m3fnuz",
+    "float8e4m3fnuz": "e4m3fnuz",
+    "e5m2fnuz": "e5m2fnuz",
+    "float8e5m2fnuz": "e5m2fnuz",
+}
+
+
+def _float8_kind(kind: str) -> str:
+    key = str(kind).strip().lower().replace("-", "").replace("_", "")
+    if key not in _FLOAT8_BY_KIND:
+        known = ", ".join(sorted(set(_FLOAT8_BY_KIND.values())))
+        raise ValueError(f"Unrecognized float8 kind: {kind}. Known kinds: {known}")
+    return _FLOAT8_BY_KIND[key]
+
+
+def _float8_constant(kind: str):
+    canonical = _float8_kind(kind)
+    return {
+        "e4m3fn": FP8_E4M3,
+        "e5m2": FP8_E5M2,
+        "e4m3fnuz": FP8_E4M3FNUZ,
+        "e5m2fnuz": FP8_E5M2FNUZ,
+    }[canonical]
+
+
+def supports_float8() -> bool:
+    """True when ml_dtypes provides both OCP E4M3FN and E5M2."""
+    return FP8_E4M3 is not None and FP8_E5M2 is not None
+
+
+def get_float8_dtype(kind: str = "e4m3fn"):
+    """Return one FP8 dtype, or None when that variant is not installed."""
+    return _float8_constant(kind)
+
+
+def float8_storage_dtype(kind: str = "e4m3fn") -> np.dtype:
+    """Dtype used to store compressed FP8 values.
+
+    A native ml_dtypes value is stored as itself. E4M3 without that package
+    is stored as uint8 codes. Other variants fall back to float16.
+    """
+    native = get_float8_dtype(kind)
+    if native is not None:
+        return np.dtype(native)
+    if _float8_kind(kind) == "e4m3fn":
+        return np.dtype(np.uint8)
+    return np.dtype(np.float16)
+
+
+def _build_fp8_e4m3_table() -> np.ndarray:
+    """OCP E4M3FN codes. Only exponent 15 with mantissa 7 is NaN."""
+    table = np.empty(256, dtype=np.float32)
+    for code in range(256):
+        sign = -1.0 if code & 0x80 else 1.0
+        exp = (code >> 3) & 0xF
+        mant = code & 0x7
+        if exp == 15 and mant == 7:
+            table[code] = np.nan
+            continue
+        if exp == 0:
+            mag = (mant / 8.0) * (2.0 ** -6)
+        else:
+            mag = (1.0 + mant / 8.0) * (2.0 ** (exp - 7))
+        table[code] = np.float32(sign * mag)
+    return table
+
+
+_FP8_E4M3_TABLE = _build_fp8_e4m3_table()
+_FP8_POS_ORDER = np.array(
+    [
+        code
+        for code in np.argsort(_FP8_E4M3_TABLE[:128], kind="stable")
+        if np.isfinite(_FP8_E4M3_TABLE[code])
+    ],
+    dtype=np.uint8,
+)
+_FP8_POS_LEVELS = np.ascontiguousarray(_FP8_E4M3_TABLE[_FP8_POS_ORDER])
+
+
+def _quantize_e4m3_codes(values: np.ndarray) -> np.ndarray:
+    scaled = np.nan_to_num(
+        np.asarray(values, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0
+    )
+    abs_vals = np.minimum(np.abs(scaled), _FP8_POS_LEVELS[-1])
+    index = np.searchsorted(_FP8_POS_LEVELS, abs_vals, side="left")
+    index = np.clip(index, 1, len(_FP8_POS_LEVELS) - 1)
+    left = index - 1
+    right_dist = np.abs(_FP8_POS_LEVELS[index] - abs_vals)
+    left_dist = np.abs(_FP8_POS_LEVELS[left] - abs_vals)
+    pick = np.where(right_dist < left_dist, index, left)
+    codes = _FP8_POS_ORDER[pick].astype(np.uint8)
+    return np.where(scaled < 0, codes | np.uint8(0x80), codes).astype(np.uint8)
+
+
+def quantize_float8(
+    values: np.ndarray,
+    scale: float = 1.0,
+    kind: str = "e4m3fn",
+) -> np.ndarray:
+    """Compress values to FP8 for a cache that ORT will see only after dequantization.
+
+    Native ml_dtypes keeps the real FP8 dtype. E4M3 without that package
+    stores uint8 codes. The matching ``dequantize_float8`` call expands
+    either form to float32 at the session boundary.
+    """
+    if float(scale) == 0.0 or not np.isfinite(scale):
+        raise ValueError(f"float8 scale must be finite and non-zero, got {scale}")
+    scaled = np.asarray(values, dtype=np.float32) / np.float32(scale)
+    native = get_float8_dtype(kind)
+    if native is not None:
+        return np.ascontiguousarray(scaled.astype(native))
+    if _float8_kind(kind) == "e4m3fn":
+        return np.ascontiguousarray(_quantize_e4m3_codes(scaled))
+    warnings.warn(
+        f"Float8 kind '{kind}' falling back to float16",
+        UserWarning,
+    )
+    return np.ascontiguousarray(scaled.astype(np.float16))
+
+
+def dequantize_float8(stored: np.ndarray, scale: float = 1.0) -> np.ndarray:
+    """Expand a compressed FP8 buffer to float32."""
+    array = np.asarray(stored)
+    factor = np.float32(scale)
+    native_dtypes = [
+        dtype
+        for dtype in (FP8_E4M3, FP8_E5M2, FP8_E4M3FNUZ, FP8_E5M2FNUZ)
+        if dtype is not None and array.dtype == np.dtype(dtype)
+    ]
+    if native_dtypes or array.dtype == np.dtype(np.float16):
+        return np.asarray(array, dtype=np.float32) * factor
+    if array.dtype == np.dtype(np.uint8) or array.dtype.itemsize == 1:
+        codes = np.ascontiguousarray(array).view(np.uint8)
+        return _FP8_E4M3_TABLE[codes] * factor
+    raise ValueError(f"Cannot dequantize float8 storage dtype {array.dtype}")
+
+
+# =============================================================================
 # ONNX TYPE MAPPINGS
 # =============================================================================
 
@@ -78,11 +237,11 @@ ONNX_DTYPE_MAP = {
     "tensor(int4)": np.int8,      # Packed 2x per byte
     "tensor(uint4)": np.uint8,    # Packed 2x per byte
     
-    # Float8 Types (emerging standard for inference)
-    "tensor(float8e4m3fn)": np.float16,   # Fallback with precision warning
-    "tensor(float8e5m2)": np.float16,     # Fallback with precision warning
-    "tensor(float8e4m3fnuz)": np.float16, # Fallback with precision warning
-    "tensor(float8e5m2fnuz)": np.float16, # Fallback with precision warning
+    # Float8 Types. Resolved to ml_dtypes when installed, else float16.
+    "tensor(float8e4m3fn)": "float8e4m3fn",
+    "tensor(float8e5m2)": "float8e5m2",
+    "tensor(float8e4m3fnuz)": "float8e4m3fnuz",
+    "tensor(float8e5m2fnuz)": "float8e5m2fnuz",
 }
 
 # Types that require special handling or have precision implications
@@ -90,8 +249,8 @@ SPECIAL_TYPES = {
     "bfloat16": "Uses ml_dtypes if available, else falls back to float32",
     "int4": "Signed 4-bit values, two per int8 byte. INT4_BLOCKWISE records the group, scale, and zero point.",
     "uint4": "Unsigned 4-bit values, two per uint8 byte. UINT4_BLOCKWISE records the group, scale, and zero point.",
-    "float8e4m3fn": "8-bit float (E4M3), falls back to float16",
-    "float8e5m2": "8-bit float (E5M2), falls back to float16",
+    "float8e4m3fn": "OCP E4M3FN. Uses ml_dtypes when available, else uint8 codes dequantized at the session boundary.",
+    "float8e5m2": "OCP E5M2. Uses ml_dtypes when available, else falls back to float16.",
 }
 
 # Numeric ONNX TensorProto.DataType codes.
@@ -115,6 +274,10 @@ ONNX_ELEMENT_TYPE_TO_NUMPY = {
     14: np.complex64,
     15: np.complex128,
     16: "bfloat16",
+    17: "float8e4m3fn",
+    18: "float8e4m3fnuz",
+    19: "float8e5m2",
+    20: "float8e5m2fnuz",
 }
 
 NUMPY_TO_ONNX_ELEMENT_TYPE = {
@@ -142,6 +305,10 @@ SHORT_DTYPE_MAP = {
     "float": np.float32,
     "double": np.float64,
     "bfloat16": "bfloat16",
+    "float8e4m3fn": "float8e4m3fn",
+    "float8e5m2": "float8e5m2",
+    "float8e4m3fnuz": "float8e4m3fnuz",
+    "float8e5m2fnuz": "float8e5m2fnuz",
     "int8": np.int8,
     "int16": np.int16,
     "int32": np.int32,
@@ -612,6 +779,41 @@ def unpack_weights(packed: np.ndarray, spec: QuantizedDtype) -> np.ndarray:
 # TYPE CONVERSION UTILITIES
 # =============================================================================
 
+_FLOAT8_SENTINELS = {
+    "float8e4m3fn": "e4m3fn",
+    "float8e5m2": "e5m2",
+    "float8e4m3fnuz": "e4m3fnuz",
+    "float8e5m2fnuz": "e5m2fnuz",
+}
+
+
+def _resolve_float8_sentinel(name: str, onnx_type: str):
+    native = get_float8_dtype(_FLOAT8_SENTINELS[name])
+    if native is not None:
+        return native
+    warnings.warn(
+        f"Float8 type '{onnx_type}' falling back to float16",
+        UserWarning,
+    )
+    return np.float16
+
+
+def _materialize_mapped_dtype(result, onnx_type: str):
+    if result == "bfloat16":
+        bf16 = get_bfloat16_dtype()
+        if bf16 is not None:
+            return bf16
+        warnings.warn(
+            "bfloat16 requested but ml_dtypes not available. "
+            "Falling back to float32 to preserve precision.",
+            UserWarning,
+        )
+        return np.float32
+    if isinstance(result, str) and result in _FLOAT8_SENTINELS:
+        return _resolve_float8_sentinel(result, onnx_type)
+    return result
+
+
 def get_numpy_dtype(onnx_type: str) -> np.dtype:
     """
     Get numpy dtype for an ONNX type string.
@@ -627,47 +829,34 @@ def get_numpy_dtype(onnx_type: str) -> np.dtype:
     """
     # Try full form first
     if onnx_type in ONNX_DTYPE_MAP:
-        result = ONNX_DTYPE_MAP[onnx_type]
-        if result == "bfloat16":
-            bf16 = get_bfloat16_dtype()
-            if bf16 is not None:
-                return bf16
-            warnings.warn(
-                "bfloat16 requested but ml_dtypes not available. "
-                "Falling back to float32 to preserve precision.",
-                UserWarning
-            )
-            return np.float32
-        return result
+        return _materialize_mapped_dtype(ONNX_DTYPE_MAP[onnx_type], onnx_type)
     
     # Try extracting type from tensor() wrapper
     if onnx_type.startswith("tensor(") and onnx_type.endswith(")"):
         inner_type = onnx_type[7:-1]
         if inner_type in SHORT_DTYPE_MAP:
-            result = SHORT_DTYPE_MAP[inner_type]
-            if result == "bfloat16":
-                bf16 = get_bfloat16_dtype()
-                return bf16 if bf16 is not None else np.float32
-            return result
+            return _materialize_mapped_dtype(SHORT_DTYPE_MAP[inner_type], onnx_type)
     
     # Try short form
     if onnx_type in SHORT_DTYPE_MAP:
-        result = SHORT_DTYPE_MAP[onnx_type]
-        if result == "bfloat16":
-            bf16 = get_bfloat16_dtype()
-            return bf16 if bf16 is not None else np.float32
-        return result
+        return _materialize_mapped_dtype(SHORT_DTYPE_MAP[onnx_type], onnx_type)
     
     # Fallback: try parsing common patterns
     onnx_lower = onnx_type.lower()
     if "float16" in onnx_lower:
         return np.float16
     elif "bfloat16" in onnx_lower:
-        bf16 = get_bfloat16_dtype()
-        return bf16 if bf16 is not None else np.float32
+        return _materialize_mapped_dtype("bfloat16", onnx_type)
     elif "float8" in onnx_lower:
-        warnings.warn(f"Float8 type '{onnx_type}' falling back to float16", UserWarning)
-        return np.float16
+        if "e4m3fnuz" in onnx_lower:
+            sentinel = "float8e4m3fnuz"
+        elif "e5m2fnuz" in onnx_lower:
+            sentinel = "float8e5m2fnuz"
+        elif "e5m2" in onnx_lower:
+            sentinel = "float8e5m2"
+        else:
+            sentinel = "float8e4m3fn"
+        return _resolve_float8_sentinel(sentinel, onnx_type)
     elif "float64" in onnx_lower or "double" in onnx_lower:
         return np.float64
     elif "float" in onnx_lower:
@@ -716,17 +905,7 @@ def numpy_dtype_from_onnx_element_type(element_type: int):
     if element_type not in ONNX_ELEMENT_TYPE_TO_NUMPY:
         raise ValueError(f"Unrecognized ONNX element type: {element_type}")
     result = ONNX_ELEMENT_TYPE_TO_NUMPY[element_type]
-    if result == "bfloat16":
-        bf16 = get_bfloat16_dtype()
-        if bf16 is not None:
-            return bf16
-        warnings.warn(
-            "bfloat16 requested but ml_dtypes not available. "
-            "Falling back to float32 to preserve precision.",
-            UserWarning
-        )
-        return np.float32
-    return result
+    return _materialize_mapped_dtype(result, f"tensor({result})")
 
 
 def safe_cast(
@@ -891,16 +1070,9 @@ def _canonical_role(tensor_role: str) -> str:
 
 
 def _fp8_dtype():
-    """OCP FP8 dtype from ml_dtypes, or None when that package is absent."""
-    try:
-        import ml_dtypes
-    except ImportError:
-        return None
-    for name in ("float8_e4m3fn", "float8_e5m2"):
-        candidate = getattr(ml_dtypes, name, None)
-        if candidate is not None:
-            return candidate
-    return None
+    """OCP E4M3FN from ml_dtypes, or None when that variant is absent."""
+    native = get_float8_dtype("e4m3fn")
+    return None if native is None else np.dtype(native)
 
 
 def _dtype_for_logical(logical: str):
@@ -1020,6 +1192,15 @@ __all__ = [
     "get_dtype_info",
     "supports_bfloat16",
     "get_bfloat16_dtype",
+    "FP8_E4M3",
+    "FP8_E5M2",
+    "FP8_E4M3FNUZ",
+    "FP8_E5M2FNUZ",
+    "supports_float8",
+    "get_float8_dtype",
+    "float8_storage_dtype",
+    "quantize_float8",
+    "dequantize_float8",
     "get_dtype_preferences",
     "resolve_preferred_dtype",
     "get_recommended_dtype",

@@ -2275,33 +2275,6 @@ _FP4_MAGNITUDES = np.array(
 )
 
 
-def _build_fp8_e4m3_table() -> np.ndarray:
-    """OCP E4M3FN codes. Only exponent 15 with mantissa 7 is NaN."""
-    table = np.empty(256, dtype=np.float32)
-    for code in range(256):
-        sign = -1.0 if code & 0x80 else 1.0
-        exp = (code >> 3) & 0xF
-        mant = code & 0x7
-        if exp == 15 and mant == 7:
-            table[code] = np.nan
-            continue
-        if exp == 0:
-            mag = (mant / 8.0) * (2.0 ** -6)
-        else:
-            mag = (1.0 + mant / 8.0) * (2.0 ** (exp - 7))
-        table[code] = np.float32(sign * mag)
-    return table
-
-
-_FP8_E4M3 = _build_fp8_e4m3_table()
-_FP8_POS_ORDER = np.argsort(_FP8_E4M3[:128], kind="stable")
-_FP8_POS_ORDER = np.array(
-    [code for code in _FP8_POS_ORDER if np.isfinite(_FP8_E4M3[code])],
-    dtype=np.uint8,
-)
-_FP8_POS_LEVELS = np.ascontiguousarray(_FP8_E4M3[_FP8_POS_ORDER])
-
-
 def _coerce_kv_quantization(scheme: Optional[str]) -> Optional[str]:
     """Map aliases onto fp16, bf16, int8, fp8, int4, or fp4."""
     if scheme is None:
@@ -2332,9 +2305,9 @@ def _bf16_storage_dtype() -> np.dtype:
 
 
 def _fp8_storage_dtype() -> np.dtype:
-    if hasattr(np, "float8_e4m3fn"):
-        return np.dtype(np.float8_e4m3fn)
-    return np.dtype(np.uint8)
+    from .dtypes import float8_storage_dtype
+
+    return float8_storage_dtype("e4m3fn")
 
 
 def _scheme_storage_dtype(scheme: str) -> np.dtype:
@@ -2415,37 +2388,16 @@ def _dequantize_bf16(stored: np.ndarray) -> np.ndarray:
     return wide.view(np.float32)
 
 
-def _fp8_bit_codes(stored: np.ndarray) -> np.ndarray:
-    if stored.dtype == np.dtype(np.uint8):
-        return np.ascontiguousarray(stored)
-    return np.ascontiguousarray(stored).view(np.uint8)
-
-
-def _store_fp8_codes(codes: np.ndarray) -> np.ndarray:
-    packed = np.ascontiguousarray(codes, dtype=np.uint8)
-    storage = _fp8_storage_dtype()
-    if storage == np.dtype(np.uint8):
-        return packed
-    return packed.view(storage)
-
-
 def _quantize_fp8(values: np.ndarray, scale: float) -> np.ndarray:
-    scaled = _finite_float32(values) / np.float32(scale)
-    abs_vals = np.minimum(np.abs(scaled), _FP8_POS_LEVELS[-1])
-    index = np.searchsorted(_FP8_POS_LEVELS, abs_vals, side="left")
-    index = np.clip(index, 1, len(_FP8_POS_LEVELS) - 1)
-    left = index - 1
-    right_dist = np.abs(_FP8_POS_LEVELS[index] - abs_vals)
-    left_dist = np.abs(_FP8_POS_LEVELS[left] - abs_vals)
-    pick = np.where(right_dist < left_dist, index, left)
-    codes = _FP8_POS_ORDER[pick].astype(np.uint8)
-    codes = np.where(scaled < 0, codes | np.uint8(0x80), codes).astype(np.uint8)
-    return _store_fp8_codes(codes)
+    from .dtypes import quantize_float8
+
+    return quantize_float8(_finite_float32(values), scale, kind="e4m3fn")
 
 
 def _dequantize_fp8(stored: np.ndarray, scale: float) -> np.ndarray:
-    codes = _fp8_bit_codes(stored)
-    return _FP8_E4M3[codes] * np.float32(scale)
+    from .dtypes import dequantize_float8
+
+    return dequantize_float8(stored, scale)
 
 
 def _pack_nibbles(nibbles: np.ndarray) -> np.ndarray:
