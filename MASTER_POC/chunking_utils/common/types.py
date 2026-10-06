@@ -5,6 +5,8 @@ This module defines the core data types used across both ONNX and SafeTensors
 splitting operations, providing a unified interface for configuration and results.
 """
 
+import os
+import re
 from enum import Enum
 from typing import Dict, Iterable, List, Any, Optional
 from dataclasses import dataclass, field
@@ -234,6 +236,30 @@ _TENSOR_DTYPE_ALIASES = {
     "nf4": TensorDtype.INT4,
     "fp4": TensorDtype.INT4,
     "auto": TensorDtype.AUTO,
+}
+# Activation and index tensors use ONNX names that are not weight dtypes.
+_INDEX_DTYPE_ALIASES = {
+    "int64": "int64",
+    "int32": "int32",
+    "int16": "int16",
+    "uint16": "uint16",
+    "uint32": "uint32",
+    "uint64": "uint64",
+    "bool": "bool",
+    "boolean": "bool",
+    "float64": "float64",
+    "double": "float64",
+    "fp64": "float64",
+}
+_LAYER_FILE_NAME = re.compile(r"^layer_(\d+)$")
+_MODEL_FILE_SUFFIXES = {
+    ".onnx",
+    ".safetensors",
+    ".gguf",
+    ".bin",
+    ".pt",
+    ".pth",
+    ".ckpt",
 }
 
 
@@ -515,6 +541,52 @@ class KVCacheConfig:
         }
 
 
+def _canonical_dtype_name(value: Any) -> str:
+    """Map fp16 and float16 onto one name. int64 stays an index dtype."""
+    if isinstance(value, TensorDtype):
+        return value.value
+    if isinstance(value, bool) or not isinstance(value, str) or not value.strip():
+        raise ValueError(f"dtype must be a dtype name, got {value!r}")
+    text = _normalize_quant_token(value)
+    if text in _TENSOR_DTYPE_ALIASES:
+        return _TENSOR_DTYPE_ALIASES[text].value
+    if text in _INDEX_DTYPE_ALIASES:
+        return _INDEX_DTYPE_ALIASES[text]
+    known = ", ".join(item.value for item in TensorDtype)
+    raise ValueError(f"Unknown dtype {value!r}. Expected one of: {known}")
+
+
+def _coerce_required_dtype(value: Any) -> TensorDtype:
+    """A split dtype is required. fp16 is stored as float16."""
+    coerced = _coerce_quant_dtype(value, "dtype")
+    if coerced is None:
+        raise ValueError("dtype is required")
+    return coerced
+
+
+def _coerce_memory_mode(value: Any) -> MemoryMode:
+    """Accept a MemoryMode or its value, such as streaming or eager."""
+    if isinstance(value, MemoryMode):
+        return value
+    if isinstance(value, bool) or not isinstance(value, str):
+        raise ValueError(f"memory_mode must be a MemoryMode, got {value!r}")
+    text = value.strip().lower()
+    try:
+        return MemoryMode(text)
+    except ValueError as exc:
+        known = ", ".join(item.value for item in MemoryMode)
+        raise ValueError(
+            f"Unknown memory_mode {value!r}. Expected one of: {known}"
+        ) from exc
+
+
+def _model_path_must_exist(model: str) -> bool:
+    """A filesystem model must exist. A Hugging Face id such as org/name does not."""
+    if os.path.isabs(model) or model.startswith(".") or model.startswith("~"):
+        return True
+    return os.path.splitext(model)[1].lower() in _MODEL_FILE_SUFFIXES
+
+
 def _coerce_kv_cache(value: Any) -> KVCacheConfig:
     """Copy a KVCacheConfig, or build one from a dict."""
     if isinstance(value, KVCacheConfig):
@@ -595,6 +667,8 @@ class SplitConfig:
     verbose: bool = False
 
     def __post_init__(self) -> None:
+        self.dtype = _coerce_required_dtype(self.dtype)
+        self.memory_mode = _coerce_memory_mode(self.memory_mode)
         self.target_device = _coerce_device_type(self.target_device)
         self.execution_policy = _coerce_execution_policy(self.execution_policy)
         if self.providers is None:
@@ -636,6 +710,45 @@ class SplitConfig:
                 f"execution_policy {self.execution_policy.value} is rejected "
                 "on an NPU provider. Sequential layer splitting on NPU is unsafe."
             )
+
+    def validate(self) -> None:
+        """
+        Reject a missing model file, an invalid memory mode, an inconsistent
+        dtype, or a sequential NPU policy.
+
+        A Hugging Face model id is not a file. ``dtype`` AUTO does not have to
+        match the activation dtype.
+        """
+        if not isinstance(self.model, str) or not self.model.strip():
+            raise ValueError(f"model must be a non-empty string, got {self.model!r}")
+        if not isinstance(self.output, str) or not self.output.strip():
+            raise ValueError(f"output must be a non-empty string, got {self.output!r}")
+        if not isinstance(self.dtype, TensorDtype):
+            raise ValueError(f"Unknown dtype {self.dtype!r}")
+        if not isinstance(self.memory_mode, MemoryMode):
+            known = ", ".join(item.value for item in MemoryMode)
+            raise ValueError(
+                f"Unknown memory_mode {self.memory_mode!r}. Expected one of: {known}"
+            )
+        if _model_path_must_exist(self.model) and not os.path.exists(self.model):
+            raise ValueError(f"missing file {self.model}")
+        activation = self.quantization.activation_dtype
+        if (
+            self.dtype is not TensorDtype.AUTO
+            and activation is not None
+            and self.dtype is not activation
+        ):
+            raise ValueError(
+                f"inconsistent dtype: split dtype {self.dtype.value} and "
+                f"activation dtype {activation.value}"
+            )
+        quant_kv = self.quantization.kv_cache_dtype
+        if quant_kv is not None and quant_kv is not self.kv_cache.dtype:
+            raise ValueError(
+                f"inconsistent dtype: quantization kv cache {quant_kv.value} and "
+                f"kv cache {self.kv_cache.dtype.value}"
+            )
+        self._reject_npu_sequential_split()
 
     def resolved_providers(self) -> List[str]:
         """
@@ -920,6 +1033,44 @@ class ExecutionPlan:
         self._reject_unsafe_npu_schedule()
         self._require_policy_phases()
 
+    def validate(self) -> None:
+        """
+        Reject a missing dependency, a cycle, or an unsafe NPU schedule.
+
+        An empty plan is a valid AUTO schedule. Hybrid, MoE, and speculative
+        plans still require the phases they name.
+        """
+        if isinstance(self.steps, (str, bytes)) or not isinstance(self.steps, list):
+            raise ValueError(f"steps must be a list, got {self.steps!r}")
+        seen = set()
+        for step in self.steps:
+            if not isinstance(step, ExecutionStep):
+                raise ValueError(
+                    f"execution step must be an ExecutionStep, got {step!r}"
+                )
+            if step.component_name in seen:
+                raise ValueError(
+                    f"execution plan repeats component {step.component_name!r}"
+                )
+            seen.add(step.component_name)
+            _coerce_step_phase(step.phase)
+            _coerce_plan_device(step.device, "device")
+        _reject_plan_cycle(self.steps)
+        if not isinstance(self.policy, ExecutionPolicy):
+            raise ValueError(
+                f"Unknown execution_policy {self.policy!r}. "
+                f"Expected one of: {', '.join(item.value for item in ExecutionPolicy)}"
+            )
+        _coerce_plan_device(self.prefill_device, "prefill_device")
+        _coerce_plan_device(self.decode_device, "decode_device")
+        if not isinstance(self.static_shapes, bool):
+            raise ValueError(
+                f"static_shapes must be a boolean, got {self.static_shapes!r}"
+            )
+        _as_non_negative_int(self.warmup_iterations, "warmup_iterations")
+        self._reject_unsafe_npu_schedule()
+        self._require_policy_phases()
+
     def _reject_unsafe_npu_schedule(self) -> None:
         """Refuse a sequential layer series on an NPU."""
         npu_steps = [step for step in self.steps if _step_uses_npu(step)]
@@ -1035,6 +1186,65 @@ class SplitResult:
             cleaned.append(tensor)
         self.boundary_tensors = cleaned
         self.execution_plan = _coerce_execution_plan(self.execution_plan)
+
+    def validate(self) -> None:
+        """
+        Reject an empty component map, a missing file, an invalid layer id,
+        a dependency that is not in the map, or an inconsistent boundary dtype.
+        """
+        if not isinstance(self.component_files, dict) or not self.component_files:
+            raise ValueError("component_files is empty")
+        if not isinstance(self.output_dir, str) or not os.path.isdir(self.output_dir):
+            raise ValueError(f"missing directory {self.output_dir!r}")
+        if isinstance(self.num_layers, bool) or not isinstance(self.num_layers, int) or self.num_layers < 0:
+            raise ValueError(
+                f"num_layers must be a non-negative integer, got {self.num_layers!r}"
+            )
+        names = set()
+        layer_ids: List[int] = []
+        for name, path in self.component_files.items():
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError(f"component name must be a non-empty string, got {name!r}")
+            if not isinstance(path, str) or not path.strip() or not os.path.isfile(path):
+                raise ValueError(f"missing file {path!r} for component {name!r}")
+            names.add(name)
+            match = _LAYER_FILE_NAME.match(name)
+            if match:
+                layer_ids.append(int(match.group(1)))
+        for layer_id in layer_ids:
+            if layer_id >= self.num_layers:
+                raise ValueError(
+                    f"invalid layer id {layer_id} for num_layers {self.num_layers}"
+                )
+        for index in range(self.num_layers):
+            layer_name = f"layer_{index}"
+            if layer_name not in names:
+                raise ValueError(f"missing component {layer_name}")
+        for tensor in self.boundary_tensors:
+            _canonical_dtype_name(tensor.dtype)
+            if tensor.producer_component not in names:
+                raise ValueError(
+                    f"boundary {tensor.name!r} depends on {tensor.producer_component!r}, "
+                    "which is not in component_files"
+                )
+            for consumer in tensor.consumer_components:
+                if consumer not in names:
+                    raise ValueError(
+                        f"boundary {tensor.name!r} depends on {consumer!r}, "
+                        "which is not in component_files"
+                    )
+        for step in self.execution_plan.steps:
+            if step.component_name not in names:
+                raise ValueError(
+                    f"Step {step.component_name!r} is not in component_files"
+                )
+            for dependency in step.depends_on:
+                if dependency not in names:
+                    raise ValueError(
+                        f"Step {step.component_name!r} depends on {dependency!r}, "
+                        "which is not in component_files"
+                    )
+        self.execution_plan.validate()
 
     def boundary_by_name(self) -> Dict[str, BoundaryTensor]:
         """Lookup used when IO binding allocates one buffer per boundary name."""
@@ -1282,6 +1492,42 @@ class ComponentInfo:
         self.device_preference = _coerce_component_device(self.device_preference)
         self.resident_policy = _coerce_component_resident(self.resident_policy)
         self.phase = _coerce_component_phase(self.phase)
+
+    def validate(self) -> None:
+        """
+        Reject an invalid layer id, a missing file, a missing dependency,
+        or an input dtype that disagrees with the output dtype.
+        """
+        if self.component_type is ComponentType.LAYER:
+            if (
+                isinstance(self.layer_id, bool)
+                or not isinstance(self.layer_id, int)
+                or self.layer_id < 0
+            ):
+                raise ValueError(f"invalid layer id {self.layer_id!r}")
+        elif self.layer_id is not None:
+            raise ValueError(
+                f"invalid layer id {self.layer_id!r} for {self.component_type.value}"
+            )
+        if self.file_path is not None and not os.path.isfile(self.file_path):
+            raise ValueError(f"missing file {self.file_path}")
+        for path in self.external_data_files:
+            if not os.path.isfile(path):
+                raise ValueError(f"missing file {path}")
+        if self.name in self.depends_on:
+            raise ValueError(f"depends_on cannot include this component {self.name!r}")
+        canonical: Dict[str, str] = {}
+        for mapping in (self.input_types, self.output_types):
+            if not isinstance(mapping, dict):
+                raise ValueError(f"dtype map must be a dict, got {mapping!r}")
+            for name, dtype in mapping.items():
+                stored = _canonical_dtype_name(dtype)
+                previous = canonical.get(name)
+                if previous is not None and previous != stored:
+                    raise ValueError(
+                        f"inconsistent dtype for {name!r}: {previous} and {stored}"
+                    )
+                canonical[name] = stored
 
     @property
     def name(self) -> str:

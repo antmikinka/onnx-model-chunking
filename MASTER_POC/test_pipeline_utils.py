@@ -6363,6 +6363,7 @@ def test_backend():
             SplitResult,
             ExecutionStep,
             ExecutionPlan,
+            MemoryMode,
         )
         from pipeline_utils.session_manager import ExecutionPolicy as session_policy
         assert DeviceType is canonical_device
@@ -6972,6 +6973,216 @@ def test_backend():
             raise AssertionError("a negative warmup count was accepted")
         except ValueError as exc:
             assert "warmup_iterations" in str(exc)
+        eager = SplitConfig(
+            model="weights",
+            output="out",
+            memory_mode="eager",
+            dtype="fp16",
+        )
+        assert eager.memory_mode is MemoryMode.EAGER
+        assert eager.dtype is TensorDtype.FLOAT16
+        assert eager.validate() is None
+        assert ExecutionPlan().validate() is None
+        assert ComponentInfo(
+            component_type="embedding",
+            input_names=["hidden", "mask"],
+            output_names=["hidden"],
+            input_types={"hidden": "fp16", "mask": "int64"},
+            output_types={"hidden": "float16"},
+        ).validate() is None
+        eager.memory_mode = "tape"
+        try:
+            eager.validate()
+            raise AssertionError("an invalid memory mode was accepted")
+        except ValueError as exc:
+            assert "memory_mode" in str(exc)
+        unsafe = SplitConfig(
+            model="weights",
+            output="out",
+            target_device="cpu",
+            execution_policy="sequential",
+        )
+        unsafe.validate()
+        unsafe.target_device = DeviceType.NPU
+        try:
+            unsafe.validate()
+            raise AssertionError("a sequential NPU policy was accepted by validate")
+        except ValueError as exc:
+            assert "NPU" in str(exc)
+        missing_model = SplitConfig(model="missing-split-model.onnx", output="out")
+        try:
+            missing_model.validate()
+            raise AssertionError("a missing model file was accepted")
+        except ValueError as exc:
+            assert "missing file" in str(exc)
+        mixed_dtype = SplitConfig(
+            model="weights",
+            output="out",
+            dtype="float16",
+            quantization=QuantizationConfig(activation_dtype="int8"),
+        )
+        try:
+            mixed_dtype.validate()
+            raise AssertionError("an inconsistent dtype was accepted")
+        except ValueError as exc:
+            assert "inconsistent dtype" in str(exc)
+        try:
+            ComponentInfo(component_type="layer").validate()
+            raise AssertionError("a layer without an id was accepted")
+        except ValueError as exc:
+            assert "layer" in str(exc)
+        try:
+            ComponentInfo(component_type="embedding", layer_id=3).validate()
+            raise AssertionError("a layer id on an embedding was accepted")
+        except ValueError as exc:
+            assert "layer" in str(exc)
+        try:
+            ComponentInfo(
+                component_type="embedding",
+                file_path="missing-component.onnx",
+            ).validate()
+            raise AssertionError("a missing component file was accepted")
+        except ValueError as exc:
+            assert "missing file" in str(exc)
+        try:
+            ComponentInfo(
+                component_type="embedding",
+                input_names=["hidden"],
+                output_names=["hidden"],
+                input_types={"hidden": "float16"},
+                output_types={"hidden": "float32"},
+            ).validate()
+            raise AssertionError("an inconsistent component dtype was accepted")
+        except ValueError as exc:
+            assert "inconsistent dtype" in str(exc)
+        try:
+            SplitResult(
+                output_dir="out",
+                num_layers=0,
+                component_files={},
+                model_info={},
+            ).validate()
+            raise AssertionError("an empty component map was accepted")
+        except ValueError as exc:
+            assert "empty" in str(exc)
+        checked_dir = tempfile.mkdtemp(prefix="split-validate-")
+        embed_path = os.path.join(checked_dir, "embedding.onnx")
+        layer_path = os.path.join(checked_dir, "layer_0.onnx")
+        extra_path = os.path.join(checked_dir, "layer_2.onnx")
+        try:
+            for path in (embed_path, layer_path, extra_path):
+                with open(path, "wb") as handle:
+                    handle.write(b"onnx")
+            ready = SplitResult(
+                output_dir=checked_dir,
+                num_layers=1,
+                component_files={
+                    "embedding": embed_path,
+                    "layer_0": layer_path,
+                },
+                model_info={},
+                boundary_tensors=[
+                    BoundaryTensor(
+                        name="hidden_states",
+                        dtype="fp16",
+                        shape=[1, None, 16],
+                        producer_component="embedding",
+                        consumer_components=["layer_0"],
+                    )
+                ],
+                execution_plan=ExecutionPlan(
+                    policy="hybrid_npu_igpu",
+                    prefill_device="npu",
+                    decode_device="igpu",
+                    steps=[
+                        ExecutionStep(
+                            component_name="embedding",
+                            provider="VitisAIExecutionProvider",
+                            device="npu",
+                            phase="prefill",
+                        ),
+                        ExecutionStep(
+                            component_name="layer_0",
+                            provider="DmlExecutionProvider",
+                            device="igpu",
+                            phase="decode",
+                            depends_on=["embedding"],
+                        ),
+                    ],
+                ),
+            )
+            ready.validate()
+            ready.execution_plan.policy = canonical_policy.SEQUENTIAL
+            try:
+                ready.execution_plan.validate()
+                raise AssertionError("a mutated sequential NPU plan was accepted")
+            except ValueError as exc:
+                assert "NPU" in str(exc)
+            missing_layer = SplitResult(
+                output_dir=checked_dir,
+                num_layers=1,
+                component_files={"embedding": embed_path},
+                model_info={},
+            )
+            try:
+                missing_layer.validate()
+                raise AssertionError("a missing layer file was accepted")
+            except ValueError as exc:
+                assert "layer_0" in str(exc)
+            orphan = SplitResult(
+                output_dir=checked_dir,
+                num_layers=1,
+                component_files={
+                    "embedding": embed_path,
+                    "layer_0": layer_path,
+                },
+                model_info={},
+                execution_plan=ExecutionPlan(
+                    steps=[
+                        ExecutionStep(
+                            component_name="embedding",
+                            device="cpu",
+                            phase="embedding",
+                        ),
+                        ExecutionStep(
+                            component_name="norm",
+                            device="cpu",
+                            phase="norm",
+                            depends_on=["embedding"],
+                        ),
+                    ],
+                ),
+            )
+            try:
+                orphan.validate()
+                raise AssertionError("a missing component dependency was accepted")
+            except ValueError as exc:
+                assert "norm" in str(exc)
+            extra_layer = SplitResult(
+                output_dir=checked_dir,
+                num_layers=1,
+                component_files={
+                    "embedding": embed_path,
+                    "layer_0": layer_path,
+                    "layer_2": extra_path,
+                },
+                model_info={},
+            )
+            try:
+                extra_layer.validate()
+                raise AssertionError("an invalid layer id was accepted")
+            except ValueError as exc:
+                assert "layer" in str(exc)
+            ComponentInfo(
+                component_type="layer",
+                layer_id=0,
+                file_path=layer_path,
+            ).validate()
+        finally:
+            for path in (embed_path, layer_path, extra_path):
+                if os.path.isfile(path):
+                    os.remove(path)
+            os.rmdir(checked_dir)
         try:
             SplitConfig(model="weights", output="out", target_device="tpu")
             raise AssertionError("an unknown device was accepted")
@@ -7540,6 +7751,7 @@ def test_backend():
     print("  quantization: awq int4 group, matmul nbits, kv dtype")
     print("  kv cache config: dense float16 bnsd, sliding window, paged blocks")
     print("  execution plan: prefill on npu, decode on igpu")
+    print("  validation: files, layers, dtypes, npu policy")
     print("backend module: OK\n")
     return True
 
