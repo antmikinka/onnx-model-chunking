@@ -8,7 +8,102 @@ including ComponentInfo for tracking extracted model components.
 from typing import Dict, List, Optional, Set, Any
 from dataclasses import dataclass, field
 
-from ..common.types import SplitResult, ModelFormat
+from ..common.types import (
+    ModelFormat,
+    SplitResult,
+    _boundary_name_is_stateful,
+    _coerce_component_device,
+    _copy_dim_list,
+    normalize_cache_role,
+)
+
+
+@dataclass
+class BoundaryTensorInfo:
+    """
+    One tensor that enters or leaves an ONNX component.
+
+    ``shape`` uses None for a symbolic axis. A past or present name is
+    stateful, carries a KV cache role, and prefers the NPU when no device
+    is set. Which component consumes or produces the tensor is the list
+    that holds this record.
+    """
+    name: str
+    dtype: str
+    shape: List[Optional[int]]
+    is_stateful: bool = False
+    cache_role: Optional[str] = None  # "past_key", "past_value", "present_key", etc.
+    device_preference: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError(
+                f"boundary tensor name must be a non-empty string, got {self.name!r}"
+            )
+        self.name = self.name.strip()
+        if not isinstance(self.dtype, str) or not self.dtype.strip():
+            raise ValueError(
+                f"boundary tensor dtype must be a non-empty string, got {self.dtype!r}"
+            )
+        self.dtype = self.dtype.strip()
+        self.shape = _copy_dim_list(self.shape, f"shape of {self.name!r}")
+        if not isinstance(self.is_stateful, bool):
+            raise ValueError(f"is_stateful must be a bool, got {self.is_stateful!r}")
+        if _boundary_name_is_stateful(self.name):
+            self.is_stateful = True
+        self.cache_role = normalize_cache_role(self.name, self.cache_role)
+        self.device_preference = _coerce_component_device(self.device_preference)
+        if self.device_preference is None and self.is_stateful:
+            self.device_preference = "npu"
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Copy the record so a caller can serialize it without sharing the shape."""
+        return {
+            "name": self.name,
+            "dtype": self.dtype,
+            "shape": list(self.shape),
+            "is_stateful": self.is_stateful,
+            "cache_role": self.cache_role,
+            "device_preference": self.device_preference,
+        }
+
+
+def _coerce_boundary_tensor_info(value: Any) -> BoundaryTensorInfo:
+    """Accept a BoundaryTensorInfo or a mapping with the same fields."""
+    if isinstance(value, BoundaryTensorInfo):
+        return value
+    if isinstance(value, dict):
+        try:
+            return BoundaryTensorInfo(**value)
+        except TypeError as exc:
+            raise ValueError(
+                f"boundary tensor fields are incomplete, got {value!r}"
+            ) from exc
+    raise ValueError(f"boundary tensor must be a BoundaryTensorInfo, got {value!r}")
+
+
+def _copy_boundary_list(value: Any, field_name: str) -> List[BoundaryTensorInfo]:
+    """Copy one boundary list. A string is not a list. Duplicate names raise."""
+    if isinstance(value, (str, bytes)) or not isinstance(value, list):
+        raise ValueError(f"{field_name} must be a list, got {value!r}")
+    cleaned: List[BoundaryTensorInfo] = []
+    seen = set()
+    for item in value:
+        tensor = _coerce_boundary_tensor_info(item)
+        if tensor.name in seen:
+            raise ValueError(f"duplicate {field_name} name {tensor.name!r}")
+        seen.add(tensor.name)
+        cleaned.append(
+            BoundaryTensorInfo(
+                name=tensor.name,
+                dtype=tensor.dtype,
+                shape=list(tensor.shape),
+                is_stateful=tensor.is_stateful,
+                cache_role=tensor.cache_role,
+                device_preference=tensor.device_preference,
+            )
+        )
+    return cleaned
 
 
 @dataclass
@@ -27,6 +122,8 @@ class ComponentInfo:
         initializer_names: Names of initializers (weights) used by this component.
         input_names: Input tensor names for this component.
         output_names: Output tensor names for this component.
+        boundary_inputs: Tensors this component consumes, with dtype, shape, and device.
+        boundary_outputs: Tensors this component produces, with dtype, shape, and device.
     """
     component_type: str  # 'embedding', 'layer', 'norm', 'lm_head', 'other'
     layer_id: Optional[int] = None  # For layer components
@@ -35,7 +132,14 @@ class ComponentInfo:
     initializer_names: Set[str] = field(default_factory=set)
     input_names: List[str] = field(default_factory=list)
     output_names: List[str] = field(default_factory=list)
-    
+    boundary_inputs: List[BoundaryTensorInfo] = field(default_factory=list)
+    boundary_outputs: List[BoundaryTensorInfo] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        """Copy boundary lists so two components do not share one factory list."""
+        self.boundary_inputs = _copy_boundary_list(self.boundary_inputs, "boundary_inputs")
+        self.boundary_outputs = _copy_boundary_list(self.boundary_outputs, "boundary_outputs")
+
     @property
     def name(self) -> str:
         """Generate a canonical name for this component."""
@@ -62,6 +166,8 @@ class ComponentInfo:
             "num_initializers": self.num_initializers,
             "input_names": self.input_names,
             "output_names": self.output_names,
+            "boundary_inputs": [item.to_dict() for item in self.boundary_inputs],
+            "boundary_outputs": [item.to_dict() for item in self.boundary_outputs],
         }
 
 

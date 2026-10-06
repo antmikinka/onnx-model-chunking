@@ -14663,6 +14663,155 @@ def test_streaming_merge():
     return True
 
 
+def test_boundary_tensor_info():
+    """Boundary tensors record dtype, shape, cache role, and device on a component."""
+    print("=" * 50)
+    print("Testing boundary tensor info...")
+    print("=" * 50)
+
+    import sys
+    import types
+
+    try:
+        from chunking_utils.onnx.types import BoundaryTensorInfo, ComponentInfo
+        import chunking_utils.onnx as onnx_pkg
+    except ModuleNotFoundError:
+        for name in list(sys.modules):
+            if name == "chunking_utils.onnx" or name.startswith("chunking_utils.onnx."):
+                del sys.modules[name]
+        onnx_stub = types.ModuleType("onnx")
+        onnx_stub.ModelProto = type("ModelProto", (), {})
+        onnx_stub.numpy_helper = types.SimpleNamespace()
+        onnx_stub.helper = types.SimpleNamespace()
+        onnx_stub.TensorProto = types.SimpleNamespace()
+        onnx_stub.shape_inference = types.SimpleNamespace()
+        sys.modules["onnx"] = onnx_stub
+        from chunking_utils.onnx.types import BoundaryTensorInfo, ComponentInfo
+        import chunking_utils.onnx as onnx_pkg
+
+    assert "BoundaryTensorInfo" not in onnx_pkg.__all__
+
+    def expect_value_error(callable_check, text):
+        try:
+            callable_check()
+            raise AssertionError(text)
+        except ValueError:
+            return
+
+    embedding = ComponentInfo(component_type="embedding", node_indices=[0])
+    other = ComponentInfo(component_type="embedding", node_indices=[0])
+    assert embedding.name == "embedding"
+    assert embedding.num_nodes == 1
+    assert embedding.boundary_inputs == []
+    assert embedding.boundary_outputs == []
+    assert embedding.boundary_inputs is not other.boundary_inputs
+    assert embedding.boundary_outputs is not other.boundary_outputs
+
+    caller_shape = [1, None, 8, 64]
+    past = BoundaryTensorInfo(
+        name=" past_key_values.0.key ",
+        dtype=" float16 ",
+        shape=caller_shape,
+        is_stateful=False,
+    )
+    assert past.name == "past_key_values.0.key"
+    assert past.dtype == "float16"
+    assert past.shape == [1, None, 8, 64]
+    assert past.shape is not caller_shape
+    assert past.is_stateful is True
+    assert past.cache_role == "past_key"
+    assert past.device_preference == "npu"
+    caller_shape.append(1)
+    assert past.shape == [1, None, 8, 64]
+
+    hidden = BoundaryTensorInfo(
+        name="hidden_states",
+        dtype="float16",
+        shape=[1, None, 4096],
+        device_preference="rdna",
+    )
+    assert hidden.is_stateful is False
+    assert hidden.cache_role is None
+    assert hidden.device_preference == "igpu"
+
+    layer = ComponentInfo(
+        component_type="layer",
+        layer_id=0,
+        boundary_inputs=[{
+            "name": "past_key_values.0.key",
+            "dtype": "float16",
+            "shape": [1, None, 8, 64],
+        }],
+        boundary_outputs=[hidden],
+    )
+    assert layer.boundary_inputs[0].is_stateful is True
+    assert layer.boundary_inputs[0].cache_role == "past_key"
+    assert layer.boundary_inputs[0].device_preference == "npu"
+    assert layer.boundary_outputs[0] is not hidden
+    assert layer.boundary_outputs[0].device_preference == "igpu"
+    hidden.shape.append(3)
+    assert layer.boundary_outputs[0].shape == [1, None, 4096]
+
+    recorded = layer.to_dict()
+    assert recorded["type"] == "layer"
+    assert recorded["input_names"] == []
+    assert recorded["boundary_inputs"] == [{
+        "name": "past_key_values.0.key",
+        "dtype": "float16",
+        "shape": [1, None, 8, 64],
+        "is_stateful": True,
+        "cache_role": "past_key",
+        "device_preference": "npu",
+    }]
+    assert recorded["boundary_outputs"][0]["name"] == "hidden_states"
+    assert recorded["boundary_outputs"][0]["device_preference"] == "igpu"
+    recorded["boundary_inputs"][0]["shape"].append(9)
+    assert layer.boundary_inputs[0].shape == [1, None, 8, 64]
+
+    expect_value_error(
+        lambda: BoundaryTensorInfo(name=" ", dtype="float16", shape=[1]),
+        "a blank boundary name was accepted",
+    )
+    expect_value_error(
+        lambda: BoundaryTensorInfo(name="hidden", dtype="float16", shape=[True]),
+        "a bool shape axis was accepted",
+    )
+    expect_value_error(
+        lambda: BoundaryTensorInfo(
+            name="hidden",
+            dtype="float16",
+            shape=[1],
+            cache_role="hidden",
+        ),
+        "an unknown cache role was accepted",
+    )
+    expect_value_error(
+        lambda: BoundaryTensorInfo(
+            name="hidden",
+            dtype="float16",
+            shape=[1],
+            device_preference="tpu",
+        ),
+        "an unknown device was accepted",
+    )
+    expect_value_error(
+        lambda: ComponentInfo(component_type="embedding", boundary_inputs="hidden"),
+        "a string boundary list was accepted",
+    )
+    expect_value_error(
+        lambda: ComponentInfo(
+            component_type="layer",
+            layer_id=0,
+            boundary_outputs=[hidden, hidden],
+        ),
+        "a duplicate boundary name was accepted",
+    )
+
+    print("boundary tensor info: OK")
+    print("  a past key is stateful on the NPU, a hidden activation keeps its device, two components do not share the boundary lists, and a blank name raises")
+    return True
+
+
 def test_path_manager():
     """ONNX discovery, external data, split directories, and NPU cache paths."""
     print("=" * 50)
@@ -15075,6 +15224,12 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"streaming_merge: FAILED - {e}")
         results.append(("streaming_merge", False))
+
+    try:
+        results.append(("boundary_tensor_info", test_boundary_tensor_info()))
+    except Exception as e:
+        print(f"boundary_tensor_info: FAILED - {e}")
+        results.append(("boundary_tensor_info", False))
 
     try:
         results.append(("path_manager", test_path_manager()))
