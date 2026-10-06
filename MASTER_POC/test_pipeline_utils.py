@@ -935,6 +935,197 @@ def test_session_manager():
         assert measured_memory.compiled_graph_mb < COMPILED_GRAPH_FLOOR_MB["npu"]
     print("  runtime memory: weights, graph, activations, one KV pool, workspace")
 
+    import os
+    import tempfile
+    import pipeline_utils.session_manager as session_manager_module
+
+    placed_info = {
+        "components": {
+            "embedding": {
+                "file": "embedding.onnx",
+                "provider": "VitisAIExecutionProvider",
+                "provider_options": {"cacheKey": "embedding"},
+            },
+            "decode": {
+                "file": "decode.onnx",
+                "provider": "DmlExecutionProvider",
+            },
+            "router": {
+                "file": "router.onnx",
+                "provider": "CPUExecutionProvider",
+                "provider_options": {
+                    "intra_op_num_threads": 2,
+                    "enable_cpu_mem_arena": False,
+                },
+            },
+            "expert_0": {
+                "file": "expert_0.onnx",
+                "provider": "VitisAIExecutionProvider",
+                "provider_options": {"cacheKey": "expert-0"},
+            },
+            "lm_head": {
+                "file": "lm_head.onnx",
+                "provider": "DmlExecutionProvider",
+                "provider_options": {"device_id": "1"},
+            },
+            "shared": {"file": "shared.onnx"},
+        },
+    }
+    placed_providers = [
+        "VitisAIExecutionProvider",
+        "DmlExecutionProvider",
+        "CPUExecutionProvider",
+    ]
+    placed = SessionManager(
+        ".",
+        SessionConfig(
+            providers=list(placed_providers),
+            execution_policy=ExecutionPolicy.HYBRID_NPU_MOE_ROUTING,
+            npu_compilation_mode="optimized",
+        ),
+        model_info=placed_info,
+        available_providers=list(placed_providers),
+    )
+    embedding_assignment = placed.provider_assignment("embedding")
+    decode_assignment = placed.provider_assignment("decode")
+    router_assignment = placed.provider_assignment("router")
+    expert_assignment = placed.provider_assignment("expert_0")
+    lm_assignment = placed.provider_assignment("lm_head")
+    shared_assignment = placed.provider_assignment("shared")
+    assert embedding_assignment.providers == [
+        "VitisAIExecutionProvider",
+        "CPUExecutionProvider",
+    ]
+    assert embedding_assignment.provider_options[0]["cacheKey"] == "embedding"
+    assert embedding_assignment.provider_options[0]["target"] == "X1"
+    assert "performance_mode" not in embedding_assignment.provider_options[0]
+    assert embedding_assignment.provider_options[1] == {}
+    assert decode_assignment.providers[0] == "DmlExecutionProvider"
+    assert decode_assignment.provider_options[0]["disable_metacommands"] == "0"
+    assert router_assignment.providers == ["CPUExecutionProvider"]
+    assert router_assignment.provider_options == [{}]
+    assert expert_assignment.provider_options[0]["cacheKey"] == "expert-0"
+    assert lm_assignment.provider_options[0]["device_id"] == "1"
+    assert shared_assignment.providers == placed_providers
+    assert placed.config.providers == placed_providers
+    router_options = placed.config.create_session_options(
+        profile=router_assignment.profile,
+        providers=router_assignment.providers,
+    )
+    decode_options = placed.config.create_session_options(
+        profile=decode_assignment.profile,
+        providers=decode_assignment.providers,
+    )
+    embedding_options = placed.config.create_session_options(
+        profile=embedding_assignment.profile,
+        providers=embedding_assignment.providers,
+    )
+    assert router_options.intra_op_num_threads == 2
+    assert router_options.enable_cpu_mem_arena is False
+    assert router_options.graph_optimization_level == ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    assert decode_options.graph_optimization_level == ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
+    assert embedding_options.graph_optimization_level == ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    assert embedding_assignment.profile.provider_options["performance_mode"] == "high_performance"
+    try:
+        placed.provider_assignment(
+            "router",
+            providers=["CPUExecutionProvider", "VitisAIExecutionProvider"],
+            provider_options=[{"intra_op_num_threads": 1}],
+        )
+        raise AssertionError("mismatched provider options were accepted")
+    except ValueError as exc:
+        assert "same length" in str(exc)
+    with warnings.catch_warnings(record=True) as dropped_warnings:
+        warnings.simplefilter("always")
+        cpu_only = SessionManager(
+            ".",
+            SessionConfig(providers=["CPUExecutionProvider"]),
+            model_info={"components": {"embedding": {
+                "file": "embedding.onnx",
+                "provider": "VitisAIExecutionProvider",
+            }}},
+            available_providers=["CPUExecutionProvider"],
+        )
+        dropped_assignment = cpu_only.provider_assignment("embedding")
+    assert dropped_assignment.providers == ["CPUExecutionProvider"]
+    assert any("embedding" in str(item.message) for item in dropped_warnings)
+    placed.load_from_plan(ExecutionPlan(steps=[
+        ExecutionStep(
+            "router", "CPUExecutionProvider", "cpu", "router",
+            provider_options={"intra_op_num_threads": 4},
+        ),
+        ExecutionStep(
+            "expert_0", "VitisAIExecutionProvider", "npu", "expert",
+            depends_on=["router"],
+            provider_options={"cacheKey": "planned-expert"},
+        ),
+        ExecutionStep("embedding", "VitisAIExecutionProvider", "npu", "embedding"),
+        ExecutionStep("decode", "DmlExecutionProvider", "igpu", "decode"),
+        ExecutionStep("lm_head", "DmlExecutionProvider", "igpu", "lm_head"),
+    ]))
+    assert placed.provider_assignment("expert_0").provider_options[0]["cacheKey"] == "planned-expert"
+    assert placed.provider_assignment("router").profile.provider_options["intra_op_num_threads"] == 4
+    assert placed.resolved_provider("lm_head") == "DmlExecutionProvider"
+    assert placed.resolved_provider("embedding") == "VitisAIExecutionProvider"
+
+    captured = {}
+
+    class _FakeSession:
+        def __init__(self, path, sess_options=None, providers=None, provider_options=None, **kwargs):
+            captured["path"] = path
+            captured["providers"] = list(providers or [])
+            captured["provider_options"] = list(provider_options or [])
+            captured["intra_op_num_threads"] = sess_options.intra_op_num_threads
+            captured["arena"] = sess_options.enable_cpu_mem_arena
+
+        def get_inputs(self):
+            return []
+
+        def get_outputs(self):
+            return []
+
+        def get_providers(self):
+            return list(captured["providers"])
+
+    with tempfile.TemporaryDirectory() as model_dir:
+        router_path = os.path.join(model_dir, "router.onnx")
+        with open(router_path, "wb") as handle:
+            handle.write(b"onnx")
+        loader = SessionManager(
+            model_dir,
+            SessionConfig(providers=["VitisAIExecutionProvider", "CPUExecutionProvider"]),
+            model_info={"components": {"router": {
+                "file": "router.onnx",
+                "provider": "CPUExecutionProvider",
+                "provider_options": {
+                    "intra_op_num_threads": 3,
+                    "enable_cpu_mem_arena": False,
+                },
+            }}},
+            available_providers=["VitisAIExecutionProvider", "CPUExecutionProvider"],
+        )
+        original = session_manager_module.ort.InferenceSession
+        session_manager_module.ort.InferenceSession = _FakeSession
+        try:
+            loaded = loader._load_single_session(
+                "router",
+                providers=["CPUExecutionProvider"],
+                provider_options=[{
+                    "intra_op_num_threads": 3,
+                    "enable_cpu_mem_arena": False,
+                }],
+            )
+        finally:
+            session_manager_module.ort.InferenceSession = original
+    assert loaded is not None
+    assert captured["providers"] == ["CPUExecutionProvider"]
+    assert captured["provider_options"] == [{}]
+    assert all(isinstance(name, str) for name in captured["providers"])
+    assert len(captured["providers"]) == len(captured["provider_options"])
+    assert captured["intra_op_num_threads"] == 3
+    assert captured["arena"] is False
+    print("  placement: per-component provider and provider_options")
+
     print("session_manager module: OK\n")
     return True
 

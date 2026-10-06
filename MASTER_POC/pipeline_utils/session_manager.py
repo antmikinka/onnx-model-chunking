@@ -600,6 +600,13 @@ def provider_profile_for(provider: Any, **overrides: Any) -> ProviderProfile:
             continue
         if hasattr(profile, key):
             setattr(profile, key, value)
+    embedded = overrides.get("provider_options")
+    if (
+        "device_id" not in overrides
+        and isinstance(embedded, dict)
+        and embedded.get("device_id") is not None
+    ):
+        profile.device_id = int(embedded["device_id"])
     if "device_id" in profile.provider_options:
         profile.provider_options["device_id"] = str(profile.device_id)
     return profile
@@ -633,6 +640,125 @@ def ep_provider_options(profile: ProviderProfile) -> Dict[str, str]:
             continue
         options[key] = str(value)
     return options
+
+
+@dataclass
+class ProviderAssignment:
+    """Provider names and the matching option dicts for one session."""
+
+    providers: List[str]
+    provider_options: List[Dict[str, str]]
+    profile: ProviderProfile
+    dropped: List[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if len(self.providers) != len(self.provider_options):
+            raise ValueError(
+                "providers and provider_options must be the same length, "
+                f"got {len(self.providers)} and {len(self.provider_options)}"
+            )
+
+
+def _normalize_provider_request(
+    requested: Sequence[Any],
+    provider_options: Optional[Sequence[Any]],
+) -> List[Tuple[str, Dict[str, Any]]]:
+    """Pair each provider name with the option dict the caller attached."""
+    entries: List[Tuple[str, Dict[str, Any]]] = []
+    for entry in requested:
+        name = _provider_name(entry)
+        embedded: Dict[str, Any] = {}
+        if (
+            isinstance(entry, (list, tuple))
+            and len(entry) > 1
+            and isinstance(entry[1], dict)
+        ):
+            embedded = dict(entry[1])
+        entries.append((name, embedded))
+    if provider_options is None:
+        return entries
+    if len(provider_options) != len(entries):
+        raise ValueError(
+            "providers and provider_options must be the same length, "
+            f"got {len(entries)} and {len(provider_options)}"
+        )
+    merged: List[Tuple[str, Dict[str, Any]]] = []
+    for (name, embedded), extra in zip(entries, provider_options):
+        if extra is None:
+            extra = {}
+        if not isinstance(extra, dict):
+            raise TypeError(
+                f"provider_options for '{name}' must be a dict, "
+                f"got {type(extra).__name__}"
+            )
+        combined = dict(embedded)
+        combined.update(extra)
+        merged.append((name, combined))
+    return merged
+
+
+def build_provider_assignment(
+    requested: Sequence[Any],
+    provider_options: Optional[Sequence[Any]] = None,
+    *,
+    available: Optional[Sequence[Any]] = None,
+    cache_dir: Optional[str] = None,
+    append_cpu: bool = False,
+    npu_graph_capture: bool = True,
+    npu_compilation_mode: str = "default",
+) -> ProviderAssignment:
+    """
+    Turn a provider request into the two lists InferenceSession accepts.
+
+    ``providers`` is a list of names. ``provider_options`` is the same length.
+    A provider missing from ``available`` is dropped. An empty result becomes
+    CPU. ``append_cpu`` adds that fallback when the request named one device.
+    """
+    entries = _normalize_provider_request(list(requested or []), provider_options)
+    if not entries:
+        entries = [("CPUExecutionProvider", {})]
+    available_names = None
+    if available is not None:
+        available_names = {_provider_name(provider) for provider in available}
+    kept: List[Tuple[str, Dict[str, Any]]] = []
+    dropped: List[str] = []
+    for name, options in entries:
+        if available_names is not None and name not in available_names:
+            dropped.append(name)
+            continue
+        kept.append((name, options))
+    if not kept:
+        kept = [("CPUExecutionProvider", {})]
+    if append_cpu and all(name != "CPUExecutionProvider" for name, _options in kept):
+        kept.append(("CPUExecutionProvider", {}))
+
+    names: List[str] = []
+    ep_options: List[Dict[str, str]] = []
+    profiles: List[ProviderProfile] = []
+    for name, embedded in kept:
+        kwargs: Dict[str, Any] = {}
+        if cache_dir:
+            kwargs["cache_dir"] = cache_dir
+        if embedded:
+            kwargs["provider_options"] = embedded
+        profile = provider_profile_for(name, **kwargs)
+        if profile.device_type in {"vitisai", "ryzenai"}:
+            if not npu_graph_capture:
+                profile.enable_graph_cache = False
+            if "performance_mode" not in embedded:
+                profile.provider_options["performance_mode"] = _NPU_PERFORMANCE_MODE.get(
+                    str(npu_compilation_mode),
+                    "balanced",
+                )
+        names.append(profile.name)
+        ep_options.append(ep_provider_options(profile))
+        profiles.append(profile)
+    return ProviderAssignment(
+        providers=names,
+        provider_options=ep_options,
+        profile=profiles[0],
+        dropped=dropped,
+    )
 
 
 # =============================================================================
@@ -781,12 +907,19 @@ class SessionConfig:
                 prepared.append(provider_name)
         return prepared
     
-    def create_session_options(self, cache_dir: Optional[str] = None) -> ort.SessionOptions:
+    def create_session_options(
+        self,
+        cache_dir: Optional[str] = None,
+        profile: Optional[ProviderProfile] = None,
+        providers: Optional[Sequence[Any]] = None,
+    ) -> ort.SessionOptions:
         """
         Create SessionOptions from the selected provider profile.
 
         VitisAI still receives graph capture, weight preload, and compilation
-        mode. AOT NPU profiles keep shape checking enabled.
+        mode. AOT NPU profiles keep shape checking enabled. Pass ``profile``
+        and ``providers`` to build options for one component instead of the
+        manager-wide provider list.
 
         Returns:
             Configured ort.SessionOptions object
@@ -800,12 +933,22 @@ class SessionConfig:
             >>> opts = config.create_session_options()
             # opts now contains vitisai.* session config entries
         """
-        profile = self.active_profile(cache_dir=cache_dir)
+        component_profile = profile is not None
+        if profile is None:
+            profile = self.active_profile(cache_dir=cache_dir)
         opts = ort.SessionOptions()
         opts.graph_optimization_level = self._optimization_enum(profile.optimization_level)
 
-        intra = self.intra_op_threads or int(profile.provider_options.get("intra_op_num_threads") or 0)
-        inter = self.inter_op_threads or int(profile.provider_options.get("inter_op_num_threads") or 0)
+        if component_profile:
+            intra = int(profile.provider_options.get("intra_op_num_threads") or 0)
+            inter = int(profile.provider_options.get("inter_op_num_threads") or 0)
+        else:
+            intra = self.intra_op_threads or int(
+                profile.provider_options.get("intra_op_num_threads") or 0
+            )
+            inter = self.inter_op_threads or int(
+                profile.provider_options.get("inter_op_num_threads") or 0
+            )
         if inter > 0:
             opts.inter_op_num_threads = inter
         if intra > 0:
@@ -829,17 +972,20 @@ class SessionConfig:
         elif self.disable_shape_check:
             opts.add_session_config_entry("session.disable_node_shape_check", "1")
 
-        self._apply_vitisai_profile(opts, profile)
+        selected_providers = self.providers if providers is None else providers
+        self._apply_vitisai_profile(opts, profile, selected_providers)
         return opts
 
     def _apply_vitisai_profile(
         self,
         opts: ort.SessionOptions,
         profile: ProviderProfile,
+        providers: Optional[Sequence[Any]] = None,
     ) -> None:
         """Write VitisAI session keys when that provider is selected or listed."""
+        selected = self.providers if providers is None else providers
         uses_vitisai = profile.device_type == "vitisai" or any(
-            "vitisai" in _provider_name(provider).lower() for provider in self.providers
+            "vitisai" in _provider_name(provider).lower() for provider in selected
         )
         if not uses_vitisai:
             return
@@ -1012,6 +1158,7 @@ class ExecutionStep:
     depends_on: List[str] = field(default_factory=list)
     output_buffers: List[str] = field(default_factory=list)
     resident: bool = True
+    provider_options: Optional[Dict[str, Any]] = None
 
     def __post_init__(self) -> None:
         self.component_name = str(self.component_name)
@@ -1021,6 +1168,15 @@ class ExecutionStep:
         self.depends_on = [str(name) for name in self.depends_on]
         self.output_buffers = [str(name) for name in self.output_buffers]
         self.resident = bool(self.resident)
+        if self.provider_options is None:
+            self.provider_options = {}
+        elif isinstance(self.provider_options, dict):
+            self.provider_options = dict(self.provider_options)
+        else:
+            raise TypeError(
+                "ExecutionStep.provider_options must be a dict, "
+                f"got {type(self.provider_options).__name__}"
+            )
 
 
 @dataclass
@@ -1563,19 +1719,137 @@ class SessionManager:
                 output_dtypes=_copy_dtype_map(comp_info.get("output_dtypes")),
             )
     
+    def provider_assignment(
+        self,
+        name: str,
+        providers: Optional[Sequence[Any]] = None,
+        provider_options: Optional[Sequence[Dict[str, Any]]] = None,
+    ) -> ProviderAssignment:
+        """
+        Resolve the provider list and option dicts for one component.
+
+        An explicit ``providers`` argument wins. Otherwise a plan step or the
+        component record supplies the device. A component with neither keeps
+        the manager list. The two returned lists have the same length.
+        """
+        if providers is None and name not in self._session_info:
+            raise KeyError(f"Session '{name}' is not in this model")
+        available = self._available_providers
+        if available is None:
+            available = ort.get_available_providers()
+        cache_dir = self.provider_profile.cache_dir
+        if providers is not None:
+            assignment = build_provider_assignment(
+                providers,
+                provider_options,
+                available=available,
+                cache_dir=cache_dir,
+                append_cpu=False,
+                npu_graph_capture=self.config.npu_graph_capture,
+                npu_compilation_mode=self.config.npu_compilation_mode,
+            )
+        else:
+            request = self._component_provider_request(name)
+            if request is None:
+                assignment = self._default_provider_assignment()
+            else:
+                requested, options, append_cpu = request
+                assignment = build_provider_assignment(
+                    requested,
+                    options,
+                    available=available,
+                    cache_dir=cache_dir,
+                    append_cpu=append_cpu,
+                    npu_graph_capture=self.config.npu_graph_capture,
+                    npu_compilation_mode=self.config.npu_compilation_mode,
+                )
+        if assignment.dropped:
+            warnings.warn(
+                f"Component '{name}' dropped unavailable provider "
+                + ", ".join(assignment.dropped)
+                + ". Using "
+                + ", ".join(assignment.providers)
+                + ".",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+        return assignment
+
+    def _default_provider_assignment(self) -> ProviderAssignment:
+        """The manager provider list, split into names and option dicts."""
+        prepared = self.config.ort_providers(cache_dir=self.provider_profile.cache_dir)
+        names: List[str] = []
+        options: List[Dict[str, str]] = []
+        for entry in prepared:
+            if isinstance(entry, tuple):
+                names.append(str(entry[0]))
+                options.append(dict(entry[1]))
+            else:
+                names.append(str(entry))
+                options.append({})
+        if not names:
+            names = ["CPUExecutionProvider"]
+            options = [{}]
+        return ProviderAssignment(
+            providers=names,
+            provider_options=options,
+            profile=self.config.active_profile(cache_dir=self.provider_profile.cache_dir),
+        )
+
+    def _component_provider_request(
+        self,
+        name: str,
+    ) -> Optional[Tuple[List[Any], Optional[List[Any]], bool]]:
+        """
+        Provider request for one component.
+
+        The third value is true when a single device should keep CPU as a
+        fallback. None means the component uses the manager list.
+        """
+        if self.execution_plan is not None:
+            for step in self.execution_plan.steps:
+                if step.component_name != name:
+                    continue
+                options = None
+                if step.provider_options:
+                    options = [dict(step.provider_options)]
+                return [step.provider], options, True
+        component = self.model_info.get("components", {}).get(name, {})
+        raw_options = component.get("provider_options")
+        if "providers" in component:
+            requested = list(component["providers"])
+            if raw_options is None:
+                return requested, None, False
+            if isinstance(raw_options, dict):
+                padded = [raw_options] + [{}] * max(0, len(requested) - 1)
+                return requested, padded, False
+            return requested, list(raw_options), False
+        if "provider" in component:
+            options = None
+            if isinstance(raw_options, dict):
+                options = [raw_options]
+            elif isinstance(raw_options, list):
+                options = list(raw_options)
+            return [component["provider"]], options, True
+        return None
+
     def _load_single_session(
         self,
         name: str,
-        providers: Optional[List[Any]] = None,
+        providers: Optional[List[str]] = None,
+        provider_options: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[ort.InferenceSession]:
         """
         Load a single ONNX session by component name.
-        
+
         Args:
             name: Component name from model_info
-            providers: ORT provider list for this step. The manager list is
-                used when this is omitted.
-            
+            providers: Provider names for this component. The plan, the
+                component record, or the manager list is used when omitted.
+            provider_options: One option dict per provider. Session hints
+                such as CPU thread counts stay on the profile. Execution-provider
+                keys are forwarded to ONNX Runtime.
+
         Returns:
             Loaded InferenceSession or None if failed
         """
@@ -1583,6 +1857,9 @@ class SessionManager:
             return None
         
         info = self._session_info[name]
+        assignment = self.provider_assignment(name, providers, provider_options)
+        if assignment.providers:
+            info.scheduled_provider = assignment.providers[0]
         
         if not os.path.exists(info.file_path):
             return None
@@ -1591,16 +1868,19 @@ class SessionManager:
             self._install_available_providers()
             self._enforce_execution_policy()
             self._prepare_profile_cache()
+            component_providers = list(assignment.providers)
+            component_provider_options = [
+                dict(options) for options in assignment.provider_options
+            ]
             opts = self.config.create_session_options(
-                cache_dir=self.provider_profile.cache_dir
-            )
-            session_providers = providers if providers is not None else (
-                self.config.ort_providers(cache_dir=self.provider_profile.cache_dir)
+                profile=assignment.profile,
+                providers=component_providers,
             )
             session = ort.InferenceSession(
                 info.file_path,
                 sess_options=opts,
-                providers=session_providers,
+                providers=component_providers,
+                provider_options=component_provider_options,
             )
             
             # Update session info with loaded details
@@ -1896,23 +2176,21 @@ class SessionManager:
             loaded: Dict[str, SessionInfo] = {}
             for step in ordered:
                 info = self._session_info[step.component_name]
-                session_providers = self._providers_for_step(step)
-                resolved_name = (
-                    _provider_name(session_providers[0])
-                    if session_providers else "CPUExecutionProvider"
-                )
-                self._resolved_providers[step.component_name] = resolved_name
                 info.phase = step.phase
                 info.device_type = step.device_type
                 info.resident = step.resident
-                info.scheduled_provider = resolved_name
                 if not step.resident:
+                    assignment = self.provider_assignment(step.component_name)
+                    info.scheduled_provider = (
+                        assignment.providers[0] if assignment.providers else step.provider
+                    )
+                    self._resolved_providers[step.component_name] = info.scheduled_provider
                     self._drop_session(step.component_name)
                     loaded[step.component_name] = info
                     continue
-                session = self._load_single_session(
-                    step.component_name,
-                    providers=session_providers,
+                session = self._load_single_session(step.component_name)
+                self._resolved_providers[step.component_name] = (
+                    info.scheduled_provider or step.provider
                 )
                 if session is not None:
                     self._sessions[step.component_name] = session
@@ -1952,35 +2230,17 @@ class SessionManager:
         """
         Build the ORT provider list for one step.
 
-        The step provider is filtered against the installed providers. CPU
-        is appended as the fallback. The manager's own provider list is
-        restored before this returns.
+        Names and option dicts stay aligned. CPU is appended when the step
+        names a single device. The manager provider list is left unchanged.
         """
-        requested = [step.provider]
-        if _provider_name(step.provider) != "CPUExecutionProvider":
-            requested.append("CPUExecutionProvider")
-        available = self._available_providers
-        if available is None:
-            available = ort.get_available_providers()
-        kept, dropped = filter_session_providers(requested, available)
-        if dropped:
-            warnings.warn(
-                f"Step '{step.component_name}' dropped unavailable provider "
-                + ", ".join(dropped)
-                + ". Using "
-                + ", ".join(_provider_name(provider) for provider in kept)
-                + ".",
-                RuntimeWarning,
-                stacklevel=4,
-            )
-        saved = list(self.config.providers)
-        self.config.providers = list(kept)
-        try:
-            return self.config.ort_providers(
-                cache_dir=self.provider_profile.cache_dir
-            )
-        finally:
-            self.config.providers = saved
+        assignment = self.provider_assignment(step.component_name)
+        prepared: List[Any] = []
+        for provider_name, options in zip(assignment.providers, assignment.provider_options):
+            if options:
+                prepared.append((provider_name, dict(options)))
+            else:
+                prepared.append(provider_name)
+        return prepared
 
     def _validate_plan_policy(self, plan: ExecutionPlan) -> None:
         """
@@ -2739,6 +2999,7 @@ __all__ = [
     "PreparedIO",
     "StaticBufferAllocation",
     "RuntimeMemoryEstimate",
+    "ProviderAssignment",
     # Functions
     "get_available_providers",
     "get_provider_for_device",
@@ -2749,6 +3010,7 @@ __all__ = [
     "provider_profile_for",
     "primary_provider_name",
     "filter_session_providers",
+    "build_provider_assignment",
     "ep_provider_options",
     # Constants
     "SUPPORTED_PROVIDERS",
