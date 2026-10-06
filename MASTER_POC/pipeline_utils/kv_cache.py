@@ -24,13 +24,15 @@ Usage:
         backend=KVCacheBackend.HYBRID_NPU_IGPU,
         max_seq_len=4096,
     )
-    past_key, past_value = cache.get_past_tensors(0)
-    past_key.ort_value  # bind this; do not copy to NumPy first
+    past_key, past_value = cache.get_device_tensors(0)
+    cache.bind_cache_to_session(session, io_binding, layer_idx=0)
 """
 
 from enum import Enum
+import re
 from typing import Dict, Tuple, Optional, Any, List
 import numpy as np
+import onnxruntime as ort
 
 from .io_binding import (
     DEFAULT_NPU_MAX_SEQ_LEN,
@@ -299,6 +301,11 @@ class KVCacheManager:
         return self.backend is not KVCacheBackend.CPU
 
     @property
+    def device_resident(self) -> bool:
+        """True when the cache is bound to OrtValues from an IOBindingManager."""
+        return self._binder is not None or bool(self._shared) or self.uses_device_memory
+
+    @property
     def static(self) -> bool:
         """True when the sequence axis is preallocated at ``max_seq_len``."""
         return self._static
@@ -314,6 +321,15 @@ class KVCacheManager:
         """
         self._seq_len = 0
         self._layer_len = [0] * self.num_layers
+        if self.device_resident:
+            if not self._cache:
+                if self._binder is not None:
+                    self._install_manager_cache(self._binder, int(self.max_seq_len))
+                else:
+                    self._allocate_device_cache()
+            if self._binder is not None:
+                self._binder.set_valid_sequence_length(0, "kv")
+            return
         if not self._static:
             self._cache.clear()
             for i in range(self.num_layers):
@@ -364,6 +380,111 @@ class KVCacheManager:
         self._seq_len = int(new_len)
         if self._binder is not None:
             self._binder.set_valid_sequence_length(self._seq_len, "kv")
+
+    def _layer_position(self, layer_idx: int) -> int:
+        if layer_idx not in self._cache:
+            return 0
+        if self._static:
+            return int(self._layer_len[layer_idx])
+        return int(_tensor_shape(self._cache[layer_idx]["key"])[_SEQ_AXIS])
+
+    def _same_resident_pool(self, io_manager: IOBindingManager, limit: int) -> bool:
+        if self._binder is not io_manager or int(self.max_seq_len or -1) != int(limit):
+            return False
+        if not self._cache or 0 not in self._cache:
+            return False
+        resident = io_manager.get_buffer("kv.layer0.key")
+        return resident is not None and resident is self._cache[0]["key"]
+
+    def _snapshot_prefix(
+        self,
+        limit: int,
+    ) -> List[Tuple[int, np.ndarray, np.ndarray]]:
+        rows: List[Tuple[int, np.ndarray, np.ndarray]] = []
+        if not self._cache:
+            return rows
+        for layer in range(self.num_layers):
+            if layer not in self._cache:
+                continue
+            position = self._layer_position(layer)
+            if position <= 0:
+                continue
+            if position > limit:
+                raise ValueError(
+                    f"Layer {layer}: current_seq_len {position} exceeds "
+                    f"max_seq_len {limit}"
+                )
+            key = self._cache[layer]["key"]
+            value = self._cache[layer]["value"]
+            rows.append(
+                (
+                    layer,
+                    np.array(_as_numpy(key)[:, :, :position, :], copy=True),
+                    np.array(_as_numpy(value)[:, :, :position, :], copy=True),
+                )
+            )
+        return rows
+
+    def _install_manager_cache(self, io_manager: IOBindingManager, limit: int) -> None:
+        pool = io_manager.get_static_kv_pool("kv")
+        installed: Dict[int, Dict[str, Any]] = {}
+        for layer in range(self.num_layers):
+            key = io_manager.get_buffer(pool.key_names[layer])
+            value = io_manager.get_buffer(pool.value_names[layer])
+            if (
+                key is None
+                or value is None
+                or key.ort_value is None
+                or value.ort_value is None
+            ):
+                raise RuntimeError(
+                    f"KV layer {layer} has no OrtValue on the IOBindingManager"
+                )
+            installed[layer] = {"key": key, "value": value}
+        self._cache = installed
+        self._binder = io_manager
+        self.max_seq_len = int(limit)
+        self._static = True
+
+    def _mask_ort_value(self) -> ort.OrtValue:
+        """Attention mask OrtValue owned by the IOBindingManager when one exists."""
+        self.attention_mask()
+        if self._binder is not None:
+            buffer = self._binder.get_buffer("kv.attention_mask")
+            if buffer is not None and buffer.ort_value is not None:
+                return buffer.ort_value
+        return self._refresh_host_ort("_mask_ort", self.attention_mask())
+
+    def _scalar_ort_value(self) -> ort.OrtValue:
+        """Resident 0-d int64 current_seq_len, updated in place."""
+        scalar = np.ascontiguousarray(self.sequence_length_scalar())
+        if self._binder is not None:
+            buffer = self._binder.get_buffer("kv.sequence_length")
+            if buffer is None or buffer.ort_value is None:
+                buffer = self._binder.allocate_buffer(
+                    "kv.sequence_length",
+                    scalar.shape,
+                    scalar.dtype,
+                    data=scalar,
+                    is_dynamic=False,
+                )
+            else:
+                _refresh_ort_contents(buffer.ort_value, scalar)
+            return buffer.ort_value
+        return self._refresh_host_ort("_scalar_ort", scalar)
+
+    def _refresh_host_ort(self, attr: str, data: np.ndarray) -> ort.OrtValue:
+        incoming = np.ascontiguousarray(data)
+        current = getattr(self, attr, None)
+        current_shape = _ort_shape(current) if current is not None else None
+        if current is not None and current_shape is not None and _same_scalar_storage(
+            current_shape, tuple(incoming.shape)
+        ):
+            _refresh_ort_contents(current, incoming)
+            return current
+        current = ort.OrtValue.ortvalue_from_numpy(incoming, "cpu", 0)
+        setattr(self, attr, current)
+        return current
 
     def _allocate_device_cache(self) -> None:
         """Allocate one resident OrtValue per key and value."""
@@ -482,7 +603,8 @@ class KVCacheManager:
         """
         Get the past key and value tensors for a specific layer.
 
-        CPU returns NumPy arrays. Other backends return DeviceBuffer
+        A dynamic CPU cache returns NumPy arrays. A device backend, or a
+        CPU cache after ``allocate_device_cache``, returns DeviceBuffer
         objects whose ``ort_value`` is the resident cache.
 
         Args:
@@ -502,11 +624,175 @@ class KVCacheManager:
         """
         Return the OrtValues for one layer.
 
-        CPU wraps the NumPy arrays in CPU OrtValues. Device backends
-        return the resident values, which are the ones to bind.
+        A device-resident cache returns the OrtValues already stored in
+        the IOBindingManager. A dynamic CPU cache wraps its NumPy arrays,
+        which allocates a new OrtValue.
         """
+        if self.device_resident:
+            return self.get_device_tensors(layer_idx)
         key, value = self.get_past_tensors(layer_idx)
         return _ort_value_of(key), _ort_value_of(value)
+
+    def allocate_device_cache(
+        self,
+        io_manager: IOBindingManager,
+        max_seq_len: int,
+    ) -> IOBindingManager:
+        """
+        Keep this cache in ``io_manager`` at a fixed sequence length.
+
+        The manager allocates ``[batch, heads, max_seq_len, head_dim]``
+        once, or the cache adopts that pool when it already exists with
+        the same layout. Tokens already stored on the host are copied
+        into the prefix once. Later updates and session bindings use
+        those OrtValues.
+
+        Args:
+            io_manager: The IOBindingManager that owns the session buffers
+            max_seq_len: Preallocated sequence capacity
+
+        Returns:
+            The same ``io_manager``, with the KV pool installed
+
+        Raises:
+            TypeError: If ``io_manager`` is not an IOBindingManager
+            ValueError: If the capacity is invalid or the manager's KV
+                pool has a different layout
+        """
+        if not isinstance(io_manager, IOBindingManager):
+            raise TypeError(
+                "allocate_device_cache expects an IOBindingManager, "
+                f"got {type(io_manager).__name__}"
+            )
+        limit = int(max_seq_len)
+        if limit <= 0:
+            raise ValueError(f"max_seq_len must be positive, got {limit}")
+        if self._same_resident_pool(io_manager, limit):
+            return io_manager
+
+        snapshot = self._snapshot_prefix(limit)
+        pool = _existing_kv_pool(io_manager)
+        if pool is None:
+            pool = io_manager.allocate_static_kv_cache(
+                name="kv",
+                num_layers=self.num_layers,
+                num_kv_heads=self.num_kv_heads,
+                head_dim=self.head_dim,
+                dtype=self.dtype,
+                batch_size=self.batch_size,
+                max_seq_len=limit,
+                seq_axis=_SEQ_AXIS,
+            )
+        else:
+            _require_pool_match(pool, self, limit)
+
+        self._binder = io_manager
+        self._shared = []
+        self.max_seq_len = limit
+        self._static = True
+        self._install_manager_cache(io_manager, limit)
+        io_manager.set_valid_sequence_length(0, pool.name)
+        self._seq_len = 0
+        self._layer_len = [0] * self.num_layers
+        for layer, key_np, value_np in snapshot:
+            self.update_from_present(layer, key_np, value_np)
+        return io_manager
+
+    def get_device_tensors(self, layer_idx: int) -> Tuple[ort.OrtValue, ort.OrtValue]:
+        """
+        Return the resident key and value OrtValues for one layer.
+
+        These are the objects to pass to ``bind_ortvalue_input`` and
+        ``bind_ortvalue_output``. The call does not wrap a NumPy array.
+        """
+        if not self.device_resident:
+            raise RuntimeError(
+                "KV cache is a CPU dictionary. Call allocate_device_cache"
+                "(io_manager, max_seq_len) before reading device tensors."
+            )
+        key, value = self.get_past_tensors(layer_idx)
+        key_ort = getattr(key, "ort_value", None)
+        value_ort = getattr(value, "ort_value", None)
+        if key_ort is None or value_ort is None:
+            raise RuntimeError(f"Layer {layer_idx} has no resident OrtValue")
+        return key_ort, value_ort
+
+    def bind_cache_to_session(
+        self,
+        session: Any,
+        io_binding: Any,
+        layer_idx: int,
+    ) -> Dict[str, str]:
+        """
+        Bind one layer's resident cache into an ONNX Runtime session.
+
+        Past key and value inputs and present key and value outputs are
+        bound to the same OrtValues. The static attention mask and a
+        sequence-length scalar are bound when the session has those
+        inputs. A present tensor whose concrete sequence length is not
+        ``max_seq_len`` is rejected so a short output is not aliased
+        onto the preallocated buffer.
+
+        Args:
+            session: ONNX Runtime session, or any object with
+                ``get_inputs`` and ``get_outputs``
+            io_binding: Object with ``bind_ortvalue_input`` and
+                ``bind_ortvalue_output``
+            layer_idx: Transformer layer to bind
+
+        Returns:
+            Map of roles to the session tensor names that were bound
+        """
+        key_ort, value_ort = self.get_device_tensors(layer_idx)
+        if not self._static or self.max_seq_len is None:
+            raise RuntimeError(
+                "bind_cache_to_session requires a static cache. "
+                "Call allocate_device_cache(io_manager, max_seq_len) first."
+            )
+        inputs = list(session.get_inputs())
+        outputs = list(session.get_outputs())
+        input_names = [node.name for node in inputs]
+        output_names = [node.name for node in outputs]
+        past_key = _resolve_kv_name(input_names, layer_idx, "key", "past")
+        past_value = _resolve_kv_name(input_names, layer_idx, "value", "past")
+        present_key = _resolve_kv_name(output_names, layer_idx, "key", "present")
+        present_value = _resolve_kv_name(output_names, layer_idx, "value", "present")
+        if past_key is None or past_value is None:
+            raise ValueError(
+                f"Session has no past key/value inputs for layer {layer_idx}. "
+                f"Inputs: {input_names}"
+            )
+        if present_key is None or present_value is None:
+            raise ValueError(
+                f"Session has no present key/value outputs for layer {layer_idx}. "
+                f"Outputs: {output_names}"
+            )
+        cache_shape = _ort_shape(key_ort)
+        nodes = {node.name: node for node in list(inputs) + list(outputs)}
+        for name in (past_key, past_value, present_key, present_value):
+            _require_static_shape(nodes[name], cache_shape, int(self.max_seq_len))
+
+        io_binding.bind_ortvalue_input(past_key, key_ort)
+        io_binding.bind_ortvalue_input(past_value, value_ort)
+        io_binding.bind_ortvalue_output(present_key, key_ort)
+        io_binding.bind_ortvalue_output(present_value, value_ort)
+        bound = {
+            "past_key": past_key,
+            "past_value": past_value,
+            "present_key": present_key,
+            "present_value": present_value,
+        }
+        for mask_name in _mask_names(input_names):
+            mask_node = nodes[mask_name]
+            mask_shape = (self.batch_size, int(self.max_seq_len))
+            _require_static_shape(mask_node, mask_shape, int(self.max_seq_len))
+            io_binding.bind_ortvalue_input(mask_name, self._mask_ort_value())
+            bound["attention_mask"] = mask_name
+        for scalar_name in _scalar_names(input_names):
+            _require_scalar_shape(nodes[scalar_name])
+            io_binding.bind_ortvalue_input(scalar_name, self._scalar_ort_value())
+            bound["sequence_length"] = scalar_name
+        return bound
 
     def attention_mask(self) -> np.ndarray:
         """
@@ -705,7 +991,7 @@ class KVCacheManager:
             "max_seq_len": self.max_seq_len,
             "current_seq_len": seq_len,
             "static": self._static,
-            "storage": "device_buffer" if self.uses_device_memory else "numpy",
+            "storage": "device_buffer" if self.device_resident else "numpy",
         }
 
     def __repr__(self) -> str:
@@ -716,6 +1002,160 @@ class KVCacheManager:
             f"head_dim={self.head_dim}, seq_len={seq_len}, "
             f"backend={self.backend.value}, memory={mem['total_mb']:.2f}MB)"
         )
+
+
+def _ort_shape(value: Any) -> Tuple[int, ...]:
+    shape = value.shape() if callable(getattr(value, "shape", None)) else value.shape
+    return tuple(int(dim) for dim in shape)
+
+
+def _as_ort_contents(data: np.ndarray, host_shape: Tuple[int, ...]) -> np.ndarray:
+    """Match a 0-d length to the 1-element vector some OrtValue builds store."""
+    incoming = np.ascontiguousarray(data)
+    if incoming.shape == host_shape:
+        return incoming
+    if incoming.shape == () and host_shape == (1,):
+        return incoming.reshape(1)
+    if incoming.shape == (1,) and host_shape == ():
+        return incoming.reshape(())
+    raise ValueError(
+        f"Cannot refresh OrtValue shape {host_shape} with {incoming.shape}"
+    )
+
+
+def _same_scalar_storage(stored: Tuple[int, ...], incoming: Tuple[int, ...]) -> bool:
+    if stored == incoming:
+        return True
+    return stored in {(), (1,)} and incoming in {(), (1,)}
+
+
+def _refresh_ort_contents(ort_value: ort.OrtValue, data: np.ndarray) -> None:
+    host = ort_value.numpy()
+    incoming = _as_ort_contents(np.ascontiguousarray(data, dtype=host.dtype), tuple(host.shape))
+    host[...] = incoming
+    if int(host.ctypes.data) != int(ort_value.data_ptr()):
+        ort_value.update_inplace(np.ascontiguousarray(host))
+
+
+def _existing_kv_pool(io_manager: IOBindingManager) -> Any:
+    try:
+        return io_manager.get_static_kv_pool("kv")
+    except KeyError:
+        return None
+
+
+def _require_pool_match(pool: Any, cache: "KVCacheManager", limit: int) -> None:
+    problems = []
+    if int(pool.max_seq_len) != int(limit):
+        problems.append(f"max_seq_len {pool.max_seq_len} != {limit}")
+    if int(pool.num_layers) != int(cache.num_layers):
+        problems.append(f"num_layers {pool.num_layers} != {cache.num_layers}")
+    if int(pool.num_kv_heads) != int(cache.num_kv_heads):
+        problems.append(f"num_kv_heads {pool.num_kv_heads} != {cache.num_kv_heads}")
+    if int(pool.head_dim) != int(cache.head_dim):
+        problems.append(f"head_dim {pool.head_dim} != {cache.head_dim}")
+    if int(pool.batch_size) != int(cache.batch_size):
+        problems.append(f"batch_size {pool.batch_size} != {cache.batch_size}")
+    if problems:
+        raise ValueError(
+            "IOBindingManager KV pool does not match this cache: " + "; ".join(problems)
+        )
+
+
+def _has_layer_index(name: str, layer_idx: int) -> bool:
+    return re.search(rf"(^|[^\d]){int(layer_idx)}([^\d]|$)", name) is not None
+
+
+def _resolve_kv_name(
+    names: List[str],
+    layer_idx: int,
+    kind: str,
+    role: str,
+) -> Optional[str]:
+    hits = [
+        name
+        for name in names
+        if kind in name.lower() and _has_layer_index(name, layer_idx)
+    ]
+    if role == "past":
+        preferred = [name for name in hits if "past" in name.lower()]
+        if not preferred:
+            preferred = [name for name in hits if "present" not in name.lower()]
+    else:
+        preferred = [name for name in hits if "present" in name.lower()]
+        if not preferred:
+            preferred = [name for name in hits if "past" not in name.lower()]
+    if len(preferred) == 1:
+        return preferred[0]
+    defaults = {
+        ("key", "past"): f"past_key_values.{layer_idx}.key",
+        ("value", "past"): f"past_key_values.{layer_idx}.value",
+        ("key", "present"): f"present.{layer_idx}.key",
+        ("value", "present"): f"present.{layer_idx}.value",
+    }
+    chosen = defaults[(kind, role)]
+    if chosen in preferred:
+        return chosen
+    if len(preferred) > 1:
+        raise ValueError(
+            f"Multiple {role} {kind} tensors for layer {layer_idx}: {preferred}"
+        )
+    return None
+
+
+def _mask_names(names: List[str]) -> List[str]:
+    found = []
+    for name in names:
+        lower = name.lower()
+        if "attention_mask" in lower or lower in {"mask", "attn_mask"}:
+            found.append(name)
+    return found
+
+
+_SCALAR_INPUTS = {"sequence_length", "seq_len", "current_seq_len", "kv_seq_len"}
+
+
+def _scalar_names(names: List[str]) -> List[str]:
+    return [name for name in names if name.lower() in _SCALAR_INPUTS]
+
+
+def _node_shape(node: Any) -> Optional[Tuple[Any, ...]]:
+    shape = getattr(node, "shape", None)
+    if shape is None:
+        return None
+    return tuple(shape)
+
+
+def _dim_is_dynamic(dim: Any) -> bool:
+    return dim is None or isinstance(dim, str)
+
+
+def _require_static_shape(node: Any, allocated: Tuple[int, ...], max_seq_len: int) -> None:
+    declared = _node_shape(node)
+    if declared is None:
+        return
+    if len(declared) != len(allocated):
+        raise ValueError(
+            f"Tensor '{node.name}' rank {len(declared)} does not match the "
+            f"static KV cache rank {len(allocated)} at max_seq_len {max_seq_len}"
+        )
+    for want, have in zip(declared, allocated):
+        if _dim_is_dynamic(want):
+            continue
+        if int(want) != int(have):
+            raise ValueError(
+                f"Tensor '{node.name}' shape {declared} does not match the "
+                f"static KV cache {allocated} at max_seq_len {max_seq_len}"
+            )
+
+
+def _require_scalar_shape(node: Any) -> None:
+    declared = _node_shape(node)
+    if declared is None or len(declared) <= 1:
+        return
+    raise ValueError(
+        f"Tensor '{node.name}' shape {declared} is not a sequence-length scalar"
+    )
 
 
 def _nbytes(value: Any) -> int:

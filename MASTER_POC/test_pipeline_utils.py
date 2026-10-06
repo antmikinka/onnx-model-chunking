@@ -105,6 +105,52 @@ def test_kv_cache():
     assert cache.get_memory_usage()["static"] is False
 
     present = np.arange(1 * 2 * 4 * 8, dtype=np.float16).reshape(1, 2, 4, 8)
+
+    class _Tensor:
+        def __init__(self, name, shape):
+            self.name = name
+            self.shape = shape
+
+    class _Session:
+        def __init__(self, present_seq=8):
+            self.present_seq = present_seq
+
+        def get_inputs(self):
+            return [
+                _Tensor("past_key_values.0.key", [1, 2, 8, 8]),
+                _Tensor("past_key_values.0.value", [1, 2, 8, 8]),
+                _Tensor("past_key_values.1.key", [1, 2, 8, 8]),
+                _Tensor("past_key_values.1.value", [1, 2, 8, 8]),
+                _Tensor("attention_mask", [1, 8]),
+                _Tensor("sequence_length", []),
+            ]
+
+        def get_outputs(self):
+            return [
+                _Tensor("present.0.key", [1, 2, self.present_seq, 8]),
+                _Tensor("present.0.value", [1, 2, self.present_seq, 8]),
+                _Tensor("present.1.key", [1, 2, self.present_seq, 8]),
+                _Tensor("present.1.value", [1, 2, self.present_seq, 8]),
+            ]
+
+    class _Binding:
+        def __init__(self):
+            self.inputs = {}
+            self.outputs = {}
+
+        def bind_ortvalue_input(self, name, value):
+            self.inputs[name] = value
+
+        def bind_ortvalue_output(self, name, value):
+            self.outputs[name] = value
+
+    class _EmptySession:
+        def get_inputs(self):
+            return []
+
+        def get_outputs(self):
+            return []
+
     static_cpu = KVCacheManager(
         num_layers=2,
         num_kv_heads=2,
@@ -198,12 +244,22 @@ def test_kv_cache():
         assert resident.get_sequence_length() == 3
         assert int(again_key.ort_value.data_ptr()) == before
         ort_key, ort_value = resident.get_ort_values(0)
+        device_key, device_value = resident.get_device_tensors(0)
+        assert device_key is ort_key
+        assert device_value is ort_value
         assert int(ort_key.data_ptr()) == before
         assert ort_value is again_value.ort_value
         mask = resident.attention_mask()
         assert mask.shape[-1] == 8
         assert int(mask[0, 2]) == 1
         assert int(mask[0, 3]) == 0
+        bound_io = _Binding()
+        resident.bind_cache_to_session(_Session(), bound_io, 0)
+        assert bound_io.inputs["past_key_values.0.key"] is device_key
+        assert bound_io.outputs["present.0.key"] is device_key
+        assert bound_io.outputs["present.0.value"] is device_value
+        assert int(np.asarray(bound_io.inputs["sequence_length"].numpy()).reshape(-1)[0]) == 3
+        assert int(device_key.data_ptr()) == before
         resident.reset()
         assert resident.get_sequence_length() == 0
         assert int(resident.get_past_tensors(0)[0].ort_value.data_ptr()) == before
@@ -219,7 +275,94 @@ def test_kv_cache():
         raise AssertionError("unknown KV backend was accepted")
     except ValueError as exc:
         assert "disk" in str(exc)
+
+    from pipeline_utils.io_binding import IOBindingManager, MemoryMode
+
+    host = KVCacheManager(
+        num_layers=2,
+        num_kv_heads=2,
+        head_dim=8,
+        dtype=np.float16,
+        batch_size=1,
+    )
+    assert host.device_resident is False
+    try:
+        host.get_device_tensors(0)
+        raise AssertionError("a CPU dictionary returned device tensors")
+    except RuntimeError as exc:
+        assert "allocate_device_cache" in str(exc)
+    host.update_from_present(0, present, present.copy())
+    host.update_from_present(1, present, present.copy())
+    manager = IOBindingManager(
+        device_type="cpu",
+        memory_mode=MemoryMode.NPU_STATIC,
+        max_seq_len=8,
+    )
+    adopted = host.allocate_device_cache(manager, max_seq_len=8)
+    assert adopted is manager
+    assert host.device_resident is True
+    assert host.current_seq_len == 4
+    assert host.get_memory_usage()["storage"] == "device_buffer"
+    key_ort, value_ort = host.get_device_tensors(0)
+    assert key_ort is manager.get_buffer("kv.layer0.key").ort_value
+    assert value_ort is manager.get_buffer("kv.layer0.value").ort_value
+    assert np.array_equal(key_ort.numpy()[:, :, :4, :], present)
+    again = host.get_device_tensors(0)
+    assert again[0] is key_ort and again[1] is value_ort
+    host.allocate_device_cache(manager, max_seq_len=8)
+    assert host.get_device_tensors(0)[0] is key_ort
+    assert host.current_seq_len == 4
+    binding = _Binding()
+    bound = host.bind_cache_to_session(_Session(), binding, 0)
+    assert bound["past_key"] == "past_key_values.0.key"
+    assert bound["present_key"] == "present.0.key"
+    assert binding.inputs["past_key_values.0.key"] is key_ort
+    assert binding.outputs["present.0.key"] is key_ort
+    assert binding.inputs["past_key_values.0.value"] is value_ort
+    assert binding.outputs["present.0.value"] is value_ort
+    assert "past_key_values.1.key" not in binding.inputs
+    mask_ort = manager.get_buffer("kv.attention_mask").ort_value
+    assert binding.inputs["attention_mask"] is mask_ort
+    assert int(mask_ort.numpy()[0, 3]) == 1
+    assert int(mask_ort.numpy()[0, 4]) == 0
+    scalar_ort = binding.inputs["sequence_length"]
+    assert int(np.asarray(scalar_ort.numpy()).reshape(-1)[0]) == 4
+    assert scalar_ort.numpy().size == 1
+    binding_again = _Binding()
+    host.bind_cache_to_session(_Session(), binding_again, 0)
+    assert binding_again.inputs["sequence_length"] is scalar_ort
+    assert binding_again.inputs["attention_mask"] is mask_ort
+    layer_one = _Binding()
+    host.bind_cache_to_session(_Session(), layer_one, 1)
+    assert layer_one.inputs["past_key_values.1.key"] is host.get_device_tensors(1)[0]
+    assert layer_one.outputs["present.1.value"] is host.get_device_tensors(1)[1]
+    assert "past_key_values.0.key" not in layer_one.inputs
+    try:
+        host.bind_cache_to_session(_Session(present_seq=1), _Binding(), 0)
+        raise AssertionError("a 1-token present tensor was bound to the static cache")
+    except ValueError as exc:
+        assert "max_seq_len" in str(exc)
+    try:
+        host.bind_cache_to_session(_EmptySession(), _Binding(), 0)
+        raise AssertionError("a session without KV tensors was bound")
+    except ValueError as exc:
+        assert "layer 0" in str(exc)
+    try:
+        host.allocate_device_cache(manager, max_seq_len=16)
+        raise AssertionError("a different max_seq_len replaced the resident pool")
+    except ValueError as exc:
+        assert "max_seq_len" in str(exc)
+    assert host.get_device_tensors(0)[0] is key_ort
+    try:
+        host.allocate_device_cache(object(), 8)
+        raise AssertionError("a non-manager was accepted")
+    except TypeError as exc:
+        assert "IOBindingManager" in str(exc)
+    host.reset()
+    assert host.current_seq_len == 0
+    assert host.get_device_tensors(0)[0] is key_ort
     print("  device KV: vitisai, ryzenai, rocm, cuda, pinned host, hybrid NPU/iGPU")
+    print("  zero-copy bind: allocate_device_cache, get_device_tensors, bind_cache_to_session")
 
     print("kv_cache module: OK\n")
     return True
