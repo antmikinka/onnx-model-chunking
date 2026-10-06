@@ -29,7 +29,7 @@ from .dtypes import (
     get_bfloat16_dtype,
 )
 
-from .kv_cache import KVCacheManager
+from .kv_cache import KVCacheManager, KVCacheBackend, coerce_kv_backend
 
 from .config_loader import (
     ModelConfig,
@@ -137,6 +137,8 @@ __all__ = [
     "get_bfloat16_dtype",
     # kv_cache exports
     "KVCacheManager",
+    "KVCacheBackend",
+    "coerce_kv_backend",
     # config_loader exports
     "ModelConfig",
     "load_model_config",

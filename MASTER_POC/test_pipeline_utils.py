@@ -58,7 +58,8 @@ def test_kv_cache():
     print("Testing kv_cache module...")
     print("=" * 50)
     
-    from pipeline_utils.kv_cache import KVCacheManager
+    from pipeline_utils.kv_cache import KVCacheManager, KVCacheBackend
+    from pipeline_utils.io_binding import DeviceBuffer
     
     # Create cache manager
     cache = KVCacheManager(
@@ -95,7 +96,69 @@ def test_kv_cache():
     # Test reset
     cache.reset()
     print(f"  After reset: seq_len = {cache.get_sequence_length()}")
-    
+    assert cache.backend is KVCacheBackend.CPU
+    assert isinstance(cache.get_past_tensors(0)[0], np.ndarray)
+    assert cache.get_memory_usage()["storage"] == "numpy"
+
+    present = np.arange(1 * 2 * 4 * 8, dtype=np.float16).reshape(1, 2, 4, 8)
+    for backend in (
+        KVCacheBackend.VITISAI,
+        KVCacheBackend.RYZENAI,
+        KVCacheBackend.ROCM,
+        KVCacheBackend.CUDA,
+        KVCacheBackend.PINNED_HOST,
+        KVCacheBackend.HYBRID_NPU_IGPU,
+    ):
+        resident = KVCacheManager(
+            num_layers=2,
+            num_kv_heads=2,
+            head_dim=8,
+            dtype=np.float16,
+            batch_size=1,
+            backend=backend,
+            max_seq_len=8,
+        )
+        key, value = resident.get_past_tensors(0)
+        assert isinstance(key, DeviceBuffer)
+        assert isinstance(value, DeviceBuffer)
+        assert key.ort_value is not None
+        assert tuple(key.shape) == (1, 2, 8, 8)
+        assert resident.get_sequence_length() == 0
+        before = int(key.ort_value.data_ptr())
+        resident.update_from_present(0, present, present.copy())
+        resident.update_from_present(1, present, present.copy())
+        assert resident.get_sequence_length() == 4
+        assert int(key.ort_value.data_ptr()) == before
+        written = key.to_numpy()[:, :, :4, :]
+        assert np.array_equal(written, present)
+        again_key, again_value = resident.get_past_tensors(0)
+        resident.update_from_present(0, again_key, again_value, valid_seq_len=3)
+        assert resident.get_sequence_length() == 3
+        assert int(again_key.ort_value.data_ptr()) == before
+        ort_key, ort_value = resident.get_ort_values(0)
+        assert int(ort_key.data_ptr()) == before
+        assert ort_value is again_value.ort_value
+        mask = resident.attention_mask()
+        assert mask.shape[-1] == 8
+        assert int(mask[0, 2]) == 1
+        assert int(mask[0, 3]) == 0
+        resident.reset()
+        assert resident.get_sequence_length() == 0
+        assert int(resident.get_past_tensors(0)[0].ort_value.data_ptr()) == before
+        try:
+            resident.update_from_present(0, np.zeros((1, 2, 9, 8), np.float16), np.zeros((1, 2, 9, 8), np.float16))
+            raise AssertionError(f"{backend.value} accepted a sequence past max_seq_len")
+        except ValueError as exc:
+            assert "max_seq_len" in str(exc)
+        assert resident.get_memory_usage()["storage"] == "device_buffer"
+        assert resident.get_memory_usage()["backend"] == backend.value
+    try:
+        KVCacheManager(1, 1, 1, backend="disk")
+        raise AssertionError("unknown KV backend was accepted")
+    except ValueError as exc:
+        assert "disk" in str(exc)
+    print("  device KV: vitisai, ryzenai, rocm, cuda, pinned host, hybrid NPU/iGPU")
+
     print("kv_cache module: OK\n")
     return True
 
