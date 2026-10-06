@@ -3263,10 +3263,17 @@ def test_backend():
     from pipeline_utils.backend import (
         DEVICE_PROVIDER_MAP,
         BackendConfig,
+        BackendType,
         DeviceType,
         LlamaCppBackend,
+        ModelFormat,
         OnnxRuntimeBackend,
+        TorchBackend,
+        VLLMBackend,
+        detect_model_format,
         filter_onnx_providers,
+        get_backend,
+        get_backend_for_model,
         _pair_present_to_past,
         _sample_next_token,
         _sequential_pipeline_class,
@@ -4187,6 +4194,582 @@ def test_backend():
     assert routed._get_component_providers("embedding")[0] == "ROCmExecutionProvider"
     assert routed._get_component_providers("router") == ["CPUExecutionProvider"]
     assert routed._get_component_providers("expert_1")[0] == "VitisAIExecutionProvider"
+
+    import sys
+    import types
+
+    assert isinstance(get_backend(BackendType.TORCH), TorchBackend)
+    assert isinstance(get_backend(BackendType.VLLM), VLLMBackend)
+    assert get_backend(BackendType.ONNX_RUNTIME).backend_type == BackendType.ONNX_RUNTIME
+    assert get_backend(BackendType.LLAMA_CPP).supported_formats == [ModelFormat.GGUF]
+    torch_backend = get_backend(BackendType.TORCH, BackendConfig(device=DeviceType.CPU))
+    assert torch_backend.backend_type == BackendType.TORCH
+    assert torch_backend.supported_formats == [ModelFormat.SAFETENSORS, ModelFormat.PYTORCH_BIN]
+    vllm_backend = get_backend(BackendType.VLLM)
+    assert vllm_backend.backend_type == BackendType.VLLM
+    assert vllm_backend.supported_formats == [ModelFormat.SAFETENSORS, ModelFormat.PYTORCH_BIN]
+    try:
+        get_backend("missing")
+        raise AssertionError("an unknown backend name was accepted")
+    except ValueError as exc:
+        assert "TORCH" in str(exc) and "VLLM" in str(exc)
+
+    weights_dir = tempfile.mkdtemp(prefix="torch-weights-")
+    bin_dir = tempfile.mkdtemp(prefix="torch-bin-")
+    gguf_dir = tempfile.mkdtemp(prefix="gguf-file-")
+    try:
+        safetensors_path = os.path.join(weights_dir, "model.safetensors")
+        with open(safetensors_path, "wb") as handle:
+            handle.write(b"")
+        bin_path = os.path.join(bin_dir, "pytorch_model.bin")
+        with open(bin_path, "wb") as handle:
+            handle.write(b"")
+        gguf_path = os.path.join(gguf_dir, "model.gguf")
+        with open(gguf_path, "wb") as handle:
+            handle.write(b"")
+        assert detect_model_format(weights_dir) == ModelFormat.SAFETENSORS
+        assert isinstance(get_backend_for_model(weights_dir), TorchBackend)
+        assert isinstance(get_backend_for_model(safetensors_path), TorchBackend)
+        assert detect_model_format(bin_path) == ModelFormat.PYTORCH_BIN
+        assert isinstance(get_backend_for_model(bin_path), TorchBackend)
+        assert isinstance(get_backend_for_model(gguf_path), LlamaCppBackend)
+        empty_dir = tempfile.mkdtemp(prefix="empty-model-")
+        try:
+            detect_model_format(empty_dir)
+            raise AssertionError("an empty directory was detected as a model")
+        except ValueError as exc:
+            assert "Cannot detect" in str(exc)
+        finally:
+            os.rmdir(empty_dir)
+    finally:
+        os.remove(safetensors_path)
+        os.remove(bin_path)
+        os.remove(gguf_path)
+        os.rmdir(weights_dir)
+        os.rmdir(bin_dir)
+        os.rmdir(gguf_dir)
+
+    def _hide_modules(*prefixes):
+        saved = {}
+        for name in list(sys.modules):
+            if any(name == prefix or name.startswith(prefix + ".") for prefix in prefixes):
+                saved[name] = sys.modules.pop(name)
+        return saved
+
+    def _restore_modules(saved):
+        for name in list(sys.modules):
+            if name in saved or any(
+                name == prefix or name.startswith(prefix + ".")
+                for prefix in ("torch", "transformers", "vllm")
+            ):
+                if name not in saved:
+                    sys.modules.pop(name, None)
+        sys.modules.update(saved)
+
+    hidden = _hide_modules("torch", "transformers", "vllm")
+    try:
+        missing_torch = TorchBackend()
+        try:
+            missing_torch.load("unused")
+            raise AssertionError("Torch load without torch was accepted")
+        except ImportError as exc:
+            assert "pip install torch" in str(exc)
+        sys.modules["torch"] = types.ModuleType("torch")
+        missing_transformers = TorchBackend()
+        try:
+            missing_transformers.load("unused")
+            raise AssertionError("Torch load without transformers was accepted")
+        except ImportError as exc:
+            assert "pip install transformers" in str(exc)
+        missing_vllm = VLLMBackend()
+        try:
+            missing_vllm.load("unused")
+            raise AssertionError("vLLM load without vllm was accepted")
+        except ImportError as exc:
+            assert "pip install vllm" in str(exc)
+    finally:
+        _restore_modules(hidden)
+
+    class _TorchTensor:
+        def __init__(self, data):
+            self.data = np.asarray(data)
+            self.shape = self.data.shape
+
+        def to(self, device):
+            return self
+
+        def detach(self):
+            return self
+
+        def float(self):
+            return self
+
+        def cpu(self):
+            return self
+
+        def numpy(self):
+            return self.data
+
+    def _install_torch(cuda=False, npu=False, mps=False):
+        torch_mod = types.ModuleType("torch")
+
+        def tensor(data, dtype=None):
+            return _TorchTensor(data)
+
+        def cat(items, dim=-1):
+            return _TorchTensor(np.concatenate([item.numpy() for item in items], axis=dim))
+
+        class _NoGrad:
+            def __enter__(self):
+                return None
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        torch_mod.tensor = tensor
+        torch_mod.cat = cat
+        torch_mod.no_grad = _NoGrad
+        torch_mod.float16 = "float16"
+        torch_mod.float32 = "float32"
+        torch_mod.bfloat16 = "bfloat16"
+        torch_mod.long = "long"
+        torch_mod.threads = None
+
+        def set_num_threads(count):
+            torch_mod.threads = count
+
+        torch_mod.set_num_threads = set_num_threads
+        torch_mod.cuda = types.SimpleNamespace(is_available=lambda: cuda)
+        torch_mod.npu = types.SimpleNamespace(is_available=lambda: npu)
+        torch_mod.backends = types.SimpleNamespace(
+            mps=types.SimpleNamespace(is_available=lambda: mps)
+        )
+        sys.modules["torch"] = torch_mod
+        return torch_mod
+
+    class _Causal:
+        def __init__(self, with_past=True):
+            self.with_past = with_past
+            self.eval_called = False
+            self.lengths = []
+
+        def eval(self):
+            self.eval_called = True
+            return self
+
+        def __call__(self, input_ids=None, attention_mask=None, past_key_values=None, use_cache=True):
+            length = int(np.asarray(input_ids.numpy()).shape[-1])
+            self.lengths.append(length)
+            logits = np.zeros((1, length, 6), dtype=np.float32)
+            logits[:, -1, 4] = 8
+            past = ("past", length) if self.with_past else None
+            return types.SimpleNamespace(logits=_TorchTensor(logits), past_key_values=past)
+
+    class _WordTokenizer:
+        eos_token_id = None
+
+        def __call__(self, prompt, return_tensors="pt"):
+            assert prompt == "Hello"
+            assert return_tensors == "pt"
+            torch_mod = sys.modules["torch"]
+            return {
+                "input_ids": torch_mod.tensor([[1, 2, 3]]),
+                "attention_mask": torch_mod.tensor([[1, 1, 1]]),
+            }
+
+        def decode(self, ids):
+            return ",".join(str(int(token)) for token in ids)
+
+    class _Transformers:
+        def __init__(self, model):
+            self.model = model
+            self.loads = []
+            self.tokenizers = []
+
+            class _AutoModel:
+                def from_pretrained(_self, path, **kwargs):
+                    self.loads.append((path, kwargs))
+                    return model
+
+            class _AutoTokenizer:
+                def from_pretrained(_self, path, **kwargs):
+                    self.tokenizers.append(path)
+                    return _WordTokenizer()
+
+            self.AutoModelForCausalLM = _AutoModel()
+            self.AutoTokenizer = _AutoTokenizer()
+
+    import pipeline_utils
+
+    assert pipeline_utils.TorchBackend is TorchBackend
+    assert pipeline_utils.VLLMBackend is VLLMBackend
+
+    hidden = _hide_modules("torch", "transformers", "vllm")
+    model_dir = tempfile.mkdtemp(prefix="torch-load-")
+    try:
+        torch_mod = _install_torch(cuda=False)
+        causal = _Causal()
+        transformers_mod = _Transformers(causal)
+        sys.modules["transformers"] = transformers_mod
+        cpu_torch = TorchBackend(BackendConfig(
+            device=DeviceType.CPU,
+            n_threads=3,
+            low_memory=True,
+        ))
+        try:
+            cpu_torch.generate("Hello")
+            raise AssertionError("torch generate before load was accepted")
+        except RuntimeError as exc:
+            assert "load()" in str(exc)
+        cpu_torch.load(model_dir)
+        assert cpu_torch.is_loaded is True
+        assert causal.eval_called is True
+        assert torch_mod.threads == 3
+        assert transformers_mod.loads[0][0] == model_dir
+        assert transformers_mod.tokenizers == [model_dir]
+        assert transformers_mod.loads[0][1]["device_map"] == "cpu"
+        assert transformers_mod.loads[0][1]["low_cpu_mem_usage"] is True
+        assert "torch_dtype" not in transformers_mod.loads[0][1]
+        assert cpu_torch.get_memory_usage()["backend"] == "torch"
+        assert cpu_torch.get_memory_usage()["device"] == "cpu"
+        try:
+            cpu_torch.generate("Hello", max_tokens=-1)
+            raise AssertionError("a negative torch max_tokens was accepted")
+        except ValueError as exc:
+            assert "max_tokens" in str(exc)
+        streamed_torch = []
+        assert cpu_torch.generate(
+            "Hello",
+            2,
+            lambda text, index: streamed_torch.append((text, index)),
+            temperature=0,
+        ) == "1,2,3,4,4"
+        assert streamed_torch == [("4", 0), ("4", 1)]
+        assert causal.lengths == [3, 1]
+        streamed_torch.clear()
+        assert cpu_torch.generate(
+            "Hello",
+            max_tokens=0,
+            temperature=0,
+            stream_callback=lambda text, index: streamed_torch.append((text, index)),
+        ) == "1,2,3"
+        assert streamed_torch == []
+        assert causal.lengths == [3, 1]
+
+        class _EosWords(_WordTokenizer):
+            eos_token_id = 4
+
+        cpu_torch._tokenizer = _EosWords()
+        causal.lengths.clear()
+        assert cpu_torch.generate("Hello", max_tokens=5, temperature=0) == "1,2,3,4"
+        assert causal.lengths == [3]
+        cpu_torch._tokenizer = _WordTokenizer()
+        causal.lengths.clear()
+        assert cpu_torch.warmup(1) == {"iterations": 1, "warmed": True}
+        assert causal.lengths == [3, 1]
+        assert cpu_torch.warmed_up is True
+        assert cpu_torch.get_memory_usage()["warmed_up"] is True
+        cpu_torch.cleanup()
+        assert cpu_torch.is_loaded is False
+        assert cpu_torch._tokenizer is None
+        assert cpu_torch.warmed_up is False
+
+        class _EmptyWords(_WordTokenizer):
+            def __call__(self, prompt, return_tensors="pt"):
+                return {"input_ids": sys.modules["torch"].tensor(np.zeros((1, 0), dtype=np.int64))}
+
+        empty_words = TorchBackend(BackendConfig(device=DeviceType.CPU))
+        empty_words.load(model_dir)
+        empty_words._tokenizer = _EmptyWords()
+        try:
+            empty_words.generate("Hello", max_tokens=1, temperature=0)
+            raise AssertionError("an empty torch prompt was accepted")
+        except ValueError as exc:
+            assert "zero tokens" in str(exc)
+
+        class _BareCausal:
+            def __init__(self):
+                self.lengths = []
+
+            def eval(self):
+                return self
+
+            def __call__(self, input_ids):
+                length = int(np.asarray(input_ids.numpy()).shape[-1])
+                self.lengths.append(length)
+                logits = np.zeros((1, length, 6), dtype=np.float32)
+                logits[:, -1, 4] = 8
+                return types.SimpleNamespace(logits=_TorchTensor(logits))
+
+        bare_model = _BareCausal()
+        sys.modules["transformers"] = _Transformers(bare_model)
+        bare = TorchBackend(BackendConfig(device=DeviceType.CPU))
+        bare.load(model_dir)
+        assert bare.generate("Hello", max_tokens=2, temperature=0) == "1,2,3,4,4"
+        assert bare_model.lengths == [3, 4]
+
+        no_past_model = _Causal(with_past=False)
+        sys.modules["transformers"] = _Transformers(no_past_model)
+        no_past = TorchBackend(BackendConfig(device=DeviceType.CPU))
+        no_past.load(model_dir)
+        assert no_past.generate("Hello", max_tokens=2, temperature=0) == "1,2,3,4,4"
+        assert no_past_model.lengths == [3, 4]
+
+        weight_file = os.path.join(model_dir, "model.safetensors")
+        with open(weight_file, "wb") as handle:
+            handle.write(b"")
+        file_model = _Causal()
+        file_tf = _Transformers(file_model)
+        sys.modules["transformers"] = file_tf
+        file_backend = TorchBackend(BackendConfig(device=DeviceType.CPU))
+        file_backend.load(weight_file)
+        assert file_tf.loads[0][0] == model_dir
+
+        _install_torch(cuda=True)
+        gpu_tf = _Transformers(_Causal())
+        sys.modules["transformers"] = gpu_tf
+        gpu = TorchBackend(BackendConfig(device=DeviceType.GPU))
+        gpu.load(model_dir)
+        assert gpu_tf.loads[0][1]["device_map"] == "cuda"
+        assert gpu_tf.loads[0][1]["torch_dtype"] == "float16"
+
+        _install_torch(mps=True)
+        mps_tf = _Transformers(_Causal())
+        sys.modules["transformers"] = mps_tf
+        mps_backend = TorchBackend(BackendConfig(device=DeviceType.GPU))
+        mps_backend.load(model_dir)
+        assert mps_tf.loads[0][1]["device_map"] == "mps"
+
+        _install_torch(cuda=False)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            fallback_tf = _Transformers(_Causal())
+            sys.modules["transformers"] = fallback_tf
+            fallback = TorchBackend(BackendConfig(device=DeviceType.GPU))
+            fallback.load(model_dir)
+        assert fallback_tf.loads[0][1]["device_map"] == "cpu"
+        assert any("CUDA or MPS" in str(item.message) for item in caught)
+
+        _install_torch(npu=True)
+        npu_tf = _Transformers(_Causal())
+        sys.modules["transformers"] = npu_tf
+        npu_torch = TorchBackend(BackendConfig(device=DeviceType.NPU))
+        npu_torch.load(model_dir)
+        assert npu_tf.loads[0][1]["device_map"] == "npu"
+        assert npu_tf.loads[0][1]["torch_dtype"] == "float16"
+
+        _install_torch(cuda=True)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            missing_npu_tf = _Transformers(_Causal())
+            sys.modules["transformers"] = missing_npu_tf
+            missing_npu = TorchBackend(BackendConfig(device=DeviceType.NPU))
+            missing_npu.load(model_dir)
+        assert missing_npu_tf.loads[0][1]["device_map"] == "cpu"
+        assert any("no NPU" in str(item.message) for item in caught)
+
+        _install_torch(cuda=True)
+        auto_tf = _Transformers(_Causal())
+        sys.modules["transformers"] = auto_tf
+        auto_torch = TorchBackend(BackendConfig(device=DeviceType.AUTO))
+        auto_torch.load(model_dir)
+        assert auto_tf.loads[0][1]["device_map"] == "auto"
+        assert auto_tf.loads[0][1]["torch_dtype"] == "float16"
+
+        _install_torch()
+        int8_tf = _Transformers(_Causal())
+        sys.modules["transformers"] = int8_tf
+        int8 = TorchBackend(BackendConfig(device=DeviceType.CPU, quantization="int8"))
+        int8.load(model_dir)
+        assert int8_tf.loads[0][1]["load_in_8bit"] is True
+        int4_tf = _Transformers(_Causal())
+        sys.modules["transformers"] = int4_tf
+        int4 = TorchBackend(BackendConfig(device=DeviceType.CPU, quantization="int4"))
+        int4.load(model_dir)
+        assert int4_tf.loads[0][1]["load_in_4bit"] is True
+        bf_tf = _Transformers(_Causal())
+        sys.modules["transformers"] = bf_tf
+        bf16 = TorchBackend(BackendConfig(device=DeviceType.CPU, quantization="bf16"))
+        bf16.load(model_dir)
+        assert bf_tf.loads[0][1]["torch_dtype"] == "bfloat16"
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            llama_quant_tf = _Transformers(_Causal())
+            sys.modules["transformers"] = llama_quant_tf
+            llama_quant = TorchBackend(BackendConfig(
+                device=DeviceType.CPU,
+                quantization="Q4_K_M",
+            ))
+            llama_quant.load(model_dir)
+        assert "torch_dtype" not in llama_quant_tf.loads[0][1]
+        assert "load_in_4bit" not in llama_quant_tf.loads[0][1]
+        assert any("Q4_K_M" in str(item.message) for item in caught)
+
+        class _SamplingParams:
+            def __init__(self, max_tokens=None, temperature=None, top_p=None):
+                self.max_tokens = max_tokens
+                self.temperature = temperature
+                self.top_p = top_p
+
+        class _LLM:
+            def __init__(
+                self,
+                model=None,
+                max_model_len=None,
+                device=None,
+                dtype=None,
+                quantization=None,
+                tensor_parallel_size=None,
+                gpu_memory_utilization=None,
+            ):
+                self.model = model
+                self.max_model_len = max_model_len
+                self.device = device
+                self.dtype = dtype
+                self.quantization = quantization
+                self.tensor_parallel_size = tensor_parallel_size
+                self.gpu_memory_utilization = gpu_memory_utilization
+                self.calls = []
+
+            def get_tokenizer(self):
+                return _WordTokenizer()
+
+            def generate(self, prompts, params):
+                self.calls.append((
+                    list(prompts),
+                    params.max_tokens,
+                    params.temperature,
+                    params.top_p,
+                ))
+                completion = types.SimpleNamespace(text="hi!", token_ids=[7, 8])
+                return [types.SimpleNamespace(outputs=[completion])]
+
+        class _NoTokLLM(_LLM):
+            def get_tokenizer(self):
+                return None
+
+        class _NarrowLLM:
+            def __init__(self, model):
+                self.source = model
+
+            def generate(self, prompts, params):
+                return ["plain"]
+
+        vllm_mod = types.ModuleType("vllm")
+        vllm_mod.SamplingParams = _SamplingParams
+        vllm_mod.LLM = _LLM
+        sys.modules["vllm"] = vllm_mod
+        engine = VLLMBackend(BackendConfig(
+            device=DeviceType.GPU,
+            quantization="awq",
+            low_memory=True,
+            n_ctx=128,
+        ))
+        try:
+            engine.generate("Hello")
+            raise AssertionError("vLLM generate before load was accepted")
+        except RuntimeError as exc:
+            assert "load()" in str(exc)
+        engine.load(model_dir)
+        assert engine.model.model == model_dir
+        assert engine.model.device == "cuda"
+        assert engine.model.dtype is None
+        assert engine.model.quantization == "awq"
+        assert engine.model.max_model_len == 128
+        assert engine.model.tensor_parallel_size == 1
+        assert engine.model.gpu_memory_utilization == 0.5
+        vllm_pieces = []
+        assert engine.generate(
+            "Hello",
+            max_tokens=4,
+            temperature=0,
+            top_p=0.3,
+            stream_callback=lambda text, index: vllm_pieces.append((text, index)),
+        ) == "hi!"
+        assert vllm_pieces == [("7", 0), ("8", 1)]
+        assert engine.model.calls == [(["Hello"], 4, 0.0, 0.3)]
+        assert engine.generate(
+            "Hello",
+            max_tokens=0,
+            stream_callback=lambda text, index: vllm_pieces.append((text, index)),
+        ) == ""
+        assert vllm_pieces == [("7", 0), ("8", 1)]
+        assert engine.model.calls == [(["Hello"], 4, 0.0, 0.3)]
+        try:
+            engine.generate("Hello", max_tokens=-2)
+            raise AssertionError("a negative vLLM max_tokens was accepted")
+        except ValueError as exc:
+            assert "max_tokens" in str(exc)
+        assert engine.warmup(2) == {"iterations": 2, "warmed": True}
+        assert engine.model.calls[1:] == [
+            (["Hello"], 2, 0.0, 0.9),
+            (["Hello"], 2, 0.0, 0.9),
+        ]
+        assert engine.get_memory_usage()["backend"] == "vllm"
+        assert engine.get_memory_usage()["device"] == "cuda"
+        assert engine.get_memory_usage()["warmed_up"] is True
+        engine.cleanup()
+        assert engine.is_loaded is False
+        assert engine.warmed_up is False
+
+        vllm_mod.LLM = _NoTokLLM
+        silent = VLLMBackend(BackendConfig(device=DeviceType.CPU, quantization="fp16"))
+        silent.load(weight_file)
+        assert silent.model.model == model_dir
+        assert silent.model.device == "cpu"
+        assert silent.model.dtype == "float16"
+        one_piece = []
+        assert silent.generate(
+            "Hello",
+            stream_callback=lambda text, index: one_piece.append((text, index)),
+        ) == "hi!"
+        assert one_piece == [("hi!", 0)]
+
+        vllm_mod.LLM = _LLM
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            npu_vllm = VLLMBackend(BackendConfig(device=DeviceType.NPU))
+            npu_vllm.load(model_dir)
+        assert npu_vllm.model.device == "cpu"
+        assert any("NPU" in str(item.message) for item in caught)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            auto_vllm = VLLMBackend(BackendConfig(
+                device=DeviceType.AUTO,
+                quantization="nope",
+            ))
+            auto_vllm.load(model_dir)
+        assert auto_vllm.model.device is None
+        assert auto_vllm._device == "auto"
+        assert any("nope" in str(item.message) for item in caught)
+
+        vllm_mod.LLM = _NarrowLLM
+        narrow = VLLMBackend(BackendConfig(
+            device=DeviceType.GPU,
+            low_memory=True,
+            quantization="gptq",
+        ))
+        narrow.load(model_dir)
+        assert narrow.model.source == model_dir
+        narrow_pieces = []
+        assert narrow.generate(
+            "Hello",
+            stream_callback=lambda text, index: narrow_pieces.append((text, index)),
+        ) == "plain"
+        assert narrow_pieces == [("plain", 0)]
+
+        vllm_mod.LLM = None
+        try:
+            VLLMBackend().load(model_dir)
+            raise AssertionError("vLLM load without LLM was accepted")
+        except ImportError as exc:
+            assert "vllm.LLM" in str(exc)
+    finally:
+        _restore_modules(hidden)
+        weight_path = os.path.join(model_dir, "model.safetensors")
+        if os.path.isfile(weight_path):
+            os.remove(weight_path)
+        os.rmdir(model_dir)
 
     print("  generate: split pipeline and monolithic prefill/decode")
     print("  providers: NPU, GPU, CPU, and auto-detect")

@@ -3,7 +3,7 @@
 backend.py - Multi-Backend Inference Abstraction Layer
 
 This module provides a unified interface for different inference backends,
-enabling the pipeline to work with ONNX Runtime, llama.cpp, or PyTorch.
+enabling the pipeline to work with ONNX Runtime, llama.cpp, PyTorch, or vLLM.
 
 Usage:
     from pipeline_utils.backend import get_backend, BackendType, DeviceType
@@ -17,6 +17,7 @@ Usage:
 """
 
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from enum import Enum
 from dataclasses import dataclass, field, replace
 from typing import Optional, List, Dict, Any, Union, Sequence, Tuple, Callable
@@ -1496,6 +1497,559 @@ class LlamaCppBackend(InferenceBackend):
         }
 
 
+def _pretrained_source(model_path: str) -> str:
+    """Use a weight file's directory as the Hugging Face load path."""
+    if os.path.isdir(model_path):
+        return model_path
+    parent = os.path.dirname(os.path.abspath(model_path))
+    return parent or model_path
+
+
+def _import_torch_stack():
+    """Import torch and transformers, or raise an install hint."""
+    try:
+        torch_mod = importlib.import_module("torch")
+    except ImportError as exc:
+        raise ImportError(
+            "torch is required for TorchBackend. "
+            "Install with: pip install torch"
+        ) from exc
+    try:
+        transformers = importlib.import_module("transformers")
+    except ImportError as exc:
+        raise ImportError(
+            "transformers is required for TorchBackend. "
+            "Install with: pip install transformers"
+        ) from exc
+    if not hasattr(transformers, "AutoModelForCausalLM") or not hasattr(transformers, "AutoTokenizer"):
+        raise ImportError(
+            "transformers.AutoModelForCausalLM and AutoTokenizer are required "
+            "for TorchBackend. Install with: pip install transformers"
+        )
+    return torch_mod, transformers
+
+
+def _import_vllm():
+    """Import vLLM, or raise an install hint."""
+    try:
+        return importlib.import_module("vllm")
+    except ImportError as exc:
+        raise ImportError(
+            "vllm is required for VLLMBackend. "
+            "Install with: pip install vllm"
+        ) from exc
+
+
+def _call_filtered(func: Any, kwargs: Dict[str, Any]) -> Any:
+    """Call ``func`` with the kwargs its signature accepts."""
+    try:
+        signature = inspect.signature(func)
+    except (TypeError, ValueError):
+        return func(**kwargs)
+    parameters = signature.parameters
+    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values()):
+        return func(**kwargs)
+    accepted = {key: value for key, value in kwargs.items() if key in parameters}
+    return func(**accepted)
+
+
+def _accelerator_kind(torch_mod: Any) -> Optional[str]:
+    """The first live accelerator this PyTorch build exposes."""
+    if torch_mod is None:
+        return None
+    cuda = getattr(torch_mod, "cuda", None)
+    is_cuda = getattr(cuda, "is_available", None)
+    if callable(is_cuda) and is_cuda():
+        return "cuda"
+    backends = getattr(torch_mod, "backends", None)
+    mps = getattr(backends, "mps", None) if backends is not None else None
+    is_mps = getattr(mps, "is_available", None)
+    if callable(is_mps) and is_mps():
+        return "mps"
+    npu = getattr(torch_mod, "npu", None)
+    is_npu = getattr(npu, "is_available", None)
+    if callable(is_npu) and is_npu():
+        return "npu"
+    return None
+
+
+def _torch_device_map(device: Union[DeviceType, str], torch_mod: Any) -> str:
+    """Map DeviceType onto a ``from_pretrained`` device_map value."""
+    kind = _accelerator_kind(torch_mod)
+    selected = _coerce_device(device)
+    if selected == DeviceType.CPU:
+        return "cpu"
+    if selected == DeviceType.GPU:
+        if kind == "cuda":
+            return "cuda"
+        if kind == "mps":
+            return "mps"
+        warnings.warn(
+            "TorchBackend placed the model on CPU because this PyTorch build "
+            "has no CUDA or MPS device.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+        return "cpu"
+    if selected == DeviceType.NPU:
+        if kind == "npu":
+            return "npu"
+        warnings.warn(
+            "TorchBackend placed the model on CPU because this PyTorch build "
+            "has no NPU device.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+        return "cpu"
+    if kind == "cuda":
+        return "auto"
+    if kind in ("mps", "npu"):
+        return kind
+    return "cpu"
+
+
+_TORCH_DTYPE_NAMES = {
+    "float32": "float32",
+    "fp32": "float32",
+    "float16": "float16",
+    "fp16": "float16",
+    "half": "float16",
+    "bfloat16": "bfloat16",
+    "bf16": "bfloat16",
+}
+
+
+def _torch_from_pretrained_kwargs(
+    config: BackendConfig,
+    torch_mod: Any,
+    device_map: str,
+) -> Dict[str, Any]:
+    """dtype, bitsandbytes flags, and device_map for one Torch load."""
+    kwargs: Dict[str, Any] = {
+        "low_cpu_mem_usage": bool(config.low_memory),
+        "device_map": device_map,
+    }
+    quant = str(config.quantization or "").strip().lower()
+    if quant in ("int8", "8bit", "load_in_8bit"):
+        kwargs["load_in_8bit"] = True
+    elif quant in ("int4", "4bit", "load_in_4bit"):
+        kwargs["load_in_4bit"] = True
+    elif quant in _TORCH_DTYPE_NAMES:
+        kwargs["torch_dtype"] = getattr(torch_mod, _TORCH_DTYPE_NAMES[quant])
+    elif quant:
+        warnings.warn(
+            f"TorchBackend does not apply quantization {config.quantization!r}. "
+            "Use fp16, bf16, fp32, int8, or int4.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+    elif device_map in ("cuda", "npu", "mps", "auto"):
+        dtype = getattr(torch_mod, "float16", None)
+        if dtype is not None:
+            kwargs["torch_dtype"] = dtype
+    return kwargs
+
+
+def _tensor_to_id_list(value: Any) -> List[int]:
+    """Flatten a tensor or array of token ids."""
+    current = value
+    if hasattr(current, "detach"):
+        current = current.detach()
+    if hasattr(current, "cpu"):
+        current = current.cpu()
+    if hasattr(current, "numpy"):
+        current = current.numpy()
+    return [int(token) for token in np.asarray(current).reshape(-1)]
+
+
+def _ids_tensor(torch_mod: Any, token_ids: Sequence[int], device: str) -> Any:
+    """A [1, seq] long tensor on ``device``."""
+    column = torch_mod.tensor(
+        [[int(token) for token in token_ids]],
+        dtype=getattr(torch_mod, "long", None),
+    )
+    if device and hasattr(column, "to"):
+        column = column.to(device)
+    return column
+
+
+def _torch_inference(torch_mod: Any):
+    """``torch.no_grad`` when the build provides it."""
+    no_grad = getattr(torch_mod, "no_grad", None)
+    if not callable(no_grad):
+        return nullcontext()
+    return no_grad()
+
+
+def _torch_forward(model: Any, input_ids: Any, attention_mask: Any, past: Any) -> Any:
+    """One causal-LM step. A model without cache kwargs receives ids only."""
+    kwargs: Dict[str, Any] = {"input_ids": input_ids, "use_cache": True}
+    if attention_mask is not None:
+        kwargs["attention_mask"] = attention_mask
+    if past is not None:
+        kwargs["past_key_values"] = past
+    try:
+        return model(**kwargs)
+    except TypeError:
+        return model(input_ids)
+
+
+def _row_from_torch_logits(outputs: Any) -> np.ndarray:
+    """The last-position logits row as a 1D numpy array."""
+    logits = getattr(outputs, "logits", None)
+    if logits is None and isinstance(outputs, (tuple, list)) and outputs:
+        logits = outputs[0]
+    if logits is None:
+        raise RuntimeError("Torch model returned no logits")
+    if hasattr(logits, "detach"):
+        logits = logits.detach()
+    if hasattr(logits, "float"):
+        logits = logits.float()
+    if hasattr(logits, "cpu"):
+        logits = logits.cpu()
+    if hasattr(logits, "numpy"):
+        logits = logits.numpy()
+    array = np.asarray(logits)
+    if array.ndim >= 2:
+        array = array.reshape(-1, array.shape[-1])[-1]
+    return np.asarray(array, dtype=np.float64).reshape(-1)
+
+
+def _vllm_device(device: Union[DeviceType, str]) -> Optional[str]:
+    """Device string for ``vllm.LLM``. AUTO leaves the choice to vLLM."""
+    selected = _coerce_device(device)
+    if selected == DeviceType.CPU:
+        return "cpu"
+    if selected == DeviceType.GPU:
+        return "cuda"
+    if selected == DeviceType.NPU:
+        warnings.warn(
+            "VLLMBackend is serving this NPU request on CPU.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+        return "cpu"
+    return None
+
+
+_VLLM_DTYPES = {
+    "float32": "float32",
+    "fp32": "float32",
+    "float16": "float16",
+    "fp16": "float16",
+    "half": "float16",
+    "bfloat16": "bfloat16",
+    "bf16": "bfloat16",
+    "auto": "auto",
+}
+_VLLM_QUANTS = {
+    "awq": "awq",
+    "gptq": "gptq",
+    "squeezellm": "squeezellm",
+    "fp8": "fp8",
+}
+
+
+def _vllm_precision(quantization: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """Return ``(dtype, quantization)`` for one vLLM load."""
+    name = str(quantization or "").strip().lower()
+    if not name:
+        return None, None
+    if name in _VLLM_QUANTS:
+        return None, _VLLM_QUANTS[name]
+    if name in _VLLM_DTYPES:
+        return _VLLM_DTYPES[name], None
+    warnings.warn(
+        f"VLLMBackend does not apply quantization {quantization!r}. "
+        "Use fp16, bf16, fp32, awq, gptq, or fp8.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+    return None, None
+
+
+def _vllm_sampling_params(vllm_mod: Any, max_tokens: int, temperature: float, top_p: float) -> Any:
+    """Build SamplingParams, keeping only fields this vLLM build accepts."""
+    kwargs = {
+        "max_tokens": int(max_tokens),
+        "temperature": float(temperature),
+        "top_p": float(top_p),
+    }
+    params_cls = getattr(vllm_mod, "SamplingParams", None)
+    if params_cls is None:
+        return kwargs
+    return _call_filtered(params_cls, kwargs)
+
+
+def _vllm_completion(outputs: Any) -> Tuple[str, List[int]]:
+    """Completion text and token ids from one ``LLM.generate`` result."""
+    if outputs is None:
+        return "", []
+    first = outputs[0] if isinstance(outputs, (list, tuple)) and outputs else outputs
+    if isinstance(first, str):
+        return first, []
+    if isinstance(first, dict):
+        text = str(first.get("text") or "")
+        token_ids = [int(token) for token in list(first.get("token_ids") or [])]
+        return text, token_ids
+    completions = getattr(first, "outputs", None)
+    if completions:
+        completion = completions[0]
+        if isinstance(completion, dict):
+            text = str(completion.get("text") or "")
+            token_ids = [int(token) for token in list(completion.get("token_ids") or [])]
+            return text, token_ids
+        text = str(getattr(completion, "text", "") or "")
+        token_ids = [int(token) for token in list(getattr(completion, "token_ids", None) or [])]
+        return text, token_ids
+    text = str(getattr(first, "text", "") or "")
+    token_ids = [int(token) for token in list(getattr(first, "token_ids", None) or [])]
+    return text, token_ids
+
+
+# =============================================================================
+# PYTORCH BACKEND
+# =============================================================================
+
+class TorchBackend(InferenceBackend):
+    """
+    Direct PyTorch backend for SafeTensors and pytorch_model.bin.
+
+    ``load`` builds a causal LM with ``from_pretrained``. ``generate``
+    runs one cached forward per new token and samples with the same
+    temperature and top-p rules as the ONNX loop.
+    """
+
+    def __init__(self, config: Optional[BackendConfig] = None):
+        super().__init__(config)
+        self._tokenizer = None
+        self._past_key_values = None
+        self._torch = None
+        self._device = self.config.device.value
+
+    @property
+    def backend_type(self) -> BackendType:
+        return BackendType.TORCH
+
+    @property
+    def supported_formats(self) -> List[ModelFormat]:
+        return [ModelFormat.SAFETENSORS, ModelFormat.PYTORCH_BIN]
+
+    def load(self, model_path: str) -> None:
+        """Load a Hugging Face directory or a single weight file."""
+        torch_mod, transformers = _import_torch_stack()
+        source = _pretrained_source(model_path)
+        self.warmed_up = False
+        self.model_path = model_path
+        self._past_key_values = None
+        if self.config.n_threads > 0 and callable(getattr(torch_mod, "set_num_threads", None)):
+            torch_mod.set_num_threads(int(self.config.n_threads))
+        self._device = _torch_device_map(self.config.device, torch_mod)
+        self._torch = torch_mod
+        model = transformers.AutoModelForCausalLM.from_pretrained(
+            source,
+            **_torch_from_pretrained_kwargs(self.config, torch_mod, self._device),
+        )
+        if hasattr(model, "eval"):
+            model.eval()
+        self.model = model
+        self._tokenizer = transformers.AutoTokenizer.from_pretrained(source)
+        self.is_loaded = True
+
+    def generate(
+        self,
+        prompt: str,
+        max_tokens: int = 50,
+        stream_callback: Optional[Callable[[str, int], None]] = None,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+    ) -> str:
+        """
+        Generate text with a loaded PyTorch model.
+
+        The return value is the decoded prompt plus the new tokens.
+        ``stream_callback`` receives each new token as soon as it is sampled.
+        """
+        if not self.is_loaded:
+            raise RuntimeError("Model not loaded. Call load() first.")
+        steps = int(max_tokens)
+        if steps < 0:
+            raise ValueError(f"max_tokens must be >= 0, got {max_tokens}")
+        self.reset_cache()
+        if self._tokenizer is None:
+            raise RuntimeError(
+                "Torch generation needs a tokenizer. Call load() on a model directory."
+            )
+        torch_mod = self._torch
+        if torch_mod is None:
+            torch_mod, _transformers = _import_torch_stack()
+            self._torch = torch_mod
+        encoded = self._tokenizer(prompt, return_tensors="pt")
+        if not isinstance(encoded, dict) and not hasattr(encoded, "keys"):
+            raise RuntimeError("Tokenizer result has no input_ids")
+        if "input_ids" not in encoded:
+            raise RuntimeError("Tokenizer result has no input_ids")
+        all_ids = _tensor_to_id_list(encoded["input_ids"])
+        if not all_ids:
+            raise ValueError("Prompt tokenized to zero tokens")
+        eos = getattr(self._tokenizer, "eos_token_id", None)
+        past = None
+        model = self.model
+        with _torch_inference(torch_mod):
+            for index in range(steps):
+                if past is None:
+                    step_ids = _ids_tensor(torch_mod, all_ids, self._device)
+                else:
+                    step_ids = _ids_tensor(torch_mod, [all_ids[-1]], self._device)
+                step_mask = _ids_tensor(torch_mod, [1] * len(all_ids), self._device)
+                outputs = _torch_forward(model, step_ids, step_mask, past)
+                past = getattr(outputs, "past_key_values", None)
+                self._past_key_values = past
+                next_id = _sample_next_token(
+                    _row_from_torch_logits(outputs),
+                    temperature,
+                    top_p,
+                )
+                all_ids.append(next_id)
+                _emit_stream_token(
+                    stream_callback,
+                    _decode_ids(self._tokenizer, [next_id]),
+                    index,
+                )
+                if eos is not None and next_id == int(eos):
+                    break
+        return _decode_ids(self._tokenizer, all_ids)
+
+    def reset_cache(self) -> None:
+        """Clear the attached KV cache and the PyTorch past state."""
+        super().reset_cache()
+        self._past_key_values = None
+
+    def cleanup(self) -> None:
+        """Drop the module and the tokenizer."""
+        self._tokenizer = None
+        self._past_key_values = None
+        self._torch = None
+        super().cleanup()
+
+    def get_memory_usage(self) -> Dict[str, Any]:
+        return {
+            "backend": "torch",
+            "device": self._device,
+            "loaded": self.is_loaded,
+            "n_ctx": self.config.n_ctx,
+            "warmed_up": self.warmed_up,
+            **self._kv_usage_fields(),
+        }
+
+
+# =============================================================================
+# VLLM BACKEND
+# =============================================================================
+
+class VLLMBackend(InferenceBackend):
+    """
+    vLLM backend for high-throughput Hugging Face checkpoints.
+
+    The same SafeTensors directory stays on ``TorchBackend`` when the
+    format is detected automatically. Construct this backend with
+    ``BackendType.VLLM`` when the server-style engine should run it.
+    """
+
+    def __init__(self, config: Optional[BackendConfig] = None):
+        super().__init__(config)
+        self._device = self.config.device.value
+
+    @property
+    def backend_type(self) -> BackendType:
+        return BackendType.VLLM
+
+    @property
+    def supported_formats(self) -> List[ModelFormat]:
+        return [ModelFormat.SAFETENSORS, ModelFormat.PYTORCH_BIN]
+
+    def load(self, model_path: str) -> None:
+        """Load a checkpoint into ``vllm.LLM``."""
+        vllm_mod = _import_vllm()
+        llm_cls = getattr(vllm_mod, "LLM", None)
+        if llm_cls is None:
+            raise ImportError(
+                "vllm.LLM is required for VLLMBackend. "
+                "Install with: pip install vllm"
+            )
+        source = _pretrained_source(model_path)
+        self.warmed_up = False
+        self.model_path = model_path
+        device = _vllm_device(self.config.device)
+        self._device = device or self.config.device.value
+        dtype, quant = _vllm_precision(self.config.quantization)
+        kwargs: Dict[str, Any] = {
+            "model": source,
+            "tensor_parallel_size": 1,
+        }
+        if int(self.config.n_ctx) > 0:
+            kwargs["max_model_len"] = int(self.config.n_ctx)
+        if device is not None:
+            kwargs["device"] = device
+        if dtype is not None:
+            kwargs["dtype"] = dtype
+        if quant is not None:
+            kwargs["quantization"] = quant
+        if self.config.low_memory:
+            kwargs["gpu_memory_utilization"] = 0.5
+        self.model = _call_filtered(llm_cls, kwargs)
+        self.is_loaded = True
+
+    def generate(
+        self,
+        prompt: str,
+        max_tokens: int = 50,
+        stream_callback: Optional[Callable[[str, int], None]] = None,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+    ) -> str:
+        """
+        Generate a completion with vLLM.
+
+        The return value is the new text only. A callback receives one
+        decoded piece per completion token id. Without token ids, the
+        callback receives the full completion once at index 0.
+        """
+        if not self.is_loaded:
+            raise RuntimeError("Model not loaded. Call load() first.")
+        steps = int(max_tokens)
+        if steps < 0:
+            raise ValueError(f"max_tokens must be >= 0, got {max_tokens}")
+        self.reset_cache()
+        if steps == 0:
+            return ""
+        vllm_mod = _import_vllm()
+        params = _vllm_sampling_params(vllm_mod, steps, temperature, top_p)
+        outputs = self.model.generate([prompt], params)
+        text, token_ids = _vllm_completion(outputs)
+        if stream_callback is not None:
+            tokenizer = None
+            getter = getattr(self.model, "get_tokenizer", None)
+            if token_ids and callable(getter):
+                tokenizer = getter()
+            if token_ids and tokenizer is not None and hasattr(tokenizer, "decode"):
+                for index, token_id in enumerate(token_ids):
+                    stream_callback(_decode_ids(tokenizer, [token_id]), index)
+            elif text:
+                stream_callback(text, 0)
+        return text
+
+    def get_memory_usage(self) -> Dict[str, Any]:
+        return {
+            "backend": "vllm",
+            "device": self._device,
+            "loaded": self.is_loaded,
+            "n_ctx": self.config.n_ctx,
+            "warmed_up": self.warmed_up,
+            **self._kv_usage_fields(),
+        }
+
+
 # =============================================================================
 # FACTORY FUNCTION
 # =============================================================================
@@ -1517,6 +2071,8 @@ def get_backend(
     backends = {
         BackendType.ONNX_RUNTIME: OnnxRuntimeBackend,
         BackendType.LLAMA_CPP: LlamaCppBackend,
+        BackendType.TORCH: TorchBackend,
+        BackendType.VLLM: VLLMBackend,
     }
     
     if backend_type not in backends:
@@ -1575,7 +2131,8 @@ def get_backend_for_model(
     format_to_backend = {
         ModelFormat.ONNX: BackendType.ONNX_RUNTIME,
         ModelFormat.GGUF: BackendType.LLAMA_CPP,
-        # SafeTensors/PyTorch would need torch backend (not implemented yet)
+        ModelFormat.SAFETENSORS: BackendType.TORCH,
+        ModelFormat.PYTORCH_BIN: BackendType.TORCH,
     }
     
     backend_type = format_to_backend.get(fmt)
@@ -1599,6 +2156,8 @@ __all__ = [
     "InferenceBackend",
     "OnnxRuntimeBackend",
     "LlamaCppBackend",
+    "TorchBackend",
+    "VLLMBackend",
     # Functions
     "get_backend",
     "detect_model_format",
