@@ -12187,12 +12187,14 @@ def test_weight_storage():
         assert planned["files"][0]["bytes"] == len(payload)
         assert "_data" not in planned["files"][0]
         planned["components"][0]["slices"].append({"name": "extra"})
-        again = plan_weight_storage(
-            _components(payload, payload),
-            missing,
-            strategy="copy",
-            size_threshold=1,
-        )
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            again = plan_weight_storage(
+                _components(payload, payload),
+                missing,
+                strategy="copy",
+                size_threshold=1,
+            )
         assert len(again["components"][0]["slices"]) == 1
         assert again is not planned
         json.dumps(again)

@@ -125,27 +125,27 @@ def _emit(notes: Dict[str, Any], chunk_size: Optional[int]) -> None:
         warnings.warn(
             "weight strategy copy duplicates 1 initializer payload across components",
             UserWarning,
-            stacklevel=4,
+            stacklevel=3,
         )
     elif count > 1:
         warnings.warn(
             "weight strategy copy duplicates "
             f"{count} initializer payloads across components",
             UserWarning,
-            stacklevel=4,
+            stacklevel=3,
         )
     for name, length in notes["oversized"]:
         warnings.warn(
             f"weight streaming stored {name} in its own chunk because its "
             f"{length} bytes exceed chunk_size {chunk_size}",
             UserWarning,
-            stacklevel=4,
+            stacklevel=3,
         )
     for path in notes["hardlink_failures"]:
         warnings.warn(
             f"weight hardlink failed for {path}; copied the shared store instead",
             UserWarning,
-            stacklevel=4,
+            stacklevel=3,
         )
 
 
