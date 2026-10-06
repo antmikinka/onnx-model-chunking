@@ -335,6 +335,35 @@ def _coerce_packing_format(value: Any) -> Optional[str]:
     return _QUANT_PACKING_ALIASES[text]
 
 
+def _from_record(cls: Any, data: Any, label: str, drop: Iterable[str] = ()) -> Any:
+    """Build a dataclass from a JSON object. Unknown keys and a non-dict raise."""
+    if not isinstance(data, dict):
+        raise ValueError(f"{label} must be a dict, got {data!r}")
+    payload = dict(data)
+    for key in drop:
+        payload.pop(key, None)
+    try:
+        return cls(**payload)
+    except TypeError as exc:
+        raise ValueError(f"{label} fields are incomplete, got {data!r}") from exc
+
+
+def _copy_json_tree(value: Any) -> Any:
+    """Copy JSON data so a loaded document does not share lists with the caller."""
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_copy_json_tree(item) for item in value]
+    if isinstance(value, dict):
+        copied: Dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ValueError(f"JSON key must be a string, got {key!r}")
+            copied[key] = _copy_json_tree(item)
+        return copied
+    raise ValueError(f"value is not JSON data, got {value!r}")
+
+
 @dataclass
 class QuantizationConfig:
     """
@@ -384,6 +413,11 @@ class QuantizationConfig:
             "has_zero_point": self.has_zero_point,
             "packing_format": self.packing_format,
         }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "QuantizationConfig":
+        """Build a record from a JSON object. Dtype names are coerced."""
+        return _from_record(cls, data, "quantization")
 
 
 def _coerce_quantization(value: Any) -> QuantizationConfig:
@@ -539,6 +573,11 @@ class KVCacheConfig:
             "page_size": self.page_size,
             "sliding_window": self.sliding_window,
         }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "KVCacheConfig":
+        """Build a record from a JSON object. Policy names are coerced."""
+        return _from_record(cls, data, "kv cache")
 
 
 def _canonical_dtype_name(value: Any) -> str:
@@ -750,6 +789,35 @@ class SplitConfig:
             )
         self._reject_npu_sequential_split()
 
+    def to_dict(self) -> Dict[str, Any]:
+        """Copy the split config. Enums are stored as their string values."""
+        return {
+            "model": self.model,
+            "output": self.output,
+            "split_only": self.split_only,
+            "dtype": self.dtype.value,
+            "memory_mode": self.memory_mode.value,
+            "device": self.device,
+            "providers": list(self.providers),
+            "target_device": self.target_device.value,
+            "execution_policy": self.execution_policy.value,
+            "quantization": self.quantization.to_dict(),
+            "kv_cache": self.kv_cache.to_dict(),
+            "low_cpu_mem_usage": self.low_cpu_mem_usage,
+            "trust_remote_code": self.trust_remote_code,
+            "use_accelerate": self.use_accelerate,
+            "context": self.context,
+            "batch_size": self.batch_size,
+            "prompt": self.prompt,
+            "max_new_tokens": self.max_new_tokens,
+            "verbose": self.verbose,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "SplitConfig":
+        """Build a split config from a JSON object."""
+        return _from_record(cls, data, "split config")
+
     def resolved_providers(self) -> List[str]:
         """
         Provider fallback order.
@@ -845,6 +913,11 @@ class BoundaryTensor:
             "is_stateful": self.is_stateful,
             "device_preference": self.device_preference,
         }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "BoundaryTensor":
+        """Build a boundary tensor from a JSON object. A symbolic axis stays None."""
+        return _from_record(cls, data, "boundary tensor")
 
 
 def _coerce_boundary_tensor(value: Any) -> BoundaryTensor:
@@ -969,6 +1042,11 @@ class ExecutionStep:
             "depends_on": list(self.depends_on),
             "resident": self.resident,
         }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ExecutionStep":
+        """Build one plan step from a JSON object."""
+        return _from_record(cls, data, "execution step")
 
 
 def _coerce_execution_step(value: Any) -> ExecutionStep:
@@ -1118,6 +1196,11 @@ class ExecutionPlan:
             "warmup_iterations": self.warmup_iterations,
         }
 
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ExecutionPlan":
+        """Build an execution plan from execution_plan.json."""
+        return _from_record(cls, data, "execution plan")
+
 
 def _coerce_execution_plan(value: Any) -> ExecutionPlan:
     """Copy an ExecutionPlan, or build one from a dict."""
@@ -1245,6 +1328,35 @@ class SplitResult:
                         "which is not in component_files"
                     )
         self.execution_plan.validate()
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Copy the split result. This object is the model_info.json document."""
+        return {
+            "output_dir": self.output_dir,
+            "num_layers": self.num_layers,
+            "component_files": dict(self.component_files),
+            "model_info": _copy_json_tree(self.model_info),
+            "format": self.format.value,
+            "boundary_tensors": [tensor.to_dict() for tensor in self.boundary_tensors],
+            "execution_plan": self.execution_plan.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "SplitResult":
+        """Build a split result from model_info.json."""
+        if not isinstance(data, dict):
+            raise ValueError(f"split result must be a dict, got {data!r}")
+        payload = dict(data)
+        if "model_info" in payload:
+            payload["model_info"] = _copy_json_tree(payload["model_info"])
+        if isinstance(payload.get("component_files"), dict):
+            payload["component_files"] = dict(payload["component_files"])
+        try:
+            return cls(**payload)
+        except TypeError as exc:
+            raise ValueError(
+                f"split result fields are incomplete, got {data!r}"
+            ) from exc
 
     def boundary_by_name(self) -> Dict[str, BoundaryTensor]:
         """Lookup used when IO binding allocates one buffer per boundary name."""
@@ -1558,6 +1670,11 @@ class ComponentInfo:
             "resident_policy": self.resident_policy,
             "phase": self.phase,
         }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ComponentInfo":
+        """Build a component from component_manifest.json. The derived name is ignored."""
+        return _from_record(cls, data, "component", drop=("name",))
 
 
 @dataclass

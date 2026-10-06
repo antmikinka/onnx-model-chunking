@@ -7183,6 +7183,118 @@ def test_backend():
                 if os.path.isfile(path):
                     os.remove(path)
             os.rmdir(checked_dir)
+        import json
+        manifest_component = ComponentInfo(
+            component_type="layer",
+            layer_id=0,
+            file_path="layer_0.onnx",
+            input_names=["hidden", "mask"],
+            output_names=["hidden"],
+            input_types={"hidden": "fp16", "mask": "int64"},
+            output_types={"hidden": "float16"},
+            input_shapes={"hidden": [1, None, 16], "mask": [1, None]},
+            output_shapes={"hidden": [1, None, 16]},
+            depends_on=["embedding"],
+            device_preference="xdna",
+            phase="prefill",
+        )
+        manifest = {"components": [manifest_component.to_dict()]}
+        manifest_raw = json.loads(json.dumps(manifest))
+        loaded_component = ComponentInfo.from_dict(manifest_raw["components"][0])
+        assert loaded_component.name == "layer_0"
+        assert loaded_component.device_preference == "npu"
+        assert loaded_component.phase == "prefill"
+        assert loaded_component.input_shapes["hidden"][1] is None
+        assert loaded_component.to_dict() == manifest_component.to_dict()
+        manifest_raw["components"][0]["input_names"].append("extra")
+        assert loaded_component.input_names == ["hidden", "mask"]
+        saved_plan = ExecutionPlan(
+            policy="hybrid_npu_igpu",
+            prefill_device="xdna",
+            decode_device="rdna",
+            warmup_iterations=2,
+            steps=[
+                ExecutionStep(
+                    component_name="embedding",
+                    provider="VitisAIExecutionProvider",
+                    device="npu",
+                    phase="prefill",
+                ),
+                ExecutionStep(
+                    component_name="layer_0",
+                    device="igpu",
+                    phase="decode",
+                    depends_on=["embedding"],
+                ),
+            ],
+        )
+        plan_raw = json.loads(json.dumps(saved_plan.to_dict()))
+        loaded_plan = ExecutionPlan.from_dict(plan_raw)
+        second_plan = ExecutionPlan.from_dict(plan_raw)
+        assert loaded_plan.policy is canonical_policy.HYBRID_NPU_IGPU
+        assert loaded_plan.prefill_device == "npu"
+        assert loaded_plan.decode_device == "igpu"
+        assert loaded_plan.warmup_iterations == 2
+        assert loaded_plan.steps[1].depends_on == ["embedding"]
+        plan_raw["steps"][1]["depends_on"].append("norm")
+        assert loaded_plan.steps[1].depends_on == ["embedding"]
+        loaded_plan.steps[1].depends_on.append("lm_head")
+        assert second_plan.steps[1].depends_on == ["embedding"]
+        saved_result = SplitResult(
+            output_dir="out",
+            num_layers=1,
+            component_files={"embedding": "embedding.onnx", "layer_0": "layer_0.onnx"},
+            model_info={"original_model": "weights", "num_layers": 1},
+            format="onnx",
+            boundary_tensors=[
+                BoundaryTensor(
+                    name="hidden_states",
+                    dtype="fp16",
+                    shape=[1, None, 16],
+                    producer_component="embedding",
+                    consumer_components=["layer_0"],
+                )
+            ],
+            execution_plan=saved_plan,
+        )
+        result_raw = json.loads(json.dumps(saved_result.to_dict()))
+        loaded_result = SplitResult.from_dict(result_raw)
+        assert loaded_result.format is ModelFormat.ONNX
+        assert loaded_result.execution_plan.policy is canonical_policy.HYBRID_NPU_IGPU
+        assert loaded_result.boundary_tensors[0].shape[1] is None
+        assert loaded_result.model_info["original_model"] == "weights"
+        result_raw["model_info"]["original_model"] = "other"
+        assert loaded_result.model_info["original_model"] == "weights"
+        saved_config = SplitConfig(
+            model="weights",
+            output="out",
+            dtype="fp16",
+            memory_mode="eager",
+            target_device="npu",
+            execution_policy="hybrid_npu_igpu",
+            quantization={"method": "awq", "weight_dtype": "int4", "group_size": 128},
+        )
+        loaded_config = SplitConfig.from_dict(json.loads(json.dumps(saved_config.to_dict())))
+        assert loaded_config.dtype is TensorDtype.FLOAT16
+        assert loaded_config.memory_mode is MemoryMode.EAGER
+        assert loaded_config.quantization.weight_dtype is TensorDtype.INT4
+        assert loaded_config.quantization.packing_format == "awq"
+        assert loaded_config.to_dict() == saved_config.to_dict()
+        try:
+            ComponentInfo.from_dict(["layer"])
+            raise AssertionError("a component list was accepted")
+        except ValueError as exc:
+            assert "dict" in str(exc)
+        try:
+            ExecutionPlan.from_dict("hybrid")
+            raise AssertionError("a plan string was accepted")
+        except ValueError as exc:
+            assert "dict" in str(exc)
+        try:
+            SplitResult.from_dict(["out"])
+            raise AssertionError("a result list was accepted")
+        except ValueError as exc:
+            assert "dict" in str(exc)
         try:
             SplitConfig(model="weights", output="out", target_device="tpu")
             raise AssertionError("an unknown device was accepted")
@@ -7752,6 +7864,7 @@ def test_backend():
     print("  kv cache config: dense float16 bnsd, sliding window, paged blocks")
     print("  execution plan: prefill on npu, decode on igpu")
     print("  validation: files, layers, dtypes, npu policy")
+    print("  serialization: component manifest, execution plan, model info")
     print("backend module: OK\n")
     return True
 
