@@ -12866,6 +12866,258 @@ def test_package_structure():
     return True
 
 
+def test_merge_order():
+    """An execution plan selects merge order for MoE, hybrid, and MTP graphs."""
+    print("=" * 50)
+    print("Testing merge order...")
+    print("=" * 50)
+
+    import inspect
+    import json
+    import os
+    import sys
+    import tempfile
+    import types
+    import chunking_utils
+
+    try:
+        import chunking_utils.onnx.merger as merger
+    except ModuleNotFoundError:
+        for name in list(sys.modules):
+            if name == "chunking_utils.onnx" or name.startswith("chunking_utils.onnx."):
+                del sys.modules[name]
+        onnx_stub = types.ModuleType("onnx")
+        onnx_stub.ModelProto = type("ModelProto", (), {})
+        onnx_stub.numpy_helper = types.SimpleNamespace()
+        onnx_stub.helper = types.SimpleNamespace()
+        onnx_stub.TensorProto = types.SimpleNamespace()
+        onnx_stub.shape_inference = types.SimpleNamespace()
+        sys.modules["onnx"] = onnx_stub
+        import chunking_utils.onnx.merger as merger
+
+    from chunking_utils.common.types import ExecutionPlan
+
+    assert chunking_utils.merge_onnx is merger.merge_onnx
+    signature = inspect.signature(merger.merge_onnx)
+    assert list(signature.parameters) == ["output_dir", "save_path", "execution_plan"]
+
+    loaded = []
+    captured = {}
+
+    def fake_load(filepath, load_external_data=True):
+        name = os.path.splitext(os.path.basename(filepath))[0]
+        loaded.append(name)
+        return types.SimpleNamespace(
+            graph=types.SimpleNamespace(
+                node=[types.SimpleNamespace(name=name)],
+                initializer=[types.SimpleNamespace(name=name + "_weight")],
+                input=[types.SimpleNamespace(name=name + "_in")],
+                output=[types.SimpleNamespace(name=name + "_out")],
+            ),
+            opset_import=[],
+            ir_version=8,
+        )
+
+    def make_graph(nodes, name, inputs, outputs, initializer):
+        captured["nodes"] = [node.name for node in nodes]
+        captured["outputs"] = [item.name for item in outputs]
+        return types.SimpleNamespace(
+            node=list(nodes),
+            input=list(inputs),
+            output=list(outputs),
+            initializer=list(initializer),
+        )
+
+    def make_model(graph, producer_name, opset_imports):
+        return types.SimpleNamespace(
+            graph=graph,
+            producer_name=producer_name,
+            ir_version=None,
+        )
+
+    if not hasattr(merger.onnx, "load"):
+        merger.onnx.load = None
+    if not hasattr(merger.onnx, "save"):
+        merger.onnx.save = None
+    original_load = merger.onnx.load
+    original_helper = merger.helper
+    merger.onnx.load = fake_load
+    merger.helper = types.SimpleNamespace(make_graph=make_graph, make_model=make_model)
+
+    def write_components(directory, names, num_layers=1, include_layers=True, files=True):
+        payload = {"components": {name: {"file": name + ".onnx"} for name in names}}
+        if include_layers:
+            payload["num_layers"] = num_layers
+        with open(os.path.join(directory, "model_info.json"), "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+        if files:
+            for name in names:
+                with open(os.path.join(directory, name + ".onnx"), "w", encoding="utf-8") as handle:
+                    handle.write("onnx")
+
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            write_components(
+                directory,
+                ["embedding", "layer_0", "norm", "lm_head", "other", "moe_router"],
+                num_layers=1,
+            )
+            loaded.clear()
+            merged = merger.merge_onnx(directory)
+            assert loaded == ["embedding", "layer_0", "norm", "lm_head", "other"]
+            assert captured["outputs"] == ["lm_head_out"]
+            assert merged.producer_name == "chunking_utils_merged"
+            assert "moe_router" not in loaded
+
+            moe_names = [
+                "embedding",
+                "moe_router",
+                "moe_expert_0",
+                "layer_0",
+                "norm",
+                "lm_head",
+                "mtp_head",
+            ]
+            write_components(directory, moe_names, include_layers=False)
+            plan = {
+                "steps": [
+                    {"component_name": "embedding"},
+                    {"component_name": "moe_router", "depends_on": ["embedding"], "phase": "router"},
+                    {"component_name": "moe_expert_0", "depends_on": ["moe_router"], "phase": "expert"},
+                    {"component_name": "layer_0", "depends_on": ["moe_expert_0"]},
+                    {"component_name": "norm", "depends_on": ["layer_0"]},
+                    {"component_name": "lm_head", "depends_on": ["norm"]},
+                    {"component_name": "mtp_head", "depends_on": ["lm_head"]},
+                ],
+                "policy": "moe_routing",
+            }
+            loaded.clear()
+            merger.merge_onnx(directory, execution_plan=plan)
+            assert loaded == moe_names
+            assert captured["outputs"] == ["mtp_head_out"]
+
+            hybrid_names = ["gated_deltanet_0", "sparse_attention_0"]
+            write_components(directory, hybrid_names, include_layers=False)
+            loaded.clear()
+            merger.merge_onnx(
+                directory,
+                execution_plan=ExecutionPlan(steps=[
+                    {"component_name": "gated_deltanet_0", "phase": "prefill"},
+                    {"component_name": "sparse_attention_0", "depends_on": ["gated_deltanet_0"], "phase": "decode"},
+                ]),
+            )
+            assert loaded == hybrid_names
+            assert captured["outputs"] == ["sparse_attention_0_out"]
+
+            write_components(directory, ["embedding", "mtp_head"], include_layers=False)
+            os.remove(os.path.join(directory, "mtp_head.onnx"))
+            try:
+                merger.merge_onnx(directory, execution_plan={
+                    "steps": [
+                        {"component_name": "embedding"},
+                        {"component_name": "mtp_head", "depends_on": ["embedding"]},
+                    ],
+                })
+                raise AssertionError("a missing planned file was skipped")
+            except ValueError as exc:
+                assert "not found" in str(exc)
+
+            write_components(directory, ["embedding", "moe_expert_0"], include_layers=False)
+            try:
+                merger.merge_onnx(directory, execution_plan={
+                    "steps": [{"component_name": "embedding"}],
+                })
+                raise AssertionError("an omitted expert was accepted")
+            except ValueError as exc:
+                assert "omits" in str(exc)
+
+            write_components(directory, ["embedding"], include_layers=False)
+            try:
+                merger.merge_onnx(directory, execution_plan={
+                    "steps": [
+                        {"component_name": "embedding"},
+                        {"component_name": "moe_expert_0"},
+                    ],
+                })
+                raise AssertionError("an unknown component was accepted")
+            except ValueError as exc:
+                assert "unknown" in str(exc)
+
+            write_components(directory, ["embedding", "mtp_head"], include_layers=False)
+            try:
+                merger.merge_onnx(directory, execution_plan={
+                    "steps": [
+                        {"component_name": "mtp_head", "depends_on": ["embedding"]},
+                        {"component_name": "embedding"},
+                    ],
+                })
+                raise AssertionError("a later dependency was accepted")
+            except ValueError as exc:
+                assert "merged later" in str(exc)
+
+            write_components(directory, ["encoder", "decoder"], include_layers=False)
+            try:
+                merger.merge_onnx(directory, execution_plan={
+                    "steps": [
+                        {"component_name": "encoder", "depends_on": ["decoder"]},
+                        {"component_name": "decoder", "depends_on": ["encoder"]},
+                    ],
+                })
+                raise AssertionError("a dependency cycle was accepted")
+            except ValueError as exc:
+                assert "cycle" in str(exc)
+
+            try:
+                merger.merge_onnx(directory, execution_plan=["embedding"])
+                raise AssertionError("a list plan was accepted")
+            except ValueError as exc:
+                assert "dict" in str(exc)
+
+            result = merger.merge_onnx_with_result(directory, execution_plan=True)
+            assert result.success is False
+            assert "dict" in result.error
+
+            with open(os.path.join(directory, "model_info.json"), "w", encoding="utf-8") as handle:
+                handle.write("{")
+            try:
+                merger.merge_onnx(directory)
+                raise AssertionError("broken JSON was accepted")
+            except ValueError as exc:
+                assert "JSON" in str(exc)
+
+            with open(os.path.join(directory, "model_info.json"), "w", encoding="utf-8") as handle:
+                handle.write("[]")
+            try:
+                merger.merge_onnx(directory)
+                raise AssertionError("a list model_info was accepted")
+            except ValueError as exc:
+                assert "dict" in str(exc)
+
+        try:
+            merger.merge_onnx("  ")
+            raise AssertionError("a blank directory was accepted")
+        except ValueError as exc:
+            assert "directory" in str(exc)
+
+        with tempfile.TemporaryDirectory() as directory:
+            file_path = os.path.join(directory, "not_a_dir")
+            with open(file_path, "w", encoding="utf-8") as handle:
+                handle.write("x")
+            try:
+                merger.merge_onnx(file_path)
+                raise AssertionError("a file was accepted as a directory")
+            except ValueError as exc:
+                assert "directory" in str(exc)
+    finally:
+        merger.onnx.load = original_load
+        merger.helper = original_helper
+
+    print("merge order: OK")
+    print("  a missing plan keeps the linear chain")
+    print("  a plan merges MoE, hybrid, and MTP components in step order")
+    return True
+
+
 def test_path_manager():
     """ONNX discovery, external data, split directories, and NPU cache paths."""
     print("=" * 50)
@@ -13242,6 +13494,12 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"package_structure: FAILED - {e}")
         results.append(("package_structure", False))
+
+    try:
+        results.append(("merge_order", test_merge_order()))
+    except Exception as e:
+        print(f"merge_order: FAILED - {e}")
+        results.append(("merge_order", False))
 
     try:
         results.append(("path_manager", test_path_manager()))
