@@ -14,6 +14,7 @@ from ..common.types import (
     _boundary_name_is_stateful,
     _coerce_component_device,
     _coerce_group_size,
+    _coerce_kv_layout,
     _coerce_quant_dtype,
     _coerce_quant_method,
     _copy_dim_list,
@@ -249,6 +250,123 @@ class QuantizationInfo:
         }
 
 
+def _coerce_positive_int(value: Any, field_name: str) -> int:
+    """A bool is not a count. Zero is not a cache dimension."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{field_name} must be an integer, got {value!r}")
+    if value < 1:
+        raise ValueError(f"{field_name} must be positive, got {value}")
+    return value
+
+
+def _coerce_kv_pattern(value: Any, field_name: str, family: str, role: str) -> str:
+    """A past or present pattern names one layer with {layer}, then key or value."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} must be a non-empty string, got {value!r}")
+    text = value.strip()
+    if text.count("{layer}") != 1:
+        raise ValueError(
+            f"{field_name} must name the layer once with {{layer}}, got {text!r}"
+        )
+    lowered = text.lower()
+    prefixes = (
+        ("past_key_values.", "past.")
+        if family == "past"
+        else ("present_key_values.", "present.")
+    )
+    if not lowered.startswith(prefixes):
+        expected = " or ".join(prefixes)
+        raise ValueError(f"{field_name} must start with {expected}, got {text!r}")
+    tail = lowered.split("{layer}", 1)[1]
+    if role == "key":
+        if ".value" in tail or ".key" not in tail:
+            raise ValueError(f"{field_name} must name a key, got {text!r}")
+    elif ".key" in tail or ".value" not in tail:
+        raise ValueError(f"{field_name} must name a value, got {text!r}")
+    return text
+
+
+@dataclass
+class KVCacheContract:
+    """
+    Past and present KV tensors for one ONNX split.
+
+    Layout BNSD is batch, heads, sequence, head dim. Each pattern contains
+    ``{layer}`` once. Past names start with ``past_key_values.`` and present
+    names start with ``present.``.
+    """
+    num_layers: int
+    num_kv_heads: int
+    head_dim: int
+    dtype: str
+    layout: str  # "BNSD"
+    max_seq_len: int
+    past_key_pattern: str
+    past_value_pattern: str
+    present_key_pattern: str
+    present_value_pattern: str
+
+    def __post_init__(self) -> None:
+        self.num_layers = _coerce_positive_int(self.num_layers, "num_layers")
+        self.num_kv_heads = _coerce_positive_int(self.num_kv_heads, "num_kv_heads")
+        self.head_dim = _coerce_positive_int(self.head_dim, "head_dim")
+        self.dtype = _coerce_info_dtype(self.dtype, "dtype")
+        self.layout = _coerce_kv_layout(self.layout)
+        self.max_seq_len = _coerce_positive_int(self.max_seq_len, "max_seq_len")
+        self.past_key_pattern = _coerce_kv_pattern(
+            self.past_key_pattern, "past_key_pattern", "past", "key"
+        )
+        self.past_value_pattern = _coerce_kv_pattern(
+            self.past_value_pattern, "past_value_pattern", "past", "value"
+        )
+        self.present_key_pattern = _coerce_kv_pattern(
+            self.present_key_pattern, "present_key_pattern", "present", "key"
+        )
+        self.present_value_pattern = _coerce_kv_pattern(
+            self.present_value_pattern, "present_value_pattern", "present", "value"
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Copy the contract so a caller can serialize it without sharing this object."""
+        return {
+            "num_layers": self.num_layers,
+            "num_kv_heads": self.num_kv_heads,
+            "head_dim": self.head_dim,
+            "dtype": self.dtype,
+            "layout": self.layout,
+            "max_seq_len": self.max_seq_len,
+            "past_key_pattern": self.past_key_pattern,
+            "past_value_pattern": self.past_value_pattern,
+            "present_key_pattern": self.present_key_pattern,
+            "present_value_pattern": self.present_value_pattern,
+        }
+
+
+def _coerce_kv_cache_contract(value: Any) -> Optional["KVCacheContract"]:
+    """None stays unset. A KVCacheContract is copied. A dict builds one."""
+    if value is None:
+        return None
+    if isinstance(value, KVCacheContract):
+        return KVCacheContract(
+            num_layers=value.num_layers,
+            num_kv_heads=value.num_kv_heads,
+            head_dim=value.head_dim,
+            dtype=value.dtype,
+            layout=value.layout,
+            max_seq_len=value.max_seq_len,
+            past_key_pattern=value.past_key_pattern,
+            past_value_pattern=value.past_value_pattern,
+            present_key_pattern=value.present_key_pattern,
+            present_value_pattern=value.present_value_pattern,
+        )
+    if isinstance(value, dict):
+        try:
+            return KVCacheContract(**value)
+        except TypeError as exc:
+            raise ValueError(f"kv cache fields are incomplete, got {value!r}") from exc
+    raise ValueError(f"kv_cache must be a KVCacheContract or a dict, got {value!r}")
+
+
 def _coerce_quantization_info(value: Any) -> Optional[QuantizationInfo]:
     """None stays unset. A QuantizationInfo is copied. A dict builds one."""
     if value is None:
@@ -291,24 +409,33 @@ class OnnxSplitResult(SplitResult):
         producer: Producer name from the original model.
         components: Dictionary of ComponentInfo objects.
         quantization: MatMulNBits, AWQ, or GPTQ contract for this split.
+        kv_cache: Past and present key and value patterns for this split.
     """
     ir_version: int = 0
     producer: str = ""
     components: Dict[str, ComponentInfo] = field(default_factory=dict)
     quantization: Optional[QuantizationInfo] = None
+    kv_cache: Optional[KVCacheContract] = None
 
     def __post_init__(self):
-        """Validate boundary tensors, keep this result on ONNX, and copy quantization."""
+        """Validate boundary tensors, keep this result on ONNX, and copy contracts."""
         super().__post_init__()
         self.format = ModelFormat.ONNX
         self.quantization = _coerce_quantization_info(self.quantization)
+        self.kv_cache = _coerce_kv_cache_contract(self.kv_cache)
+        if self.kv_cache is not None and self.kv_cache.num_layers != self.num_layers:
+            raise ValueError(
+                f"kv_cache num_layers {self.kv_cache.num_layers} does not match "
+                f"split num_layers {self.num_layers!r}"
+            )
 
     def to_dict(self) -> Dict[str, Any]:
-        """Copy the split result and include the quantization record."""
+        """Copy the split result and include the quantization and KV cache records."""
         recorded = super().to_dict()
         recorded["quantization"] = (
             None if self.quantization is None else self.quantization.to_dict()
         )
+        recorded["kv_cache"] = None if self.kv_cache is None else self.kv_cache.to_dict()
         return recorded
 
 

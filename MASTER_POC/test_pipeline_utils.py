@@ -14948,6 +14948,208 @@ def test_quantization_info():
     return True
 
 
+def test_kv_cache_contract():
+    """An ONNX split records past and present key and value patterns."""
+    print("=" * 50)
+    print("Testing kv cache contract...")
+    print("=" * 50)
+
+    import sys
+    import types
+
+    try:
+        from chunking_utils.onnx.types import KVCacheContract, OnnxSplitResult
+        import chunking_utils.onnx as onnx_pkg
+    except ModuleNotFoundError:
+        for name in list(sys.modules):
+            if name == "chunking_utils.onnx" or name.startswith("chunking_utils.onnx."):
+                del sys.modules[name]
+        onnx_stub = types.ModuleType("onnx")
+        onnx_stub.ModelProto = type("ModelProto", (), {})
+        onnx_stub.numpy_helper = types.SimpleNamespace()
+        onnx_stub.helper = types.SimpleNamespace()
+        onnx_stub.TensorProto = types.SimpleNamespace()
+        onnx_stub.shape_inference = types.SimpleNamespace()
+        sys.modules["onnx"] = onnx_stub
+        from chunking_utils.onnx.types import KVCacheContract, OnnxSplitResult
+        import chunking_utils.onnx as onnx_pkg
+
+    assert "KVCacheContract" not in onnx_pkg.__all__
+
+    def expect_value_error(callable_check, text):
+        try:
+            callable_check()
+            raise AssertionError(text)
+        except ValueError:
+            return
+
+    bare = OnnxSplitResult(
+        output_dir="out",
+        num_layers=1,
+        component_files={},
+        model_info={},
+    )
+    assert bare.kv_cache is None
+    assert bare.to_dict()["kv_cache"] is None
+
+    shared = KVCacheContract(
+        num_layers=2,
+        num_kv_heads=8,
+        head_dim=64,
+        dtype="fp16",
+        layout="bnsd",
+        max_seq_len=4096,
+        past_key_pattern=" past_key_values.{layer}.key ",
+        past_value_pattern="past_key_values.{layer}.value",
+        present_key_pattern="present.{layer}.key",
+        present_value_pattern="present.{layer}.value",
+    )
+    assert shared.dtype == "float16"
+    assert shared.layout == "BNSD"
+    assert shared.past_key_pattern == "past_key_values.{layer}.key"
+    assert "{layer}" in shared.past_key_pattern
+    assert shared.present_value_pattern == "present.{layer}.value"
+
+    first = OnnxSplitResult(
+        output_dir="out",
+        num_layers=2,
+        component_files={},
+        model_info={},
+        kv_cache=shared,
+    )
+    second = OnnxSplitResult(
+        output_dir="out",
+        num_layers=2,
+        component_files={},
+        model_info={},
+        kv_cache={
+            "num_layers": 2,
+            "num_kv_heads": 8,
+            "head_dim": 64,
+            "dtype": "float16",
+            "layout": "BNSD",
+            "max_seq_len": 2048,
+            "past_key_pattern": "past_key_values.{layer}.key",
+            "past_value_pattern": "past_key_values.{layer}.value",
+            "present_key_pattern": "present.{layer}.key",
+            "present_value_pattern": "present.{layer}.value",
+        },
+    )
+    assert first.kv_cache is not shared
+    assert first.kv_cache is not second.kv_cache
+    assert second.kv_cache.max_seq_len == 2048
+    first.kv_cache.max_seq_len = 1024
+    assert shared.max_seq_len == 4096
+    assert second.kv_cache.max_seq_len == 2048
+
+    recorded = first.to_dict()["kv_cache"]
+    assert recorded["num_kv_heads"] == 8
+    assert recorded["layout"] == "BNSD"
+    assert recorded["past_key_pattern"] == "past_key_values.{layer}.key"
+    recorded["head_dim"] = 0
+    assert first.kv_cache.head_dim == 64
+
+    expect_value_error(
+        lambda: KVCacheContract(
+            num_layers=2,
+            num_kv_heads=True,
+            head_dim=64,
+            dtype="float16",
+            layout="BNSD",
+            max_seq_len=4096,
+            past_key_pattern="past_key_values.{layer}.key",
+            past_value_pattern="past_key_values.{layer}.value",
+            present_key_pattern="present.{layer}.key",
+            present_value_pattern="present.{layer}.value",
+        ),
+        "a bool head count was accepted",
+    )
+    expect_value_error(
+        lambda: KVCacheContract(
+            num_layers=2,
+            num_kv_heads=8,
+            head_dim=0,
+            dtype="float16",
+            layout="BNSD",
+            max_seq_len=4096,
+            past_key_pattern="past_key_values.{layer}.key",
+            past_value_pattern="past_key_values.{layer}.value",
+            present_key_pattern="present.{layer}.key",
+            present_value_pattern="present.{layer}.value",
+        ),
+        "a zero head dim was accepted",
+    )
+    expect_value_error(
+        lambda: KVCacheContract(
+            num_layers=2,
+            num_kv_heads=8,
+            head_dim=64,
+            dtype="float16",
+            layout="BNSD",
+            max_seq_len=4096,
+            past_key_pattern=" ",
+            past_value_pattern="past_key_values.{layer}.value",
+            present_key_pattern="present.{layer}.key",
+            present_value_pattern="present.{layer}.value",
+        ),
+        "a blank pattern was accepted",
+    )
+    expect_value_error(
+        lambda: KVCacheContract(
+            num_layers=2,
+            num_kv_heads=8,
+            head_dim=64,
+            dtype="float16",
+            layout="BNSD",
+            max_seq_len=4096,
+            past_key_pattern="past_key_values.0.key",
+            past_value_pattern="past_key_values.{layer}.value",
+            present_key_pattern="present.{layer}.key",
+            present_value_pattern="present.{layer}.value",
+        ),
+        "a pattern without a layer placeholder was accepted",
+    )
+    expect_value_error(
+        lambda: KVCacheContract(
+            num_layers=2,
+            num_kv_heads=8,
+            head_dim=64,
+            dtype="float16",
+            layout="BNSD",
+            max_seq_len=4096,
+            past_key_pattern="past_key_values.{layer}.value",
+            past_value_pattern="past_key_values.{layer}.value",
+            present_key_pattern="present.{layer}.key",
+            present_value_pattern="present.{layer}.value",
+        ),
+        "a value pattern in the key slot was accepted",
+    )
+    expect_value_error(
+        lambda: OnnxSplitResult(
+            output_dir="out",
+            num_layers=2,
+            component_files={},
+            model_info={},
+            kv_cache="past_key_values.{layer}.key",
+        ),
+        "a string kv cache record was accepted",
+    )
+    expect_value_error(
+        lambda: OnnxSplitResult(
+            output_dir="out",
+            num_layers=1,
+            component_files={},
+            model_info={},
+            kv_cache=shared,
+        ),
+        "a layer count mismatch was accepted",
+    )
+
+    print("kv cache contract: OK")
+    print("  a past key pattern keeps the layer placeholder, BNSD stays the layout, two split results do not share the record, and a bool head count raises")
+    return True
+
+
 def test_path_manager():
     """ONNX discovery, external data, split directories, and NPU cache paths."""
     print("=" * 50)
@@ -15372,6 +15574,12 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"quantization_info: FAILED - {e}")
         results.append(("quantization_info", False))
+
+    try:
+        results.append(("kv_cache_contract", test_kv_cache_contract()))
+    except Exception as e:
+        print(f"kv_cache_contract: FAILED - {e}")
+        results.append(("kv_cache_contract", False))
 
     try:
         results.append(("path_manager", test_path_manager()))
