@@ -2272,6 +2272,69 @@ def test_config_loader():
             raise AssertionError("explicit zero heads must not become 8")
         except ValueError as exc:
             assert "num_kv_heads must be positive" in str(exc)
+        try:
+            load_model_config(directory, require_all_fields=True)
+            raise AssertionError("require_all_fields must reject zero heads")
+        except ValueError as exc:
+            message = str(exc)
+            assert "num_kv_heads=0" in message
+            assert "Refusing defaults" in message
+            assert "num_kv_heads must be positive" not in message
+
+    with tempfile.TemporaryDirectory() as directory:
+        _write_json(directory, "model_info.json", {
+            "num_layers": 2,
+            "architecture": {"num_kv_heads": 4, "head_dim": -16},
+        })
+        try:
+            load_model_config(directory, require_all_fields=True)
+            raise AssertionError("require_all_fields must reject a negative head_dim")
+        except ValueError as exc:
+            message = str(exc)
+            assert "head_dim=-16" in message
+            assert "Refusing defaults" in message
+        try:
+            load_model_config(directory)
+            raise AssertionError("a negative head_dim must be rejected")
+        except ValueError as exc:
+            assert "head_dim must be positive" in str(exc)
+
+    with tempfile.TemporaryDirectory() as directory:
+        _write_json(directory, "config.json", {
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "hidden_size": 384,
+            "head_dim": -8,
+            "model_type": "llama",
+        })
+        try:
+            load_model_config(directory, require_all_fields=True)
+            raise AssertionError("require_all_fields must reject a negative Hugging Face head_dim")
+        except ValueError as exc:
+            assert "head_dim=-8" in str(exc)
+            assert "Refusing defaults" in str(exc)
+
+    with tempfile.TemporaryDirectory() as directory:
+        _write_json(directory, "genai_config.json", {
+            "model": {
+                "type": "llama",
+                "vocab_size": 10,
+                "decoder": {
+                    "num_hidden_layers": 2,
+                    "num_key_value_heads": -2,
+                    "head_size": 96,
+                    "hidden_size": 384,
+                    "num_attention_heads": 4,
+                },
+            },
+        })
+        try:
+            load_model_config(directory, require_all_fields=True)
+            raise AssertionError("require_all_fields must reject negative GenAI heads")
+        except ValueError as exc:
+            assert "num_kv_heads=-2" in str(exc)
+            assert "Refusing defaults" in str(exc)
 
     with tempfile.TemporaryDirectory() as directory:
         onnx_path = os.path.join(directory, "layer_0.onnx")
@@ -3199,6 +3262,7 @@ def test_config_loader():
         assert any("tokenizer_config.json" in str(item.message) for item in caught)
 
     print("  kv shape: refuse silent 8/128, infer 4 x 96 from ONNX")
+    print("  require_all_fields: non-positive KV shape raises")
     print("  max_seq_len: max_position_embeddings, sequence aliases, unset stays 0")
     print("  quantization: AWQ, GPTQ, Quark, MatMulNBits, unset stays empty")
     print("  dtype: torch_dtype, dtype, decoder dtype, missing stays float16")

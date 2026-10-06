@@ -1136,6 +1136,21 @@ def _require_or_default_kv_shape(
     return resolved_heads, resolved_dim
 
 
+def _enforce_required_kv_fields(config: ModelConfig, require_all_fields: bool) -> None:
+    """Raise when ``require_all_fields`` is set and a KV dimension is not positive."""
+    if require_all_fields and (config.num_kv_heads <= 0 or config.head_dim <= 0):
+        bad = []
+        if config.num_kv_heads <= 0:
+            bad.append(f"num_kv_heads={config.num_kv_heads}")
+        if config.head_dim <= 0:
+            bad.append(f"head_dim={config.head_dim}")
+        raise ValueError(
+            f"{config.source_file} has non-positive {', '.join(bad)}. "
+            f"Refusing defaults num_kv_heads={_DEFAULT_NUM_KV_HEADS} and "
+            f"head_dim={_DEFAULT_HEAD_DIM}."
+        )
+
+
 def _parse_model_info(
     config: Dict[str, Any],
     source: str,
@@ -1223,7 +1238,10 @@ def load_model_config(
     name. Missing ``num_kv_heads`` or ``head_dim`` are read from a past-key
     ONNX input shaped ``[batch, num_kv_heads, seq, head_dim]``. When that
     shape is also unavailable, ``require_all_fields=True`` raises. Otherwise
-    the loader warns and uses the explicit defaults 8 and 128.
+    the loader warns and uses the explicit defaults 8 and 128. The same flag
+    rejects a config whose ``num_kv_heads`` or ``head_dim`` is zero or
+    negative, including Hugging Face and GenAI files. An explicit 0 is not
+    replaced by 8 or 128.
 
     Quantization fields stay unset unless the file names a scheme such as
     AWQ, GPTQ, Quark, or MatMulNBits. ``quantization_group_size`` -1 means
@@ -1240,14 +1258,16 @@ def load_model_config(
         model_dir: Directory containing model/config files
         tokenizer_path: Optional alternative path for config files
         require_all_fields: If True, raise if critical KV fields are missing
+            or not positive
         
     Returns:
         ModelConfig with extracted parameters
         
     Raises:
         FileNotFoundError: If no config file found
-        ValueError: If require_all_fields and critical fields are missing,
-            or a present dimension is not a positive integer
+        ValueError: If require_all_fields and num_kv_heads or head_dim is
+            missing or not positive, or a present dimension is not a positive
+            integer
     """
     search_dirs = [model_dir]
     if tokenizer_path:
@@ -1262,6 +1282,7 @@ def load_model_config(
             if data:
                 config = _parse_genai_config(data, genai_path)
                 if config:
+                    _enforce_required_kv_fields(config, require_all_fields)
                     config.validate()
                     return config
         
@@ -1272,6 +1293,7 @@ def load_model_config(
             if data:
                 config = _parse_hf_config(data, hf_path)
                 if config:
+                    _enforce_required_kv_fields(config, require_all_fields)
                     config.validate()
                     return config
     
@@ -1287,6 +1309,7 @@ def load_model_config(
                 require_all_fields=require_all_fields,
             )
             if config:
+                _enforce_required_kv_fields(config, require_all_fields)
                 config.validate()
                 return config
     
