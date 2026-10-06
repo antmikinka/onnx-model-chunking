@@ -6,7 +6,7 @@ with support for external data files and large models.
 """
 
 import os
-from typing import Optional
+from typing import Any, Optional
 
 import onnx
 
@@ -49,8 +49,205 @@ def resolve_model_path(model_path: str) -> str:
         raise FileNotFoundError(f"Model path does not exist: {model_path}")
 
 
+def _coerce_optional_path(value: Optional[str], label: str) -> Optional[str]:
+    """Return a stripped path. None stays unset. A blank or bool raises."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{label} must be a non-empty string, got {value!r}")
+    return value.strip()
+
+
+def _resolve_master_data(path: str) -> str:
+    """
+    Return the master external-data file for a fallback path.
+
+    A ``.data`` file is used as itself. A directory prefers
+    ``model.onnx.data``, then the only other ``.data`` file it holds.
+    """
+    raw = os.path.normpath(path)
+    if os.path.isfile(raw):
+        if not raw.endswith(".data"):
+            raise ValueError(
+                f"external_data_dir must be a directory or a .data file, got {raw}"
+            )
+        return raw
+    if not os.path.isdir(raw):
+        raise FileNotFoundError(f"external data path does not exist: {raw}")
+    master = os.path.join(raw, "model.onnx.data")
+    if os.path.isfile(master):
+        return master
+    found = []
+    try:
+        names = os.listdir(raw)
+    except OSError as exc:
+        raise FileNotFoundError(f"external data path is not readable: {raw}") from exc
+    for name in names:
+        if not name.endswith(".data"):
+            continue
+        candidate = os.path.join(raw, name)
+        if os.path.isfile(candidate):
+            found.append(candidate)
+    found.sort()
+    if len(found) == 1:
+        return found[0]
+    if not found:
+        raise FileNotFoundError(f"no external data file in {raw}")
+    raise ValueError(f"external_data_dir {raw} contains multiple data files")
+
+
+def _entry_pair(entry: Any) -> tuple:
+    if isinstance(entry, dict):
+        return entry.get("key"), entry.get("value")
+    return getattr(entry, "key", None), getattr(entry, "value", None)
+
+
+def _external_entries(tensor: Any) -> list:
+    external = getattr(tensor, "external_data", None)
+    if not external:
+        return []
+    return list(external)
+
+
+def _location_of(tensor: Any) -> Optional[str]:
+    for entry in _external_entries(tensor):
+        key, value = _entry_pair(entry)
+        if key == "location" and isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+def _set_location(tensor: Any, location: str) -> None:
+    external = getattr(tensor, "external_data", None)
+    if not external:
+        raise ValueError("initializer has no external data location")
+    for entry in external:
+        if isinstance(entry, dict):
+            if entry.get("key") == "location":
+                entry["value"] = location
+                return
+        elif getattr(entry, "key", None) == "location":
+            try:
+                entry.value = location
+            except Exception as exc:
+                raise ValueError("external data location cannot be updated") from exc
+            return
+    raise ValueError("external data location is missing")
+
+
+def _external_int(value: Any, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError(f"{label} must be a non-negative integer, got {value!r}")
+    if isinstance(value, str):
+        text = value.strip()
+        if not text.isdigit():
+            raise ValueError(f"{label} must be a non-negative integer, got {value!r}")
+        return int(text)
+    if value < 0:
+        raise ValueError(f"{label} must be a non-negative integer, got {value!r}")
+    return value
+
+
+def _external_span(tensor: Any) -> tuple:
+    offset = 0
+    length = None
+    for entry in _external_entries(tensor):
+        key, value = _entry_pair(entry)
+        if key == "offset":
+            offset = _external_int(value, "offset")
+        elif key == "length":
+            length = _external_int(value, "length")
+    return offset, length
+
+
+def _resolve_external_file(model_file: str, location: str) -> Optional[str]:
+    if os.path.isabs(location):
+        return location if os.path.isfile(location) else None
+    beside = os.path.normpath(os.path.join(os.path.dirname(model_file), location))
+    if os.path.isfile(beside):
+        return beside
+    return None
+
+
+def _location_for_master(model_file: str, data_file: str) -> str:
+    model_dir = os.path.dirname(os.path.normpath(model_file))
+    data_file = os.path.normpath(data_file)
+    if os.path.dirname(data_file) == model_dir:
+        return os.path.basename(data_file)
+    return os.path.abspath(data_file)
+
+
+def _iter_external_tensors(model: onnx.ModelProto):
+    graph = getattr(model, "graph", None)
+    if graph is None:
+        return
+    yield from _graph_external_tensors(graph)
+
+
+def _graph_external_tensors(graph: Any):
+    for name in ("initializer", "sparse_initializer"):
+        for tensor in getattr(graph, name, []) or []:
+            if _location_of(tensor):
+                yield tensor
+    for node in getattr(graph, "node", []) or []:
+        for attr in getattr(node, "attribute", []) or []:
+            tensor = getattr(attr, "t", None)
+            if tensor is not None and _location_of(tensor):
+                yield tensor
+            for item in getattr(attr, "tensors", []) or []:
+                if _location_of(item):
+                    yield item
+            subgraph = getattr(attr, "g", None)
+            if subgraph is not None:
+                yield from _graph_external_tensors(subgraph)
+
+
+def _read_span(path: str, offset: int, length: Optional[int]) -> bytes:
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(offset)
+            payload = handle.read() if length is None else handle.read(length)
+    except OSError as exc:
+        raise FileNotFoundError(f"external data file is not readable: {path}") from exc
+    if length is not None and len(payload) != length:
+        raise ValueError(
+            f"external data file {path} does not contain {length} bytes at offset {offset}"
+        )
+    return payload
+
+
+def _store_raw(tensor: Any, payload: bytes) -> None:
+    try:
+        tensor.raw_data = payload
+    except Exception as exc:
+        raise ValueError("initializer does not accept raw_data") from exc
+
+
+def _map_external_data(model: onnx.ModelProto, model_file: str, data_file: str) -> None:
+    """Point missing external locations at the master data file and read them."""
+    stored = _location_for_master(model_file, data_file)
+    for tensor in _iter_external_tensors(model):
+        location = _location_of(tensor)
+        if location is None:
+            continue
+        if _resolve_external_file(model_file, location) is None:
+            _set_location(tensor, stored)
+    for tensor in _iter_external_tensors(model):
+        location = _location_of(tensor)
+        if location is None:
+            continue
+        resolved = _resolve_external_file(model_file, location)
+        if resolved is None:
+            raise FileNotFoundError(
+                f"external data location {location!r} is not available for {model_file}"
+            )
+        offset, length = _external_span(tensor)
+        _store_raw(tensor, _read_span(resolved, offset, length))
+
+
 def load_onnx_model(
     model_path: str,
+    external_data_dir: Optional[str] = None,
     load_external_data: bool = True,
     lazy_load_threshold_mb: float = 10000,
 ) -> onnx.ModelProto:
@@ -60,10 +257,13 @@ def load_onnx_model(
     Supports:
     - Single ONNX files
     - ONNX files with external data (.onnx.data files)
+    - A shared master data file when the component sibling is absent
     - Lazy loading for very large models (>10GB by default)
     
     Args:
         model_path: Path to ONNX model file or directory.
+        external_data_dir: Fallback to the master .data file. A directory
+            or a path to that file. Used when ``<model>.onnx.data`` is absent.
         load_external_data: Whether to load external data (weights).
         lazy_load_threshold_mb: If external data exceeds this size in MB,
             use lazy loading (graph structure only).
@@ -75,14 +275,19 @@ def load_onnx_model(
         >>> model = load_onnx_model("./model.onnx")
         >>> print(f"Nodes: {len(model.graph.node)}")
     """
+    fallback = _coerce_optional_path(external_data_dir, "external_data_dir")
     model_file = resolve_model_path(model_path)
     print(f"Loading ONNX model from: {model_file}")
     
-    # Check for external data
-    data_file = model_file + ".data"
-    has_external_data = os.path.exists(data_file)
+    # The component sibling wins. A hardlinked master file is the fallback.
+    sibling = model_file + ".data"
+    data_file = sibling if os.path.isfile(sibling) else None
+    used_fallback = False
+    if data_file is None and fallback is not None:
+        data_file = _resolve_master_data(fallback)
+        used_fallback = True
     
-    if has_external_data:
+    if data_file is not None:
         size_mb = os.path.getsize(data_file) / (1024 * 1024)
         print(f"  External data file detected: {os.path.basename(data_file)} ({size_mb:.1f} MB)")
         
@@ -90,6 +295,9 @@ def load_onnx_model(
         if size_mb > lazy_load_threshold_mb:
             print(f"  Using LAZY loading (graph structure only) for large model")
             model = onnx.load(model_file, load_external_data=False)
+        elif used_fallback and load_external_data:
+            model = onnx.load(model_file, load_external_data=False)
+            _map_external_data(model, model_file, data_file)
         else:
             model = onnx.load(model_file, load_external_data=load_external_data)
     else:

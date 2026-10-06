@@ -15402,6 +15402,226 @@ def test_schema_version():
     return True
 
 
+def test_external_data_fallback():
+    """A component graph can read a shared master data file."""
+    print("=" * 50)
+    print("Testing external data fallback...")
+    print("=" * 50)
+
+    import inspect
+    import os
+    import sys
+    import tempfile
+    import types
+
+    try:
+        import chunking_utils.onnx.loader as loader
+    except ModuleNotFoundError:
+        for name in list(sys.modules):
+            if name == "chunking_utils.onnx" or name.startswith("chunking_utils.onnx."):
+                del sys.modules[name]
+        onnx_stub = types.ModuleType("onnx")
+        onnx_stub.ModelProto = type("ModelProto", (), {})
+        onnx_stub.numpy_helper = types.SimpleNamespace()
+        onnx_stub.helper = types.SimpleNamespace()
+        onnx_stub.TensorProto = types.SimpleNamespace()
+        onnx_stub.shape_inference = types.SimpleNamespace()
+        sys.modules["onnx"] = onnx_stub
+        import chunking_utils.onnx.loader as loader
+
+    signature = inspect.signature(loader.load_onnx_model)
+    assert list(signature.parameters)[:2] == ["model_path", "external_data_dir"]
+    assert signature.parameters["external_data_dir"].default is None
+
+    class _Entry:
+        def __init__(self, key, value):
+            self.key = key
+            self.value = value
+
+    class _Tensor:
+        def __init__(self, name, location, offset, length):
+            self.name = name
+            self.external_data = [
+                _Entry("location", location),
+                _Entry("offset", offset),
+                _Entry("length", length),
+            ]
+            self.raw_data = b""
+
+    class _Model:
+        def __init__(self, tensors):
+            self.graph = types.SimpleNamespace(
+                initializer=list(tensors),
+                sparse_initializer=[],
+                node=[],
+            )
+            self.ir_version = 8
+            self.producer_name = "test"
+
+    calls = []
+
+    def fake_load(path, load_external_data=True):
+        calls.append((path, load_external_data))
+        if load_external_data and not os.path.isfile(path + ".data"):
+            raise FileNotFoundError(path + ".data")
+        model = _Model([
+            _Tensor("kept", "note.onnx.data", "0", "4"),
+            _Tensor("layer", "layer_0.onnx.data", "4", "7"),
+        ])
+        if load_external_data:
+            with open(path + ".data", "rb") as handle:
+                model.graph.initializer[1].raw_data = handle.read()
+        return model
+
+    def expect(callable_check, error_type, text):
+        try:
+            callable_check()
+            raise AssertionError(text)
+        except error_type:
+            return
+
+    had_load = hasattr(loader.onnx, "load")
+    original_load = getattr(loader.onnx, "load", None)
+    loader.onnx.load = fake_load
+    try:
+        with tempfile.TemporaryDirectory() as root:
+            split_dir = os.path.join(root, "split")
+            os.makedirs(split_dir)
+            component = os.path.join(split_dir, "layer_0.onnx")
+            with open(component, "wb") as handle:
+                handle.write(b"graph")
+            with open(os.path.join(split_dir, "note.onnx.data"), "wb") as handle:
+                handle.write(b"NOTE")
+            with open(os.path.join(split_dir, "model.onnx.data"), "wb") as handle:
+                handle.write(b"HEADWEIGHTSTAIL")
+
+            calls.clear()
+            loaded = loader.load_onnx_model(component, external_data_dir=split_dir)
+            kept, layer = loaded.graph.initializer
+            assert calls == [(component, False)]
+            assert kept.raw_data == b"NOTE"
+            assert kept.external_data[0].value == "note.onnx.data"
+            assert layer.raw_data == b"WEIGHTS"
+            assert layer.external_data[0].value == "model.onnx.data"
+
+            calls.clear()
+            again = loader.load_onnx_model(component, external_data_dir="  " + split_dir + "  ")
+            assert again.graph.initializer[0] is not loaded.graph.initializer[0]
+            assert again.graph.initializer[1].raw_data == b"WEIGHTS"
+            again.graph.initializer[1].raw_data = b"CHANGED"
+            assert loaded.graph.initializer[1].raw_data == b"WEIGHTS"
+
+            master_dir = os.path.join(root, "master")
+            os.makedirs(master_dir)
+            master_file = os.path.join(master_dir, "model.onnx.data")
+            with open(master_file, "wb") as handle:
+                handle.write(b"HEADWEIGHTSTAIL")
+            os.remove(os.path.join(split_dir, "model.onnx.data"))
+            direct = loader.load_onnx_model(component, external_data_dir=master_file)
+            assert direct.graph.initializer[1].raw_data == b"WEIGHTS"
+            assert direct.graph.initializer[1].external_data[0].value == os.path.abspath(master_file)
+
+            single_dir = os.path.join(root, "single")
+            os.makedirs(single_dir)
+            with open(os.path.join(single_dir, "weights.onnx.data"), "wb") as handle:
+                handle.write(b"HEADWEIGHTSTAIL")
+            single = loader.load_onnx_model(component, external_data_dir=single_dir)
+            assert single.graph.initializer[1].raw_data == b"WEIGHTS"
+            assert single.graph.initializer[1].external_data[0].value == os.path.abspath(
+                os.path.join(single_dir, "weights.onnx.data")
+            )
+
+            sibling = os.path.join(split_dir, "layer_0.onnx.data")
+            with open(sibling, "wb") as handle:
+                handle.write(b"SIBLING-DATA")
+            calls.clear()
+            owned = loader.load_onnx_model(component, external_data_dir=master_file)
+            assert calls == [(component, True)]
+            assert owned.graph.initializer[1].external_data[0].value == "layer_0.onnx.data"
+            assert owned.graph.initializer[1].raw_data == b"SIBLING-DATA"
+
+            os.remove(sibling)
+            calls.clear()
+            graph_only = loader.load_onnx_model(
+                component,
+                external_data_dir=master_file,
+                load_external_data=False,
+            )
+            assert calls == [(component, False)]
+            assert graph_only.graph.initializer[1].raw_data == b""
+            assert graph_only.graph.initializer[1].external_data[0].value == "layer_0.onnx.data"
+
+            calls.clear()
+            lazy = loader.load_onnx_model(
+                component,
+                external_data_dir=master_file,
+                lazy_load_threshold_mb=0,
+            )
+            assert calls == [(component, False)]
+            assert lazy.graph.initializer[1].raw_data == b""
+            assert lazy.graph.initializer[1].external_data[0].value == "layer_0.onnx.data"
+
+            expect(
+                lambda: loader.load_onnx_model(component, external_data_dir=" "),
+                ValueError,
+                "a blank path was accepted",
+            )
+            expect(
+                lambda: loader.load_onnx_model(component, external_data_dir=True),
+                ValueError,
+                "a bool path was accepted",
+            )
+            expect(
+                lambda: loader.load_onnx_model(component, external_data_dir=os.path.join(root, "missing")),
+                FileNotFoundError,
+                "a missing directory was accepted",
+            )
+            empty_dir = os.path.join(root, "empty")
+            os.makedirs(empty_dir)
+            expect(
+                lambda: loader.load_onnx_model(component, external_data_dir=empty_dir),
+                FileNotFoundError,
+                "an empty directory was accepted",
+            )
+            plain = os.path.join(root, "notes.txt")
+            with open(plain, "wb") as handle:
+                handle.write(b"text")
+            expect(
+                lambda: loader.load_onnx_model(component, external_data_dir=plain),
+                ValueError,
+                "a non-data file was accepted",
+            )
+            mixed = os.path.join(root, "mixed")
+            os.makedirs(mixed)
+            for name in ("a.data", "b.data"):
+                with open(os.path.join(mixed, name), "wb") as handle:
+                    handle.write(b"HEADWEIGHTSTAIL")
+            expect(
+                lambda: loader.load_onnx_model(component, external_data_dir=mixed),
+                ValueError,
+                "several data files were accepted",
+            )
+
+            def broken_offset(path, load_external_data=True):
+                return _Model([_Tensor("layer", "layer_0.onnx.data", True, "4")])
+
+            loader.onnx.load = broken_offset
+            expect(
+                lambda: loader.load_onnx_model(component, external_data_dir=master_file),
+                ValueError,
+                "a bool offset was accepted",
+            )
+    finally:
+        if had_load:
+            loader.onnx.load = original_load
+        elif hasattr(loader.onnx, "load"):
+            del loader.onnx.load
+
+    print("external data fallback: OK")
+    print("  a component reads the master data file, the component data file wins when it exists, and a blank path raises")
+    return True
+
+
 def test_path_manager():
     """ONNX discovery, external data, split directories, and NPU cache paths."""
     print("=" * 50)
@@ -15844,6 +16064,12 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"schema_version: FAILED - {e}")
         results.append(("schema_version", False))
+
+    try:
+        results.append(("external_data_fallback", test_external_data_fallback()))
+    except Exception as e:
+        print(f"external_data_fallback: FAILED - {e}")
+        results.append(("external_data_fallback", False))
 
     try:
         results.append(("path_manager", test_path_manager()))
