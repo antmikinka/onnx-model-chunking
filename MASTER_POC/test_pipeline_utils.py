@@ -9178,6 +9178,7 @@ def test_path_manager():
         get_cache_dir,
         resolve_npu_artifact_cache,
         sanitize_model_name,
+        validate_split_model,
         validate_split_model_dir,
     )
     from chunking_utils.common.path_utils import is_local_path
@@ -9186,6 +9187,8 @@ def test_path_manager():
     assert common.find_external_data is find_external_data
     assert common.find_external_data_files is find_external_data_files
     assert chunking_utils.find_external_data_files is find_external_data_files
+    assert common.validate_split_model is validate_split_model
+    assert chunking_utils.validate_split_model is validate_split_model
     assert common.validate_split_model_dir is validate_split_model_dir
     assert common.get_cache_dir is get_cache_dir
     assert common.resolve_npu_artifact_cache is resolve_npu_artifact_cache
@@ -9288,6 +9291,45 @@ def test_path_manager():
         assert validate_split_model_dir(layers) is False
         assert validate_split_model_dir(os.path.join(root, "missing")) is False
 
+        checked = os.path.join(root, "checked")
+        os.makedirs(checked)
+        names = ("embedding.onnx", "layer_0.onnx", "norm.onnx", "lm_head.onnx")
+        for name in names:
+            with open(os.path.join(checked, name), "wb") as handle:
+                handle.write(name.encode("utf-8"))
+        missing_info = validate_split_model(checked)
+        assert missing_info["valid"] is False
+        assert missing_info["errors"] == ["model_info.json not found"]
+        assert missing_info["components"] == []
+        manifest = {
+            "components": {
+                "embedding": {"file": "embedding.onnx"},
+                "layer_0": {"file": "layer_0.onnx"},
+                "norm": {"file": "norm.onnx"},
+                "lm_head": {"file": "lm_head.onnx"},
+            }
+        }
+        info_path = os.path.join(checked, "model_info.json")
+        with open(info_path, "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle)
+        complete = validate_split_model(checked)
+        assert complete["valid"] is True
+        assert complete["errors"] == []
+        assert complete["components"] == ["embedding", "layer_0", "norm", "lm_head"]
+        manifest["components"]["layer_1"] = {"file": "layer_1.onnx"}
+        with open(info_path, "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle)
+        partial = validate_split_model(checked)
+        assert partial["valid"] is False
+        assert partial["components"] == ["embedding", "layer_0", "norm", "lm_head"]
+        assert partial["errors"] == ["Missing: " + os.path.join(checked, "layer_1.onnx")]
+        with open(info_path, "w", encoding="utf-8") as handle:
+            handle.write("{")
+        broken = validate_split_model(checked)
+        assert broken["valid"] is False
+        assert broken["errors"] == ["model_info.json is not valid JSON"]
+        assert broken["components"] == []
+
         cache = get_cache_dir(os.path.join(root, "caches"), "meta-llama/Llama-2-7b")
         assert cache == os.path.join(root, "caches", "meta-llama--Llama-2-7b")
         assert os.path.isdir(cache)
@@ -9304,6 +9346,7 @@ def test_path_manager():
         ("directory", find_onnx_model, "  "),
         ("model_path", find_external_data, None),
         ("model_path", find_external_data_files, "  "),
+        ("directory", validate_split_model, " "),
         ("directory", validate_split_model_dir, ""),
         ("base_dir", get_cache_dir, ""),
         ("model_dir", resolve_npu_artifact_cache, None),

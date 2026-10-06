@@ -14,6 +14,7 @@ from .path_utils import (
     find_external_data_files as _candidate_external_data_files,
     is_local_path,
     sanitize_model_name,
+    validate_split_model,
 )
 
 # Re-exported so callers can use one path module.
@@ -23,6 +24,7 @@ __all__ = [
     "find_onnx_model",
     "find_external_data",
     "find_external_data_files",
+    "validate_split_model",
     "validate_split_model_dir",
     "get_cache_dir",
     "resolve_npu_artifact_cache",

@@ -5,14 +5,15 @@ This module provides utilities for handling filesystem paths,
 including detection of local vs remote paths and sanitization
 of model names for safe filesystem usage.
 
-Model discovery, split directories, and the NPU artifact cache live
-in path_manager.py. This module names the external weight files that
-sit beside a graph.
+Model discovery and the NPU artifact cache live in path_manager.py.
+This module names the external weight files that sit beside a graph
+and checks a split directory against model_info.json.
 """
 
+import json
 import os
 import re
-from typing import List
+from typing import Any, Dict, List
 
 
 def is_local_path(model_id: str) -> bool:
@@ -104,3 +105,54 @@ def find_external_data_files(model_path: str) -> List[str]:
         seen.add(candidate)
         found.append(candidate)
     return found
+
+
+def validate_split_model(directory: str) -> Dict[str, Any]:
+    """
+    Validate split model directory structure.
+
+    ``model_info.json`` must exist. Each entry in ``components`` is
+    present when its ``file`` exists. A missing file is recorded and
+    the components that do exist are still listed. ``valid`` is true
+    when ``errors`` is empty.
+
+    Args:
+        directory: Split model directory.
+
+    Returns:
+        A dict with ``valid``, ``errors``, and ``components``.
+    """
+    if not isinstance(directory, str) or not directory.strip():
+        raise ValueError("directory must be a non-empty string")
+    directory = os.path.normpath(directory.strip())
+    result: Dict[str, Any] = {"valid": False, "errors": [], "components": []}
+    info_path = os.path.join(directory, "model_info.json")
+    if not os.path.isfile(info_path):
+        result["errors"].append("model_info.json not found")
+        return result
+    try:
+        with open(info_path, "r", encoding="utf-8") as handle:
+            info = json.load(handle)
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        result["errors"].append("model_info.json is not valid JSON")
+        return result
+    if not isinstance(info, dict):
+        result["errors"].append("model_info.json is not an object")
+        return result
+    components = info.get("components", {})
+    if not isinstance(components, dict):
+        result["errors"].append("components is not an object")
+        return result
+    for name, comp in components.items():
+        filename = ""
+        if isinstance(comp, dict):
+            raw_file = comp.get("file", "")
+            if isinstance(raw_file, str):
+                filename = raw_file
+        comp_file = os.path.join(directory, filename)
+        if filename.strip() and os.path.isfile(comp_file):
+            result["components"].append(name)
+        else:
+            result["errors"].append(f"Missing: {comp_file}")
+    result["valid"] = len(result["errors"]) == 0
+    return result
