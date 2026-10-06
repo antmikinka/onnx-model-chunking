@@ -19,6 +19,7 @@ from ..common.architecture import (
     ArchitecturePrefixes,
     SAFETENSORS_PREFIXES,
     architecture_from_string,
+    classify_qwen_family,
     get_prefixes,
 )
 from ..common.types import SplitConfig, SplitResult, ModelFormat
@@ -45,9 +46,9 @@ def detect_architecture_from_weights(state_dict: Dict[str, torch.Tensor]) -> Arc
     
     # Check for common architecture patterns
     if any("model.layers." in k for k in sample_keys):
-        # Check for Qwen3 specific patterns (has q_norm/k_norm in attention)
-        if any("self_attn.q_norm" in k or "self_attn.k_norm" in k for k in keys):
-            return ArchitectureType.QWEN3
+        variant = classify_qwen_family(keys)
+        if variant is not None:
+            return variant
         return ArchitectureType.LLAMA  # Generic LLaMA-style architecture
     elif any("transformer.h." in k for k in sample_keys):
         return ArchitectureType.GPT2

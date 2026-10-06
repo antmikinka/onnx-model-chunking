@@ -62,12 +62,31 @@ class MemoryMode(str, Enum):
 class ComponentType(str, Enum):
     """
     Types of model components that can be extracted during splitting.
+
+    MoE router and expert, Gated DeltaNet, sparse attention, the multi-token
+    prediction head, and n-gram embeddings are the hybrid Qwen3.8 components.
     """
     EMBEDDING = "embedding"
     LAYER = "layer"
     NORM = "norm"
     LM_HEAD = "lm_head"
+    MOE_ROUTER = "moe_router"
+    MOE_EXPERT = "moe_expert"
+    GATED_DELTANET = "gated_deltanet"
+    SPARSE_ATTENTION = "sparse_attention"
+    MTP_HEAD = "mtp_head"
+    NGRAM_EMBEDDING = "ngram_embedding"
     OTHER = "other"
+
+
+# Components that live on one transformer layer. A layer id is part of the name.
+_LAYER_SCOPED_COMPONENTS = {
+    ComponentType.LAYER,
+    ComponentType.MOE_ROUTER,
+    ComponentType.MOE_EXPERT,
+    ComponentType.GATED_DELTANET,
+    ComponentType.SPARSE_ATTENTION,
+}
 
 
 class DeviceType(str, Enum):
@@ -1617,7 +1636,10 @@ class ComponentInfo:
                 or self.layer_id < 0
             ):
                 raise ValueError(f"invalid layer id {self.layer_id!r}")
-        elif self.layer_id is not None:
+        elif (
+            self.layer_id is not None
+            and self.component_type not in _LAYER_SCOPED_COMPONENTS
+        ):
             raise ValueError(
                 f"invalid layer id {self.layer_id!r} for {self.component_type.value}"
             )
@@ -1644,8 +1666,10 @@ class ComponentInfo:
     @property
     def name(self) -> str:
         """Generate a canonical name for this component."""
-        if self.component_type == ComponentType.LAYER:
-            return f"layer_{self.layer_id}"
+        if self.component_type is ComponentType.LAYER or (
+            self.component_type in _LAYER_SCOPED_COMPONENTS and self.layer_id is not None
+        ):
+            return f"{self.component_type.value}_{self.layer_id}"
         return self.component_type.value
 
     def to_dict(self) -> Dict[str, Any]:

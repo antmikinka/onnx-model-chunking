@@ -11,7 +11,7 @@ To add support for a new architecture:
 """
 
 from enum import Enum
-from typing import Dict, Tuple
+from typing import Dict, Iterable, Optional, Tuple
 from dataclasses import dataclass
 
 
@@ -28,6 +28,8 @@ class ArchitectureType(str, Enum):
     QWEN = "qwen"
     QWEN2 = "qwen2"
     QWEN3 = "qwen3"
+    QWEN3_MOE = "qwen3_moe"
+    QWEN3_HYBRID = "qwen3_hybrid"  # GDN + QSA + MoE
     GPT2 = "gpt2"
     UNKNOWN = "unknown"
 
@@ -41,6 +43,8 @@ LLAMA_STYLE_ARCHITECTURES = {
     ArchitectureType.QWEN,
     ArchitectureType.QWEN2,
     ArchitectureType.QWEN3,
+    ArchitectureType.QWEN3_MOE,
+    ArchitectureType.QWEN3_HYBRID,
 }
 
 
@@ -166,6 +170,56 @@ def get_prefixes_tuple(
     return (p.embed_prefix, p.layer_prefix, p.norm_prefix, p.lm_head_prefix)
 
 
+def _is_qwen3_hybrid_name(model_type: str) -> bool:
+    """True for Qwen3.8 and other hybrid Qwen3 names."""
+    if "hybrid" in model_type:
+        return True
+    compact = model_type.replace("_", "").replace("-", "").replace(" ", "")
+    return "qwen3.8" in model_type or "qwen38" in compact
+
+
+def classify_qwen_family(names: Iterable[str]) -> Optional[ArchitectureType]:
+    """
+    Distinguish dense Qwen3, Qwen3 MoE, and hybrid Qwen3.8.
+
+    Gated DeltaNet, sparse attention, a multi-token prediction head, or
+    n-gram embeddings select the hybrid. Expert weights beside a Qwen q_norm
+    select MoE. q_norm alone stays dense Qwen3. Any other name list returns
+    None so the caller can keep its llama or GPT-2 result.
+    """
+    hybrid = False
+    moe = False
+    dense = False
+    for name in names:
+        text = name.lower()
+        if (
+            "linear_attn" in text
+            or "gated_deltanet" in text
+            or "gated_delta" in text
+            or "sparse_attn" in text
+            or "sparse_attention" in text
+            or "mtp_head" in text
+            or "multi_token" in text
+            or "ngram_embed" in text
+        ):
+            hybrid = True
+        if (
+            "mlp.experts" in text
+            or ".experts." in text
+            or "shared_expert" in text
+        ):
+            moe = True
+        if "q_norm" in text or "k_norm" in text:
+            dense = True
+    if hybrid:
+        return ArchitectureType.QWEN3_HYBRID
+    if moe and dense:
+        return ArchitectureType.QWEN3_MOE
+    if dense:
+        return ArchitectureType.QWEN3
+    return None
+
+
 def architecture_from_string(model_type: str) -> ArchitectureType:
     """
     Convert a model_type string to ArchitectureType enum.
@@ -188,6 +242,10 @@ def architecture_from_string(model_type: str) -> ArchitectureType:
     if "qwen" in model_type_lower:
         # Only check for explicit qwen3/qwen2 - NOT just "3" or "2" which causes false positives
         if "qwen3" in model_type_lower:
+            if _is_qwen3_hybrid_name(model_type_lower):
+                return ArchitectureType.QWEN3_HYBRID
+            if "moe" in model_type_lower:
+                return ArchitectureType.QWEN3_MOE
             return ArchitectureType.QWEN3
         if "qwen2" in model_type_lower:
             return ArchitectureType.QWEN2

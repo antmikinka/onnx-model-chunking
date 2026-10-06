@@ -18,6 +18,7 @@ from ..common.path_utils import sanitize_model_name
 from ..common.architecture import (
     ArchitectureType,
     ONNX_PREFIXES,
+    classify_qwen_family,
     get_prefixes,
 )
 from ..common.types import SplitConfig, ModelFormat
@@ -37,20 +38,18 @@ def detect_architecture_from_onnx(graph) -> ArchitectureType:
         Detected ArchitectureType.
     """
     sample_names = []
-    for node in list(graph.node)[:100]:
+    for node in graph.node:
         if node.name:
             sample_names.append(node.name)
-    
-    # Also check initializer names
-    for init in list(graph.initializer)[:50]:
+
+    for init in graph.initializer:
         if init.name:
             sample_names.append(init.name)
-    
-    # Check for architecture patterns
+
     if any("/model/layers." in n or "model.layers." in n for n in sample_names):
-        # Check for Qwen3 specific patterns
-        if any("q_norm" in n or "k_norm" in n for n in sample_names):
-            return ArchitectureType.QWEN3
+        variant = classify_qwen_family(sample_names)
+        if variant is not None:
+            return variant
         return ArchitectureType.LLAMA
     elif any("/transformer/h." in n or "transformer.h." in n for n in sample_names):
         return ArchitectureType.GPT2

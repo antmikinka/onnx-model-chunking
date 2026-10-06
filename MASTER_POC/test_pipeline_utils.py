@@ -8743,9 +8743,11 @@ def test_architecture():
         _LLAMA_STYLE,
         _LLAMA_STYLE_ONNX,
         architecture_from_string,
+        classify_qwen_family,
         get_prefixes,
         get_prefixes_tuple,
     )
+    from chunking_utils.common.types import ComponentInfo, ComponentType
 
     assert common.SAFETENSORS_PREFIXES is SAFETENSORS_PREFIXES
     assert common.ONNX_PREFIXES is ONNX_PREFIXES
@@ -8753,7 +8755,9 @@ def test_architecture():
     assert set(ONNX_PREFIXES) == set(ArchitectureType)
     assert ArchitectureType.GPT2 not in LLAMA_STYLE_ARCHITECTURES
     assert ArchitectureType.UNKNOWN not in LLAMA_STYLE_ARCHITECTURES
-    assert len(LLAMA_STYLE_ARCHITECTURES) == 7
+    assert len(LLAMA_STYLE_ARCHITECTURES) == 9
+    assert ArchitectureType.QWEN3_MOE in LLAMA_STYLE_ARCHITECTURES
+    assert ArchitectureType.QWEN3_HYBRID in LLAMA_STYLE_ARCHITECTURES
     assert _LLAMA_STYLE is not _LLAMA_STYLE_ONNX
     assert isinstance(_LLAMA_STYLE, ArchitecturePrefixes)
 
@@ -8821,7 +8825,78 @@ def test_architecture():
     assert architecture_from_string("") is ArchitectureType.UNKNOWN
     assert get_prefixes(architecture_from_string("mixtral"), "safetensors") is _LLAMA_STYLE
 
-    print("  architecture prefixes: one llama style record, gpt2 stays separate")
+    assert architecture_from_string("qwen3_moe") is ArchitectureType.QWEN3_MOE
+    assert architecture_from_string("Qwen3-MoE") is ArchitectureType.QWEN3_MOE
+    assert architecture_from_string("qwen3_hybrid") is ArchitectureType.QWEN3_HYBRID
+    assert architecture_from_string("Qwen3.8") is ArchitectureType.QWEN3_HYBRID
+    assert architecture_from_string("qwen3-8") is ArchitectureType.QWEN3_HYBRID
+    assert architecture_from_string("qwen3_8") is ArchitectureType.QWEN3_HYBRID
+    assert ArchitectureType.QWEN3.value == "qwen3"
+    assert ArchitectureType.QWEN3_MOE.value == "qwen3_moe"
+    assert ArchitectureType.QWEN3_HYBRID.value == "qwen3_hybrid"
+    hybrid_tuple = get_prefixes_tuple(ArchitectureType.QWEN3_HYBRID, "safetensors")
+    assert hybrid_tuple == (
+        "model.embed_tokens.",
+        "model.layers.",
+        "model.norm.",
+        "lm_head.",
+    )
+    assert SAFETENSORS_PREFIXES[ArchitectureType.QWEN3_HYBRID] is _LLAMA_STYLE
+    assert SAFETENSORS_PREFIXES[ArchitectureType.QWEN3_MOE] is _LLAMA_STYLE
+    assert ONNX_PREFIXES[ArchitectureType.QWEN3_HYBRID] is _LLAMA_STYLE_ONNX
+    assert get_prefixes_tuple(ArchitectureType.QWEN3_MOE, "onnx") == (
+        "/model/embed",
+        "/model/layers.",
+        "/model/norm",
+        "/lm_head",
+    )
+
+    assert classify_qwen_family(["model.layers.0.self_attn.q_norm.weight"]) is ArchitectureType.QWEN3
+    assert classify_qwen_family([
+        "model.layers.0.self_attn.q_norm.weight",
+        "model.layers.0.mlp.experts.0.gate_proj.weight",
+    ]) is ArchitectureType.QWEN3_MOE
+    assert classify_qwen_family([
+        "model.layers.0.linear_attn.in_proj_qkv.weight",
+        "model.layers.1.mlp.experts.0.up_proj.weight",
+    ]) is ArchitectureType.QWEN3_HYBRID
+    assert classify_qwen_family(["model.layers.4.sparse_attention.q_proj.weight"]) is ArchitectureType.QWEN3_HYBRID
+    assert classify_qwen_family(["model.mtp_head.weight"]) is ArchitectureType.QWEN3_HYBRID
+    assert classify_qwen_family(["model.ngram_embedding.weight"]) is ArchitectureType.QWEN3_HYBRID
+    assert classify_qwen_family(["model.layers.0.mlp.experts.0.weight"]) is None
+    assert classify_qwen_family(["model.layers.0.self_attn.q_proj.weight"]) is None
+
+    expert = ComponentInfo(component_type="moe_expert", layer_id=3)
+    assert expert.component_type is ComponentType.MOE_EXPERT
+    assert expert.name == "moe_expert_3"
+    expert.validate()
+    router = ComponentInfo(component_type=ComponentType.MOE_ROUTER, layer_id=1)
+    assert router.name == "moe_router_1"
+    gdn = ComponentInfo(component_type="gated_deltanet", layer_id=0)
+    assert gdn.name == "gated_deltanet_0"
+    gdn.validate()
+    sparse = ComponentInfo(component_type="sparse_attention", layer_id=2)
+    assert sparse.name == "sparse_attention_2"
+    mtp = ComponentInfo(component_type="mtp_head")
+    assert mtp.component_type is ComponentType.MTP_HEAD
+    assert mtp.name == "mtp_head"
+    ngram = ComponentInfo(component_type=ComponentType.NGRAM_EMBEDDING)
+    assert ngram.name == "ngram_embedding"
+    ngram.validate()
+    layer = ComponentInfo(component_type=ComponentType.LAYER, layer_id=4)
+    assert layer.name == "layer_4"
+    try:
+        ComponentInfo(component_type="ngram_embedding", layer_id=1).validate()
+        raise AssertionError("an n-gram embedding accepted a layer id")
+    except ValueError as exc:
+        assert "layer id" in str(exc)
+    try:
+        ComponentInfo(component_type="mtp_head", layer_id=0).validate()
+        raise AssertionError("an MTP head accepted a layer id")
+    except ValueError as exc:
+        assert "layer id" in str(exc)
+
+    print("  architecture prefixes: one llama style record, qwen3 hybrid, gpt2 stays separate")
     print("architecture prefixes: OK\n")
     return True
 
