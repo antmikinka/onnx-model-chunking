@@ -766,6 +766,175 @@ def test_session_manager():
         assert "num_key_value_heads" in str(exc)
     print("  io sync: static KV, resident hidden, shared NPU to iGPU pointer")
 
+    import os
+    import tempfile
+    from pipeline_utils.session_manager import (
+        COMPILED_GRAPH_FLOOR_MB,
+        PROVIDER_WORKSPACE_FLOOR_MB,
+        RuntimeMemoryEstimate,
+    )
+
+    memory_info = {
+        "num_hidden_layers": 2,
+        "num_key_value_heads": 4,
+        "head_dim": 8,
+        "hidden_size": 16,
+        "dtype": "float16",
+        "max_seq_len": 32,
+        "batch_size": 1,
+        "components": {
+            "embedding": {"file": "embedding.onnx"},
+            "prefill": {
+                "file": "prefill.onnx",
+                "weights_bytes": 4 * 1024 * 1024,
+                "input_names": ["hidden", "attention_mask"],
+                "output_names": ["hidden"],
+                "input_shapes": {
+                    "hidden": [1, "seq", 16],
+                    "attention_mask": ["batch", "seq"],
+                },
+                "output_shapes": {"hidden": [1, "seq", 16]},
+                "input_dtypes": {"hidden": "float16", "attention_mask": "int64"},
+                "output_dtypes": {"hidden": "float16"},
+            },
+            "decode": {
+                "file": "decode.onnx",
+                "input_names": ["hidden"],
+                "output_names": ["logits"],
+                "input_shapes": {"hidden": [1, "seq", 16]},
+                "output_shapes": {"logits": [1, "seq", 32]},
+            },
+        },
+    }
+    memory_manager = SessionManager(
+        ".",
+        SessionConfig(
+            providers=[
+                "VitisAIExecutionProvider",
+                "DmlExecutionProvider",
+                "CPUExecutionProvider",
+            ],
+            execution_policy=ExecutionPolicy.HYBRID_NPU_IGPU_PHASE_SPLIT,
+        ),
+        model_info=memory_info,
+        available_providers=[
+            "VitisAIExecutionProvider",
+            "DmlExecutionProvider",
+            "CPUExecutionProvider",
+        ],
+    )
+    memory_manager.load_from_plan(ExecutionPlan(steps=[
+        ExecutionStep("embedding", "CPUExecutionProvider", "cpu", "embedding"),
+        ExecutionStep(
+            "prefill", "VitisAIExecutionProvider", "npu", "prefill",
+            depends_on=["embedding"], output_buffers=["hidden"], resident=True,
+        ),
+        ExecutionStep(
+            "decode", "DmlExecutionProvider", "igpu", "decode",
+            depends_on=["prefill"], output_buffers=["logits"], resident=True,
+        ),
+    ]))
+    prefill_memory = memory_manager.estimate_runtime_memory("prefill")
+    decode_memory = memory_manager.estimate_runtime_memory("decode")
+    embed_memory = memory_manager.estimate_runtime_memory("embedding")
+    assert isinstance(prefill_memory, RuntimeMemoryEstimate)
+    assert prefill_memory.weights_mb == 4.0
+    assert prefill_memory.compiled_graph_mb == COMPILED_GRAPH_FLOOR_MB["npu"]
+    assert prefill_memory.provider_workspace_mb == PROVIDER_WORKSPACE_FLOOR_MB["npu"]
+    assert prefill_memory.activation_mb > 0
+    assert prefill_memory.kv_cache_mb > 0
+    assert prefill_memory.total_mb == round(
+        prefill_memory.weights_mb
+        + prefill_memory.compiled_graph_mb
+        + prefill_memory.activation_mb
+        + prefill_memory.kv_cache_mb
+        + prefill_memory.provider_workspace_mb,
+        6,
+    )
+    assert memory_manager.estimate_runtime_memory_mb("prefill") == prefill_memory.total_mb
+    assert prefill_memory.total_mb > memory_manager.get_session_info("prefill").to_dict()["file_size_mb"]
+    assert decode_memory.kv_cache_mb == prefill_memory.kv_cache_mb
+    assert embed_memory.kv_cache_mb == 0.0
+    assert embed_memory.compiled_graph_mb == COMPILED_GRAPH_FLOOR_MB["cpu"]
+    assert decode_memory.compiled_graph_mb == COMPILED_GRAPH_FLOOR_MB["directml"]
+    assert decode_memory.compiled_graph_mb < prefill_memory.compiled_graph_mb
+    model_mb = memory_manager.estimate_model_runtime_memory_mb()
+    summed = prefill_memory.total_mb + decode_memory.total_mb + embed_memory.total_mb
+    assert abs((summed - model_mb) - prefill_memory.kv_cache_mb) < 1e-5
+    usage = memory_manager.get_memory_usage()
+    assert usage["total_mb"] == 0
+    assert usage["total_runtime_mb"] == model_mb
+    assert usage["per_session_runtime_mb"]["prefill"] == prefill_memory.total_mb
+    assert memory_manager.fits_npu_monolithic(64) is False
+    assert memory_manager.fits_npu_monolithic(100000) is True
+    try:
+        memory_manager.fits_npu_monolithic()
+        raise AssertionError("missing NPU budget was accepted")
+    except ValueError as exc:
+        assert "npu_memory_mb" in str(exc)
+    try:
+        memory_manager.estimate_runtime_memory_mb("missing")
+        raise AssertionError("missing component was estimated")
+    except KeyError:
+        pass
+
+    shard = SessionManager(
+        ".",
+        SessionConfig(providers=["CPUExecutionProvider"]),
+        model_info={
+            "num_hidden_layers": 2,
+            "num_key_value_heads": 4,
+            "head_dim": 8,
+            "max_seq_len": 32,
+            "components": {
+                "layer_0": {"file": "layer_0.onnx", "weights_mb": 1},
+                "layer_1": {"file": "layer_1.onnx", "weights_mb": 1},
+            },
+        },
+        available_providers=["CPUExecutionProvider"],
+    )
+    layer_0 = shard.estimate_runtime_memory("layer_0")
+    layer_1 = shard.estimate_runtime_memory("layer_1")
+    assert layer_0.kv_cache_mb == layer_1.kv_cache_mb
+    assert layer_0.kv_cache_mb > 0
+    shard_model = shard.estimate_model_runtime_memory_mb()
+    shard_non_kv = (
+        (layer_0.total_mb - layer_0.kv_cache_mb)
+        + (layer_1.total_mb - layer_1.kv_cache_mb)
+    )
+    shard_kv = round(shard_model - shard_non_kv, 6)
+    assert layer_0.kv_cache_mb < shard_kv < layer_0.kv_cache_mb + layer_1.kv_cache_mb
+
+    with tempfile.TemporaryDirectory() as model_dir:
+        external = os.path.join(model_dir, "prefill.onnx.data")
+        with open(external, "wb") as handle:
+            handle.write(b"\0" * (2 * 1024 * 1024))
+        cache_root = os.path.join(model_dir, "cache", "prefill")
+        os.makedirs(cache_root)
+        with open(os.path.join(cache_root, "model.xclbin"), "wb") as handle:
+            handle.write(b"\0" * (3 * 1024 * 1024))
+        measured = SessionManager(
+            model_dir,
+            SessionConfig(
+                providers=["VitisAIExecutionProvider", "CPUExecutionProvider"],
+                cache_dir=os.path.join(model_dir, "cache"),
+            ),
+            model_info={
+                "num_key_value_heads": 1,
+                "head_dim": 4,
+                "max_seq_len": 8,
+                "components": {
+                    "prefill": {"file": "prefill.onnx"},
+                },
+            },
+            available_providers=["VitisAIExecutionProvider", "CPUExecutionProvider"],
+        )
+        measured_memory = measured.estimate_runtime_memory("prefill")
+        assert measured_memory.weights_mb == 2.0
+        assert measured_memory.compiled_graph_mb == 3.0
+        assert measured_memory.compiled_graph_mb < COMPILED_GRAPH_FLOOR_MB["npu"]
+    print("  runtime memory: weights, graph, activations, one KV pool, workspace")
+
     print("session_manager module: OK\n")
     return True
 

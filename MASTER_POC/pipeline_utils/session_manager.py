@@ -1275,6 +1275,166 @@ class StaticBufferAllocation:
     bridges: Dict[str, Any]
 
 
+_MIB = 1024 * 1024
+
+# Planning factors used when the compiled binary or the provider workspace
+# has not been measured. The floor matters most for an AOT NPU: the XCLBIN
+# context and the runtime workspace stay large even when the ONNX file is small.
+COMPILED_GRAPH_FACTOR = {
+    "npu": 0.35,
+    "tensorrt": 0.40,
+    "migraphx": 0.30,
+    "directml": 0.10,
+    "cuda": 0.05,
+    "rocm": 0.05,
+    "gpu": 0.10,
+    "igpu": 0.10,
+    "cpu": 0.02,
+}
+COMPILED_GRAPH_FLOOR_MB = {
+    "npu": 32.0,
+    "tensorrt": 16.0,
+    "migraphx": 16.0,
+    "directml": 8.0,
+    "cuda": 4.0,
+    "rocm": 4.0,
+    "gpu": 8.0,
+    "igpu": 8.0,
+    "cpu": 1.0,
+}
+PROVIDER_WORKSPACE_FACTOR = {
+    "npu": 0.15,
+    "tensorrt": 0.20,
+    "migraphx": 0.15,
+    "directml": 0.10,
+    "cuda": 0.08,
+    "rocm": 0.08,
+    "gpu": 0.10,
+    "igpu": 0.10,
+    "cpu": 0.05,
+}
+PROVIDER_WORKSPACE_FLOOR_MB = {
+    "npu": 48.0,
+    "tensorrt": 32.0,
+    "migraphx": 32.0,
+    "directml": 16.0,
+    "cuda": 16.0,
+    "rocm": 16.0,
+    "gpu": 16.0,
+    "igpu": 16.0,
+    "cpu": 8.0,
+}
+
+_DTYPE_BYTES = {
+    "float16": 2.0,
+    "bfloat16": 2.0,
+    "float32": 4.0,
+    "float64": 8.0,
+    "int64": 8.0,
+    "int32": 4.0,
+    "int8": 1.0,
+    "bool": 1.0,
+}
+
+_AUX_COMPONENT_NAMES = frozenset({
+    "embedding",
+    "embed",
+    "tok_embeddings",
+    "norm",
+    "final_norm",
+    "lm_head",
+})
+
+
+def _round_mb(value: float) -> float:
+    return round(float(value), 6)
+
+
+def _declared_mb(mapping: Dict[str, Any], mb_key: str, bytes_key: str) -> Optional[float]:
+    """Return a caller-supplied size in mebibytes."""
+    if mb_key in mapping and mapping[mb_key] is not None:
+        return float(mapping[mb_key])
+    if bytes_key in mapping and mapping[bytes_key] is not None:
+        return float(mapping[bytes_key]) / _MIB
+    return None
+
+
+def _element_bytes(value: Any) -> float:
+    """Bytes per element. int4 packs two values per byte."""
+    text = str(value).lower() if value is not None else ""
+    if "int4" in text or "uint4" in text:
+        return 0.5
+    return float(_DTYPE_BYTES.get(_dtype_name(value), 2.0))
+
+
+def _is_aux_component(name: str) -> bool:
+    return name in _AUX_COMPONENT_NAMES or name.startswith("embed")
+
+
+def _provider_memory_class(provider: str, device_type: Optional[str]) -> str:
+    text = provider.lower()
+    if "tensorrt" in text:
+        return "tensorrt"
+    if "migraphx" in text:
+        return "migraphx"
+    if "cuda" in text:
+        return "cuda"
+    if "rocm" in text:
+        return "rocm"
+    if "dml" in text or "directml" in text:
+        return "directml"
+    if device_type == "igpu":
+        return "igpu"
+    if device_type == "gpu":
+        return "gpu"
+    return "cpu"
+
+
+def _kv_bytes(architecture: Dict[str, Any], layers: int, batch: int, seq: int) -> float:
+    """Key, value, and one int64 attention mask at the static sequence length."""
+    if layers <= 0:
+        return 0.0
+    element = _element_bytes(architecture["dtype"])
+    tensors = (
+        batch
+        * int(architecture["num_kv_heads"])
+        * seq
+        * int(architecture["head_dim"])
+        * 2
+        * layers
+        * element
+    )
+    mask = batch * seq * 8
+    return float(tensors + mask)
+
+
+@dataclass
+class RuntimeMemoryEstimate:
+    """
+    Runtime bytes a session keeps resident.
+
+    ``file_size_bytes`` is only the ONNX file. This adds the compiled graph,
+    the live activations, the static KV cache, and the provider workspace.
+    """
+
+    component_name: str
+    weights_mb: float
+    compiled_graph_mb: float
+    activation_mb: float
+    kv_cache_mb: float
+    provider_workspace_mb: float
+
+    @property
+    def total_mb(self) -> float:
+        return _round_mb(
+            self.weights_mb
+            + self.compiled_graph_mb
+            + self.activation_mb
+            + self.kv_cache_mb
+            + self.provider_workspace_mb
+        )
+
+
 # =============================================================================
 # SESSION MANAGER
 # =============================================================================
@@ -1576,12 +1736,83 @@ class SessionManager:
         with self._lock:
             return list(self._sessions.keys())
     
+    def estimate_runtime_memory(self, name: str) -> RuntimeMemoryEstimate:
+        """
+        Estimate the memory one component keeps resident at runtime.
+
+        The five terms are weights, the compiled graph, activations, the
+        KV cache this component owns, and the provider workspace. A declared
+        size or an on-disk external-data or compile-cache file replaces the
+        heuristic for that term.
+        """
+        info = self._session_info.get(name)
+        if info is None:
+            raise KeyError(f"Session '{name}' is not in this model")
+        component = self.model_info.get("components", {}).get(name, {})
+        batch, seq = self._estimate_limits()
+        profile = self._component_profile(name)
+        device = self._memory_device(name, profile.name)
+        weights_mb = self._weights_mb(info, component)
+        return RuntimeMemoryEstimate(
+            component_name=name,
+            weights_mb=weights_mb,
+            compiled_graph_mb=self._compiled_graph_mb(
+                name, component, profile, device, weights_mb
+            ),
+            activation_mb=self._activation_mb(name, component, batch, seq),
+            kv_cache_mb=self._component_kv_cache_mb(name, component, batch, seq),
+            provider_workspace_mb=self._workspace_mb(
+                component, profile, device, weights_mb
+            ),
+        )
+
+    def estimate_runtime_memory_mb(self, name: str) -> float:
+        """
+        Return ``weights + compiled graph + activations + KV + workspace`` in MiB.
+
+        Compare :meth:`estimate_model_runtime_memory_mb` with the NPU budget
+        before choosing a monolithic session. File size alone is the weight
+        term, and only when the weights are embedded in the ONNX file.
+        """
+        return self.estimate_runtime_memory(name).total_mb
+
+    def estimate_model_runtime_memory_mb(self) -> float:
+        """
+        Estimate the whole model.
+
+        Weights, compiled graphs, activations, and workspaces add across
+        components. The KV pool is added once, because prefill and decode
+        bind the same cache.
+        """
+        estimates = [
+            self.estimate_runtime_memory(name) for name in self._session_info
+        ]
+        resident = sum(
+            item.weights_mb
+            + item.compiled_graph_mb
+            + item.activation_mb
+            + item.provider_workspace_mb
+            for item in estimates
+        )
+        return _round_mb(resident + self._model_kv_cache_mb())
+
+    def fits_npu_monolithic(self, budget_mb: Optional[float] = None) -> bool:
+        """
+        True when the model estimate fits in the NPU budget.
+
+        ``budget_mb`` wins. Otherwise ``model_info['npu_memory_mb']`` or the
+        active profile's ``memory_limit_mb`` is the budget. A model that does
+        not fit has to use a hybrid phase split or MoE route instead of one
+        monolithic NPU session.
+        """
+        return self.estimate_model_runtime_memory_mb() <= self._npu_budget_mb(budget_mb)
+
     def get_memory_usage(self) -> Dict[str, Any]:
         """
         Get memory usage statistics.
-        
-        Returns:
-            Dict with memory stats per session and total
+
+        ``total_mb`` is the ONNX file size of loaded sessions.
+        ``total_runtime_mb`` is the five-term model estimate.
         """
         with self._lock:
             per_session = {}
@@ -1593,6 +1824,10 @@ class SessionManager:
                     per_session[name] = info.file_size_bytes
                     total_bytes += info.file_size_bytes
                     loaded_count += 1
+            runtime = {
+                name: self.estimate_runtime_memory_mb(name)
+                for name in self._session_info
+            }
             
             return {
                 "total_bytes": total_bytes,
@@ -1600,6 +1835,8 @@ class SessionManager:
                 "loaded_count": loaded_count,
                 "total_count": len(self._session_info),
                 "per_session_bytes": per_session,
+                "per_session_runtime_mb": runtime,
+                "total_runtime_mb": self.estimate_model_runtime_memory_mb(),
             }
     
     def get_component_names(self) -> List[str]:
@@ -1995,6 +2232,251 @@ class SessionManager:
             "dtype": _dtype_name(info.get("dtype") or info.get("torch_dtype") or "float16"),
         }
 
+    def _try_architecture(self) -> Optional[Dict[str, Any]]:
+        try:
+            return self._architecture()
+        except ValueError:
+            return None
+
+    def _estimate_limits(self) -> Tuple[int, int]:
+        batch = self._static_batch or int(self.model_info.get("batch_size") or 1)
+        seq = self._static_seq or self.model_info.get("max_seq_len") or (
+            self.model_info.get("max_position_embeddings") or 4096
+        )
+        batch = int(batch)
+        seq = int(seq)
+        if batch <= 0 or seq <= 0:
+            raise ValueError(
+                f"batch_size and max_seq_len must be positive, got {batch} and {seq}"
+            )
+        return batch, seq
+
+    def _component_provider(self, name: str) -> str:
+        info = self._session_info[name]
+        if info.scheduled_provider:
+            return info.scheduled_provider
+        if info.provider_used:
+            return info.provider_used
+        return primary_provider_name(self.config.providers)
+
+    def _component_profile(self, name: str) -> ProviderProfile:
+        provider = self._component_provider(name)
+        if provider == self.provider_profile.name:
+            return self.provider_profile
+        profile = provider_profile_for(provider)
+        if self.provider_profile.cache_dir:
+            profile.cache_dir = self.provider_profile.cache_dir
+        return profile
+
+    def _memory_device(self, name: str, provider: str) -> str:
+        info = self._session_info[name]
+        if info.device_type == "npu" or provider_is_npu(provider):
+            return "npu"
+        if info.device_type == "cpu":
+            return "cpu"
+        return _provider_memory_class(provider, info.device_type)
+
+    def _npu_budget_mb(self, budget_mb: Optional[float]) -> float:
+        if budget_mb is not None:
+            budget = float(budget_mb)
+        elif self.model_info.get("npu_memory_mb"):
+            budget = float(self.model_info["npu_memory_mb"])
+        elif self.provider_profile.memory_limit_mb:
+            budget = float(self.provider_profile.memory_limit_mb)
+        else:
+            raise ValueError(
+                "Pass budget_mb or set model_info['npu_memory_mb'] "
+                "to decide whether the model fits a monolithic NPU."
+            )
+        if budget <= 0:
+            raise ValueError(f"NPU budget must be positive, got {budget}")
+        return budget
+
+    def _weights_mb(self, info: SessionInfo, component: Dict[str, Any]) -> float:
+        declared = _declared_mb(component, "weights_mb", "weights_bytes")
+        if declared is not None:
+            return _round_mb(declared)
+        external = self._external_weight_bytes(info, component)
+        if external:
+            return _round_mb(external / _MIB)
+        return _round_mb(info.file_size_bytes / _MIB)
+
+    def _external_weight_bytes(self, info: SessionInfo, component: Dict[str, Any]) -> int:
+        declared = component.get("external_data_bytes")
+        if declared is not None:
+            return int(declared)
+        paths = component.get("external_data") or []
+        if isinstance(paths, str):
+            paths = [paths]
+        candidates = [str(path) for path in paths]
+        if info.file_path:
+            candidates.append(info.file_path + ".data")
+            if info.file_path.endswith(".onnx"):
+                candidates.append(info.file_path[:-5] + ".onnx.data")
+        total = 0
+        seen = set()
+        for rel in candidates:
+            path = rel if os.path.isabs(rel) else os.path.join(self.model_dir, rel)
+            if path in seen or not os.path.isfile(path):
+                continue
+            seen.add(path)
+            total += os.path.getsize(path)
+        return total
+
+    def _compiled_cache_bytes(self, name: str, profile: ProviderProfile) -> int:
+        cache_dir = profile.cache_dir
+        if not cache_dir:
+            return 0
+        root = os.path.join(cache_dir, name)
+        if os.path.isfile(root):
+            return os.path.getsize(root)
+        if not os.path.isdir(root):
+            return 0
+        total = 0
+        for dirpath, _dirs, files in os.walk(root):
+            for filename in files:
+                total += os.path.getsize(os.path.join(dirpath, filename))
+        return total
+
+    def _compiled_graph_mb(
+        self,
+        name: str,
+        component: Dict[str, Any],
+        profile: ProviderProfile,
+        device: str,
+        weights_mb: float,
+    ) -> float:
+        declared = _declared_mb(component, "compiled_graph_mb", "compiled_graph_bytes")
+        if declared is not None:
+            return _round_mb(declared)
+        measured = self._compiled_cache_bytes(name, profile)
+        if measured:
+            return _round_mb(measured / _MIB)
+        return _round_mb(max(
+            COMPILED_GRAPH_FLOOR_MB[device],
+            COMPILED_GRAPH_FACTOR[device] * weights_mb,
+        ))
+
+    def _workspace_mb(
+        self,
+        component: Dict[str, Any],
+        profile: ProviderProfile,
+        device: str,
+        weights_mb: float,
+    ) -> float:
+        declared = _declared_mb(
+            component, "provider_workspace_mb", "provider_workspace_bytes"
+        )
+        if declared is not None:
+            return _round_mb(declared)
+        factor = PROVIDER_WORKSPACE_FACTOR[device]
+        floor = PROVIDER_WORKSPACE_FLOOR_MB[device]
+        options = profile.provider_options
+        if device == "cpu" and not bool(options.get("enable_cpu_mem_arena", True)):
+            factor, floor = 0.01, 2.0
+        if device == "cuda" and str(options.get("cudnn_conv_use_max_workspace", "0")) == "1":
+            factor *= 2
+        return _round_mb(max(floor, factor * weights_mb))
+
+    def _activation_mb(
+        self,
+        name: str,
+        component: Dict[str, Any],
+        batch: int,
+        seq: int,
+    ) -> float:
+        declared = _declared_mb(component, "activation_mb", "activation_bytes")
+        if declared is not None:
+            return _round_mb(declared)
+        metadata = self.get_io_metadata(name)
+        seen = set()
+        total = 0.0
+        counted = False
+        for tensor in list(metadata.inputs) + list(metadata.outputs):
+            if tensor.name in seen or not tensor.shape:
+                continue
+            seen.add(tensor.name)
+            try:
+                shape = resolve_static_shape(
+                    tensor.shape,
+                    static=True,
+                    batch_size=batch,
+                    max_seq_len=seq,
+                )
+            except ValueError:
+                continue
+            if any(dim is None or int(dim) <= 0 for dim in shape):
+                continue
+            nbytes = _element_bytes(tensor.dtype)
+            for dim in shape:
+                nbytes *= int(dim)
+            total += nbytes
+            counted = True
+        if counted:
+            return _round_mb(total / _MIB)
+        hidden = self.model_info.get("hidden_size")
+        if not hidden:
+            return 0.0
+        element = _element_bytes(self.model_info.get("dtype") or "float16")
+        return _round_mb((2 * batch * seq * int(hidden) * element) / _MIB)
+
+    def _kv_layers_for(self, name: str, total_layers: int) -> int:
+        """
+        Layers whose KV this component binds.
+
+        A layer shard owns one layer. Prefill and decode each report the
+        full pool, because both sessions bind it. The model total still
+        counts that pool once.
+        """
+        component = self.model_info.get("components", {}).get(name, {})
+        if "kv_layers" in component:
+            return max(0, int(component["kv_layers"]))
+        if component.get("num_layers") is not None:
+            return max(0, int(component["num_layers"]))
+        if _LAYER_COMPONENT.search(name):
+            return 1
+        if _is_aux_component(name):
+            return 0
+        if any(_LAYER_COMPONENT.search(other) for other in self._session_info):
+            return 0
+        info = self._session_info[name]
+        if info.phase in {"prefill", "decode"}:
+            return total_layers
+        bodies = [
+            other for other in self._session_info if not _is_aux_component(other)
+        ]
+        if len(bodies) == 1 and name in bodies:
+            return total_layers
+        return 0
+
+    def _component_kv_cache_mb(
+        self,
+        name: str,
+        component: Dict[str, Any],
+        batch: int,
+        seq: int,
+    ) -> float:
+        declared = _declared_mb(component, "kv_cache_mb", "kv_cache_bytes")
+        if declared is not None:
+            return _round_mb(declared)
+        architecture = self._try_architecture()
+        if architecture is None:
+            return 0.0
+        layers = self._kv_layers_for(name, architecture["num_layers"])
+        return _round_mb(_kv_bytes(architecture, layers, batch, seq) / _MIB)
+
+    def _model_kv_cache_mb(self) -> float:
+        declared = _declared_mb(self.model_info, "kv_cache_mb", "kv_cache_bytes")
+        if declared is not None:
+            return _round_mb(declared)
+        architecture = self._try_architecture()
+        if architecture is None:
+            return 0.0
+        batch, seq = self._estimate_limits()
+        return _round_mb(
+            _kv_bytes(architecture, architecture["num_layers"], batch, seq) / _MIB
+        )
+
     def _npu_igpu_bridges(self) -> List[Tuple[ExecutionStep, ExecutionStep, str]]:
         """Output buffers that leave an NPU step and enter an iGPU step."""
         if self.execution_plan is None:
@@ -2256,6 +2738,7 @@ __all__ = [
     "IOMetadata",
     "PreparedIO",
     "StaticBufferAllocation",
+    "RuntimeMemoryEstimate",
     # Functions
     "get_available_providers",
     "get_provider_for_device",
@@ -2274,4 +2757,8 @@ __all__ = [
     "NPU_PROVIDER_MARKERS",
     "EXECUTION_PHASES",
     "resolve_static_shape",
+    "COMPILED_GRAPH_FACTOR",
+    "COMPILED_GRAPH_FLOOR_MB",
+    "PROVIDER_WORKSPACE_FACTOR",
+    "PROVIDER_WORKSPACE_FLOOR_MB",
 ]
