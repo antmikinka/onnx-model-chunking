@@ -18,6 +18,18 @@ def test_dtypes():
         ONNX_ELEMENT_TYPE_TO_NUMPY,
         NUMPY_TO_ONNX_ELEMENT_TYPE,
         numpy_dtype_from_onnx_element_type,
+        QuantizedDtype,
+        INT4_BLOCKWISE,
+        UINT4_BLOCKWISE,
+        MATMUL_NBITS_INT4,
+        AWQ_INT4,
+        GPTQ_INT4,
+        get_quantized_dtype,
+        quantized_dtype_from_matmul_nbits,
+        pack_quantized,
+        unpack_quantized,
+        pack_weights,
+        unpack_weights,
         supports_bfloat16,
         get_bfloat16_dtype,
         get_dtype_info
@@ -113,6 +125,114 @@ def test_dtypes():
     except ValueError as exc:
         assert "99" in str(exc)
     print("  numeric TensorProto map round-trips and io_binding shares it")
+
+    assert get_numpy_dtype("tensor(int4)") == np.int8
+    assert get_numpy_dtype("tensor(uint4)") == np.uint8
+    assert INT4_BLOCKWISE == QuantizedDtype(
+        logical_dtype="int4",
+        bits=4,
+        signed=True,
+        storage_dtype=np.int8,
+        group_size=32,
+        has_scale=True,
+        has_zero_point=True,
+        scale_dtype=np.float16,
+        zero_point_dtype=np.uint8,
+        layout="blocked",
+    )
+    assert INT4_BLOCKWISE.block_size == 32
+    assert INT4_BLOCKWISE.values_per_storage_element == 2
+    assert INT4_BLOCKWISE.matmul_nbits_attributes() == {"bits": 4, "block_size": 32}
+    assert INT4_BLOCKWISE.packing_order()["axis"] == "k_block"
+    assert INT4_BLOCKWISE.packing_order()["bit_order"] == "low_bits_first"
+    assert INT4_BLOCKWISE.packing_order()["interleave"] == 1
+    assert UINT4_BLOCKWISE.signed is False
+    assert UINT4_BLOCKWISE.storage_dtype == np.dtype(np.uint8)
+    assert get_quantized_dtype("tensor(int4)") is INT4_BLOCKWISE
+    assert get_quantized_dtype("AWQ_INT4") is AWQ_INT4
+    assert get_quantized_dtype("gptq") is GPTQ_INT4
+    assert AWQ_INT4.storage_dtype == np.dtype(np.int32)
+    assert AWQ_INT4.values_per_storage_element == 8
+    assert AWQ_INT4.packing_order()["axis"] == "output"
+    assert AWQ_INT4.group_size == 128
+    assert AWQ_INT4.scale_shape((256, 32)) == (2, 32)
+    assert GPTQ_INT4.packing_order()["axis"] == "input"
+    assert GPTQ_INT4.scale_shape((32, 256)) == (32, 2)
+    assert MATMUL_NBITS_INT4.matmul_nbits_attributes() == {"bits": 4, "block_size": 128}
+    assert MATMUL_NBITS_INT4.signed is False
+    assert MATMUL_NBITS_INT4.zero_point_dtype == np.dtype(np.uint8)
+    nbits_32 = quantized_dtype_from_matmul_nbits(
+        bits=4, block_size=32, signed=True, has_zero_point=True
+    )
+    assert nbits_32.group_size == 32
+    assert nbits_32.storage_dtype == np.dtype(np.int8)
+    assert nbits_32.layout == "matmul_nbits"
+    no_zp = quantized_dtype_from_matmul_nbits(has_zero_point=False)
+    assert no_zp.has_zero_point is False
+    assert no_zp.zero_point_dtype is None
+    signed_values = np.array([-1, 2, -8, 7], dtype=np.int8)
+    signed_packed = pack_quantized(signed_values, INT4_BLOCKWISE)
+    assert signed_packed.dtype == np.dtype(np.int8)
+    assert signed_packed.tolist() == [0x2F, 0x78]
+    assert unpack_quantized(signed_packed, INT4_BLOCKWISE).tolist() == [-1, 2, -8, 7]
+    unsigned_values = np.array([1, 2, 15, 0], dtype=np.uint8)
+    unsigned_packed = pack_quantized(unsigned_values, UINT4_BLOCKWISE)
+    assert unsigned_packed.tolist() == [0x21, 0x0F]
+    assert unpack_quantized(unsigned_packed, UINT4_BLOCKWISE).tolist() == [1, 2, 15, 0]
+    nbits_weight = np.array([[1, 2, 3, 4, 5, 6, 7, 8]], dtype=np.int32)
+    nbits_spec = quantized_dtype_from_matmul_nbits(bits=4, block_size=4, has_zero_point=False)
+    nbits_stored = pack_weights(nbits_weight, nbits_spec)
+    assert nbits_stored.shape == (1, 2, 2)
+    assert nbits_stored.dtype == np.dtype(np.uint8)
+    assert nbits_stored.reshape(-1).tolist() == [0x21, 0x43, 0x65, 0x87]
+    assert unpack_weights(nbits_stored, nbits_spec).tolist() == nbits_weight.tolist()
+    assert nbits_spec.scale_shape((1, 8)) == (1, 2)
+    awq_values = np.arange(1, 9, dtype=np.int32).reshape(1, 8)
+    awq_stored = pack_weights(awq_values, AWQ_INT4)
+    assert awq_stored.shape == (1, 1)
+    assert awq_stored.dtype == np.dtype(np.int32)
+    assert int(awq_stored.view(np.uint32).reshape(-1)[0]) == sum((i + 1) << (4 * i) for i in range(8))
+    assert unpack_weights(awq_stored, AWQ_INT4).tolist() == awq_values.tolist()
+    gptq_stored = pack_weights(awq_values, GPTQ_INT4)
+    assert gptq_stored.shape == (1, 1)
+    assert int(gptq_stored.reshape(-1)[0]) == int(awq_stored.reshape(-1)[0])
+    assert GPTQ_INT4.packing_axis == "input"
+    assert AWQ_INT4.packing_axis == "output"
+    assert pipeline_utils.QuantizedDtype is QuantizedDtype
+    assert pipeline_utils.INT4_BLOCKWISE is INT4_BLOCKWISE
+    assert pipeline_utils.MATMUL_NBITS_INT4 is MATMUL_NBITS_INT4
+    try:
+        get_quantized_dtype("awq_int8")
+        raise AssertionError("awq_int8 is not a sub-byte layout")
+    except ValueError as exc:
+        assert "awq_int8" in str(exc)
+    try:
+        QuantizedDtype(
+            logical_dtype="int4",
+            bits=3,
+            signed=True,
+            storage_dtype=np.int8,
+            group_size=32,
+            has_scale=True,
+            has_zero_point=False,
+            scale_dtype=np.float16,
+            zero_point_dtype=None,
+            layout="blocked",
+        )
+        raise AssertionError("3-bit values do not pack into a byte")
+    except ValueError as exc:
+        assert "3-bit" in str(exc)
+    try:
+        pack_weights(np.ones((1, 6), dtype=np.int32), nbits_spec)
+        raise AssertionError("K must be a multiple of the block")
+    except ValueError as exc:
+        assert "block_size" in str(exc)
+    try:
+        quantized_dtype_from_matmul_nbits(bits=4, block_size=3)
+        raise AssertionError("block_size 3 does not fill bytes")
+    except ValueError as exc:
+        assert "whole bytes" in str(exc)
+    print("  quantized dtype: INT4 block, MatMulNBits, AWQ, GPTQ")
     
     print("dtypes module: OK\n")
     return True

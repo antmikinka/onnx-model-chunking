@@ -10,6 +10,7 @@ Usage:
 """
 
 import warnings
+from dataclasses import dataclass
 from typing import Optional, Union
 import numpy as np
 
@@ -87,8 +88,8 @@ ONNX_DTYPE_MAP = {
 # Types that require special handling or have precision implications
 SPECIAL_TYPES = {
     "bfloat16": "Uses ml_dtypes if available, else falls back to float32",
-    "int4": "Packed format - 2 values per byte, requires unpacking for computation",
-    "uint4": "Packed format - 2 values per byte, requires unpacking for computation",
+    "int4": "Signed 4-bit values, two per int8 byte. INT4_BLOCKWISE records the group, scale, and zero point.",
+    "uint4": "Unsigned 4-bit values, two per uint8 byte. UINT4_BLOCKWISE records the group, scale, and zero point.",
     "float8e4m3fn": "8-bit float (E4M3), falls back to float16",
     "float8e5m2": "8-bit float (E5M2), falls back to float16",
 }
@@ -201,6 +202,410 @@ AWQ_DTYPE_MAP = {
     "awq_fp16_act": np.float16,   # FP16 activations
     "awq_bf16_act": "bfloat16",   # BF16 activations
 }
+
+
+# =============================================================================
+# QUANTIZED DTYPE METADATA
+# =============================================================================
+
+@dataclass(frozen=True)
+class QuantizedDtype:
+    """Packing metadata for a sub-byte weight dtype.
+
+    ``ONNX_DTYPE_MAP`` still names the storage numpy dtype. This record
+    names the logical width, the group, the scale, the zero point, and
+    the packing order used by blocked INT4, MatMulNBits, AWQ, and GPTQ.
+    """
+
+    logical_dtype: str
+    bits: int
+    signed: bool
+    storage_dtype: np.dtype
+    group_size: Optional[int]
+    has_scale: bool
+    has_zero_point: bool
+    scale_dtype: Optional[np.dtype]
+    zero_point_dtype: Optional[np.dtype]
+    layout: Optional[str]
+    packing_axis: Optional[str] = None
+    bit_order: str = "low_bits_first"
+    interleave: int = 1
+
+    def __post_init__(self):
+        storage = np.dtype(self.storage_dtype)
+        object.__setattr__(self, "storage_dtype", storage)
+        if self.scale_dtype is not None:
+            object.__setattr__(self, "scale_dtype", np.dtype(self.scale_dtype))
+        if self.zero_point_dtype is not None:
+            object.__setattr__(self, "zero_point_dtype", np.dtype(self.zero_point_dtype))
+        width = storage.itemsize * 8
+        if self.bits < 1 or self.bits > width:
+            raise ValueError(f"bits must fit in {storage}, got {self.bits}")
+        if width % self.bits != 0:
+            raise ValueError(
+                f"{self.bits}-bit values do not pack evenly into {storage}"
+            )
+        if self.group_size is not None:
+            if int(self.group_size) < 1:
+                raise ValueError(f"group_size must be positive, got {self.group_size}")
+            object.__setattr__(self, "group_size", int(self.group_size))
+        if self.has_scale and self.scale_dtype is None:
+            raise ValueError("has_scale requires scale_dtype")
+        if not self.has_scale and self.scale_dtype is not None:
+            raise ValueError("scale_dtype is set but has_scale is false")
+        if self.has_zero_point and self.zero_point_dtype is None:
+            raise ValueError("has_zero_point requires zero_point_dtype")
+        if not self.has_zero_point and self.zero_point_dtype is not None:
+            raise ValueError("zero_point_dtype is set but has_zero_point is false")
+        if self.bit_order not in ("low_bits_first", "high_bits_first"):
+            raise ValueError(f"unsupported bit_order: {self.bit_order}")
+        if int(self.interleave) < 1:
+            raise ValueError(f"interleave must be positive, got {self.interleave}")
+        object.__setattr__(self, "interleave", int(self.interleave))
+
+    @property
+    def values_per_storage_element(self) -> int:
+        """Logical values stored in one storage scalar."""
+        return (self.storage_dtype.itemsize * 8) // self.bits
+
+    @property
+    def block_size(self) -> Optional[int]:
+        """MatMulNBits block size. These layouts use the group size."""
+        return self.group_size
+
+    def matmul_nbits_attributes(self) -> dict:
+        """Attributes a MatMulNBits node needs besides K and N."""
+        if self.group_size is None:
+            raise ValueError("group_size is required for MatMulNBits block_size")
+        return {"bits": int(self.bits), "block_size": int(self.group_size)}
+
+    def packing_order(self) -> dict:
+        """How logical values sit inside the storage container."""
+        layout = (self.layout or "").lower()
+        axis = self.packing_axis
+        if axis is None:
+            axis = {
+                "blocked": "k_block",
+                "matmul_nbits": "k_block",
+                "awq": "output",
+                "gptq": "input",
+            }.get(layout)
+        return {
+            "layout": self.layout,
+            "bit_order": self.bit_order,
+            "axis": axis,
+            "interleave": self.interleave,
+            "values_per_storage_element": self.values_per_storage_element,
+            "group_size": self.group_size,
+            "block_size": self.group_size,
+        }
+
+    def scale_shape(self, weight_shape: tuple) -> tuple:
+        """Scale tensor shape for a rank-2 weight of this layout."""
+        if self.group_size is None:
+            raise ValueError("group_size is required to place scales")
+        if len(weight_shape) != 2:
+            raise ValueError(f"weight shape must be rank 2, got {weight_shape}")
+        layout = (self.layout or "").lower()
+        if layout == "awq":
+            rows, cols = weight_shape
+            if rows % self.group_size != 0:
+                raise ValueError(
+                    f"AWQ K {rows} is not a multiple of group_size {self.group_size}"
+                )
+            return (rows // self.group_size, cols)
+        rows, cols = weight_shape
+        if cols % self.group_size != 0:
+            raise ValueError(
+                f"K {cols} is not a multiple of group_size {self.group_size}"
+            )
+        return (rows, cols // self.group_size)
+
+
+INT4_BLOCKWISE = QuantizedDtype(
+    logical_dtype="int4",
+    bits=4,
+    signed=True,
+    storage_dtype=np.int8,
+    group_size=32,
+    has_scale=True,
+    has_zero_point=True,
+    scale_dtype=np.float16,
+    zero_point_dtype=np.uint8,
+    layout="blocked",
+)
+
+UINT4_BLOCKWISE = QuantizedDtype(
+    logical_dtype="uint4",
+    bits=4,
+    signed=False,
+    storage_dtype=np.uint8,
+    group_size=32,
+    has_scale=True,
+    has_zero_point=True,
+    scale_dtype=np.float16,
+    zero_point_dtype=np.uint8,
+    layout="blocked",
+)
+
+AWQ_INT4 = QuantizedDtype(
+    logical_dtype="uint4",
+    bits=4,
+    signed=False,
+    storage_dtype=np.int32,
+    group_size=128,
+    has_scale=True,
+    has_zero_point=True,
+    scale_dtype=np.float16,
+    zero_point_dtype=np.int32,
+    layout="awq",
+    packing_axis="output",
+)
+
+GPTQ_INT4 = QuantizedDtype(
+    logical_dtype="uint4",
+    bits=4,
+    signed=False,
+    storage_dtype=np.int32,
+    group_size=128,
+    has_scale=True,
+    has_zero_point=True,
+    scale_dtype=np.float16,
+    zero_point_dtype=np.int32,
+    layout="gptq",
+    packing_axis="input",
+)
+
+
+def quantized_dtype_from_matmul_nbits(
+    bits: int = 4,
+    block_size: int = 128,
+    signed: bool = False,
+    has_zero_point: bool = True,
+    scale_dtype: Optional[np.dtype] = np.float16,
+    zero_point_dtype: Optional[np.dtype] = np.uint8,
+) -> QuantizedDtype:
+    """Build MatMulNBits metadata from the node attributes.
+
+    ORT packs ``block_size`` values along K. The low bits of each byte
+    hold the first value. ``block_size`` is the group size. The default
+    attributes are bits 4 and block size 128.
+    """
+    if bits not in (4, 8):
+        raise ValueError(f"MatMulNBits bits must be 4 or 8, got {bits}")
+    if int(block_size) < 1 or (int(block_size) * int(bits)) % 8 != 0:
+        raise ValueError(
+            f"block_size {block_size} * bits {bits} must fill whole bytes"
+        )
+    return QuantizedDtype(
+        logical_dtype=f"{'int' if signed else 'uint'}{int(bits)}",
+        bits=int(bits),
+        signed=bool(signed),
+        storage_dtype=np.int8 if signed else np.uint8,
+        group_size=int(block_size),
+        has_scale=True,
+        has_zero_point=bool(has_zero_point),
+        scale_dtype=scale_dtype,
+        zero_point_dtype=zero_point_dtype if has_zero_point else None,
+        layout="matmul_nbits",
+        packing_axis="k_block",
+    )
+
+
+MATMUL_NBITS_INT4 = quantized_dtype_from_matmul_nbits()
+
+QUANTIZED_DTYPE_MAP = {
+    "int4": INT4_BLOCKWISE,
+    "tensor(int4)": INT4_BLOCKWISE,
+    "int4_blockwise": INT4_BLOCKWISE,
+    "uint4": UINT4_BLOCKWISE,
+    "tensor(uint4)": UINT4_BLOCKWISE,
+    "uint4_blockwise": UINT4_BLOCKWISE,
+    "matmul_nbits": MATMUL_NBITS_INT4,
+    "matmulnbits": MATMUL_NBITS_INT4,
+    "awq": AWQ_INT4,
+    "awq_int4": AWQ_INT4,
+    "awq_uint4": AWQ_INT4,
+    "awq_gemm_int4": AWQ_INT4,
+    "awq_gemv_int4": AWQ_INT4,
+    "awq_w4a16": AWQ_INT4,
+    "gptq": GPTQ_INT4,
+    "gptq_int4": GPTQ_INT4,
+}
+
+
+def get_quantized_dtype(name: str) -> QuantizedDtype:
+    """Return packing metadata for an INT4, UINT4, MatMulNBits, AWQ, or GPTQ name."""
+    key = str(name).strip().lower()
+    if key not in QUANTIZED_DTYPE_MAP:
+        known = ", ".join(sorted(QUANTIZED_DTYPE_MAP))
+        raise ValueError(f"Unrecognized quantized dtype: {name}. Known names: {known}")
+    return QUANTIZED_DTYPE_MAP[key]
+
+
+def _logical_to_codes(matrix: np.ndarray, spec: QuantizedDtype) -> np.ndarray:
+    values = np.asarray(matrix, dtype=np.int32)
+    mask = (1 << spec.bits) - 1
+    if spec.signed:
+        limit = 1 << (spec.bits - 1)
+        if np.any(values < -limit) or np.any(values > limit - 1):
+            raise ValueError(
+                f"signed {spec.bits}-bit values must be in [{-limit}, {limit - 1}]"
+            )
+        return (values & mask).astype(np.uint32)
+    if np.any(values < 0) or np.any(values > mask):
+        raise ValueError(f"unsigned {spec.bits}-bit values must be in [0, {mask}]")
+    return values.astype(np.uint32)
+
+
+def _as_unsigned_words(packed: np.ndarray, storage: np.dtype) -> np.ndarray:
+    raw = np.asarray(packed)
+    if storage == np.dtype(np.int8):
+        return raw.view(np.uint8).astype(np.uint32)
+    if storage == np.dtype(np.uint8):
+        return raw.astype(np.uint32)
+    if storage == np.dtype(np.int32):
+        return raw.view(np.uint32)
+    if storage == np.dtype(np.uint32):
+        return raw.astype(np.uint32)
+    raise ValueError(f"unsupported storage dtype {storage}")
+
+
+def _store_words(words: np.ndarray, storage: np.dtype) -> np.ndarray:
+    if storage.itemsize == 1:
+        narrowed = words.astype(np.uint8)
+        if storage == np.dtype(np.int8):
+            return narrowed.view(np.int8)
+        return narrowed
+    if storage == np.dtype(np.int32):
+        return words.astype(np.uint32).view(np.int32)
+    if storage == np.dtype(np.uint32):
+        return words.astype(np.uint32)
+    raise ValueError(f"unsupported storage dtype {storage}")
+
+
+def pack_quantized(values: np.ndarray, spec: QuantizedDtype) -> np.ndarray:
+    """Pack the last axis into ``spec.storage_dtype``.
+
+    Slot 0 occupies the low bits. A 4-bit byte layout stores two values
+    per byte. AWQ and GPTQ store eight values per int32.
+    """
+    array = np.asarray(values)
+    if array.ndim == 0:
+        raise ValueError("values must include a logical axis")
+    if spec.interleave != 1:
+        raise ValueError(
+            f"interleave {spec.interleave} is recorded; packing implements interleave 1"
+        )
+    if spec.bit_order != "low_bits_first":
+        raise ValueError(f"bit_order {spec.bit_order} is not implemented")
+    per = spec.values_per_storage_element
+    logical = array.shape[-1]
+    if logical % per != 0:
+        raise ValueError(f"logical count {logical} is not a multiple of {per}")
+    leading = array.shape[:-1]
+    rows = int(np.prod(leading, dtype=np.int64)) if leading else 1
+    codes = _logical_to_codes(np.reshape(array, (rows, logical)), spec)
+    words = np.zeros((rows, logical // per), dtype=np.uint32)
+    for slot in range(per):
+        words |= codes[:, slot::per] << np.uint32(spec.bits * slot)
+    stored = _store_words(words, spec.storage_dtype)
+    return stored.reshape(leading + (logical // per,))
+
+
+def unpack_quantized(packed: np.ndarray, spec: QuantizedDtype) -> np.ndarray:
+    """Inverse of ``pack_quantized``. Signed layouts restore two's-complement nibbles."""
+    array = np.asarray(packed)
+    if array.ndim == 0:
+        raise ValueError("packed values must include a storage axis")
+    if spec.interleave != 1:
+        raise ValueError(
+            f"interleave {spec.interleave} is recorded; unpacking implements interleave 1"
+        )
+    if spec.bit_order != "low_bits_first":
+        raise ValueError(f"bit_order {spec.bit_order} is not implemented")
+    if array.dtype != spec.storage_dtype:
+        raise ValueError(
+            f"packed dtype {array.dtype} does not match storage {spec.storage_dtype}"
+        )
+    per = spec.values_per_storage_element
+    leading = array.shape[:-1]
+    stored = array.shape[-1]
+    rows = int(np.prod(leading, dtype=np.int64)) if leading else 1
+    words = _as_unsigned_words(np.reshape(array, (rows, stored)), spec.storage_dtype)
+    logical = stored * per
+    codes = np.zeros((rows, logical), dtype=np.int16)
+    mask = (1 << spec.bits) - 1
+    for slot in range(per):
+        codes[:, slot::per] = (words >> np.uint32(spec.bits * slot)) & np.uint32(mask)
+    if spec.signed:
+        sign = 1 << (spec.bits - 1)
+        codes = np.where(codes >= sign, codes - (1 << spec.bits), codes)
+    return codes.reshape(leading + (logical,))
+
+
+def pack_weights(weight: np.ndarray, spec: QuantizedDtype) -> np.ndarray:
+    """Pack a rank-2 weight into the layout named by ``spec``.
+
+    Blocked and MatMulNBits weights are ``[N, K]`` and become
+    ``[N, K / block_size, blob]``. AWQ weights are ``[K, N]`` and become
+    ``[K, N / values_per_word]``. GPTQ weights are ``[N, K]`` and become
+    ``[N, K / values_per_word]``.
+    """
+    array = np.asarray(weight)
+    if array.ndim != 2:
+        raise ValueError(f"weight must be rank 2, got shape {array.shape}")
+    layout = (spec.layout or "").lower()
+    if layout in ("blocked", "matmul_nbits"):
+        if spec.group_size is None:
+            raise ValueError("group_size is required for blocked packing")
+        _rows, cols = array.shape
+        if cols % spec.group_size != 0:
+            raise ValueError(
+                f"K {cols} is not a multiple of block_size {spec.group_size}"
+            )
+        blocks = cols // spec.group_size
+        grouped = array.reshape(array.shape[0], blocks, spec.group_size)
+        return pack_quantized(grouped, spec)
+    if layout == "awq":
+        _rows, cols = array.shape
+        if cols % spec.values_per_storage_element != 0:
+            raise ValueError(
+                f"AWQ N {cols} is not a multiple of {spec.values_per_storage_element}"
+            )
+        return pack_quantized(array, spec)
+    if layout == "gptq":
+        _rows, cols = array.shape
+        if cols % spec.values_per_storage_element != 0:
+            raise ValueError(
+                f"GPTQ K {cols} is not a multiple of {spec.values_per_storage_element}"
+            )
+        return pack_quantized(array, spec)
+    raise ValueError(f"unsupported quantized layout: {spec.layout}")
+
+
+def unpack_weights(packed: np.ndarray, spec: QuantizedDtype) -> np.ndarray:
+    """Inverse of ``pack_weights``."""
+    array = np.asarray(packed)
+    layout = (spec.layout or "").lower()
+    if layout in ("blocked", "matmul_nbits"):
+        if array.ndim != 3:
+            raise ValueError(
+                f"MatMulNBits storage must be [N, blocks, blob], got {array.shape}"
+            )
+        if spec.group_size is None:
+            raise ValueError("group_size is required for blocked unpacking")
+        logical = unpack_quantized(array, spec)
+        if logical.shape[-1] != spec.group_size:
+            raise ValueError(
+                f"unpacked block {logical.shape[-1]} does not match group_size {spec.group_size}"
+            )
+        return logical.reshape(logical.shape[0], logical.shape[1] * logical.shape[2])
+    if layout in ("awq", "gptq"):
+        if array.ndim != 2:
+            raise ValueError(f"{layout} storage must be rank 2, got {array.shape}")
+        return unpack_quantized(array, spec)
+    raise ValueError(f"unsupported quantized layout: {spec.layout}")
 
 
 # =============================================================================
@@ -422,9 +827,23 @@ __all__ = [
     "SPECIAL_TYPES",
     "GGUF_DTYPE_MAP",
     "AWQ_DTYPE_MAP",
+    "QUANTIZED_DTYPE_MAP",
+    # Quantized metadata
+    "QuantizedDtype",
+    "INT4_BLOCKWISE",
+    "UINT4_BLOCKWISE",
+    "MATMUL_NBITS_INT4",
+    "AWQ_INT4",
+    "GPTQ_INT4",
     # Functions
     "get_numpy_dtype",
     "numpy_dtype_from_onnx_element_type",
+    "get_quantized_dtype",
+    "quantized_dtype_from_matmul_nbits",
+    "pack_quantized",
+    "unpack_quantized",
+    "pack_weights",
+    "unpack_weights",
     "safe_cast",
     "get_dtype_info",
     "supports_bfloat16",
