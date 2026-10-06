@@ -216,6 +216,398 @@ def validate_npu_execution_policy(
 
 
 # =============================================================================
+# PROVIDER PROFILES
+# =============================================================================
+
+# Keys ONNX Runtime accepts on each execution provider. Anything else stays
+# on the profile for session options and is not passed into InferenceSession.
+_EP_OPTION_KEYS = {
+    "cpu": frozenset(),
+    "generic": frozenset(),
+    "cuda": frozenset({
+        "device_id",
+        "arena_extend_strategy",
+        "gpu_mem_limit",
+        "cudnn_conv_algo_search",
+        "do_copy_in_default_stream",
+        "enable_cuda_graph",
+        "cudnn_conv_use_max_workspace",
+    }),
+    "rocm": frozenset({
+        "device_id",
+        "arena_extend_strategy",
+        "gpu_mem_limit",
+        "miopen_conv_exhaustive_search",
+        "do_copy_in_default_stream",
+        "tunable_op_enable",
+        "tunable_op_tuning_enable",
+        "enable_hip_graph",
+    }),
+    "migraphx": frozenset({
+        "device_id",
+        "gpu_mem_limit",
+        "arena_extend_strategy",
+    }),
+    "directml": frozenset({
+        "device_id",
+        "disable_metacommands",
+    }),
+    "vitisai": frozenset({
+        "config_file",
+        "cacheDir",
+        "cacheKey",
+        "target",
+    }),
+    "ryzenai": frozenset({
+        "cacheDir",
+        "cacheKey",
+        "target",
+    }),
+    "tensorrt": frozenset({
+        "device_id",
+        "trt_engine_cache_enable",
+        "trt_engine_cache_path",
+        "trt_max_workspace_size",
+    }),
+    "openvino": frozenset({
+        "device_type",
+        "cache_dir",
+        "num_of_threads",
+    }),
+    "coreml": frozenset({
+        "ModelFormat",
+        "MLComputeUnits",
+        "RequireStaticInputShapes",
+    }),
+}
+
+_STATIC_SHAPE_DEVICES = frozenset({"vitisai", "ryzenai", "openvino", "coreml"})
+
+_NPU_PERFORMANCE_MODE = {
+    "default": "balanced",
+    "fast": "low_latency",
+    "optimized": "high_performance",
+}
+
+_GPU_MEMORY_DEVICES = frozenset({"cuda", "rocm", "migraphx", "tensorrt"})
+
+_npu_static_shape_warning_sent = False
+
+
+def _warn_static_npu_shapes(provider_name: str) -> None:
+    """Tell the caller once that an AOT NPU profile keeps shape checking on."""
+    global _npu_static_shape_warning_sent
+    if _npu_static_shape_warning_sent:
+        return
+    _npu_static_shape_warning_sent = True
+    warnings.warn(
+        f"{provider_name} keeps ONNX shape checking enabled. "
+        "AOT NPU compilation requires static shapes.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+
+
+@dataclass
+class ProviderProfile:
+    """
+    Session and execution-provider settings for one device.
+
+    ``provider_options`` holds both session hints and EP keys. Only the keys
+    in ``_EP_OPTION_KEYS`` are forwarded to ONNX Runtime.
+    """
+
+    name: str
+    device_type: str
+    optimization_level: str
+    enable_graph_cache: bool
+    enable_compile_cache: bool
+    cache_dir: Optional[str]
+    device_id: int
+    memory_limit_mb: Optional[int]
+    provider_options: Dict[str, Any] = field(default_factory=dict)
+
+    def copy(self) -> "ProviderProfile":
+        """Return a detached copy so overrides do not change the template."""
+        return ProviderProfile(
+            name=self.name,
+            device_type=self.device_type,
+            optimization_level=self.optimization_level,
+            enable_graph_cache=self.enable_graph_cache,
+            enable_compile_cache=self.enable_compile_cache,
+            cache_dir=self.cache_dir,
+            device_id=self.device_id,
+            memory_limit_mb=self.memory_limit_mb,
+            provider_options=dict(self.provider_options),
+        )
+
+
+def _cpu_profile() -> ProviderProfile:
+    threads = os.cpu_count() or 1
+    return ProviderProfile(
+        name="CPUExecutionProvider",
+        device_type="cpu",
+        optimization_level="DISABLE",
+        enable_graph_cache=False,
+        enable_compile_cache=False,
+        cache_dir=None,
+        device_id=0,
+        memory_limit_mb=None,
+        provider_options={
+            "intra_op_num_threads": threads,
+            "inter_op_num_threads": 1,
+            "enable_cpu_mem_arena": True,
+            "arena_extend_strategy": "kSameAsRequested",
+            "allow_spinning": False,
+        },
+    )
+
+
+def _cuda_profile() -> ProviderProfile:
+    return ProviderProfile(
+        name="CUDAExecutionProvider",
+        device_type="cuda",
+        optimization_level="EXTENDED",
+        enable_graph_cache=False,
+        enable_compile_cache=False,
+        cache_dir=None,
+        device_id=0,
+        memory_limit_mb=None,
+        provider_options={
+            "device_id": "0",
+            "arena_extend_strategy": "kSameAsRequested",
+            "do_copy_in_default_stream": "1",
+            "cudnn_conv_algo_search": "HEURISTIC",
+            "cudnn_conv_use_max_workspace": "0",
+            "enable_cuda_graph": "0",
+        },
+    )
+
+
+def _rocm_profile() -> ProviderProfile:
+    return ProviderProfile(
+        name="ROCmExecutionProvider",
+        device_type="rocm",
+        optimization_level="EXTENDED",
+        enable_graph_cache=False,
+        enable_compile_cache=False,
+        cache_dir=None,
+        device_id=0,
+        memory_limit_mb=None,
+        provider_options={
+            "device_id": "0",
+            "arena_extend_strategy": "kSameAsRequested",
+            "do_copy_in_default_stream": "1",
+            "miopen_conv_exhaustive_search": "0",
+            "tunable_op_enable": "1",
+            "tunable_op_tuning_enable": "0",
+            "enable_hip_graph": "0",
+        },
+    )
+
+
+def _migraphx_profile() -> ProviderProfile:
+    return ProviderProfile(
+        name="MIGraphXExecutionProvider",
+        device_type="migraphx",
+        optimization_level="EXTENDED",
+        enable_graph_cache=False,
+        enable_compile_cache=False,
+        cache_dir=None,
+        device_id=0,
+        memory_limit_mb=None,
+        provider_options={
+            "device_id": "0",
+            "arena_extend_strategy": "kSameAsRequested",
+        },
+    )
+
+
+def _directml_profile() -> ProviderProfile:
+    return ProviderProfile(
+        name="DmlExecutionProvider",
+        device_type="directml",
+        optimization_level="EXTENDED",
+        enable_graph_cache=True,
+        enable_compile_cache=False,
+        cache_dir=None,
+        device_id=0,
+        memory_limit_mb=None,
+        provider_options={
+            "device_id": "0",
+            # Metacommands are the Windows GPU/NPU fast path. Leaving them
+            # enabled is the graph-cache behavior for DirectML.
+            "disable_metacommands": "0",
+        },
+    )
+
+
+def _npu_profile(name: str, device_type: str) -> ProviderProfile:
+    return ProviderProfile(
+        name=name,
+        device_type=device_type,
+        optimization_level="DISABLE",
+        enable_graph_cache=True,
+        enable_compile_cache=True,
+        cache_dir=None,
+        device_id=0,
+        memory_limit_mb=None,
+        provider_options={
+            "target": "X1",
+            "cacheKey": device_type,
+            "performance_mode": "balanced",
+        },
+    )
+
+
+def _tensorrt_profile() -> ProviderProfile:
+    return ProviderProfile(
+        name="TensorrtExecutionProvider",
+        device_type="tensorrt",
+        optimization_level="EXTENDED",
+        enable_graph_cache=False,
+        enable_compile_cache=True,
+        cache_dir=None,
+        device_id=0,
+        memory_limit_mb=None,
+        provider_options={
+            "device_id": "0",
+            "trt_engine_cache_enable": "1",
+        },
+    )
+
+
+def _openvino_profile() -> ProviderProfile:
+    return ProviderProfile(
+        name="OpenVINOExecutionProvider",
+        device_type="openvino",
+        optimization_level="DISABLE",
+        enable_graph_cache=True,
+        enable_compile_cache=True,
+        cache_dir=None,
+        device_id=0,
+        memory_limit_mb=None,
+        provider_options={
+            "device_type": "NPU",
+            "num_of_threads": "1",
+        },
+    )
+
+
+def _coreml_profile() -> ProviderProfile:
+    return ProviderProfile(
+        name="CoreMLExecutionProvider",
+        device_type="coreml",
+        optimization_level="DISABLE",
+        enable_graph_cache=False,
+        enable_compile_cache=False,
+        cache_dir=None,
+        device_id=0,
+        memory_limit_mb=None,
+        provider_options={
+            "ModelFormat": "MLProgram",
+            "MLComputeUnits": "ALL",
+            "RequireStaticInputShapes": "1",
+        },
+    )
+
+
+def _generic_profile(name: str) -> ProviderProfile:
+    return ProviderProfile(
+        name=name,
+        device_type="generic",
+        optimization_level="DISABLE",
+        enable_graph_cache=False,
+        enable_compile_cache=False,
+        cache_dir=None,
+        device_id=0,
+        memory_limit_mb=None,
+        provider_options={},
+    )
+
+
+_PROFILE_BUILDERS = (
+    ("vitisai", lambda: _npu_profile("VitisAIExecutionProvider", "vitisai")),
+    ("ryzenai", lambda: _npu_profile("RyzenAIExecutionProvider", "ryzenai")),
+    ("openvino", _openvino_profile),
+    ("coreml", _coreml_profile),
+    ("tensorrt", _tensorrt_profile),
+    ("cuda", _cuda_profile),
+    ("migraphx", _migraphx_profile),
+    ("rocm", _rocm_profile),
+    ("directml", _directml_profile),
+    ("dml", _directml_profile),
+    ("cpu", _cpu_profile),
+)
+
+
+def primary_provider_name(providers: Optional[Sequence[Any]]) -> str:
+    """Return the first provider. That entry is the selected target."""
+    for provider in providers or ():
+        return _provider_name(provider)
+    return "CPUExecutionProvider"
+
+
+def provider_profile_for(provider: Any, **overrides: Any) -> ProviderProfile:
+    """
+    Build the profile for one provider name.
+
+    Keyword arguments replace fields on the copy. ``provider_options`` is
+    merged rather than replaced.
+    """
+    name = _provider_name(provider)
+    lowered = name.lower()
+    builder = None
+    for marker, candidate in _PROFILE_BUILDERS:
+        if marker in lowered:
+            builder = candidate
+            break
+    profile = builder() if builder is not None else _generic_profile(name)
+    profile.name = name
+    for key, value in overrides.items():
+        if value is None:
+            continue
+        if key == "provider_options" and isinstance(value, dict):
+            profile.provider_options.update(value)
+            continue
+        if hasattr(profile, key):
+            setattr(profile, key, value)
+    if "device_id" in profile.provider_options:
+        profile.provider_options["device_id"] = str(profile.device_id)
+    return profile
+
+
+def ep_provider_options(profile: ProviderProfile) -> Dict[str, str]:
+    """
+    Return the provider-options dict ONNX Runtime will accept.
+
+    Session hints such as CPU thread counts and ``performance_mode`` stay on
+    the profile. They are not included here.
+    """
+    allowed = _EP_OPTION_KEYS.get(profile.device_type, frozenset())
+    source: Dict[str, Any] = dict(profile.provider_options)
+    if profile.device_type in _GPU_MEMORY_DEVICES or profile.device_type == "directml":
+        source.setdefault("device_id", str(profile.device_id))
+    if profile.memory_limit_mb and profile.device_type in _GPU_MEMORY_DEVICES:
+        source["gpu_mem_limit"] = str(int(profile.memory_limit_mb) * 1024 * 1024)
+    if profile.cache_dir and profile.enable_compile_cache:
+        if profile.device_type in {"vitisai", "ryzenai"}:
+            source.setdefault("cacheDir", profile.cache_dir)
+            source.setdefault("cacheKey", profile.device_type)
+        elif profile.device_type == "openvino":
+            source.setdefault("cache_dir", profile.cache_dir)
+        elif profile.device_type == "tensorrt":
+            source["trt_engine_cache_enable"] = "1"
+            source["trt_engine_cache_path"] = profile.cache_dir
+    options: Dict[str, str] = {}
+    for key, value in source.items():
+        if key not in allowed or value is None:
+            continue
+        options[key] = str(value)
+    return options
+
+
+# =============================================================================
 # DATA CLASSES
 # =============================================================================
 
@@ -225,14 +617,22 @@ class SessionConfig:
     Configuration for ONNX Runtime session creation.
 
     Attributes:
-        providers: Execution providers in priority order
-        optimization_level: Graph optimization level (DISABLE/BASIC/EXTENDED/ALL)
-        inter_op_threads: Number of threads for parallel op execution
-        intra_op_threads: Number of threads within a single op
-        memory_limit_mb: Optional memory limit for arena allocator
+        providers: Execution providers in priority order. The first entry
+            selects the ProviderProfile.
+        profile: Explicit profile. When omitted, the first provider selects one.
+        optimization_level: Graph optimization level (DISABLE/BASIC/EXTENDED/ALL).
+            None uses the selected profile's level.
+        inter_op_threads: Number of threads for parallel op execution.
+            0 uses the profile value.
+        intra_op_threads: Number of threads within a single op.
+            0 uses the profile value.
+        memory_limit_mb: Optional memory limit for the active device allocator.
+        device_id: Optional device index override for the selected profile.
+        cache_dir: Optional compile-cache directory override.
         enable_profiling: Enable ONNX Runtime profiling
         graph_optimization_level: Enum for optimization level
-        disable_shape_check: Disable node shape checking for dynamic shapes
+        disable_shape_check: Disable node shape checking for dynamic shapes.
+            AOT NPU profiles keep shape checking on.
         execution_policy: How this model may be split across sessions.
             NPU targets reject sequential layer splits. Phase-split and MoE
             routing are the allowed NPU exceptions.
@@ -252,34 +652,113 @@ class SessionConfig:
     """
     providers: List[str] = field(default_factory=lambda: ['CPUExecutionProvider'])
     execution_policy: ExecutionPolicy = ExecutionPolicy.MONOLITHIC_ONLY
-    optimization_level: str = "DISABLE"  # DISABLE, BASIC, EXTENDED, ALL
-    inter_op_threads: int = 0  # 0 = auto
-    intra_op_threads: int = 0  # 0 = auto
+    profile: Optional[ProviderProfile] = None
+    optimization_level: Optional[str] = None  # None = use the provider profile
+    inter_op_threads: int = 0  # 0 = profile default
+    intra_op_threads: int = 0  # 0 = profile default
     memory_limit_mb: Optional[int] = None
+    device_id: Optional[int] = None
+    cache_dir: Optional[str] = None
     enable_profiling: bool = False
-    disable_shape_check: bool = True  # For dynamic shapes in LLMs
+    disable_shape_check: bool = True  # Ignored for AOT NPU profiles
 
     # NPU-specific options (P1.2: NPU Session Options)
     npu_graph_capture: bool = True
     npu_weight_preload: bool = True
     npu_compilation_mode: str = "default"  # "default", "fast", "optimized"
     
-    def get_optimization_level_enum(self) -> ort.GraphOptimizationLevel:
-        """Convert string to ONNX Runtime enum."""
+    def active_profile(self, cache_dir: Optional[str] = None) -> ProviderProfile:
+        """
+        Return the profile for the selected provider.
+
+        An explicit ``profile`` wins. Otherwise the first provider is the
+        selection. Session-level device, memory, cache, and optimization
+        fields replace the matching profile values when they are set.
+        """
+        if self.profile is not None:
+            profile = self.profile.copy()
+        else:
+            profile = provider_profile_for(primary_provider_name(self.providers))
+        if self.optimization_level:
+            profile.optimization_level = self.optimization_level
+        if self.memory_limit_mb is not None:
+            profile.memory_limit_mb = self.memory_limit_mb
+        if self.device_id is not None:
+            profile.device_id = int(self.device_id)
+            if "device_id" in profile.provider_options:
+                profile.provider_options["device_id"] = str(self.device_id)
+        chosen_cache = self.cache_dir or cache_dir
+        if chosen_cache and not profile.cache_dir:
+            profile.cache_dir = chosen_cache
+        if profile.device_type in {"vitisai", "ryzenai"}:
+            if not self.npu_graph_capture:
+                profile.enable_graph_cache = False
+            profile.provider_options["performance_mode"] = _NPU_PERFORMANCE_MODE.get(
+                str(self.npu_compilation_mode),
+                "balanced",
+            )
+        if profile.memory_limit_mb and profile.device_type in _GPU_MEMORY_DEVICES:
+            profile.provider_options["gpu_mem_limit"] = str(
+                int(profile.memory_limit_mb) * 1024 * 1024
+            )
+        return profile
+
+    def resolved_optimization_level(self) -> str:
+        """Profile level, unless this config sets one explicitly."""
+        return self.active_profile().optimization_level
+
+    @staticmethod
+    def _optimization_enum(level: str) -> ort.GraphOptimizationLevel:
+        """Convert a profile or config level string to the ORT enum."""
         mapping = {
             "DISABLE": ort.GraphOptimizationLevel.ORT_DISABLE_ALL,
             "BASIC": ort.GraphOptimizationLevel.ORT_ENABLE_BASIC,
             "EXTENDED": ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED,
             "ALL": ort.GraphOptimizationLevel.ORT_ENABLE_ALL,
         }
-        return mapping.get(self.optimization_level.upper(), 
-                          ort.GraphOptimizationLevel.ORT_DISABLE_ALL)
-    
-    def create_session_options(self) -> ort.SessionOptions:
-        """
-        Create configured SessionOptions object.
+        return mapping.get(
+            str(level).upper(),
+            ort.GraphOptimizationLevel.ORT_DISABLE_ALL,
+        )
 
-        Includes NPU-specific configuration when VitisAIExecutionProvider is used.
+    def get_optimization_level_enum(self) -> ort.GraphOptimizationLevel:
+        """Convert the resolved optimization level to an ONNX Runtime enum."""
+        return self._optimization_enum(self.resolved_optimization_level())
+
+    def ort_providers(self, cache_dir: Optional[str] = None) -> List[Any]:
+        """
+        Build the provider list passed to InferenceSession.
+
+        Each accelerator gets its own option dict. CPU stays a bare name.
+        """
+        prepared: List[Any] = []
+        for provider in self.providers:
+            profile = provider_profile_for(provider)
+            if self.device_id is not None:
+                profile.device_id = int(self.device_id)
+                if "device_id" in profile.provider_options:
+                    profile.provider_options["device_id"] = str(self.device_id)
+            if self.memory_limit_mb is not None:
+                profile.memory_limit_mb = self.memory_limit_mb
+            chosen_cache = self.cache_dir or cache_dir
+            if chosen_cache:
+                profile.cache_dir = chosen_cache
+            if profile.device_type in {"vitisai", "ryzenai"} and not self.npu_graph_capture:
+                profile.enable_graph_cache = False
+            options = ep_provider_options(profile)
+            provider_name = _provider_name(provider)
+            if options:
+                prepared.append((provider_name, options))
+            else:
+                prepared.append(provider_name)
+        return prepared
+    
+    def create_session_options(self, cache_dir: Optional[str] = None) -> ort.SessionOptions:
+        """
+        Create SessionOptions from the selected provider profile.
+
+        VitisAI still receives graph capture, weight preload, and compilation
+        mode. AOT NPU profiles keep shape checking enabled.
 
         Returns:
             Configured ort.SessionOptions object
@@ -293,65 +772,66 @@ class SessionConfig:
             >>> opts = config.create_session_options()
             # opts now contains vitisai.* session config entries
         """
+        profile = self.active_profile(cache_dir=cache_dir)
         opts = ort.SessionOptions()
-        opts.graph_optimization_level = self.get_optimization_level_enum()
+        opts.graph_optimization_level = self._optimization_enum(profile.optimization_level)
 
-        if self.inter_op_threads > 0:
-            opts.inter_op_num_threads = self.inter_op_threads
-        if self.intra_op_threads > 0:
-            opts.intra_op_num_threads = self.intra_op_threads
+        intra = self.intra_op_threads or int(profile.provider_options.get("intra_op_num_threads") or 0)
+        inter = self.inter_op_threads or int(profile.provider_options.get("inter_op_num_threads") or 0)
+        if inter > 0:
+            opts.inter_op_num_threads = inter
+        if intra > 0:
+            opts.intra_op_num_threads = intra
+
+        if profile.device_type == "cpu":
+            opts.enable_cpu_mem_arena = bool(
+                profile.provider_options.get("enable_cpu_mem_arena", True)
+            )
+            spinning = bool(profile.provider_options.get("allow_spinning", False))
+            spin_value = "1" if spinning else "0"
+            opts.add_session_config_entry("session.intra_op.allow_spinning", spin_value)
+            opts.add_session_config_entry("session.inter_op.allow_spinning", spin_value)
 
         if self.enable_profiling:
             opts.enable_profiling = True
 
-        if self.disable_shape_check:
+        if profile.device_type in _STATIC_SHAPE_DEVICES:
+            if self.disable_shape_check:
+                _warn_static_npu_shapes(profile.name)
+        elif self.disable_shape_check:
             opts.add_session_config_entry("session.disable_node_shape_check", "1")
 
-        # P1.2: Add NPU-specific session configuration
-        if "VitisAIExecutionProvider" in self.providers:
-            self._add_npu_session_config(opts)
-
+        self._apply_vitisai_profile(opts, profile)
         return opts
 
-    def _add_npu_session_config(self, opts: ort.SessionOptions) -> None:
-        """
-        Add NPU-specific session configuration entries.
-
-        These options optimize VitisAI Execution Provider performance:
-
-        1. vitisai.graph_capture: Enable graph capture for reuse
-           - Reduces compilation overhead on subsequent runs
-           - Recommended for inference workloads
-
-        2. vitisai.weight_preload: Preload weights to tile SRAM
-           - Keeps weights in on-chip memory for faster access
-           - Critical for NPU performance
-
-        3. vitisai.compilation_mode: Compilation strategy
-           - "default": Balanced approach
-           - "fast": Prioritize compilation speed
-           - "optimized": Prioritize runtime performance
-
-        Args:
-            opts: SessionOptions object to configure
-        """
-        # Graph capture for faster inference
+    def _apply_vitisai_profile(
+        self,
+        opts: ort.SessionOptions,
+        profile: ProviderProfile,
+    ) -> None:
+        """Write VitisAI session keys when that provider is selected or listed."""
+        uses_vitisai = profile.device_type == "vitisai" or any(
+            "vitisai" in _provider_name(provider).lower() for provider in self.providers
+        )
+        if not uses_vitisai:
+            return
         opts.add_session_config_entry(
             "vitisai.graph_capture",
-            "1" if self.npu_graph_capture else "0"
+            "1" if profile.enable_graph_cache else "0",
         )
-
-        # Weight preloading to tile SRAM
         opts.add_session_config_entry(
             "vitisai.weight_preload",
-            "1" if self.npu_weight_preload else "0"
+            "1" if self.npu_weight_preload else "0",
         )
-
-        # Compilation mode
         opts.add_session_config_entry(
             "vitisai.compilation_mode",
-            self.npu_compilation_mode
+            self.npu_compilation_mode,
         )
+        if profile.memory_limit_mb is not None:
+            opts.add_session_config_entry(
+                "vitisai.memory_limit_mb",
+                str(int(profile.memory_limit_mb)),
+            )
 
     def resolved_execution_policy(self) -> ExecutionPolicy:
         """Return ``execution_policy`` as an enum, accepting its string value."""
@@ -436,6 +916,7 @@ class SessionManager:
     - Provider fallback handling
     - Reject layer-by-layer loads on VitisAI, RyzenAI, OpenVINO, and CoreML
       unless the policy is phase-split or MoE expert routing
+    - Select a ProviderProfile from the first execution provider
     """
     
     def __init__(
@@ -454,6 +935,9 @@ class SessionManager:
         """
         self.model_dir = model_dir
         self.config = config or SessionConfig()
+        self.provider_profile = self.config.active_profile(
+            cache_dir=os.path.join(self.model_dir, ".ort_cache")
+        )
         
         # Load model info if not provided
         if model_info is None:
@@ -516,11 +1000,16 @@ class SessionManager:
         
         try:
             self._enforce_execution_policy()
-            opts = self.config.create_session_options()
+            self._prepare_profile_cache()
+            opts = self.config.create_session_options(
+                cache_dir=self.provider_profile.cache_dir
+            )
             session = ort.InferenceSession(
                 info.file_path,
                 sess_options=opts,
-                providers=self.config.providers
+                providers=self.config.ort_providers(
+                    cache_dir=self.provider_profile.cache_dir
+                ),
             )
             
             # Update session info with loaded details
@@ -691,6 +1180,12 @@ class SessionManager:
         
         return ordered
     
+    def _prepare_profile_cache(self) -> None:
+        """Create the compile-cache directory when this profile uses one."""
+        profile = self.provider_profile
+        if profile.cache_dir and (profile.enable_compile_cache or profile.enable_graph_cache):
+            os.makedirs(profile.cache_dir, exist_ok=True)
+
     def _enforce_execution_policy(self) -> None:
         """
         Reject an NPU layer-by-layer load.
@@ -783,6 +1278,7 @@ __all__ = [
     "SessionConfig",
     "SessionInfo",
     "ExecutionPolicy",
+    "ProviderProfile",
     # Functions
     "get_available_providers",
     "get_provider_for_device",
@@ -790,6 +1286,9 @@ __all__ = [
     "providers_target_npu",
     "is_sequential_layer_split",
     "validate_npu_execution_policy",
+    "provider_profile_for",
+    "primary_provider_name",
+    "ep_provider_options",
     # Constants
     "SUPPORTED_PROVIDERS",
     "PROVIDER_CATEGORIES",

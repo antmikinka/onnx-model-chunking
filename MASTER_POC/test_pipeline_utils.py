@@ -162,6 +162,7 @@ def test_session_manager():
         SessionConfig,
         SessionInfo,
         ExecutionPolicy,
+        provider_profile_for,
         get_available_providers,
         get_provider_for_device,
         provider_is_npu,
@@ -303,6 +304,110 @@ def test_session_manager():
         )
     assert caught and issubclass(caught[0].category, RuntimeWarning)
     print("  NPU sequential split rejected; phase-split and MoE routing allowed")
+
+    import onnxruntime as ort
+    cpu_profile = provider_profile_for("CPUExecutionProvider")
+    assert cpu_profile.device_type == "cpu"
+    assert cpu_profile.optimization_level == "DISABLE"
+    assert cpu_profile.enable_graph_cache is False
+    assert cpu_profile.provider_options["enable_cpu_mem_arena"] is True
+    assert cpu_profile.provider_options["arena_extend_strategy"] == "kSameAsRequested"
+    assert cpu_profile.provider_options["intra_op_num_threads"] >= 1
+    cpu_options = SessionConfig(providers=["CPUExecutionProvider"]).create_session_options()
+    assert cpu_options.graph_optimization_level == ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    assert cpu_options.enable_cpu_mem_arena is True
+    assert cpu_options.intra_op_num_threads == cpu_profile.provider_options["intra_op_num_threads"]
+
+    cuda_profile = provider_profile_for("CUDAExecutionProvider")
+    assert cuda_profile.optimization_level == "EXTENDED"
+    assert cuda_profile.provider_options["do_copy_in_default_stream"] == "1"
+    assert cuda_profile.provider_options["enable_cuda_graph"] == "0"
+    cuda_config = SessionConfig(
+        providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+        device_id=2,
+        memory_limit_mb=256,
+    )
+    assert cuda_config.resolved_optimization_level() == "EXTENDED"
+    cuda_providers = cuda_config.ort_providers()
+    assert cuda_providers[0][0] == "CUDAExecutionProvider"
+    assert cuda_providers[0][1]["device_id"] == "2"
+    assert cuda_providers[0][1]["gpu_mem_limit"] == str(256 * 1024 * 1024)
+    assert cuda_providers[0][1]["arena_extend_strategy"] == "kSameAsRequested"
+    assert cuda_providers[1] == "CPUExecutionProvider"
+    pinned = SessionConfig(
+        providers=["CUDAExecutionProvider"],
+        optimization_level="DISABLE",
+    )
+    assert pinned.resolved_optimization_level() == "DISABLE"
+
+    rocm_config = SessionConfig(
+        providers=["ROCmExecutionProvider", "CPUExecutionProvider"],
+        device_id=1,
+        memory_limit_mb=128,
+        execution_policy=ExecutionPolicy.SPLIT_GPU_PERSISTENT,
+    )
+    rocm_providers = rocm_config.ort_providers()
+    assert rocm_providers[0][1]["device_id"] == "1"
+    assert rocm_providers[0][1]["do_copy_in_default_stream"] == "1"
+    assert rocm_providers[0][1]["arena_extend_strategy"] == "kSameAsRequested"
+    assert rocm_providers[0][1]["enable_hip_graph"] == "0"
+    assert rocm_providers[0][1]["gpu_mem_limit"] == str(128 * 1024 * 1024)
+    assert rocm_providers[1] == "CPUExecutionProvider"
+
+    dml_profile = provider_profile_for("DmlExecutionProvider")
+    assert dml_profile.device_type == "directml"
+    assert dml_profile.enable_graph_cache is True
+    assert dml_profile.provider_options["disable_metacommands"] == "0"
+
+    npu_profile = provider_profile_for("VitisAIExecutionProvider")
+    assert npu_profile.enable_graph_cache is True
+    assert npu_profile.enable_compile_cache is True
+    assert npu_profile.provider_options["performance_mode"] == "balanced"
+    assert npu_profile.optimization_level == "DISABLE"
+    with warnings.catch_warnings(record=True) as npu_warnings:
+        warnings.simplefilter("always")
+        npu_options = SessionConfig(
+            providers=["VitisAIExecutionProvider"]
+        ).create_session_options()
+    assert npu_options.graph_optimization_level == ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    assert any("static shapes" in str(item.message) for item in npu_warnings)
+    mono_info = {"components": {"model": {"file": "model.onnx"}}}
+    npu_manager = SessionManager(
+        ".",
+        SessionConfig(providers=["VitisAIExecutionProvider", "CPUExecutionProvider"]),
+        model_info=mono_info,
+    )
+    assert npu_manager.provider_profile.device_type == "vitisai"
+    assert npu_manager.provider_profile.cache_dir.endswith(".ort_cache")
+    npu_providers = npu_manager.config.ort_providers(
+        cache_dir=npu_manager.provider_profile.cache_dir
+    )
+    assert npu_providers[0][0] == "VitisAIExecutionProvider"
+    assert npu_providers[0][1]["target"] == "X1"
+    assert npu_providers[0][1]["cacheDir"].endswith(".ort_cache")
+    assert npu_providers[0][1]["cacheKey"] == "vitisai"
+    assert "performance_mode" not in npu_providers[0][1]
+    assert npu_providers[1] == "CPUExecutionProvider"
+
+    hybrid = SessionConfig(
+        providers=["RyzenAIExecutionProvider", "DmlExecutionProvider", "CPUExecutionProvider"],
+        execution_policy=ExecutionPolicy.HYBRID_NPU_IGPU_PHASE_SPLIT,
+        npu_compilation_mode="optimized",
+    )
+    assert hybrid.active_profile().device_type == "ryzenai"
+    assert hybrid.active_profile().provider_options["performance_mode"] == "high_performance"
+    hybrid_providers = hybrid.ort_providers(cache_dir="/tmp/ort-cache")
+    assert hybrid_providers[0][0] == "RyzenAIExecutionProvider"
+    assert hybrid_providers[0][1]["cacheDir"] == "/tmp/ort-cache"
+    assert hybrid_providers[1][0] == "DmlExecutionProvider"
+    assert hybrid_providers[1][1]["disable_metacommands"] == "0"
+    assert hybrid_providers[2] == "CPUExecutionProvider"
+
+    custom = provider_profile_for("CUDAExecutionProvider", device_id=3)
+    forced = SessionConfig(providers=["CPUExecutionProvider"], profile=custom)
+    assert forced.active_profile().device_type == "cuda"
+    assert forced.active_profile().device_id == 3
+    print("  provider profiles: cpu arena, rocm hip, vitisai cache, directml, cuda stream")
 
     print("session_manager module: OK\n")
     return True
