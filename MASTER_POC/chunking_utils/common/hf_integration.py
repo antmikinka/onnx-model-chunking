@@ -8,12 +8,18 @@ including AutoConfig for architecture detection and accelerate for memory-effici
 import os
 from typing import Optional, Dict, Any
 
-import torch
-
 from .types import TensorDtype, MemoryMode
 from .architecture import architecture_from_string, ArchitectureType
 
-# Optional imports
+# Optional imports. ONNX Runtime is the execution target, so this module
+# loads when PyTorch is absent.
+try:
+    import torch
+    HAS_TORCH = True
+except ImportError:
+    torch = None
+    HAS_TORCH = False
+
 try:
     from transformers import AutoConfig, AutoTokenizer
     HAS_TRANSFORMERS = True
@@ -27,18 +33,31 @@ except ImportError:
     HAS_ACCELERATE = False
 
 
-# Dtype mapping between our enum and torch/ONNX types
-TORCH_DTYPE_MAP: Dict[TensorDtype, Optional[torch.dtype]] = {
-    TensorDtype.FLOAT32: torch.float32,
-    TensorDtype.FLOAT16: torch.float16,
-    TensorDtype.BFLOAT16: torch.bfloat16,
-    TensorDtype.INT8: torch.int8,
-    TensorDtype.INT4: None,  # Requires special quantization
-    TensorDtype.AUTO: None,  # Preserve original
+# Dtype mapping between our enum and torch/ONNX types.
+# INT4 has no native torch.dtype. AUTO preserves the checkpoint dtype.
+if HAS_TORCH:
+    TORCH_DTYPE_MAP: Dict[TensorDtype, Optional[Any]] = {
+        TensorDtype.FLOAT32: torch.float32,
+        TensorDtype.FLOAT16: torch.float16,
+        TensorDtype.BFLOAT16: torch.bfloat16,
+        TensorDtype.INT8: torch.int8,
+        TensorDtype.INT4: None,  # Requires special quantization
+        TensorDtype.AUTO: None,  # Preserve original
+    }
+else:
+    TORCH_DTYPE_MAP = {item: None for item in TensorDtype}
+
+# ONNX Runtime type strings. AUTO is omitted and falls back to float16.
+ONNX_DTYPE_MAP: Dict[TensorDtype, str] = {
+    TensorDtype.FLOAT32: "tensor(float)",
+    TensorDtype.FLOAT16: "tensor(float16)",
+    TensorDtype.BFLOAT16: "tensor(bfloat16)",
+    TensorDtype.INT8: "tensor(int8)",
+    TensorDtype.INT4: "tensor(int4)",
 }
 
 
-def get_torch_dtype(dtype: TensorDtype) -> Optional[torch.dtype]:
+def get_torch_dtype(dtype: TensorDtype) -> Optional[Any]:
     """
     Convert TensorDtype enum to torch.dtype.
     
@@ -46,9 +65,31 @@ def get_torch_dtype(dtype: TensorDtype) -> Optional[torch.dtype]:
         dtype: TensorDtype enum value.
     
     Returns:
-        Corresponding torch.dtype, or None for AUTO.
+        Corresponding torch.dtype, or None for AUTO and INT4.
+    
+    Raises:
+        ImportError: If PyTorch is not installed.
     """
+    if not HAS_TORCH:
+        raise ImportError(
+            "torch is required to resolve a PyTorch dtype. "
+            "Install with: pip install torch"
+        )
     return TORCH_DTYPE_MAP.get(dtype, None)
+
+
+def get_onnx_dtype(dtype: TensorDtype) -> str:
+    """
+    Convert TensorDtype to an ONNX Runtime type string.
+
+    Args:
+        dtype: TensorDtype enum value.
+
+    Returns:
+        ONNX type such as tensor(float16). AUTO and unknown values use
+        tensor(float16).
+    """
+    return ONNX_DTYPE_MAP.get(dtype, "tensor(float16)")
 
 
 def detect_architecture_hf(model_path: str, trust_remote_code: bool = True) -> ArchitectureType:
@@ -154,5 +195,5 @@ def check_dependencies() -> Dict[str, bool]:
     return {
         "transformers": HAS_TRANSFORMERS,
         "accelerate": HAS_ACCELERATE,
-        "torch": True,  # Required
+        "torch": HAS_TORCH,
     }

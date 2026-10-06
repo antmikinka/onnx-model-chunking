@@ -37,6 +37,8 @@ from .types import (
 _HF_EXPORTS = (
     "TORCH_DTYPE_MAP",
     "get_torch_dtype",
+    "ONNX_DTYPE_MAP",
+    "get_onnx_dtype",
     "detect_architecture_hf",
     "get_model_config",
     "estimate_model_memory",
@@ -87,6 +89,8 @@ __all__ = [
     # HuggingFace integration
     "TORCH_DTYPE_MAP",
     "get_torch_dtype",
+    "ONNX_DTYPE_MAP",
+    "get_onnx_dtype",
     "detect_architecture_hf",
     "get_model_config",
     "estimate_model_memory",

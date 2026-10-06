@@ -7869,6 +7869,68 @@ def test_backend():
     return True
 
 
+def test_hf_integration():
+    """ONNX Runtime dtype strings sit beside the PyTorch map."""
+    print("=" * 50)
+    print("Testing HuggingFace dtype mapping...")
+    print("=" * 50)
+
+    import numpy as np
+
+    import chunking_utils.common as common
+    from chunking_utils.common.hf_integration import (
+        HAS_TORCH,
+        ONNX_DTYPE_MAP as direct_map,
+        TORCH_DTYPE_MAP,
+        check_dependencies,
+        get_onnx_dtype as direct_get,
+        get_torch_dtype,
+    )
+    from chunking_utils.common.types import TensorDtype
+    from pipeline_utils.dtypes import get_numpy_dtype
+
+    assert common.get_onnx_dtype is direct_get
+    assert common.ONNX_DTYPE_MAP is direct_map
+    assert direct_get(TensorDtype.FLOAT32) == "tensor(float)"
+    assert direct_get(TensorDtype.FLOAT16) == "tensor(float16)"
+    assert direct_get(TensorDtype.BFLOAT16) == "tensor(bfloat16)"
+    assert direct_get(TensorDtype.INT8) == "tensor(int8)"
+    assert direct_get(TensorDtype.INT4) == "tensor(int4)"
+    assert direct_get("float32") == "tensor(float)"
+    assert direct_get("int4") == "tensor(int4)"
+    assert direct_get(TensorDtype.AUTO) == "tensor(float16)"
+    assert direct_get("auto") == "tensor(float16)"
+    assert TensorDtype.AUTO not in direct_map
+    assert set(direct_map) == {
+        TensorDtype.FLOAT32,
+        TensorDtype.FLOAT16,
+        TensorDtype.BFLOAT16,
+        TensorDtype.INT8,
+        TensorDtype.INT4,
+    }
+    assert TORCH_DTYPE_MAP[TensorDtype.INT4] is None
+    assert TORCH_DTYPE_MAP[TensorDtype.AUTO] is None
+    assert get_numpy_dtype(direct_get(TensorDtype.FLOAT16)) == np.float16
+    assert get_numpy_dtype(direct_get(TensorDtype.FLOAT32)) == np.float32
+    assert get_numpy_dtype(direct_get(TensorDtype.INT8)) == np.int8
+    assert get_numpy_dtype(direct_get(TensorDtype.INT4)) == np.int8
+    if HAS_TORCH:
+        assert check_dependencies()["torch"] is True
+        assert get_torch_dtype(TensorDtype.FLOAT16) is not None
+        assert get_torch_dtype(TensorDtype.INT4) is None
+        assert get_torch_dtype(TensorDtype.AUTO) is None
+    else:
+        assert check_dependencies()["torch"] is False
+        try:
+            get_torch_dtype(TensorDtype.FLOAT16)
+            raise AssertionError("torch dtype without torch was accepted")
+        except ImportError as exc:
+            assert "torch" in str(exc)
+    print("  onnx dtype: float, float16, bfloat16, int8, int4")
+    print("hf integration: OK\n")
+    return True
+
+
 if __name__ == "__main__":
     print("\n" + "=" * 60)
     print("Pipeline Utils Module Tests")
@@ -7917,6 +7979,12 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"backend: FAILED - {e}")
         results.append(("backend", False))
+
+    try:
+        results.append(("hf_integration", test_hf_integration()))
+    except Exception as e:
+        print(f"hf_integration: FAILED - {e}")
+        results.append(("hf_integration", False))
     
     # Summary
     print("=" * 60)
