@@ -898,6 +898,10 @@ class SessionInfo:
         input_types: Dict of input name to ONNX type string
         output_types: Dict of output name to ONNX type string
         provider_used: Actual provider being used (only when loaded)
+        phase: Scheduler phase from the active execution plan
+        device_type: Device the plan assigned (npu, igpu, gpu, cpu)
+        resident: Whether the plan keeps this session loaded
+        scheduled_provider: Provider the plan resolved for this step
     """
     name: str
     file_path: str
@@ -908,6 +912,10 @@ class SessionInfo:
     input_types: Dict[str, str] = field(default_factory=dict)
     output_types: Dict[str, str] = field(default_factory=dict)
     provider_used: Optional[str] = None
+    phase: Optional[str] = None
+    device_type: Optional[str] = None
+    resident: bool = False
+    scheduled_provider: Optional[str] = None
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
@@ -922,7 +930,184 @@ class SessionInfo:
             "input_types": self.input_types,
             "output_types": self.output_types,
             "provider_used": self.provider_used,
+            "phase": self.phase,
+            "device_type": self.device_type,
+            "resident": self.resident,
+            "scheduled_provider": self.scheduled_provider,
         }
+
+
+# Phases a heterogeneous schedule can assign. Embedding is accepted because
+# the token path starts there; the other six are the scheduler's device phases.
+EXECUTION_PHASES = frozenset({
+    "prefill",
+    "decode",
+    "router",
+    "expert",
+    "norm",
+    "lm_head",
+    "embedding",
+})
+
+_IGPU_PROVIDER_MARKERS = ("rocm", "migraphx", "dml", "directml")
+_DISCRETE_GPU_MARKERS = ("cuda", "tensorrt")
+
+
+def device_type_for_provider(provider: Any) -> str:
+    """Return npu, igpu, gpu, cpu, or generic for a provider name."""
+    name = _provider_name(provider).lower()
+    if any(marker in name for marker in NPU_PROVIDER_MARKERS):
+        return "npu"
+    if any(marker in name for marker in _IGPU_PROVIDER_MARKERS):
+        return "igpu"
+    if any(marker in name for marker in _DISCRETE_GPU_MARKERS):
+        return "gpu"
+    if "cpu" in name:
+        return "cpu"
+    return "generic"
+
+
+def _coerce_phase(phase: Any) -> str:
+    """Normalize a phase name and reject ones the scheduler does not know."""
+    value = getattr(phase, "value", phase)
+    text = str(value).strip().lower()
+    if text not in EXECUTION_PHASES:
+        allowed = ", ".join(sorted(EXECUTION_PHASES))
+        raise ValueError(
+            f"Unknown execution phase '{phase}'. Expected one of: {allowed}"
+        )
+    return text
+
+
+def _step_targets_npu(step: "ExecutionStep") -> bool:
+    """True when the step is placed on an ahead-of-time NPU."""
+    return step.device_type == "npu" or provider_is_npu(step.provider)
+
+
+@dataclass
+class ExecutionStep:
+    """
+    One component in a heterogeneous run.
+
+    ``phase`` is prefill, decode, router, expert, norm, lm_head, or embedding.
+    ``depends_on`` names earlier steps. ``resident`` keeps the session loaded.
+    """
+
+    component_name: str
+    provider: str
+    device_type: str
+    phase: str
+    depends_on: List[str] = field(default_factory=list)
+    output_buffers: List[str] = field(default_factory=list)
+    resident: bool = True
+
+    def __post_init__(self) -> None:
+        self.component_name = str(self.component_name)
+        self.provider = _provider_name(self.provider)
+        self.device_type = str(self.device_type).strip().lower()
+        self.phase = _coerce_phase(self.phase)
+        self.depends_on = [str(name) for name in self.depends_on]
+        self.output_buffers = [str(name) for name in self.output_buffers]
+        self.resident = bool(self.resident)
+
+
+@dataclass
+class ExecutionPlan:
+    """
+    Ordered schedule for SessionManager.
+
+    Steps form a dependency graph. ``ordered_steps`` is the run order.
+    """
+
+    steps: List[ExecutionStep]
+    name: str = "model"
+
+    def validate(self) -> None:
+        """
+        Reject an empty plan, a repeated component, a bad device placement,
+        a missing dependency, or a cycle.
+        """
+        if not self.steps:
+            raise ValueError("Execution plan has no steps")
+        seen = set()
+        for step in self.steps:
+            if not step.component_name:
+                raise ValueError("Execution step is missing a component name")
+            if step.component_name in seen:
+                raise ValueError(
+                    f"Execution plan repeats component '{step.component_name}'"
+                )
+            seen.add(step.component_name)
+            expected = device_type_for_provider(step.provider)
+            if expected != "generic" and step.device_type != expected:
+                raise ValueError(
+                    f"Step '{step.component_name}' uses {step.provider}, "
+                    f"which is a {expected} provider, not '{step.device_type}'."
+                )
+            deduped: List[str] = []
+            for dependency in step.depends_on:
+                if dependency not in deduped:
+                    deduped.append(dependency)
+            step.depends_on = deduped
+            for buffer_name in step.output_buffers:
+                if not buffer_name.strip():
+                    raise ValueError(
+                        f"Step '{step.component_name}' has an empty output buffer"
+                    )
+        self.ordered_steps()
+
+    def ordered_steps(self) -> List[ExecutionStep]:
+        """
+        Return steps in dependency order.
+
+        Independent steps keep their declaration order.
+        """
+        by_name = {step.component_name: step for step in self.steps}
+        if len(by_name) != len(self.steps):
+            raise ValueError("Execution plan repeats a component name")
+        index = {
+            step.component_name: position
+            for position, step in enumerate(self.steps)
+        }
+        children: Dict[str, List[str]] = {name: [] for name in by_name}
+        indegree = {name: 0 for name in by_name}
+        for step in self.steps:
+            for dependency in step.depends_on:
+                if dependency not in by_name:
+                    raise ValueError(
+                        f"Step '{step.component_name}' depends on '{dependency}', "
+                        "which is not in the plan."
+                    )
+                if dependency == step.component_name:
+                    raise ValueError(
+                        f"Step '{step.component_name}' depends on itself"
+                    )
+                children[dependency].append(step.component_name)
+                indegree[step.component_name] += 1
+        ready = sorted(
+            [name for name, degree in indegree.items() if degree == 0],
+            key=lambda name: index[name],
+        )
+        ordered: List[ExecutionStep] = []
+        while ready:
+            name = ready.pop(0)
+            ordered.append(by_name[name])
+            released = []
+            for child in children[name]:
+                indegree[child] -= 1
+                if indegree[child] == 0:
+                    released.append(child)
+            released.sort(key=lambda child: index[child])
+            ready.extend(released)
+            ready.sort(key=lambda child: index[child])
+        if len(ordered) != len(by_name):
+            raise ValueError("Execution plan has a dependency cycle")
+        return ordered
+
+    def steps_for_phase(self, phase: str) -> List[ExecutionStep]:
+        """Return steps of one phase in run order."""
+        selected = _coerce_phase(phase)
+        return [step for step in self.ordered_steps() if step.phase == selected]
 
 
 # =============================================================================
@@ -946,6 +1131,7 @@ class SessionManager:
       unless the policy is phase-split or MoE expert routing
     - Select a ProviderProfile from the first execution provider that is
       installed in this ONNX Runtime build
+    - Run from an ExecutionPlan: dependency order, device, phase, and residency
     """
     
     def __init__(
@@ -986,6 +1172,8 @@ class SessionManager:
         self._session_info: Dict[str, SessionInfo] = {}
         self._lock = threading.Lock()
         self._policy_signature: Optional[Tuple[Any, ...]] = None
+        self.execution_plan: Optional[ExecutionPlan] = None
+        self._resolved_providers: Dict[str, str] = {}
         
         # Pre-populate session info (without loading)
         self._discover_sessions()
@@ -1044,12 +1232,18 @@ class SessionManager:
                 output_names=comp_info.get("output_names", []),
             )
     
-    def _load_single_session(self, name: str) -> Optional[ort.InferenceSession]:
+    def _load_single_session(
+        self,
+        name: str,
+        providers: Optional[List[Any]] = None,
+    ) -> Optional[ort.InferenceSession]:
         """
         Load a single ONNX session by component name.
         
         Args:
             name: Component name from model_info
+            providers: ORT provider list for this step. The manager list is
+                used when this is omitted.
             
         Returns:
             Loaded InferenceSession or None if failed
@@ -1069,12 +1263,13 @@ class SessionManager:
             opts = self.config.create_session_options(
                 cache_dir=self.provider_profile.cache_dir
             )
+            session_providers = providers if providers is not None else (
+                self.config.ort_providers(cache_dir=self.provider_profile.cache_dir)
+            )
             session = ort.InferenceSession(
                 info.file_path,
                 sess_options=opts,
-                providers=self.config.ort_providers(
-                    cache_dir=self.provider_profile.cache_dir
-                ),
+                providers=session_providers,
             )
             
             # Update session info with loaded details
@@ -1165,13 +1360,18 @@ class SessionManager:
             True if session was unloaded
         """
         with self._lock:
-            if name in self._sessions:
-                del self._sessions[name]
-                if name in self._session_info:
-                    self._session_info[name].is_loaded = False
-                    self._session_info[name].provider_used = None
-                return True
-            return False
+            return self._drop_session(name)
+
+    def _drop_session(self, name: str) -> bool:
+        """Unload one session. Caller holds ``self._lock``."""
+        removed = name in self._sessions
+        if removed:
+            del self._sessions[name]
+        info = self._session_info.get(name)
+        if info is not None:
+            info.is_loaded = False
+            info.provider_used = None
+        return removed
     
     def unload_all(self) -> int:
         """
@@ -1228,7 +1428,17 @@ class SessionManager:
             }
     
     def get_component_names(self) -> List[str]:
-        """Get all component names in execution order."""
+        """
+        Get component names in execution order.
+
+        An active execution plan supplies dependency order. Otherwise the
+        prefix heuristic orders embedding, layers, norm, and lm_head.
+        """
+        if self.execution_plan is not None:
+            return [
+                step.component_name
+                for step in self.execution_plan.ordered_steps()
+            ]
         # Try to return in logical order: other, embedding, layers, norm, lm_head
         names = list(self._session_info.keys())
         ordered = []
@@ -1247,6 +1457,146 @@ class SessionManager:
         
         return ordered
     
+    def load_from_plan(self, plan: ExecutionPlan) -> Dict[str, SessionInfo]:
+        """
+        Schedule and load sessions from an execution plan.
+
+        Resident steps are loaded in dependency order with that step's
+        provider. Non-resident steps are unloaded. The plan's device and
+        phase are recorded on each SessionInfo.
+        """
+        if not isinstance(plan, ExecutionPlan):
+            raise TypeError("load_from_plan expects an ExecutionPlan")
+        with self._lock:
+            plan.validate()
+            for step in plan.steps:
+                if step.component_name not in self._session_info:
+                    raise KeyError(
+                        f"Execution plan names '{step.component_name}', "
+                        "which is not in this model."
+                    )
+            self._install_available_providers()
+            self._enforce_execution_policy()
+            self._validate_plan_policy(plan)
+            ordered = plan.ordered_steps()
+            self.execution_plan = plan
+            self._resolved_providers = {}
+            loaded: Dict[str, SessionInfo] = {}
+            for step in ordered:
+                info = self._session_info[step.component_name]
+                session_providers = self._providers_for_step(step)
+                resolved_name = (
+                    _provider_name(session_providers[0])
+                    if session_providers else "CPUExecutionProvider"
+                )
+                self._resolved_providers[step.component_name] = resolved_name
+                info.phase = step.phase
+                info.device_type = step.device_type
+                info.resident = step.resident
+                info.scheduled_provider = resolved_name
+                if not step.resident:
+                    self._drop_session(step.component_name)
+                    loaded[step.component_name] = info
+                    continue
+                session = self._load_single_session(
+                    step.component_name,
+                    providers=session_providers,
+                )
+                if session is not None:
+                    self._sessions[step.component_name] = session
+                loaded[step.component_name] = info
+            return loaded
+
+    def execution_order(self) -> List[ExecutionStep]:
+        """Return the active plan in dependency order."""
+        if self.execution_plan is None:
+            raise RuntimeError("No execution plan is loaded")
+        return self.execution_plan.ordered_steps()
+
+    def sessions_for_phase(self, phase: str) -> List[ExecutionStep]:
+        """Return active-plan steps for one phase, in run order."""
+        if self.execution_plan is None:
+            raise RuntimeError("No execution plan is loaded")
+        return self.execution_plan.steps_for_phase(phase)
+
+    def placement(self, component_name: str) -> ExecutionStep:
+        """Return the plan step for a component."""
+        if self.execution_plan is None:
+            raise RuntimeError("No execution plan is loaded")
+        for step in self.execution_plan.steps:
+            if step.component_name == component_name:
+                return step
+        raise KeyError(f"Component '{component_name}' is not in the execution plan")
+
+    def resolved_provider(self, component_name: str) -> str:
+        """Return the provider that will run a planned step on this machine."""
+        if component_name not in self._resolved_providers:
+            raise KeyError(
+                f"Component '{component_name}' has no resolved provider"
+            )
+        return self._resolved_providers[component_name]
+
+    def _providers_for_step(self, step: ExecutionStep) -> List[Any]:
+        """
+        Build the ORT provider list for one step.
+
+        The step provider is filtered against the installed providers. CPU
+        is appended as the fallback. The manager's own provider list is
+        restored before this returns.
+        """
+        requested = [step.provider]
+        if _provider_name(step.provider) != "CPUExecutionProvider":
+            requested.append("CPUExecutionProvider")
+        available = self._available_providers
+        if available is None:
+            available = ort.get_available_providers()
+        kept, dropped = filter_session_providers(requested, available)
+        if dropped:
+            warnings.warn(
+                f"Step '{step.component_name}' dropped unavailable provider "
+                + ", ".join(dropped)
+                + ". Using "
+                + ", ".join(_provider_name(provider) for provider in kept)
+                + ".",
+                RuntimeWarning,
+                stacklevel=4,
+            )
+        saved = list(self.config.providers)
+        self.config.providers = list(kept)
+        try:
+            return self.config.ort_providers(
+                cache_dir=self.provider_profile.cache_dir
+            )
+        finally:
+            self.config.providers = saved
+
+    def _validate_plan_policy(self, plan: ExecutionPlan) -> None:
+        """
+        Check the plan shape against the configured execution policy.
+
+        Monolithic NPU runs get one NPU step. Phase-split needs prefill and
+        decode. MoE routing needs a router and an expert.
+        """
+        policy = self.config.resolved_execution_policy()
+        phases = {step.phase for step in plan.steps}
+        npu_steps = [step for step in plan.steps if _step_targets_npu(step)]
+        if policy == ExecutionPolicy.MONOLITHIC_ONLY and len(npu_steps) > 1:
+            raise RuntimeError(NPU_SEQUENTIAL_SPLIT_ERROR)
+        if policy in SEQUENTIAL_LAYER_SPLIT_POLICIES and npu_steps:
+            raise RuntimeError(NPU_SEQUENTIAL_SPLIT_ERROR)
+        if policy == ExecutionPolicy.HYBRID_NPU_IGPU_PHASE_SPLIT and (
+            "prefill" not in phases or "decode" not in phases
+        ):
+            raise ValueError(
+                "hybrid_npu_igpu_phase_split requires a prefill step and a decode step."
+            )
+        if policy == ExecutionPolicy.HYBRID_NPU_MOE_ROUTING and (
+            "router" not in phases or "expert" not in phases
+        ):
+            raise ValueError(
+                "hybrid_npu_moe_routing requires a router step and an expert step."
+            )
+
     def _prepare_profile_cache(self) -> None:
         """Create the compile-cache directory when this profile uses one."""
         profile = self.provider_profile
@@ -1345,6 +1695,8 @@ __all__ = [
     "SessionConfig",
     "SessionInfo",
     "ExecutionPolicy",
+    "ExecutionStep",
+    "ExecutionPlan",
     "ProviderProfile",
     # Functions
     "get_available_providers",
@@ -1362,4 +1714,5 @@ __all__ = [
     "PROVIDER_CATEGORIES",
     "NPU_SEQUENTIAL_SPLIT_ERROR",
     "NPU_PROVIDER_MARKERS",
+    "EXECUTION_PHASES",
 ]

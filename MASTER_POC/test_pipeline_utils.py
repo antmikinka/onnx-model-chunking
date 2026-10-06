@@ -162,6 +162,8 @@ def test_session_manager():
         SessionConfig,
         SessionInfo,
         ExecutionPolicy,
+        ExecutionPlan,
+        ExecutionStep,
         provider_profile_for,
         filter_session_providers,
         get_available_providers,
@@ -474,6 +476,186 @@ def test_session_manager():
     assert azure_dropped == ["VitisAIExecutionProvider"]
     print("  provider profiles: cpu arena, rocm hip, vitisai cache, directml, cuda stream")
     print(f"  available providers kept: {kept}")
+
+    def _plan_info(*names):
+        return {
+            "components": {
+                name: {"file": f"{name}.onnx", "input_names": [], "output_names": []}
+                for name in names
+            }
+        }
+
+    order_manager = SessionManager(
+        ".",
+        SessionConfig(
+            providers=["CPUExecutionProvider"],
+            execution_policy=ExecutionPolicy.SPLIT_CPU_MEMORY_OPTIMIZED,
+        ),
+        model_info=_plan_info("embedding", "norm", "lm_head", "other"),
+    )
+    assert order_manager.get_component_names() == ["other", "embedding", "norm", "lm_head"]
+    order_manager.load_from_plan(ExecutionPlan(steps=[
+        ExecutionStep("norm", "CPUExecutionProvider", "cpu", "norm", [], ["hidden"], True),
+        ExecutionStep(
+            "embedding", "CPUExecutionProvider", "cpu", "embedding",
+            ["norm"], ["tokens"], True,
+        ),
+        ExecutionStep(
+            "lm_head", "CPUExecutionProvider", "cpu", "lm_head",
+            ["embedding"], ["logits"], True,
+        ),
+    ]))
+    assert order_manager.get_component_names() == ["norm", "embedding", "lm_head"]
+    assert "other" not in order_manager.get_component_names()
+    assert order_manager.placement("lm_head").output_buffers == ["logits"]
+    assert order_manager.resolved_provider("norm") == "CPUExecutionProvider"
+
+    installed = [
+        "VitisAIExecutionProvider",
+        "DmlExecutionProvider",
+        "RyzenAIExecutionProvider",
+        "ROCmExecutionProvider",
+        "CPUExecutionProvider",
+    ]
+    phase_plan_manager = SessionManager(
+        ".",
+        SessionConfig(
+            providers=["VitisAIExecutionProvider", "DmlExecutionProvider", "CPUExecutionProvider"],
+            execution_policy=ExecutionPolicy.HYBRID_NPU_IGPU_PHASE_SPLIT,
+        ),
+        model_info=_plan_info("embedding", "prefill", "decode", "norm", "lm_head"),
+        available_providers=installed,
+    )
+    phase_plan_manager.load_from_plan(ExecutionPlan(steps=[
+        ExecutionStep("embedding", "CPUExecutionProvider", "cpu", "embedding", [], ["hidden"]),
+        ExecutionStep(
+            "prefill", "VitisAIExecutionProvider", "npu", "prefill",
+            ["embedding"], ["kv"], True,
+        ),
+        ExecutionStep(
+            "decode", "DmlExecutionProvider", "igpu", "decode",
+            ["prefill"], ["hidden"], True,
+        ),
+        ExecutionStep("norm", "CPUExecutionProvider", "cpu", "norm", ["decode"], ["hidden"]),
+        ExecutionStep(
+            "lm_head", "DmlExecutionProvider", "igpu", "lm_head",
+            ["norm"], ["logits"], True,
+        ),
+    ]))
+    assert [step.component_name for step in phase_plan_manager.execution_order()] == [
+        "embedding", "prefill", "decode", "norm", "lm_head",
+    ]
+    assert [step.component_name for step in phase_plan_manager.sessions_for_phase("prefill")] == ["prefill"]
+    assert phase_plan_manager.sessions_for_phase("decode")[0].device_type == "igpu"
+    assert phase_plan_manager.resolved_provider("prefill") == "VitisAIExecutionProvider"
+    assert phase_plan_manager.get_session_info("prefill").phase == "prefill"
+    assert phase_plan_manager.get_session_info("prefill").resident is True
+    assert phase_plan_manager.get_session_info("decode").device_type == "igpu"
+
+    moe_manager = SessionManager(
+        ".",
+        SessionConfig(
+            providers=["RyzenAIExecutionProvider", "ROCmExecutionProvider"],
+            execution_policy=ExecutionPolicy.HYBRID_NPU_MOE_ROUTING,
+        ),
+        model_info=_plan_info("router", "expert_0"),
+        available_providers=installed,
+    )
+    moe_manager._sessions["expert_0"] = object()
+    moe_manager._session_info["expert_0"].is_loaded = True
+    moe_manager.load_from_plan(ExecutionPlan(steps=[
+        ExecutionStep(
+            "router", "RyzenAIExecutionProvider", "npu", "router",
+            [], ["route"], True,
+        ),
+        ExecutionStep(
+            "expert_0", "ROCmExecutionProvider", "igpu", "expert",
+            ["router"], ["hidden"], False,
+        ),
+    ]))
+    assert "expert_0" not in moe_manager.get_loaded_sessions()
+    assert moe_manager.get_session_info("expert_0").resident is False
+    assert moe_manager.get_session_info("expert_0").is_loaded is False
+    assert moe_manager.get_session_info("router").resident is True
+    assert moe_manager.resolved_provider("expert_0") == "ROCmExecutionProvider"
+
+    multi_npu = SessionManager(
+        ".",
+        SessionConfig(
+            providers=["VitisAIExecutionProvider", "CPUExecutionProvider"],
+            execution_policy=ExecutionPolicy.MONOLITHIC_ONLY,
+        ),
+        model_info=_plan_info("prefill", "decode"),
+        available_providers=installed,
+    )
+    try:
+        multi_npu.load_from_plan(ExecutionPlan(steps=[
+            ExecutionStep("prefill", "VitisAIExecutionProvider", "npu", "prefill", [], ["kv"]),
+            ExecutionStep(
+                "decode", "VitisAIExecutionProvider", "npu", "decode",
+                ["prefill"], ["hidden"],
+            ),
+        ]))
+        raise AssertionError("two NPU steps were accepted in monolithic mode")
+    except RuntimeError as exc:
+        assert NPU_SEQUENTIAL_SPLIT_ERROR in str(exc)
+    assert multi_npu.execution_plan is None
+
+    incomplete = SessionManager(
+        ".",
+        SessionConfig(
+            providers=["VitisAIExecutionProvider", "CPUExecutionProvider"],
+            execution_policy=ExecutionPolicy.HYBRID_NPU_IGPU_PHASE_SPLIT,
+        ),
+        model_info=_plan_info("prefill"),
+        available_providers=installed,
+    )
+    try:
+        incomplete.load_from_plan(ExecutionPlan(steps=[
+            ExecutionStep("prefill", "VitisAIExecutionProvider", "npu", "prefill", [], ["kv"]),
+        ]))
+        raise AssertionError("phase split without decode was accepted")
+    except ValueError as exc:
+        assert "decode" in str(exc)
+
+    try:
+        ExecutionPlan(steps=[
+            ExecutionStep("prefill", "VitisAIExecutionProvider", "igpu", "prefill"),
+        ]).validate()
+        raise AssertionError("NPU provider was accepted as an iGPU step")
+    except ValueError as exc:
+        assert "npu" in str(exc)
+
+    try:
+        ExecutionPlan(steps=[
+            ExecutionStep("a", "CPUExecutionProvider", "cpu", "embedding", ["b"]),
+            ExecutionStep("b", "CPUExecutionProvider", "cpu", "norm", ["a"]),
+        ]).validate()
+        raise AssertionError("a dependency cycle was accepted")
+    except ValueError as exc:
+        assert "cycle" in str(exc)
+
+    fallback_manager = SessionManager(
+        ".",
+        SessionConfig(providers=["CPUExecutionProvider"]),
+        model_info=_plan_info("model"),
+        available_providers=["CPUExecutionProvider"],
+    )
+    with warnings.catch_warnings(record=True) as fallback_warnings:
+        warnings.simplefilter("always")
+        fallback_manager.load_from_plan(ExecutionPlan(steps=[
+            ExecutionStep("model", "VitisAIExecutionProvider", "npu", "prefill", [], ["kv"]),
+        ]))
+    assert fallback_manager.resolved_provider("model") == "CPUExecutionProvider"
+    assert any("model" in str(item.message) for item in fallback_warnings)
+    try:
+        fallback_manager.load_from_plan(ExecutionPlan(steps=[
+            ExecutionStep("missing", "CPUExecutionProvider", "cpu", "norm"),
+        ]))
+        raise AssertionError("unknown component was scheduled")
+    except KeyError:
+        pass
+    print("  execution plan: dependency order, phase split, MoE residency, monolithic NPU guard")
 
     print("session_manager module: OK\n")
     return True
