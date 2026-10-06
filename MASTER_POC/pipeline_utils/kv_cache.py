@@ -392,7 +392,9 @@ class KVCacheManager:
         batch_size: Batch size (default 1)
         backend: KVCacheBackend value
         max_seq_len: Preallocated sequence capacity, when the cache is static
-        current_seq_len: Tokens resident in the cache
+        current_seq_len: Write cursor. The next token is stored at this index.
+            ``advance_sequence_length``, ``truncate_to_length``, and
+            ``reserve`` move the cursor for a prefill/decode split.
         policy: KVCachePolicy. Dense keeps every token. Sliding window,
             paged blocks, and hybrid sparse keep a bounded working set
             inside the same allocation.
@@ -950,8 +952,174 @@ class KVCacheManager:
 
     @property
     def current_seq_len(self) -> int:
-        """Tokens written into the cache. The static buffer is not resized."""
+        """
+        Write cursor for the static buffer.
+
+        The next token is stored at ``cache[:, :, current_seq_len, :]``.
+        ``advance_sequence_length`` moves it forward after prefill or
+        decode has written that many tokens. ``truncate_to_length``
+        rewinds it. The buffer stays at ``max_seq_len``.
+        """
         return self.get_sequence_length()
+
+    def advance_sequence_length(self, num_tokens: int) -> int:
+        """
+        Move the write cursor forward by ``num_tokens``.
+
+        Prefill writes the prompt into the static buffer, then advances
+        by the prompt length. Decode writes one token at
+        ``current_seq_len`` and advances by 1. Every layer shares that
+        cursor. Returns the new length.
+
+        Raises:
+            ValueError: If ``num_tokens`` is negative, the cache is still
+                dynamic, the new length exceeds ``max_seq_len``, or a
+                layer would have to evict tokens to move the cursor.
+        """
+        with self._lock:
+            count = int(num_tokens)
+            if count < 0:
+                raise ValueError(f"num_tokens must be >= 0, got {count}")
+            self._require_static_cursor("advance_sequence_length")
+            current = int(self.current_seq_len)
+            new_len = current + count
+            self._require_cursor_room(new_len)
+            if count == 0 and all(
+                int(self._layer_len[layer]) == new_len for layer in range(self.num_layers)
+            ):
+                return new_len
+            self._set_shared_cursor(new_len)
+            return new_len
+
+    def truncate_to_length(self, length: int) -> int:
+        """
+        Rewind the write cursor to ``length``.
+
+        Speculative rejection and a shorter prefill use this. The
+        allocated buffer and its address stay in place. The attention
+        mask covers only the retained prefix. Returns the new length.
+
+        Raises:
+            ValueError: If ``length`` is negative, past ``current_seq_len``,
+                or past ``max_seq_len``, or the cache is still dynamic.
+        """
+        with self._lock:
+            target = int(length)
+            if target < 0:
+                raise ValueError(f"length must be >= 0, got {target}")
+            self._require_static_cursor("truncate_to_length")
+            if target > int(self.max_seq_len):
+                raise ValueError(
+                    f"sequence length {target} exceeds max_seq_len {self.max_seq_len}"
+                )
+            current = int(self.current_seq_len)
+            if target > current:
+                raise ValueError(
+                    f"truncate_to_length({target}) is past current_seq_len {current}"
+                )
+            self._require_cursor_room(target)
+            if target == current and all(
+                int(self._layer_len[layer]) == target for layer in range(self.num_layers)
+            ):
+                return target
+            self._set_shared_cursor(target)
+            return target
+
+    def reserve(self, max_length: int) -> int:
+        """
+        Make sure the static buffer can hold ``max_length`` tokens.
+
+        A dynamic CPU cache becomes static at that capacity and keeps
+        tokens already stored. A cache whose ``max_seq_len`` is already
+        at least ``max_length`` keeps that allocation, the write cursor,
+        and any OrtValue address. Returns the reserved capacity.
+
+        Raises:
+            ValueError: If ``max_length`` is not positive, or it is larger
+                than an existing ``max_seq_len``.
+        """
+        with self._lock:
+            limit = int(max_length)
+            if limit <= 0:
+                raise ValueError(f"max_length must be positive, got {limit}")
+            self._require_cursor_policy()
+            if self.max_seq_len is not None and int(self.max_seq_len) < limit:
+                raise ValueError(
+                    f"reserve({limit}) exceeds max_seq_len {self.max_seq_len}"
+                )
+            if self.uses_device_memory or self._binder is not None:
+                return int(self.max_seq_len)
+            if self._static and self.max_seq_len is not None and self._cache:
+                return int(self.max_seq_len)
+            snapshot = self._snapshot_prefix(limit)
+            shape = (
+                self.batch_size,
+                self.num_kv_heads,
+                limit,
+                self.head_dim,
+            )
+            self.max_seq_len = limit
+            self._static = True
+            self._cache = {}
+            for layer in range(self.num_layers):
+                self._cache[layer] = {
+                    "key": np.zeros(shape, dtype=self.dtype),
+                    "value": np.zeros(shape, dtype=self.dtype),
+                }
+            self._seq_len = 0
+            self._layer_len = [0] * self.num_layers
+            for layer, key_np, value_np in snapshot:
+                self.update_from_present(layer, key_np, value_np)
+            return int(self.max_seq_len)
+
+    def _require_static_cursor(self, method: str) -> None:
+        self._require_cursor_policy()
+        if not self._static or self.max_seq_len is None:
+            raise ValueError(
+                f"{method} needs a static cache. Call reserve(max_length) "
+                "before splitting prefill and decode."
+            )
+
+    def _require_cursor_policy(self) -> None:
+        for layer in range(self.num_layers):
+            policy = self.policy_for(layer)
+            if policy in (KVCachePolicy.PAGED_BLOCKS, KVCachePolicy.HYBRID_SPARSE):
+                raise ValueError(
+                    f"Layer {layer} uses {policy.value}. The write cursor is a "
+                    "dense or sliding prefix. Paged and hybrid sparse positions "
+                    "move inside update_from_present."
+                )
+
+    def _require_cursor_room(self, new_len: int) -> None:
+        if new_len > int(self.max_seq_len):
+            raise ValueError(
+                f"sequence length {new_len} exceeds max_seq_len {self.max_seq_len}"
+            )
+        for layer in range(self.num_layers):
+            if self.policy_for(layer) is not KVCachePolicy.SLIDING_WINDOW:
+                continue
+            cap = int(self.window_size)
+            if new_len > cap:
+                raise ValueError(
+                    f"Layer {layer}: length {new_len} exceeds the sliding_window "
+                    f"cursor cap {cap}. Eviction stays inside update_from_present."
+                )
+
+    def _set_shared_cursor(self, new_len: int) -> None:
+        """Publish one write cursor for every layer and refresh the mask."""
+        for layer in range(self.num_layers):
+            if (
+                self.policy_for(layer) is KVCachePolicy.DENSE_CONTIGUOUS
+                or self._seen[layer] <= new_len
+            ):
+                self._seen[layer] = new_len
+            self._layer_len[layer] = new_len
+            self._invalidate_quant(layer)
+        self._seq_len = int(new_len)
+        self._seen_published = max(self._seen) if self._seen else int(new_len)
+        self._mask_layer = 0
+        if self._binder is not None:
+            self._binder.set_valid_sequence_length(int(new_len), "kv")
 
     def sequence_length_scalar(self) -> np.ndarray:
         """

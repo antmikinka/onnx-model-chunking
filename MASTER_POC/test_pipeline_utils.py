@@ -1008,6 +1008,152 @@ def test_kv_cache():
     assert locked.get_sequence_length() == 0
     print("  lock: reentrant RLock around reset, update, inject, and extract")
 
+    cursor = KVCacheManager(
+        num_layers=2,
+        num_kv_heads=2,
+        head_dim=4,
+        dtype=np.float32,
+        max_seq_len=8,
+    )
+    cursor_key = cursor.get_past_tensors(0)[0]
+    assert cursor.reserve(8) == 8
+    assert cursor.reserve(4) == 8
+    assert cursor.get_past_tensors(0)[0] is cursor_key
+    assert cursor.current_seq_len == 0
+    assert cursor.max_seq_len == 8
+    prefill = np.arange(1 * 2 * 3 * 4, dtype=np.float32).reshape(1, 2, 3, 4)
+    cursor_key[:, :, :3, :] = prefill
+    cursor.get_past_tensors(0)[1][:, :, :3, :] = prefill + 1
+    cursor.get_past_tensors(1)[0][:, :, :3, :] = prefill
+    cursor.get_past_tensors(1)[1][:, :, :3, :] = prefill + 1
+    assert cursor.advance_sequence_length(3) == 3
+    assert cursor.current_seq_len == 3
+    assert cursor.layer_length(1) == 3
+    assert int(cursor.sequence_length_scalar()) == 3
+    cursor_mask = cursor.attention_mask()
+    assert int(cursor_mask[0, 2]) == 1
+    assert int(cursor_mask[0, 3]) == 0
+    cursor_key[:, :, 3, :] = 9
+    cursor.get_past_tensors(0)[1][:, :, 3, :] = 9
+    with cursor._lock:
+        assert cursor.advance_sequence_length(1) == 4
+    assert cursor.get_past_tensors(0)[0] is cursor_key
+    assert cursor.seen_tokens == 4
+    assert cursor.truncate_to_length(3) == 3
+    assert int(cursor.attention_mask()[0, 3]) == 0
+    decode_token = np.full((1, 2, 1, 4), 5, dtype=np.float32)
+    cursor.update_from_present(0, decode_token, decode_token)
+    assert cursor.current_seq_len == 4
+    assert cursor.layer_length(0) == 4
+    assert np.allclose(cursor.get_past_tensors(0)[0][:, :, 3, :], 5)
+    assert np.allclose(cursor.get_past_tensors(0)[0][:, :, :3, :], prefill)
+    try:
+        cursor.advance_sequence_length(5)
+        raise AssertionError("advance past max_seq_len was accepted")
+    except ValueError as exc:
+        assert "max_seq_len" in str(exc)
+    try:
+        cursor.truncate_to_length(cursor.current_seq_len + 1)
+        raise AssertionError("truncate past the cursor was accepted")
+    except ValueError as exc:
+        assert "current_seq_len" in str(exc)
+    try:
+        cursor.advance_sequence_length(-1)
+        raise AssertionError("negative advance was accepted")
+    except ValueError as exc:
+        assert "num_tokens" in str(exc)
+
+    dynamic_cursor = KVCacheManager(
+        num_layers=1,
+        num_kv_heads=2,
+        head_dim=4,
+        dtype=np.float32,
+    )
+    try:
+        dynamic_cursor.advance_sequence_length(1)
+        raise AssertionError("advance on a dynamic cache was accepted")
+    except ValueError as exc:
+        assert "reserve" in str(exc)
+    stored = np.arange(1 * 2 * 2 * 4, dtype=np.float32).reshape(1, 2, 2, 4)
+    dynamic_cursor.update_from_present(0, stored, stored + 1)
+    assert dynamic_cursor.reserve(8) == 8
+    assert dynamic_cursor.static
+    assert dynamic_cursor.current_seq_len == 2
+    assert dynamic_cursor.get_past_tensors(0)[0].shape[2] == 8
+    assert np.allclose(dynamic_cursor.get_past_tensors(0)[0][:, :, :2, :], stored)
+    reserved_key = dynamic_cursor.get_past_tensors(0)[0]
+    assert dynamic_cursor.reserve(8) is not None
+    assert dynamic_cursor.get_past_tensors(0)[0] is reserved_key
+    try:
+        dynamic_cursor.reserve(16)
+        raise AssertionError("reserve past max_seq_len was accepted")
+    except ValueError as exc:
+        assert "max_seq_len" in str(exc)
+
+    sliding_cursor = KVCacheManager(
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=4,
+        dtype=np.float32,
+        max_seq_len=8,
+        policy=KVCachePolicy.SLIDING_WINDOW,
+        window_size=4,
+    )
+    assert sliding_cursor.advance_sequence_length(4) == 4
+    try:
+        sliding_cursor.advance_sequence_length(1)
+        raise AssertionError("sliding advance past the window was accepted")
+    except ValueError as exc:
+        assert "sliding_window" in str(exc)
+    assert sliding_cursor.truncate_to_length(2) == 2
+
+    paged_cursor = KVCacheManager(
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=4,
+        dtype=np.float32,
+        max_seq_len=8,
+        policy=KVCachePolicy.PAGED_BLOCKS,
+        block_size=4,
+    )
+    try:
+        paged_cursor.advance_sequence_length(1)
+        raise AssertionError("paged advance was accepted")
+    except ValueError as exc:
+        assert "paged_blocks" in str(exc)
+
+    quant_cursor = KVCacheManager(
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=4,
+        dtype=np.float32,
+        kv_quantization="int8",
+        max_seq_len=4,
+    )
+    quant_token = np.ones((1, 1, 1, 4), dtype=np.float32)
+    quant_cursor.update_from_present(0, quant_token, quant_token)
+    quant_cursor.quantize_kv(0)
+    quant_cursor.advance_sequence_length(1)
+    assert np.isnan(quant_cursor.key_scale[0])
+
+    device_cursor = KVCacheManager(
+        num_layers=1,
+        num_kv_heads=2,
+        head_dim=4,
+        dtype=np.float16,
+        backend=KVCacheBackend.VITISAI,
+        max_seq_len=8,
+    )
+    device_ptr = int(device_cursor.get_device_tensors(0)[0].data_ptr())
+    assert device_cursor.reserve(8) == 8
+    device_cursor.advance_sequence_length(2)
+    device_cursor.truncate_to_length(1)
+    assert int(device_cursor.get_device_tensors(0)[0].data_ptr()) == device_ptr
+    assert device_cursor.current_seq_len == 1
+    assert int(device_cursor.attention_mask()[0, 0]) == 1
+    assert int(device_cursor.attention_mask()[0, 1]) == 0
+    print("  cursor: reserve, advance_sequence_length, truncate_to_length")
+
     print("kv_cache module: OK\n")
     return True
 
