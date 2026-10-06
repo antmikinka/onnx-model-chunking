@@ -417,7 +417,125 @@ def test_dtypes():
     assert pipeline_utils.bfloat16_to_uint16_view is bfloat16_to_uint16_view
     assert pipeline_utils.uint16_view_to_bfloat16 is uint16_view_to_bfloat16
     print("  bfloat16: uint16 transport, native view when a 16-bit dtype is present")
-    
+
+    overflow_i = np.array([100000, -100000, 3], dtype=np.int64)
+    with warnings.catch_warnings(record=True) as cast_warnings:
+        warnings.simplefilter("always")
+        wrapped = safe_cast(overflow_i, np.int16)
+    assert wrapped.dtype == np.dtype(np.int16)
+    assert wrapped.tolist() == overflow_i.astype(np.int16).tolist()
+    assert wrapped.tolist() != [32767, -32768, 3]
+    assert any("may lose precision" in str(item.message) for item in cast_warnings)
+    try:
+        safe_cast(np.array([100000], dtype=np.int64), np.int16, check_range=True, warn_on_precision_loss=False)
+        raise AssertionError("100000 does not fit in int16")
+    except ValueError as exc:
+        assert "100000" in str(exc)
+        assert "int16" in str(exc)
+        assert "out of range" in str(exc)
+    with warnings.catch_warnings(record=True) as sat_warnings:
+        warnings.simplefilter("always")
+        saturated = safe_cast(overflow_i, np.int16, saturate=True, warn_on_precision_loss=False)
+    assert saturated.tolist() == [32767, -32768, 3]
+    assert any("Saturating" in str(item.message) for item in sat_warnings)
+    inside = safe_cast(
+        np.array([32767, -32768], dtype=np.int64),
+        np.int16,
+        check_range=True,
+        warn_on_precision_loss=False,
+    )
+    assert inside.tolist() == [32767, -32768]
+    unsigned = safe_cast(
+        np.array([-1, 300], dtype=np.int16),
+        np.uint8,
+        saturate=True,
+        warn_on_precision_loss=False,
+    )
+    assert unsigned.tolist() == [0, 255]
+    wide_u = np.array([1 << 40], dtype=np.uint64)
+    try:
+        safe_cast(wide_u, np.int16, check_range=True, warn_on_precision_loss=False)
+        raise AssertionError("a uint64 above 32767 does not fit in int16")
+    except ValueError as exc:
+        assert "int16" in str(exc)
+    assert safe_cast(wide_u, np.int16, saturate=True, warn_on_precision_loss=False).tolist() == [32767]
+    assert safe_cast(np.array([4], dtype=np.uint64), np.int16, check_range=True).tolist() == [4]
+    empty_cast = safe_cast(
+        np.array([], dtype=np.int64),
+        np.int16,
+        check_range=True,
+        warn_on_precision_loss=False,
+    )
+    assert empty_cast.shape == (0,) and empty_cast.dtype == np.dtype(np.int16)
+    big_f = np.array([1e10, -1e10, 1.0], dtype=np.float32)
+    try:
+        safe_cast(big_f, np.float16, check_range=True, warn_on_precision_loss=False)
+        raise AssertionError("1e10 does not fit in float16")
+    except ValueError as exc:
+        assert "float16" in str(exc)
+        assert "out of range" in str(exc)
+    sat_f = safe_cast(big_f, np.float16, saturate=True, warn_on_precision_loss=False)
+    assert sat_f.dtype == np.dtype(np.float16)
+    assert sat_f[0] == np.finfo(np.float16).max
+    assert sat_f[1] == -np.finfo(np.float16).max
+    assert sat_f[2] == np.float16(1.0)
+    tiny_f = np.array([1e-20, -1e-20, 0.0], dtype=np.float32)
+    try:
+        safe_cast(tiny_f, np.float16, check_range=True, warn_on_precision_loss=False)
+        raise AssertionError("1e-20 underflows float16")
+    except ValueError as exc:
+        assert "float16" in str(exc)
+    sat_tiny = safe_cast(tiny_f, np.float16, saturate=True, warn_on_precision_loss=False)
+    sub = np.finfo(np.float16).smallest_subnormal
+    assert sat_tiny[0] == sub
+    assert sat_tiny[1] == -sub
+    assert sat_tiny[2] == np.float16(0.0)
+    kept_sub = safe_cast(
+        np.array([sub], dtype=np.float32),
+        np.float16,
+        check_range=True,
+        warn_on_precision_loss=False,
+    )
+    assert kept_sub[0] == np.float16(sub)
+    in_range_f = safe_cast(
+        np.array([1.5], dtype=np.float32),
+        np.float16,
+        check_range=True,
+        warn_on_precision_loss=False,
+    )
+    assert in_range_f.dtype == np.dtype(np.float16)
+    assert in_range_f[0] == np.float16(1.5)
+    try:
+        safe_cast(np.array([np.nan], dtype=np.float32), np.int16, check_range=True, warn_on_precision_loss=False)
+        raise AssertionError("NaN does not fit in int16")
+    except ValueError as exc:
+        assert "int16" in str(exc)
+    nan_sat = safe_cast(
+        np.array([np.nan, np.inf, -np.inf], dtype=np.float32),
+        np.int16,
+        saturate=True,
+        warn_on_precision_loss=False,
+    )
+    assert nan_sat.tolist() == [0, 32767, -32768]
+    try:
+        safe_cast(np.array([1e20], dtype=np.float64), np.int64, check_range=True, warn_on_precision_loss=False)
+        raise AssertionError("1e20 does not fit in int64")
+    except ValueError as exc:
+        assert "int64" in str(exc)
+    int64_sat = safe_cast(
+        np.array([1e20, -1e20], dtype=np.float64),
+        np.int64,
+        saturate=True,
+        warn_on_precision_loss=False,
+    )
+    assert int64_sat.dtype == np.dtype(np.int64)
+    assert np.all(np.isfinite(int64_sat.astype(np.float64)))
+    assert int64_sat[0] > 0 and int64_sat[1] < 0
+    same = safe_cast(np.array([100000], dtype=np.int64), np.int64, check_range=True)
+    assert same.tolist() == [100000]
+    assert pipeline_utils.safe_cast is safe_cast
+    print("  safe_cast: range check raises, saturate clamps")
+
     print("dtypes module: OK\n")
     return True
 

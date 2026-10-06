@@ -1004,27 +1004,155 @@ def numpy_dtype_from_onnx_element_type(element_type: int):
     return _materialize_mapped_dtype(result, f"tensor({result})")
 
 
+# Integers larger than this are not exact in float64.
+_EXACT_INT_IN_FLOAT64 = 1 << 53
+
+
+def _integer_outside(array: np.ndarray, lo: int, hi: int) -> np.ndarray:
+    """True where an integer array cannot fit in [lo, hi].
+
+    Bounds are applied only when they fit in the source dtype. Comparing a
+    uint8 value with 300 would otherwise wrap the bound and hide the overflow.
+    """
+    src = np.iinfo(array.dtype)
+    src_lo = int(src.min)
+    src_hi = int(src.max)
+    if hi >= src_hi:
+        above = np.zeros(array.shape, dtype=bool)
+    elif hi < src_lo:
+        above = np.ones(array.shape, dtype=bool)
+    else:
+        above = array > np.array(hi, dtype=array.dtype)
+    if lo <= src_lo:
+        below = np.zeros(array.shape, dtype=bool)
+    elif lo > src_hi:
+        below = np.ones(array.shape, dtype=bool)
+    else:
+        below = array < np.array(lo, dtype=array.dtype)
+    return above | below
+
+
+def _outside_target_range(array: np.ndarray, target: np.dtype) -> np.ndarray:
+    """Mask of values that overflow, underflow, or are not finite in ``target``."""
+    if array.size == 0:
+        return np.zeros(array.shape, dtype=bool)
+    if np.issubdtype(target, np.integer):
+        info = np.iinfo(target)
+        lo, hi = int(info.min), int(info.max)
+        if np.issubdtype(array.dtype, np.floating):
+            wide = np.asarray(array, dtype=np.float64)
+            if hi > _EXACT_INT_IN_FLOAT64:
+                # int64 and uint64 limits are not exact in float64.
+                above = wide >= np.float64(1 << 64) if hi >= (1 << 64) - 1 else wide >= np.float64(1 << 63)
+            else:
+                above = wide > hi
+            if lo < -_EXACT_INT_IN_FLOAT64:
+                below = wide < np.float64(-(1 << 63))
+            else:
+                below = wide < lo
+            return ~np.isfinite(wide) | above | below
+        if np.issubdtype(array.dtype, np.integer):
+            return _integer_outside(array, lo, hi)
+        return np.zeros(array.shape, dtype=bool)
+    if np.issubdtype(target, np.floating):
+        info = np.finfo(target)
+        if np.issubdtype(array.dtype, np.integer):
+            limit = float(info.max)
+            if limit >= int(np.iinfo(array.dtype).max):
+                return np.zeros(array.shape, dtype=bool)
+            bound = int(limit)
+            return _integer_outside(array, -bound, bound)
+        if np.issubdtype(array.dtype, np.floating):
+            finite = np.isfinite(array)
+            overflow = finite & ((array > info.max) | (array < -info.max))
+            sub = np.float64(info.smallest_subnormal)
+            magnitude = np.abs(np.asarray(array, dtype=np.float64))
+            underflow = finite & (array != 0) & (magnitude < sub)
+            return overflow | underflow
+    return np.zeros(array.shape, dtype=bool)
+
+
+def _saturate_to_integer(array: np.ndarray, target: np.dtype) -> np.ndarray:
+    """Clamp to the target integer limits, then cast."""
+    info = np.iinfo(target)
+    lo, hi = int(info.min), int(info.max)
+    if np.issubdtype(array.dtype, np.floating):
+        values = np.nan_to_num(
+            np.asarray(array, dtype=np.float64),
+            nan=0.0,
+            posinf=np.inf,
+            neginf=-np.inf,
+        )
+        if hi > _EXACT_INT_IN_FLOAT64:
+            ceiling = np.float64(1 << 64) if hi >= (1 << 64) - 1 else np.float64(1 << 63)
+            hi_f = np.nextafter(ceiling, np.float64(0.0))
+        else:
+            hi_f = np.float64(hi)
+        lo_f = np.float64(-(1 << 63)) if lo < -_EXACT_INT_IN_FLOAT64 else np.float64(lo)
+        return np.clip(values, lo_f, hi_f).astype(target)
+    if np.issubdtype(array.dtype, np.unsignedinteger):
+        src_hi = int(np.iinfo(array.dtype).max)
+        hi_fit = hi if hi < src_hi else src_hi
+        clipped = np.minimum(array, np.array(hi_fit, dtype=array.dtype))
+        if lo > 0:
+            clipped = np.maximum(clipped, np.array(min(lo, src_hi), dtype=array.dtype))
+        return clipped.astype(target)
+    src = np.iinfo(array.dtype)
+    lo_c = max(lo, int(src.min))
+    hi_c = min(hi, int(src.max))
+    return np.clip(array, lo_c, hi_c).astype(target)
+
+
+def _saturate_to_float(array: np.ndarray, target: np.dtype) -> np.ndarray:
+    """Clamp overflow to the finite maximum and underflow to the tiniest subnormal."""
+    info = np.finfo(target)
+    if np.issubdtype(array.dtype, np.integer):
+        limit = np.float64(info.max)
+        return np.clip(np.asarray(array, dtype=np.float64), -limit, limit).astype(target)
+    values = np.asarray(array, dtype=np.float64)
+    finite = np.isfinite(values)
+    clipped = np.clip(values, -np.float64(info.max), np.float64(info.max))
+    sub = np.float64(info.smallest_subnormal)
+    magnitude = np.abs(clipped)
+    tiny = finite & (magnitude > 0) & (magnitude < sub)
+    sign = np.where(clipped < 0, -1.0, 1.0)
+    clipped = np.where(tiny, sign * sub, clipped)
+    return clipped.astype(target)
+
+
 def safe_cast(
-    array: np.ndarray, 
+    array: np.ndarray,
     target_dtype: np.dtype,
-    warn_on_precision_loss: bool = True
+    warn_on_precision_loss: bool = True,
+    check_range: bool = False,
+    saturate: bool = False,
 ) -> np.ndarray:
     """
     Safely cast a numpy array to target dtype with optional precision warnings.
-    
+
     Args:
         array: Source numpy array
         target_dtype: Target numpy dtype
         warn_on_precision_loss: If True, warn when casting may lose precision
-        
+        check_range: If True, raise ValueError when a finite value overflows
+            or underflows the target, or when a non-finite value is cast to
+            an integer. NaN and inf are allowed when the target is floating.
+        saturate: If True, clamp out-of-range values into the target instead
+            of raising. Integer NaN becomes 0 and infinities become the limits.
+            Float underflow becomes the smallest subnormal of that sign.
+
     Returns:
         Array cast to target dtype
+
+    Raises:
+        ValueError: ``check_range`` is set and a value does not fit
     """
+    target_dtype = np.dtype(target_dtype)
     if array.dtype == target_dtype:
         return array
-    
+
     source_dtype = array.dtype
-    
+
     # Check for potential precision loss
     if warn_on_precision_loss:
         precision_loss_cases = [
@@ -1044,7 +1172,7 @@ def safe_cast(
             (np.float32, np.int32),
             (np.float16, np.int16),
         ]
-        
+
         for src, tgt in precision_loss_cases:
             if np.issubdtype(source_dtype, src) and target_dtype == tgt:
                 warnings.warn(
@@ -1052,7 +1180,33 @@ def safe_cast(
                     UserWarning
                 )
                 break
-    
+
+    if check_range or saturate:
+        outside = _outside_target_range(array, target_dtype)
+        if bool(outside.any()):
+            count = int(outside.sum())
+            if saturate:
+                warnings.warn(
+                    f"Saturating {count} value(s) into {target_dtype}",
+                    UserWarning,
+                )
+                if np.issubdtype(target_dtype, np.integer):
+                    return _saturate_to_integer(array, target_dtype)
+                if np.issubdtype(target_dtype, np.floating):
+                    return _saturate_to_float(array, target_dtype)
+            if check_range:
+                sample = np.asarray(array[outside]).reshape(-1)[0].item()
+                if np.issubdtype(target_dtype, np.integer):
+                    info = np.iinfo(target_dtype)
+                    lo, hi = int(info.min), int(info.max)
+                else:
+                    info = np.finfo(target_dtype)
+                    lo, hi = float(-info.max), float(info.max)
+                raise ValueError(
+                    f"safe_cast cannot represent {sample} as {target_dtype}; "
+                    f"range is [{lo}, {hi}] ({count} value(s) out of range)"
+                )
+
     return array.astype(target_dtype)
 
 
