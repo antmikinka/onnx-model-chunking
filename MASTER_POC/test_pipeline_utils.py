@@ -6275,6 +6275,31 @@ def test_backend():
         assert detect_model_format(bin_path) == ModelFormat.PYTORCH_BIN
         assert isinstance(get_backend_for_model(bin_path), TorchBackend)
         assert isinstance(get_backend_for_model(gguf_path), LlamaCppBackend)
+        from chunking_utils.common.types import ModelFormat as canonical_format
+        from chunking_utils import ModelFormat as package_format
+        from chunking_utils import auto_detect_format, split_model
+        assert ModelFormat is canonical_format is package_format
+        assert canonical_format.__module__ == "chunking_utils.common.types"
+        assert [item.value for item in ModelFormat] == [
+            "onnx",
+            "safetensors",
+            "gguf",
+            "pytorch_bin",
+        ]
+        assert not hasattr(ModelFormat, "PYTORCH")
+        assert ModelFormat.ONNX == "onnx"
+        assert ModelFormat.SAFETENSORS == "safetensors"
+        assert ModelFormat.GGUF == "gguf"
+        assert ModelFormat.PYTORCH_BIN == "pytorch_bin"
+        assert auto_detect_format(bin_path) is ModelFormat.PYTORCH_BIN
+        assert auto_detect_format(gguf_path) is ModelFormat.GGUF
+        assert auto_detect_format(safetensors_path) is ModelFormat.SAFETENSORS
+        assert auto_detect_format(weights_dir) is ModelFormat.SAFETENSORS
+        try:
+            split_model(gguf_path, gguf_dir)
+            raise AssertionError("a gguf file was sent to a splitter")
+        except ValueError as exc:
+            assert "gguf" in str(exc)
         empty_dir = tempfile.mkdtemp(prefix="empty-model-")
         try:
             detect_model_format(empty_dir)
@@ -6816,6 +6841,7 @@ def test_backend():
     print("  generate: split pipeline and monolithic prefill/decode")
     print("  providers: NPU, GPU, CPU, and auto-detect")
     print("  hybrid: prefill/decode, NPU layer range, MoE router and experts")
+    print("  model format: one enum for onnx, safetensors, gguf, pytorch_bin")
     print("backend module: OK\n")
     return True
 

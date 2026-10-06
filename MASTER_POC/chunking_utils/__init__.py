@@ -5,8 +5,10 @@ A unified package for splitting large language models into per-component
 files for efficient deployment, debugging, and modular inference.
 
 Supported Formats:
-    - SafeTensors (.safetensors) - HuggingFace model format
-    - ONNX (.onnx) - Open Neural Network Exchange format
+    - ONNX (.onnx)
+    - SafeTensors (.safetensors)
+    - GGUF (.gguf)
+    - PyTorch .bin (pytorch_bin)
 
 Supported Architectures:
     - LLaMA, Mistral, Phi, Gemma (LLaMA-style)
@@ -49,6 +51,8 @@ Merging:
     >>> merged_model = merge_onnx("./output/model")
 """
 
+import importlib
+
 # ==============================================================================
 # Common Types and Utilities
 # ==============================================================================
@@ -79,39 +83,43 @@ from .common.path_utils import (
     sanitize_model_name,
 )
 
-# ==============================================================================
-# SafeTensors Operations
-# ==============================================================================
+# SafeTensors and ONNX splitters import torch and onnx. They load on first use
+# so ModelFormat can be imported without those packages.
+_LAZY_EXPORTS = {
+    "split_safetensors": (".safetensors", "split_safetensors"),
+    "merge_safetensors": (".safetensors", "merge_safetensors"),
+    "load_state_dict": (".safetensors", "load_state_dict"),
+    "download_model": (".safetensors", "download_model"),
+    "stream_tensors": (".safetensors", "stream_tensors"),
+    "get_safetensors_files": (".safetensors", "get_safetensors_files"),
+    "find_complete_config": (".safetensors", "find_complete_config"),
+    "ensure_complete_config": (".safetensors", "ensure_complete_config"),
+    "detect_architecture_from_weights": (".safetensors", "detect_architecture_from_weights"),
+    "infer_safetensors": (".safetensors", "infer"),
+    "split_onnx": (".onnx", "split_onnx"),
+    "merge_onnx": (".onnx", "merge_onnx"),
+    "load_onnx_model": (".onnx", "load_onnx_model"),
+    "resolve_model_path": (".onnx", "resolve_model_path"),
+    "extract_components": (".onnx", "extract_components"),
+    "create_component_onnx": (".onnx", "create_component_onnx"),
+    "detect_architecture_from_onnx": (".onnx", "detect_architecture_from_onnx"),
+    "ComponentInfo": (".onnx", "ComponentInfo"),
+    "OnnxSplitResult": (".onnx", "OnnxSplitResult"),
+    "infer_onnx": (".onnx", "run_inference"),
+}
 
-from .safetensors import (
-    split_safetensors,
-    merge_safetensors,
-    load_state_dict,
-    download_model,
-    stream_tensors,
-    get_safetensors_files,
-    find_complete_config,
-    ensure_complete_config,
-    detect_architecture_from_weights,
-    infer as infer_safetensors,
-)
 
-# ==============================================================================
-# ONNX Operations
-# ==============================================================================
+def __getattr__(name):
+    """Import a splitter symbol the first time a caller asks for it."""
+    target = _LAZY_EXPORTS.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_name, attr = target
+    module = importlib.import_module(module_name, __package__)
+    value = getattr(module, attr)
+    globals()[name] = value
+    return value
 
-from .onnx import (
-    split_onnx,
-    merge_onnx,
-    load_onnx_model,
-    resolve_model_path,
-    extract_components,
-    create_component_onnx,
-    detect_architecture_from_onnx,
-    ComponentInfo,
-    OnnxSplitResult,
-    run_inference as infer_onnx,
-)
 
 # ==============================================================================
 # Convenience Functions
@@ -131,22 +139,22 @@ def auto_detect_format(model_path: str) -> ModelFormat:
     
     if model_path.endswith(".onnx"):
         return ModelFormat.ONNX
-    
-    if os.path.isdir(model_path):
-        # Check for ONNX files first
-        for f in os.listdir(model_path):
-            if f.endswith(".onnx"):
-                return ModelFormat.ONNX
-        # Default to SafeTensors for directories
-        return ModelFormat.SAFETENSORS
-    
-    # Check extension
+    if model_path.endswith(".gguf"):
+        return ModelFormat.GGUF
     if model_path.endswith(".safetensors"):
         return ModelFormat.SAFETENSORS
     if model_path.endswith(".bin"):
-        return ModelFormat.PYTORCH
+        return ModelFormat.PYTORCH_BIN
     
-    # Default to SafeTensors (works for HuggingFace model IDs)
+    if os.path.isdir(model_path):
+        names = os.listdir(model_path)
+        if any(name.endswith(".onnx") for name in names):
+            return ModelFormat.ONNX
+        if any(name.endswith(".gguf") for name in names):
+            return ModelFormat.GGUF
+        return ModelFormat.SAFETENSORS
+    
+    # HuggingFace model IDs have no local extension.
     return ModelFormat.SAFETENSORS
 
 
@@ -178,9 +186,12 @@ def split_model(
         format = auto_detect_format(model)
     
     if format == ModelFormat.ONNX:
-        return split_onnx(model=model, output=output, **kwargs)
-    else:
-        return split_safetensors(model=model, output=output, **kwargs)
+        return __getattr__("split_onnx")(model=model, output=output, **kwargs)
+    if format in (ModelFormat.SAFETENSORS, ModelFormat.PYTORCH_BIN):
+        return __getattr__("split_safetensors")(model=model, output=output, **kwargs)
+    raise ValueError(
+        f"No splitter for format {format.value}. Supported split formats are onnx and safetensors."
+    )
 
 
 # ==============================================================================

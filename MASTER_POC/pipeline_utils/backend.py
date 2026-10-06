@@ -32,6 +32,7 @@ import warnings
 import numpy as np
 
 from .kv_cache import KVCacheManager
+from chunking_utils.common.types import ModelFormat
 
 
 # =============================================================================
@@ -52,14 +53,6 @@ class DeviceType(Enum):
     GPU = "gpu"       # CUDA/ROCm/MPS
     NPU = "npu"       # VitisAI/OpenVINO/CoreML
     AUTO = "auto"     # Best available
-
-
-class ModelFormat(Enum):
-    """Model file formats."""
-    ONNX = "onnx"
-    GGUF = "gguf"
-    SAFETENSORS = "safetensors"
-    PYTORCH_BIN = "pytorch_bin"
 
 
 # Preference order for OnnxRuntimeBackend. AUTO is detected from this table.

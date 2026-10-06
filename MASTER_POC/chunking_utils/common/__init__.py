@@ -23,14 +23,26 @@ from .types import (
     SplitResult,
     MergeResult,
 )
-from .hf_integration import (
-    TORCH_DTYPE_MAP,
-    get_torch_dtype,
-    detect_architecture_hf,
-    get_model_config,
-    estimate_model_memory,
-    check_dependencies,
+
+_HF_EXPORTS = (
+    "TORCH_DTYPE_MAP",
+    "get_torch_dtype",
+    "detect_architecture_hf",
+    "get_model_config",
+    "estimate_model_memory",
+    "check_dependencies",
 )
+
+
+def __getattr__(name):
+    """Load HuggingFace helpers on first use so torch is not required to import types."""
+    if name in _HF_EXPORTS:
+        from . import hf_integration
+
+        value = getattr(hf_integration, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
     # Path utilities

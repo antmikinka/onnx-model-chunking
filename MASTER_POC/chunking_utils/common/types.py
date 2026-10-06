@@ -12,11 +12,14 @@ from dataclasses import dataclass, field
 
 class ModelFormat(str, Enum):
     """
-    Supported model formats for chunking operations.
+    Canonical model file formats for chunking and inference.
+
+    ONNX, SafeTensors, GGUF, and PyTorch ``.bin`` checkpoints share this enum.
     """
-    SAFETENSORS = "safetensors"
     ONNX = "onnx"
-    PYTORCH = "pytorch"  # .bin files
+    SAFETENSORS = "safetensors"
+    GGUF = "gguf"
+    PYTORCH_BIN = "pytorch_bin"
 
 
 class TensorDtype(str, Enum):
