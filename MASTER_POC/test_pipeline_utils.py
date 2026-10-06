@@ -172,7 +172,10 @@ def test_session_manager():
         validate_npu_execution_policy,
         NPU_SEQUENTIAL_SPLIT_ERROR,
         SUPPORTED_PROVIDERS,
+        ProviderCacheSpec,
     )
+    import os
+    import tempfile
     import warnings
     
     # Test available providers
@@ -1229,6 +1232,112 @@ def test_session_manager():
     except ValueError:
         pass
     print("  warmup: cold run excluded, then 2 warmup and 5 measured")
+
+    assert SessionConfig().enable_provider_cache is True
+    assert SessionConfig().profile_dir is None
+    with tempfile.TemporaryDirectory() as cache_root:
+        compile_dir = os.path.join(cache_root, "compile")
+        trace_dir = os.path.join(cache_root, "traces")
+        cached = SessionConfig(
+            providers=["VitisAIExecutionProvider", "CPUExecutionProvider"],
+            cache_dir=compile_dir,
+            enable_provider_cache=True,
+            enable_profiling=True,
+            profile_dir=trace_dir,
+        )
+        spec = cached.artifact_cache()
+        assert isinstance(spec, ProviderCacheSpec)
+        assert spec.enabled is True
+        assert spec.cache_dir == compile_dir
+        assert spec.xclbin_dir == os.path.join(compile_dir, "xclbin")
+        assert spec.vitisai_dir == os.path.join(compile_dir, "vitisai")
+        assert spec.profile_dir == trace_dir
+        assert spec.profiling is True
+        assert spec.logical_options == {"cache_dir": compile_dir, "enable_cache": True}
+        assert spec.provider_options["cacheDir"] == compile_dir
+        assert spec.provider_options["cacheKey"] == "vitisai"
+        assert "enable_cache" not in spec.provider_options
+        forwarded = cached.ort_providers()
+        assert forwarded[0][1]["cacheDir"] == compile_dir
+        assert forwarded[0][1]["cacheKey"] == "vitisai"
+        spec.ensure_directories()
+        assert os.path.isdir(spec.xclbin_dir)
+        assert os.path.isdir(spec.vitisai_dir)
+        profiled = cached.create_session_options()
+        assert profiled.enable_profiling is True
+        assert profiled.profile_file_prefix == os.path.join(trace_dir, "ort_profile")
+        assert os.path.isdir(trace_dir)
+
+        ryzen = SessionConfig(
+            providers=["RyzenAIExecutionProvider"],
+            cache_dir=compile_dir,
+            enable_provider_cache=True,
+        )
+        ryzen_options = ryzen.ort_providers()[0][1]
+        assert ryzen_options["cacheDir"] == compile_dir
+        assert ryzen_options["cacheKey"] == "ryzenai"
+        assert ryzen.artifact_cache().xclbin_dir.endswith(os.path.join("compile", "xclbin"))
+
+        disabled = SessionConfig(
+            providers=["VitisAIExecutionProvider"],
+            cache_dir=compile_dir,
+            enable_provider_cache=False,
+            enable_profiling=True,
+        )
+        quiet = disabled.artifact_cache()
+        assert quiet.enabled is False
+        assert quiet.cache_dir is None
+        assert quiet.logical_options["enable_cache"] is False
+        assert quiet.provider_options == {}
+        assert "cacheDir" not in disabled.ort_providers()[0][1]
+        assert "cacheKey" not in disabled.ort_providers()[0][1]
+        fallback_trace = os.path.join(cache_root, "unused-cache", "profiles")
+        disabled_options = disabled.create_session_options()
+        assert disabled_options.enable_profiling is True
+        assert disabled_options.profile_file_prefix == "onnxruntime_profile_"
+        assert not os.path.isdir(fallback_trace)
+
+        model_dir = os.path.join(cache_root, "model")
+        os.makedirs(model_dir)
+        caching_manager = SessionManager(
+            model_dir,
+            SessionConfig(
+                providers=["VitisAIExecutionProvider"],
+                enable_profiling=True,
+            ),
+            model_info={"components": {"model": {"file": "model.onnx"}}},
+            available_providers=["VitisAIExecutionProvider", "CPUExecutionProvider"],
+        )
+        managed = caching_manager.artifact_cache()
+        assert managed.cache_dir == os.path.join(model_dir, ".ort_cache")
+        assert managed.logical_options["enable_cache"] is True
+        assert managed.profile_dir == os.path.join(model_dir, ".ort_cache", "profiles")
+        caching_manager._prepare_profile_cache()
+        assert os.path.isdir(managed.xclbin_dir)
+        assert os.path.isdir(managed.profile_dir)
+        assignment = caching_manager.provider_assignment(
+            "model",
+            providers=["VitisAIExecutionProvider"],
+        )
+        assert assignment.provider_options[0]["cacheDir"] == managed.cache_dir
+
+        blocked = SessionManager(
+            model_dir,
+            SessionConfig(
+                providers=["RyzenAIExecutionProvider"],
+                cache_dir=compile_dir,
+                enable_provider_cache=False,
+            ),
+            model_info={"components": {"model": {"file": "model.onnx"}}},
+            available_providers=["RyzenAIExecutionProvider", "CPUExecutionProvider"],
+        )
+        assert blocked.provider_profile.cache_dir is None
+        assert blocked.artifact_cache().provider_options == {}
+        blocked_assignment = blocked.provider_assignment(
+            "model",
+            providers=["RyzenAIExecutionProvider"],
+        )
+        assert "cacheDir" not in blocked_assignment.provider_options[0]
 
     print("session_manager module: OK\n")
     return True

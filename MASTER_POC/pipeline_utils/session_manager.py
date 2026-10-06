@@ -637,12 +637,125 @@ def ep_provider_options(profile: ProviderProfile) -> Dict[str, str]:
         elif profile.device_type == "tensorrt":
             source["trt_engine_cache_enable"] = "1"
             source["trt_engine_cache_path"] = profile.cache_dir
+    elif not profile.enable_compile_cache:
+        for key in (
+            "cacheDir",
+            "cacheKey",
+            "cache_dir",
+            "trt_engine_cache_enable",
+            "trt_engine_cache_path",
+        ):
+            source.pop(key, None)
     options: Dict[str, str] = {}
     for key, value in source.items():
         if key not in allowed or value is None:
             continue
         options[key] = str(value)
     return options
+
+
+_CACHE_EP_KEYS = frozenset({
+    "cacheDir",
+    "cacheKey",
+    "cache_dir",
+    "trt_engine_cache_enable",
+    "trt_engine_cache_path",
+})
+
+
+@dataclass
+class ProviderCacheSpec:
+    """
+    Compile cache and ORT profile locations for one provider.
+
+    ``logical_options`` is the stable view (``cache_dir`` and ``enable_cache``).
+    ``provider_options`` is that view translated into the keys the selected
+    execution provider accepts. VitisAI and RyzenAI receive ``cacheDir`` and
+    ``cacheKey``. The XCLBIN and VitisAI directories sit under ``cache_dir``.
+    """
+
+    enabled: bool
+    cache_dir: Optional[str]
+    xclbin_dir: Optional[str]
+    vitisai_dir: Optional[str]
+    profile_dir: Optional[str]
+    profiling: bool
+    logical_options: Dict[str, Any] = field(default_factory=dict)
+    provider_options: Dict[str, str] = field(default_factory=dict)
+
+    def ensure_directories(self) -> None:
+        """Create the compile-cache and profile directories this spec names."""
+        if self.enabled and self.cache_dir:
+            os.makedirs(self.cache_dir, exist_ok=True)
+            if self.xclbin_dir:
+                os.makedirs(self.xclbin_dir, exist_ok=True)
+            if self.vitisai_dir:
+                os.makedirs(self.vitisai_dir, exist_ok=True)
+        if self.profiling and self.profile_dir:
+            os.makedirs(self.profile_dir, exist_ok=True)
+
+
+def provider_cache_spec(
+    profile: ProviderProfile,
+    *,
+    enabled: bool,
+    profiling: bool = False,
+    profile_dir: Optional[str] = None,
+) -> ProviderCacheSpec:
+    """
+    Describe where this provider should reuse compiled artifacts.
+
+    Caching is active only when the caller enabled it and the profile has a
+    directory. The logical options stay ``cache_dir`` and ``enable_cache``.
+    The forwarded options are whatever ``ep_provider_options`` keeps for a
+    compile cache.
+    """
+    active = bool(enabled and profile.enable_compile_cache and profile.cache_dir)
+    cache_dir = profile.cache_dir if active else None
+    npu = profile.device_type in {"vitisai", "ryzenai"}
+    xclbin_dir = os.path.join(cache_dir, "xclbin") if cache_dir and npu else None
+    vitisai_dir = os.path.join(cache_dir, "vitisai") if cache_dir and npu else None
+    resolved_profile = profile_dir if profiling else None
+    if profiling and not resolved_profile and cache_dir:
+        resolved_profile = os.path.join(cache_dir, "profiles")
+    forwarded = {
+        key: value
+        for key, value in ep_provider_options(profile).items()
+        if key in _CACHE_EP_KEYS
+    }
+    if not active:
+        forwarded = {}
+    return ProviderCacheSpec(
+        enabled=bool(enabled),
+        cache_dir=cache_dir,
+        xclbin_dir=xclbin_dir,
+        vitisai_dir=vitisai_dir,
+        profile_dir=resolved_profile,
+        profiling=bool(profiling),
+        logical_options={
+            "cache_dir": cache_dir,
+            "enable_cache": active,
+        },
+        provider_options=forwarded,
+    )
+
+
+def _apply_cache_switch(
+    profile: ProviderProfile,
+    *,
+    enabled: bool,
+    cache_dir: Optional[str],
+    overwrite: bool,
+) -> None:
+    """Turn compile caching on or off before provider options are built."""
+    if not enabled:
+        profile.enable_compile_cache = False
+        profile.cache_dir = None
+        return
+    if not cache_dir:
+        return
+    if overwrite or not profile.cache_dir:
+        profile.cache_dir = cache_dir
 
 
 @dataclass
@@ -706,6 +819,7 @@ def build_provider_assignment(
     *,
     available: Optional[Sequence[Any]] = None,
     cache_dir: Optional[str] = None,
+    enable_provider_cache: bool = True,
     append_cpu: bool = False,
     npu_graph_capture: bool = True,
     npu_compilation_mode: str = "default",
@@ -740,11 +854,17 @@ def build_provider_assignment(
     profiles: List[ProviderProfile] = []
     for name, embedded in kept:
         kwargs: Dict[str, Any] = {}
-        if cache_dir:
+        if cache_dir and enable_provider_cache:
             kwargs["cache_dir"] = cache_dir
         if embedded:
             kwargs["provider_options"] = embedded
         profile = provider_profile_for(name, **kwargs)
+        _apply_cache_switch(
+            profile,
+            enabled=enable_provider_cache,
+            cache_dir=cache_dir,
+            overwrite=False,
+        )
         if profile.device_type in {"vitisai", "ryzenai"}:
             if not npu_graph_capture:
                 profile.enable_graph_cache = False
@@ -872,8 +992,14 @@ class SessionConfig:
             0 uses the profile value.
         memory_limit_mb: Optional memory limit for the active device allocator.
         device_id: Optional device index override for the selected profile.
-        cache_dir: Optional compile-cache directory override.
-        enable_profiling: Enable ONNX Runtime profiling
+        cache_dir: Compile-cache directory. The manager uses
+            ``<model_dir>/.ort_cache`` when this is omitted and caching is on.
+        enable_provider_cache: Reuse compiled graphs across loads. VitisAI and
+            RyzenAI receive ``cacheDir`` and ``cacheKey`` when this is true
+            and a directory is set.
+        enable_profiling: Enable ONNX Runtime profiling.
+        profile_dir: Directory for the ORT profile trace. When omitted and
+            profiling is on, traces go under ``<cache_dir>/profiles``.
         graph_optimization_level: Enum for optimization level
         disable_shape_check: Disable node shape checking for dynamic shapes.
             AOT NPU profiles keep shape checking on.
@@ -903,7 +1029,9 @@ class SessionConfig:
     memory_limit_mb: Optional[int] = None
     device_id: Optional[int] = None
     cache_dir: Optional[str] = None
+    enable_provider_cache: bool = True
     enable_profiling: bool = False
+    profile_dir: Optional[str] = None
     disable_shape_check: bool = True  # Ignored for AOT NPU profiles
 
     # NPU-specific options (P1.2: NPU Session Options)
@@ -931,9 +1059,12 @@ class SessionConfig:
             profile.device_id = int(self.device_id)
             if "device_id" in profile.provider_options:
                 profile.provider_options["device_id"] = str(self.device_id)
-        chosen_cache = self.cache_dir or cache_dir
-        if chosen_cache and not profile.cache_dir:
-            profile.cache_dir = chosen_cache
+        _apply_cache_switch(
+            profile,
+            enabled=self.enable_provider_cache,
+            cache_dir=self.cache_dir or cache_dir,
+            overwrite=False,
+        )
         if profile.device_type in {"vitisai", "ryzenai"}:
             if not self.npu_graph_capture:
                 profile.enable_graph_cache = False
@@ -984,9 +1115,12 @@ class SessionConfig:
                     profile.provider_options["device_id"] = str(self.device_id)
             if self.memory_limit_mb is not None:
                 profile.memory_limit_mb = self.memory_limit_mb
-            chosen_cache = self.cache_dir or cache_dir
-            if chosen_cache:
-                profile.cache_dir = chosen_cache
+            _apply_cache_switch(
+                profile,
+                enabled=self.enable_provider_cache,
+                cache_dir=self.cache_dir or cache_dir,
+                overwrite=True,
+            )
             if profile.device_type in {"vitisai", "ryzenai"} and not self.npu_graph_capture:
                 profile.enable_graph_cache = False
             options = ep_provider_options(profile)
@@ -1053,8 +1187,11 @@ class SessionConfig:
             opts.add_session_config_entry("session.intra_op.allow_spinning", spin_value)
             opts.add_session_config_entry("session.inter_op.allow_spinning", spin_value)
 
+        profile_prefix = self._profile_file_prefix(profile)
         if self.enable_profiling:
             opts.enable_profiling = True
+            if profile_prefix:
+                opts.profile_file_prefix = profile_prefix
 
         if profile.device_type in _STATIC_SHAPE_DEVICES:
             if self.disable_shape_check:
@@ -1096,6 +1233,32 @@ class SessionConfig:
                 "vitisai.memory_limit_mb",
                 str(int(profile.memory_limit_mb)),
             )
+
+    def artifact_cache(self, cache_dir: Optional[str] = None) -> ProviderCacheSpec:
+        """
+        Return the compile-cache description for the selected provider.
+
+        The logical options are ``cache_dir`` and ``enable_cache``. The
+        provider-options dict is the translation for that provider.
+        """
+        return provider_cache_spec(
+            self.active_profile(cache_dir=cache_dir),
+            enabled=self.enable_provider_cache,
+            profiling=self.enable_profiling,
+            profile_dir=self.profile_dir,
+        )
+
+    def _profile_file_prefix(self, profile: ProviderProfile) -> Optional[str]:
+        """Directory prefix for an ORT profile trace, or None when unused."""
+        if not self.enable_profiling:
+            return None
+        directory = self.profile_dir
+        if not directory and self.enable_provider_cache and profile.cache_dir:
+            directory = os.path.join(profile.cache_dir, "profiles")
+        if not directory:
+            return None
+        os.makedirs(directory, exist_ok=True)
+        return os.path.join(directory, "ort_profile")
 
     def resolved_execution_policy(self) -> ExecutionPolicy:
         """Return ``execution_policy`` as an enum, accepting its string value."""
@@ -1835,6 +1998,7 @@ class SessionManager:
                 provider_options,
                 available=available,
                 cache_dir=cache_dir,
+                enable_provider_cache=self.config.enable_provider_cache,
                 append_cpu=False,
                 npu_graph_capture=self.config.npu_graph_capture,
                 npu_compilation_mode=self.config.npu_compilation_mode,
@@ -1850,6 +2014,7 @@ class SessionManager:
                     options,
                     available=available,
                     cache_dir=cache_dir,
+                    enable_provider_cache=self.config.enable_provider_cache,
                     append_cpu=append_cpu,
                     npu_graph_capture=self.config.npu_graph_capture,
                     npu_compilation_mode=self.config.npu_compilation_mode,
@@ -3077,11 +3242,28 @@ class SessionManager:
             elif tensor_name in output_names:
                 binding.bind_ortvalue_output(tensor_name, ort_value)
 
+    def artifact_cache(self) -> ProviderCacheSpec:
+        """
+        Compile cache for the installed provider profile.
+
+        An enabled cache with no configured directory uses
+        ``<model_dir>/.ort_cache``, which ``_install_available_providers``
+        already applied to ``provider_profile``.
+        """
+        profile = self.provider_profile.copy()
+        if not self.config.enable_provider_cache:
+            profile.enable_compile_cache = False
+            profile.cache_dir = None
+        return provider_cache_spec(
+            profile,
+            enabled=self.config.enable_provider_cache,
+            profiling=self.config.enable_profiling,
+            profile_dir=self.config.profile_dir,
+        )
+
     def _prepare_profile_cache(self) -> None:
-        """Create the compile-cache directory when this profile uses one."""
-        profile = self.provider_profile
-        if profile.cache_dir and (profile.enable_compile_cache or profile.enable_graph_cache):
-            os.makedirs(profile.cache_dir, exist_ok=True)
+        """Create the compile-cache and profile directories for this load."""
+        self.artifact_cache().ensure_directories()
 
     def _enforce_execution_policy(self) -> None:
         """
