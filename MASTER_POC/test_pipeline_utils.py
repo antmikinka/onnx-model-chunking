@@ -1994,6 +1994,24 @@ def test_config_loader():
     assert d["num_experts"] == 0
     assert d["attention_variant"] == "dense"
     assert d["architecture_extras"] == {}
+    assert config.kv_cache_dtype is None
+    assert config.kv_cache_layout == "BNSD"
+    assert config.kv_cache_max_len is None
+    assert config.kv_cache_page_size is None
+    assert config.use_sliding_window is False
+    assert d["kv_cache_dtype"] is None
+    assert d["kv_cache_layout"] == "BNSD"
+    assert d["kv_cache_max_len"] is None
+    try:
+        ModelConfig(num_layers=1, num_kv_heads=1, head_dim=8, kv_cache_max_len=0).validate()
+        raise AssertionError("a zero kv cache length must be rejected")
+    except ValueError as exc:
+        assert "kv_cache_max_len" in str(exc)
+    try:
+        ModelConfig(num_layers=1, num_kv_heads=1, head_dim=8, kv_cache_layout="").validate()
+        raise AssertionError("an empty kv layout must be rejected")
+    except ValueError as exc:
+        assert "kv_cache_layout" in str(exc)
     try:
         ModelConfig(num_layers=1, num_kv_heads=1, head_dim=8, num_experts=-1).validate()
         raise AssertionError("a negative expert count must be rejected")
@@ -2136,6 +2154,10 @@ def test_config_loader():
         assert genai.is_moe is False
         assert genai.attention_variant == "dense"
         assert genai.architecture_extras == {}
+        assert genai.kv_cache_dtype is None
+        assert genai.kv_cache_layout == "BNSD"
+        assert genai.kv_cache_max_len is None
+        assert genai.use_sliding_window is False
 
     with tempfile.TemporaryDirectory() as directory:
         _write_json(directory, "config.json", {
@@ -2924,12 +2946,139 @@ def test_config_loader():
         assert info_moe.architecture_extras["attention_type"] == "sparse"
         assert info_moe.architecture_extras["sliding_window"] == 1024
         assert info_moe.architecture_extras["use_sparse_attention"] is True
+        assert info_moe.use_sliding_window is True
+
+    with tempfile.TemporaryDirectory() as directory:
+        payload = dict(hf_base)
+        payload["max_position_embeddings"] = 4096
+        _write_json(directory, "config.json", payload)
+        context_only = load_model_config(directory)
+        assert context_only.max_seq_len == 4096
+        assert context_only.kv_cache_max_len is None
+        assert context_only.kv_cache_dtype is None
+        assert context_only.kv_cache_layout == "BNSD"
+        assert context_only.use_sliding_window is False
+    with tempfile.TemporaryDirectory() as directory:
+        payload = dict(hf_base)
+        payload.update({
+            "kv_cache_dtype": "float16",
+            "kv_cache_layout": "bnsd",
+            "kv_cache_max_len": 0,
+            "kv_cache_max_length": 32,
+            "kv_cache_page_size": 16,
+            "use_sliding_window": True,
+        })
+        _write_json(directory, "config.json", payload)
+        cached = load_model_config(directory)
+        assert cached.kv_cache_dtype == "fp16"
+        assert cached.kv_cache_layout == "BNSD"
+        assert cached.kv_cache_max_len == 32
+        assert cached.kv_cache_page_size == 16
+        assert cached.use_sliding_window is True
+        assert cached.to_dict()["kv_cache_layout"] == "BNSD"
+        from pipeline_utils.kv_cache import KVCacheManager
+        linked = KVCacheManager(
+            cached.num_layers,
+            cached.num_kv_heads,
+            cached.head_dim,
+            dtype=cached.dtype,
+            max_seq_len=cached.kv_cache_max_len,
+            kv_quantization=cached.kv_cache_dtype,
+            block_size=cached.kv_cache_page_size,
+            policy="sliding_window",
+            window_size=cached.kv_cache_max_len,
+        )
+        assert linked.max_seq_len == 32
+        assert linked.block_size == 16
+        assert linked.kv_quantization == "fp16"
+    with tempfile.TemporaryDirectory() as directory:
+        payload = dict(hf_base)
+        payload.update({"sliding_window": 4096, "use_sliding_window": False})
+        _write_json(directory, "config.json", payload)
+        forced = load_model_config(directory)
+        assert forced.attention_variant == "sliding_window"
+        assert forced.use_sliding_window is False
+    with tempfile.TemporaryDirectory() as directory:
+        payload = dict(hf_base)
+        payload["sliding_window"] = 2048
+        _write_json(directory, "config.json", payload)
+        implied = load_model_config(directory)
+        assert implied.use_sliding_window is True
+        assert implied.kv_cache_max_len is None
+    with tempfile.TemporaryDirectory() as directory:
+        payload = dict(hf_base)
+        payload["kv_cache_dtype"] = "nope"
+        _write_json(directory, "config.json", payload)
+        try:
+            load_model_config(directory)
+            raise AssertionError("an unknown kv cache dtype must be rejected")
+        except ValueError as exc:
+            assert "kv_cache_dtype" in str(exc)
+    with tempfile.TemporaryDirectory() as directory:
+        payload = dict(hf_base)
+        payload["kv_cache_page_size"] = -8
+        _write_json(directory, "config.json", payload)
+        try:
+            load_model_config(directory)
+            raise AssertionError("a negative kv page size must be rejected")
+        except ValueError as exc:
+            assert "kv_cache_page_size" in str(exc)
+    with tempfile.TemporaryDirectory() as directory:
+        payload = dict(hf_base)
+        payload["use_sliding_window"] = "yes"
+        _write_json(directory, "config.json", payload)
+        try:
+            load_model_config(directory)
+            raise AssertionError("a non-boolean sliding flag must be rejected")
+        except ValueError as exc:
+            assert "use_sliding_window" in str(exc)
+    with tempfile.TemporaryDirectory() as directory:
+        _write_json(directory, "genai_config.json", {
+            "model": {
+                "type": "llama",
+                "vocab_size": 10,
+                "decoder": {
+                    "num_hidden_layers": 3,
+                    "num_key_value_heads": 4,
+                    "head_size": 96,
+                    "hidden_size": 384,
+                    "num_attention_heads": 4,
+                    "kv_cache_dtype": "bf16",
+                    "kv_cache_layout": "BSHD",
+                    "kv_cache_max_len": 128,
+                },
+            },
+        })
+        genai_kv = load_model_config(directory)
+        assert genai_kv.kv_cache_dtype == "bf16"
+        assert genai_kv.kv_cache_layout == "BSHD"
+        assert genai_kv.kv_cache_max_len == 128
+        assert genai_kv.kv_cache_page_size is None
+    with tempfile.TemporaryDirectory() as directory:
+        _write_json(directory, "model_info.json", {
+            "num_layers": 4,
+            "num_kv_heads": 4,
+            "head_dim": 96,
+            "kv_cache": {
+                "dtype": "int8",
+                "layout": "bnsh",
+                "max_len": 64,
+                "block_size": 8,
+            },
+        })
+        info_kv = load_model_config(directory, require_all_fields=True)
+        assert info_kv.kv_cache_dtype == "int8"
+        assert info_kv.kv_cache_layout == "BNSD"
+        assert info_kv.kv_cache_max_len == 64
+        assert info_kv.kv_cache_page_size == 8
+        assert info_kv.use_sliding_window is False
 
     print("  kv shape: refuse silent 8/128, infer 4 x 96 from ONNX")
     print("  max_seq_len: max_position_embeddings, sequence aliases, unset stays 0")
     print("  quantization: AWQ, GPTQ, Quark, MatMulNBits, unset stays empty")
     print("  dtype: torch_dtype, dtype, decoder dtype, missing stays float16")
     print("  architecture: moe experts, hybrid attention, dense stays empty")
+    print("  kv cache: dtype, BNSD layout, max len, page size, sliding window")
     print("  onnx graph: layers, KV axes, dtype, present outputs, external data")
     print("config_loader module: OK\n")
     return True

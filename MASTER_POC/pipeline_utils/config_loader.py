@@ -57,6 +57,13 @@ class ModelConfig:
     num_experts_per_token: int = 0
     attention_variant: str = "dense"
     architecture_extras: Dict[str, Any] = field(default_factory=dict)
+    # None means the file did not name a KV cache dtype or capacity.
+    # BNSD is batch, heads, sequence, head dim, the layout kv_cache.py allocates.
+    kv_cache_dtype: Optional[str] = None
+    kv_cache_layout: str = "BNSD"
+    kv_cache_max_len: Optional[int] = None
+    kv_cache_page_size: Optional[int] = None
+    use_sliding_window: bool = False
     dtype: np.dtype = field(default_factory=lambda: np.dtype(np.float16))
     model_type: str = "unknown"
     
@@ -113,6 +120,36 @@ class ModelConfig:
             raise ValueError(
                 f"architecture_extras must be a dict, got {self.architecture_extras!r}"
             )
+        if self.kv_cache_dtype is not None and (
+            not isinstance(self.kv_cache_dtype, str) or not self.kv_cache_dtype.strip()
+        ):
+            raise ValueError(
+                f"kv_cache_dtype must be a dtype name, got {self.kv_cache_dtype!r}"
+            )
+        if not isinstance(self.kv_cache_layout, str) or not self.kv_cache_layout.strip():
+            raise ValueError(
+                f"kv_cache_layout must be a non-empty string, got {self.kv_cache_layout!r}"
+            )
+        if self.kv_cache_max_len is not None and (
+            isinstance(self.kv_cache_max_len, bool)
+            or not isinstance(self.kv_cache_max_len, int)
+            or self.kv_cache_max_len <= 0
+        ):
+            raise ValueError(
+                f"kv_cache_max_len must be positive, got {self.kv_cache_max_len!r}"
+            )
+        if self.kv_cache_page_size is not None and (
+            isinstance(self.kv_cache_page_size, bool)
+            or not isinstance(self.kv_cache_page_size, int)
+            or self.kv_cache_page_size <= 0
+        ):
+            raise ValueError(
+                f"kv_cache_page_size must be positive, got {self.kv_cache_page_size!r}"
+            )
+        if not isinstance(self.use_sliding_window, bool):
+            raise ValueError(
+                f"use_sliding_window must be a boolean, got {self.use_sliding_window!r}"
+            )
         if self.head_dim % 8 != 0:
             warnings.warn(f"head_dim {self.head_dim} is not divisible by 8, may be non-standard")
     
@@ -138,6 +175,11 @@ class ModelConfig:
             "num_experts_per_token": self.num_experts_per_token,
             "attention_variant": self.attention_variant,
             "architecture_extras": dict(self.architecture_extras),
+            "kv_cache_dtype": self.kv_cache_dtype,
+            "kv_cache_layout": self.kv_cache_layout,
+            "kv_cache_max_len": self.kv_cache_max_len,
+            "kv_cache_page_size": self.kv_cache_page_size,
+            "use_sliding_window": self.use_sliding_window,
             "dtype": str(self.dtype),
             "model_type": self.model_type,
             "source_file": self.source_file,
@@ -179,6 +221,7 @@ def _parse_genai_config(config: Dict[str, Any], source: str) -> Optional[ModelCo
                 max_seq_len=_max_seq_len_from(decoder, model, config),
                 **_quantization_from(decoder, model, config),
                 **_architecture_from(decoder, model, config),
+                **_kv_cache_from(decoder, model, config),
                 dtype=get_dtype_from_config(config),
                 source_file=source,
             )
@@ -222,6 +265,7 @@ def _parse_hf_config(config: Dict[str, Any], source: str) -> Optional[ModelConfi
                 max_seq_len=_max_seq_len_from(config),
                 **_quantization_from(config),
                 **_architecture_from(config),
+                **_kv_cache_from(config),
                 dtype=get_dtype_from_config(config),
                 source_file=source,
             )
@@ -790,6 +834,122 @@ def _architecture_from(*sources: Any) -> Dict[str, Any]:
     }
 
 
+_KV_DTYPE_ALIASES = {
+    "float16": "fp16",
+    "fp16": "fp16",
+    "half": "fp16",
+    "float32": "fp32",
+    "fp32": "fp32",
+    "float": "fp32",
+    "bfloat16": "bf16",
+    "bf16": "bf16",
+    "int8": "int8",
+    "uint8": "uint8",
+    "fp8": "fp8",
+    "float8": "fp8",
+    "int4": "int4",
+    "fp4": "fp4",
+}
+_KV_LAYOUT_ALIASES = {
+    "bnsd": "BNSD",
+    "bnsh": "BNSD",
+    "batch_heads_seq_dim": "BNSD",
+    "batch_num_seq_dim": "BNSD",
+}
+_KV_NESTED_KEYS = ("kv_cache", "kv_cache_config")
+_KV_MAX_LEN_KEYS = (
+    "kv_cache_max_len",
+    "kv_cache_max_length",
+    "max_cache_length",
+    "max_cache_len",
+)
+_KV_PAGE_KEYS = ("kv_cache_page_size", "kv_page_size", "page_size")
+
+
+def _kv_blocks(*sources: Any) -> list:
+    """Nested KV cache objects. A root dict is not one of them."""
+    blocks = []
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for key in _KV_NESTED_KEYS:
+            nested = source.get(key)
+            if isinstance(nested, dict):
+                blocks.append(nested)
+    return blocks
+
+
+def _kv_dtype_name(key: str, raw: Any) -> str:
+    """Return a cache scheme name ``kv_cache.py`` can store."""
+    token = _arch_token(raw)
+    if token is not None and token.startswith("torch."):
+        token = token[6:]
+    if token is None or token not in _KV_DTYPE_ALIASES:
+        raise ValueError(f"{key} {raw!r} is not a recognized kv cache dtype")
+    return _KV_DTYPE_ALIASES[token]
+
+
+def _kv_layout_name(key: str, raw: Any) -> str:
+    """Return BNSD for the layout ``kv_cache.py`` allocates, or the named layout."""
+    token = _arch_token(raw)
+    if token is None:
+        raise ValueError(f"{key} {raw!r} is not a recognized kv cache layout")
+    if token in _KV_LAYOUT_ALIASES:
+        return _KV_LAYOUT_ALIASES[token]
+    compact = token.replace("_", "")
+    if compact.isalpha():
+        return token.upper()
+    raise ValueError(f"{key} {raw!r} is not a recognized kv cache layout")
+
+
+def _kv_cache_from(*sources: Any) -> Dict[str, Any]:
+    """Read KV cache requirements. A file that names none keeps the defaults.
+
+    ``kv_cache_dtype`` is a scheme name such as fp16 or int8. ``kv_cache_layout``
+    stays BNSD, which is batch, heads, sequence, head dim. ``kv_cache_max_len``
+    is the cache capacity and is not copied from ``max_seq_len``. A positive
+    ``sliding_window`` turns on ``use_sliding_window`` unless the file sets
+    that flag false. ``kv_cache_page_size`` is the paged block size.
+    """
+    roots = [source for source in sources if isinstance(source, dict)]
+    nested = _kv_blocks(*sources)
+    searchable = roots + nested
+
+    dtype_key, dtype_raw = _first_present(
+        searchable, ("kv_cache_dtype", "cache_dtype", "kv_dtype", "past_kv_dtype")
+    )
+    if dtype_key is None:
+        dtype_key, dtype_raw = _first_present(nested, ("dtype",))
+    kv_dtype = None if dtype_key is None else _kv_dtype_name(dtype_key, dtype_raw)
+
+    layout_key, layout_raw = _first_present(
+        searchable, ("kv_cache_layout", "cache_layout", "kv_layout")
+    )
+    if layout_key is None:
+        layout_key, layout_raw = _first_present(nested, ("layout",))
+    layout = "BNSD" if layout_key is None else _kv_layout_name(layout_key, layout_raw)
+
+    _, max_len = _positive_int_from(searchable, _KV_MAX_LEN_KEYS)
+    if max_len == 0:
+        _, max_len = _positive_int_from(nested, ("max_len", "max_length"))
+    _, page = _positive_int_from(searchable, _KV_PAGE_KEYS)
+    if page == 0:
+        _, page = _positive_int_from(nested, ("block_size",))
+
+    _, sliding_flag = _optional_bool(searchable, ("use_sliding_window",))
+    _, sliding = _positive_int_from(searchable, ("sliding_window", "sliding_window_size"))
+    if sliding_flag is None:
+        sliding_flag = sliding > 0
+
+    return {
+        "kv_cache_dtype": kv_dtype,
+        "kv_cache_layout": layout,
+        "kv_cache_max_len": None if max_len == 0 else max_len,
+        "kv_cache_page_size": None if page == 0 else page,
+        "use_sliding_window": sliding_flag,
+    }
+
+
 def _read_field(sources: tuple, keys: tuple) -> Any:
     """Return the first present non-null value for ``keys``."""
     for source in sources:
@@ -1037,6 +1197,7 @@ def _parse_model_info(
         max_seq_len=_max_seq_len_from(*sources),
         **_quantization_from(*sources),
         **_architecture_from(*sources),
+        **_kv_cache_from(*sources),
         dtype=get_dtype_from_config(config),
         model_type=str(config.get("strategy", config.get("model_type", "unknown"))),
         source_file=source,
@@ -1069,6 +1230,9 @@ def load_model_config(
     Dense checkpoints leave ``is_moe`` false, ``num_experts`` 0, and
     ``attention_variant`` dense. Mixture-of-experts counts and hybrid
     attention keys are stored on those fields and in ``architecture_extras``.
+    KV cache metadata stays at ``kv_cache_dtype`` none, layout ``BNSD``, and
+    no max length until the file names them. ``kv_cache_max_len`` is the
+    capacity passed to the KV cache. It is separate from ``max_seq_len``.
     
     Args:
         model_dir: Directory containing model/config files

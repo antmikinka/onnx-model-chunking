@@ -185,10 +185,19 @@ class SequentialModelPipeline:
                     f", moe experts {getattr(self.config, 'num_experts', 0)}"
                     f" per_token {getattr(self.config, 'num_experts_per_token', 0)}"
                 )
+            kv_note = ""
+            kv_dtype_name = getattr(self.config, "kv_cache_dtype", None)
+            if isinstance(kv_dtype_name, str) and kv_dtype_name:
+                kv_note += f", kv {kv_dtype_name}"
+            kv_layout = getattr(self.config, "kv_cache_layout", "BNSD")
+            if isinstance(kv_layout, str) and kv_layout and kv_layout != "BNSD":
+                kv_note += f", kv layout {kv_layout}"
+            if getattr(self.config, "use_sliding_window", False) is True:
+                kv_note += ", sliding kv"
             self._log(
                 f"  [Config] {self.config.num_layers} layers, {self.config.num_kv_heads} KV heads, "
                 f"{self.config.head_dim} head dim, max_seq_len {self.config.max_seq_len}"
-                f"{quant_note}{arch_note}"
+                f"{quant_note}{arch_note}{kv_note}"
             )
         except FileNotFoundError:
             self._log("  [Warning] No config found, using defaults (may be incorrect)")
@@ -199,20 +208,55 @@ class SequentialModelPipeline:
                 source_file="defaults"
             )
         
-        # Initialize KV cache manager. A positive max_seq_len preallocates
-        # the static buffer once; 0 leaves the cache to grow per token.
+        # Initialize KV cache manager. A positive kv_cache_max_len, or else
+        # max_seq_len, preallocates the static buffer once. 0 leaves a CPU
+        # cache to grow per token. BNSD is the layout this manager allocates.
         raw_limit = getattr(self.config, "max_seq_len", 0)
         try:
             max_seq_len = int(raw_limit)
         except (TypeError, ValueError):
             max_seq_len = 0
+        raw_kv_limit = getattr(self.config, "kv_cache_max_len", None)
+        if (
+            isinstance(raw_kv_limit, int)
+            and not isinstance(raw_kv_limit, bool)
+            and raw_kv_limit > 0
+        ):
+            max_seq_len = raw_kv_limit
+        kv_kwargs = {}
+        if max_seq_len > 0:
+            kv_kwargs["max_seq_len"] = max_seq_len
+        kv_scheme = getattr(self.config, "kv_cache_dtype", None)
+        if isinstance(kv_scheme, str) and kv_scheme in {
+            "fp16", "bf16", "int8", "fp8", "int4", "fp4",
+        }:
+            kv_kwargs["kv_quantization"] = kv_scheme
+        page = getattr(self.config, "kv_cache_page_size", None)
+        if isinstance(page, int) and not isinstance(page, bool) and page > 0:
+            kv_kwargs["block_size"] = page
+        if getattr(self.config, "use_sliding_window", False) is True:
+            window = None
+            extras = getattr(self.config, "architecture_extras", None)
+            if isinstance(extras, dict):
+                raw_window = extras.get("sliding_window")
+                if (
+                    isinstance(raw_window, int)
+                    and not isinstance(raw_window, bool)
+                    and raw_window > 0
+                ):
+                    window = raw_window
+            if window is None and max_seq_len > 0:
+                window = max_seq_len
+            if isinstance(window, int) and window > 0:
+                kv_kwargs["policy"] = "sliding_window"
+                kv_kwargs["window_size"] = window
         self.kv_cache = KVCacheManager(
             num_layers=self.config.num_layers,
             num_kv_heads=self.config.num_kv_heads,
             head_dim=self.config.head_dim,
             dtype=self.config.dtype,
             batch_size=1,
-            **({"max_seq_len": max_seq_len} if max_seq_len > 0 else {}),
+            **kv_kwargs,
         )
         
         # Session management
