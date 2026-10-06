@@ -1952,7 +1952,11 @@ def test_config_loader():
     print("Testing config_loader module...")
     print("=" * 50)
     
-    from pipeline_utils.config_loader import ModelConfig, load_model_config
+    from pipeline_utils.config_loader import (
+        ModelConfig,
+        load_model_config,
+        validate_config_against_onnx,
+    )
     
     # Test ModelConfig dataclass
     config = ModelConfig(
@@ -1978,7 +1982,9 @@ def test_config_loader():
     import warnings
 
     from pipeline_utils import load_model_config as exported_loader
+    from pipeline_utils import validate_config_against_onnx as exported_validate
     assert exported_loader is load_model_config
+    assert exported_validate is validate_config_against_onnx
 
     def _write_json(directory, name, payload):
         path = os.path.join(directory, name)
@@ -2008,7 +2014,7 @@ def test_config_loader():
         data = payload.encode() if isinstance(payload, str) else payload
         return _proto_key(field, 2) + _encode_varint(len(data)) + data
 
-    def _write_past_key_onnx(path, shapes):
+    def _write_past_key_onnx(path, shapes, elem=1, external=None, present=True):
         def dim(item):
             if isinstance(item, int):
                 return _proto_bytes(1, _proto_int(1, item))
@@ -2016,7 +2022,7 @@ def test_config_loader():
 
         def value_info(name, dims):
             shape = b"".join(dim(item) for item in dims)
-            tensor = _proto_int(1, 1) + _proto_bytes(2, shape)
+            tensor = _proto_int(1, elem) + _proto_bytes(2, shape)
             return _proto_bytes(1, name) + _proto_bytes(2, _proto_bytes(1, tensor))
 
         def node(op_type, inputs, outputs):
@@ -2026,11 +2032,21 @@ def test_config_loader():
             return body
 
         graph = _proto_bytes(2, "g")
+        if external:
+            entry = _proto_bytes(1, "location") + _proto_bytes(2, external)
+            initializer = (
+                _proto_int(1, 1)
+                + _proto_int(2, elem)
+                + _proto_bytes(8, "weights")
+                + _proto_bytes(13, entry)
+                + _proto_int(14, 1)
+            )
+            graph += _proto_bytes(5, initializer)
         for name, dims in shapes:
-            present = "present_" + name.replace(".", "_")
-            graph += _proto_bytes(1, node("Identity", [name], [present]))
+            output = ("present_" if present else "hidden_") + name.replace(".", "_")
+            graph += _proto_bytes(1, node("Identity", [name], [output]))
             graph += _proto_bytes(11, value_info(name, dims))
-            graph += _proto_bytes(12, value_info(present, dims))
+            graph += _proto_bytes(12, value_info(output, dims))
         model = _proto_int(1, 8) + _proto_bytes(7, graph) + _proto_bytes(8, _proto_int(2, 13))
         with open(path, "wb") as handle:
             handle.write(model)
@@ -2217,7 +2233,146 @@ def test_config_loader():
         except ValueError as exc:
             assert "missing num_kv_heads, head_dim" in str(exc)
 
+    kv_shapes = [
+        ("past_key_values.0.key", [1, 4, "seq", 96]),
+        ("past_key_values.0.value", [1, 4, "seq", 96]),
+    ]
+
+    def _matching_config(**overrides):
+        fields = dict(num_layers=2, num_kv_heads=4, head_dim=96, dtype=np.float16)
+        fields.update(overrides)
+        return ModelConfig(**fields)
+
+    def _write_split(directory, shapes=None, elem=10, external="weights.onnx.data", present=True):
+        shapes = kv_shapes if shapes is None else shapes
+        _write_past_key_onnx(
+            os.path.join(directory, "embeddings.onnx"),
+            [("hidden", [1, "seq", 384])],
+            elem=1,
+        )
+        for index in (0, 1):
+            _write_past_key_onnx(
+                os.path.join(directory, f"layer_{index}.onnx"),
+                shapes,
+                elem=elem,
+                external=external if index == 0 else None,
+                present=present,
+            )
+        if external:
+            with open(os.path.join(directory, external), "wb") as handle:
+                handle.write(b"\x00\x00")
+        _write_json(directory, "model_info.json", {
+            "num_layers": 2,
+            "architecture": "llama",
+            "components": {
+                "embedding": {"type": "embedding", "file": "embeddings.onnx"},
+                "layer_0": {"type": "layer", "layer_id": 0, "file": "layer_0.onnx"},
+                "layer_1": {"type": "layer", "layer_id": 1, "file": "layer_1.onnx"},
+                "norm": {"type": "norm", "file": "norm.onnx"},
+            },
+        })
+
+    with tempfile.TemporaryDirectory() as directory:
+        _write_split(directory)
+        report = validate_config_against_onnx(_matching_config(), directory)
+        assert report["num_layers"] == 2
+        assert report["layer_components"] == ["layer_0", "layer_1"]
+        assert report["num_kv_heads"] == 4
+        assert report["head_dim"] == 96
+        assert report["dtype"] == np.dtype(np.float16)
+        assert report["onnx_dtype"] == "tensor(float16)"
+        assert "past_key_values.0.key" in report["past_key_values"]
+        assert "past_key_values.0.value" in report["past_key_values"]
+        assert any("present" in name and name.endswith("key") for name in report["present_outputs"])
+        assert any(name.endswith("value") for name in report["present_outputs"])
+        assert report["external_data"] == ["weights.onnx.data"]
+        assert any(
+            item["name"] == "hidden" and item["dtype"] == "tensor(float)"
+            for item in report["inputs"]
+        )
+        assert any(
+            item["name"] == "past_key_values.0.key" and item["shape"][1] == 4 and item["shape"][3] == 96
+            for item in report["inputs"]
+        )
+
+    def _expect_mismatch(directory, config, text):
+        try:
+            validate_config_against_onnx(config, directory)
+            raise AssertionError(f"expected mismatch containing {text}")
+        except ValueError as exc:
+            message = str(exc)
+            assert "does not match" in message
+            assert text in message
+            return message
+
+    with tempfile.TemporaryDirectory() as directory:
+        _write_split(directory)
+        _expect_mismatch(directory, _matching_config(num_layers=3), "num_layers 3 != 2")
+        _expect_mismatch(directory, _matching_config(num_kv_heads=8), "num_kv_heads 8 != 4")
+        _expect_mismatch(directory, _matching_config(head_dim=128), "head_dim 128 != 96")
+        _expect_mismatch(directory, _matching_config(dtype=np.float32), "dtype float32 != tensor(float16)")
+        os.remove(os.path.join(directory, "weights.onnx.data"))
+        _expect_mismatch(directory, _matching_config(), "missing external data weights.onnx.data")
+        os.remove(os.path.join(directory, "layer_1.onnx"))
+        _expect_mismatch(directory, _matching_config(), "layer component layer_1 is missing layer_1.onnx")
+
+    with tempfile.TemporaryDirectory() as directory:
+        _write_split(directory, present=False)
+        _expect_mismatch(
+            directory,
+            _matching_config(),
+            "has a past key input and no present key output",
+        )
+
+    with tempfile.TemporaryDirectory() as directory:
+        _write_split(directory, shapes=[
+            ("past_key_values.0.key", [1, 4, "seq", "head_dim"]),
+            ("past_key_values.0.value", [1, 4, "seq", "head_dim"]),
+        ])
+        _expect_mismatch(directory, _matching_config(), "head_dim is symbolic")
+
+    with tempfile.TemporaryDirectory() as directory:
+        _write_split(directory)
+        _write_past_key_onnx(
+            os.path.join(directory, "layer_1.onnx"),
+            [("past_key_values.0.key", [1, 2, "seq", 96]),
+             ("past_key_values.0.value", [1, 2, "seq", 96])],
+            elem=10,
+        )
+        _expect_mismatch(directory, _matching_config(), "num_kv_heads 2 from")
+
+    with tempfile.TemporaryDirectory() as directory:
+        _write_past_key_onnx(os.path.join(directory, "model.onnx"), [
+            ("past_key_values.0.key", [1, 4, "seq", 96]),
+            ("past_key_values.0.value", [1, 4, "seq", 96]),
+            ("past_key_values.1.key", [1, 4, "seq", 96]),
+            ("past_key_values.1.value", [1, 4, "seq", 96]),
+        ], elem=10)
+        monolithic = validate_config_against_onnx(_matching_config(), directory)
+        assert monolithic["num_layers"] == 2
+        assert monolithic["layer_components"] == ["past_key_0", "past_key_1"]
+        assert monolithic["num_kv_heads"] == 4
+        assert monolithic["head_dim"] == 96
+
+    with tempfile.TemporaryDirectory() as directory:
+        try:
+            validate_config_against_onnx(_matching_config(), directory)
+            raise AssertionError("an empty directory has no ONNX graph")
+        except ValueError as exc:
+            assert "No ONNX graph" in str(exc)
+    try:
+        validate_config_against_onnx(_matching_config(), os.path.join(tempfile.gettempdir(), "missing-model-dir"))
+        raise AssertionError("a missing directory should raise")
+    except FileNotFoundError as exc:
+        assert "model directory not found" in str(exc)
+    try:
+        validate_config_against_onnx({"num_layers": 2}, tempfile.gettempdir())
+        raise AssertionError("a plain dict is not a ModelConfig")
+    except TypeError as exc:
+        assert "ModelConfig" in str(exc)
+
     print("  kv shape: refuse silent 8/128, infer 4 x 96 from ONNX")
+    print("  onnx graph: layers, KV axes, dtype, present outputs, external data")
     print("config_loader module: OK\n")
     return True
 

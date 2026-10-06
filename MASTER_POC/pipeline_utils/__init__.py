@@ -85,6 +85,7 @@ from .kv_cache import (
 from .config_loader import (
     ModelConfig,
     load_model_config,
+    validate_config_against_onnx,
     get_dtype_from_config,
 )
 
@@ -248,6 +249,7 @@ __all__ = [
     # config_loader exports
     "ModelConfig",
     "load_model_config",
+    "validate_config_against_onnx",
     "get_dtype_from_config",
     # session_manager exports
     "SessionManager",

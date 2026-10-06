@@ -14,6 +14,7 @@ Usage:
 
 import json
 import os
+import re
 import warnings
 from dataclasses import dataclass, field
 from typing import Optional, Any, Dict
@@ -156,6 +157,9 @@ def _parse_hf_config(config: Dict[str, Any], source: str) -> Optional[ModelConfi
 # ``require_all_fields=True`` refuses these instead of building the wrong cache.
 _DEFAULT_NUM_KV_HEADS = 8
 _DEFAULT_HEAD_DIM = 128
+_LAYER_NAME = re.compile(r"^layer_(\d+)(?:_of_\d+)?$")
+_LAYER_FILE = re.compile(r"^layer_(\d+)(?:_of_\d+)?\.onnx$")
+_EXTERNAL_LOCATION = b"\x0a\x08location\x12"
 
 
 def _as_dim(value: Any) -> Optional[int]:
@@ -279,6 +283,17 @@ def _onnx_candidates(model_dir: str, config: Dict[str, Any]) -> list:
     return unique
 
 
+def _open_onnx_session(ort: Any, path: str):
+    """Open a graph for inspection without compiling it."""
+    options = ort.SessionOptions()
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    return ort.InferenceSession(
+        path,
+        sess_options=options,
+        providers=["CPUExecutionProvider"],
+    )
+
+
 def _infer_kv_shape_from_onnx(
     model_dir: str,
     config: Dict[str, Any],
@@ -303,13 +318,7 @@ def _infer_kv_shape_from_onnx(
         if not os.path.isfile(path):
             continue
         try:
-            options = ort.SessionOptions()
-            options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
-            session = ort.InferenceSession(
-                path,
-                sess_options=options,
-                providers=["CPUExecutionProvider"],
-            )
+            session = _open_onnx_session(ort, path)
             found = _kv_shape_from_session_inputs(session.get_inputs())
         except Exception as exc:
             warnings.warn(
@@ -501,6 +510,388 @@ def load_model_config(
     )
 
 
+def _read_varint(data: bytes, pos: int) -> tuple:
+    """Read one protobuf varint. Returns ``(None, pos)`` when it does not fit."""
+    value = 0
+    shift = 0
+    while pos < len(data) and shift <= 63:
+        byte = data[pos]
+        pos += 1
+        value |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return value, pos
+        shift += 7
+    return None, pos
+
+
+def _external_data_locations(path: str) -> list:
+    """Return ONNX external-data ``location`` strings stored in ``path``."""
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read()
+    except OSError:
+        return []
+    refs = []
+    start = 0
+    while True:
+        index = data.find(_EXTERNAL_LOCATION, start)
+        if index < 0:
+            break
+        pos = index + len(_EXTERNAL_LOCATION)
+        length, pos = _read_varint(data, pos)
+        if length is None or length < 0 or pos + length > len(data):
+            start = index + 1
+            continue
+        try:
+            location = data[pos:pos + length].decode("utf-8")
+        except UnicodeDecodeError:
+            start = pos + length
+            continue
+        if location and location not in refs:
+            refs.append(location)
+        start = pos + length
+    return refs
+
+
+def _layer_index(name: str, comp: Dict[str, Any]) -> Optional[int]:
+    """Return a layer component index, or None when ``comp`` is not a layer."""
+    is_layer = comp.get("type") == "layer" or _LAYER_NAME.match(str(name)) is not None
+    if not is_layer:
+        return None
+    layer_id = comp.get("layer_id")
+    if layer_id is not None:
+        try:
+            return int(layer_id)
+        except (TypeError, ValueError):
+            pass
+    match = _LAYER_NAME.match(str(name))
+    if match:
+        return int(match.group(1))
+    numbers = re.findall(r"(\d+)", str(name))
+    if numbers:
+        return int(numbers[-1])
+    return None
+
+
+def _layer_components(model_dir: str, info: Dict[str, Any]) -> list:
+    """Layer components from model_info plus any layer_*.onnx files on disk."""
+    layers = []
+    declared_paths = set()
+    components = info.get("components") if isinstance(info, dict) else None
+    if isinstance(components, dict):
+        pending = []
+        for name, comp in components.items():
+            if not isinstance(comp, dict):
+                continue
+            index = _layer_index(str(name), comp)
+            if index is None and comp.get("type") == "layer":
+                pending.append((str(name), comp))
+                continue
+            if index is None:
+                continue
+            filename = comp.get("file") or f"{name}.onnx"
+            path = filename if os.path.isabs(str(filename)) else os.path.join(model_dir, str(filename))
+            layers.append({"name": str(name), "index": index, "path": path})
+            declared_paths.add(os.path.abspath(path))
+        next_index = max((item["index"] for item in layers), default=-1) + 1
+        for name, comp in pending:
+            filename = comp.get("file") or f"{name}.onnx"
+            path = filename if os.path.isabs(str(filename)) else os.path.join(model_dir, str(filename))
+            layers.append({"name": name, "index": next_index, "path": path})
+            declared_paths.add(os.path.abspath(path))
+            next_index += 1
+    if os.path.isdir(model_dir):
+        for filename in sorted(os.listdir(model_dir)):
+            match = _LAYER_FILE.match(filename)
+            if not match:
+                continue
+            path = os.path.join(model_dir, filename)
+            if os.path.abspath(path) in declared_paths:
+                continue
+            layers.append({
+                "name": f"layer_{int(match.group(1))}",
+                "index": int(match.group(1)),
+                "path": path,
+            })
+    layers.sort(key=lambda item: (item["index"], item["name"]))
+    return layers
+
+
+def _component_onnx_files(model_dir: str, info: Dict[str, Any], layers: list) -> list:
+    """ONNX paths to inspect. A monolithic model.onnx is used when no layer file exists."""
+    paths = []
+    components = info.get("components") if isinstance(info, dict) else None
+    if isinstance(components, dict):
+        for comp in components.values():
+            if not isinstance(comp, dict):
+                continue
+            filename = comp.get("file")
+            if not isinstance(filename, str) or not filename:
+                continue
+            path = filename if os.path.isabs(filename) else os.path.join(model_dir, filename)
+            paths.append(path)
+    for layer in layers:
+        paths.append(layer["path"])
+    if not layers:
+        paths.append(os.path.join(model_dir, "model.onnx"))
+    unique = []
+    seen = set()
+    for path in paths:
+        if path in seen:
+            continue
+        seen.add(path)
+        unique.append(path)
+    return unique
+
+
+def _is_past_value_input(name: str) -> bool:
+    token = str(name).lower()
+    return "past" in token and ".value" in token
+
+
+def _is_present_key_output(name: str) -> bool:
+    token = str(name).lower()
+    return "present" in token and "key" in token and ".value" not in token and not token.endswith("value")
+
+
+def _is_present_value_output(name: str) -> bool:
+    token = str(name).lower()
+    if "present" not in token:
+        return False
+    return ".value" in token or token.endswith("value")
+
+
+def _io_record(item: Any) -> Dict[str, Any]:
+    shape = getattr(item, "shape", ()) or ()
+    return {
+        "name": str(getattr(item, "name", "")),
+        "shape": [None if dim is None else dim for dim in shape],
+        "dtype": str(getattr(item, "type", "")),
+    }
+
+
+def _past_layer_indexes(names: list) -> set:
+    indexes = set()
+    for name in names:
+        if not _is_past_key_input(name):
+            continue
+        numbers = re.findall(r"(\d+)", name)
+        indexes.add(int(numbers[-1]) if numbers else 0)
+    return indexes
+
+
+def _numpy_dtype_from_onnx_type(type_name: str) -> np.dtype:
+    from .dtypes import get_numpy_dtype
+    return np.dtype(get_numpy_dtype(type_name))
+
+
+def validate_config_against_onnx(
+    config: ModelConfig,
+    model_dir: str,
+) -> Dict[str, Any]:
+    """
+    Check ``config`` against the ONNX graphs in ``model_dir``.
+
+    Split layer components are the source of the layer count. Each past-key
+    input is ``[batch, num_kv_heads, seq, head_dim]``. ``config.num_kv_heads``
+    must match axis 1 and ``config.head_dim`` must match axis 3. ``config.dtype``
+    must match that tensor's ONNX type. Present key and value outputs must
+    exist beside the past inputs, and every external-data location must exist
+    on disk.
+
+    Returns the inspected names, shapes, dtype, and external-data paths.
+    A mismatch raises ``ValueError`` listing every difference.
+    """
+    if not isinstance(config, ModelConfig):
+        raise TypeError(f"config must be a ModelConfig, got {type(config).__name__}")
+    if not os.path.isdir(model_dir):
+        raise FileNotFoundError(f"model directory not found: {model_dir}")
+
+    info_path = os.path.join(model_dir, "model_info.json")
+    info = _load_json_safe(info_path) if os.path.isfile(info_path) else {}
+    if not isinstance(info, dict):
+        info = {}
+    layers = _layer_components(model_dir, info)
+    files = _component_onnx_files(model_dir, info, layers)
+    existing = [path for path in files if os.path.isfile(path)]
+    if not existing:
+        raise ValueError(f"No ONNX graph found in {model_dir}")
+
+    try:
+        import onnxruntime as ort
+    except ImportError as exc:
+        raise ValueError(
+            "onnxruntime is unavailable, so the ONNX graph cannot be validated"
+        ) from exc
+
+    problems = []
+    inputs = []
+    outputs = []
+    past_names = []
+    present_names = []
+    external = []
+    graph_heads = None
+    graph_dim = None
+    graph_dtype = None
+    graph_type_name = None
+    heads_from = None
+    dim_from = None
+    opened = 0
+
+    for layer in layers:
+        if not os.path.isfile(layer["path"]):
+            problems.append(
+                f"layer component {layer['name']} is missing {os.path.basename(layer['path'])}"
+            )
+
+    for path in existing:
+        for location in _external_data_locations(path):
+            resolved = location if os.path.isabs(location) else os.path.join(
+                os.path.dirname(path), location
+            )
+            if os.path.isfile(resolved):
+                if location not in external:
+                    external.append(location)
+            else:
+                problems.append(
+                    f"missing external data {location} referenced by {os.path.basename(path)}"
+                )
+        try:
+            session = _open_onnx_session(ort, path)
+        except Exception as exc:
+            problems.append(
+                f"could not read ONNX graph {os.path.basename(path)}: {exc}"
+            )
+            continue
+        opened += 1
+        graph_inputs = [_io_record(item) for item in session.get_inputs()]
+        graph_outputs = [_io_record(item) for item in session.get_outputs()]
+        inputs.extend(graph_inputs)
+        outputs.extend(graph_outputs)
+        input_names = [item["name"] for item in graph_inputs]
+        output_names = [item["name"] for item in graph_outputs]
+        has_past_key = any(_is_past_key_input(name) for name in input_names)
+        has_past_value = any(_is_past_value_input(name) for name in input_names)
+        has_present_key = any(_is_present_key_output(name) for name in output_names)
+        has_present_value = any(_is_present_value_output(name) for name in output_names)
+        if has_past_key and not has_present_key:
+            problems.append(
+                f"{os.path.basename(path)} has a past key input and no present key output"
+            )
+        if has_past_value and not has_present_value:
+            problems.append(
+                f"{os.path.basename(path)} has a past value input and no present value output"
+            )
+        for name in input_names:
+            if _is_past_key_input(name) or _is_past_value_input(name):
+                if name not in past_names:
+                    past_names.append(name)
+        for name in output_names:
+            if _is_present_key_output(name) or _is_present_value_output(name):
+                if name not in present_names:
+                    present_names.append(name)
+        for record in graph_inputs:
+            name = record["name"]
+            is_key = _is_past_key_input(name)
+            is_value = _is_past_value_input(name)
+            if not is_key and not is_value:
+                continue
+            if is_key:
+                shape = record["shape"]
+                if len(shape) != 4:
+                    problems.append(
+                        f"{name} rank {len(shape)} != 4; expected "
+                        f"[batch, num_kv_heads, seq, head_dim]"
+                    )
+                else:
+                    heads = _concrete_axis(shape[1])
+                    head_dim = _concrete_axis(shape[3])
+                    if heads is None:
+                        problems.append(f"num_kv_heads is symbolic on {name}")
+                    elif graph_heads is None:
+                        graph_heads = heads
+                        heads_from = name
+                    elif heads != graph_heads:
+                        problems.append(
+                            f"num_kv_heads {heads} from {name} != {graph_heads} from {heads_from}"
+                        )
+                    if head_dim is None:
+                        problems.append(f"head_dim is symbolic on {name}")
+                    elif graph_dim is None:
+                        graph_dim = head_dim
+                        dim_from = name
+                    elif head_dim != graph_dim:
+                        problems.append(
+                            f"head_dim {head_dim} from {name} != {graph_dim} from {dim_from}"
+                        )
+            type_name = record["dtype"]
+            if not type_name:
+                problems.append(f"{name} has no ONNX tensor dtype")
+                continue
+            try:
+                numpy_dtype = _numpy_dtype_from_onnx_type(type_name)
+            except ValueError:
+                problems.append(f"unrecognized ONNX tensor dtype {type_name} on {name}")
+                continue
+            if graph_dtype is None:
+                graph_dtype = numpy_dtype
+                graph_type_name = type_name
+            elif numpy_dtype != graph_dtype:
+                problems.append(
+                    f"dtype {type_name} on {name} != {graph_type_name}"
+                )
+
+    if layers:
+        observed_layers = len(layers)
+        layer_names = [item["name"] for item in layers]
+    else:
+        observed_layers = len(_past_layer_indexes(past_names))
+        layer_names = [f"past_key_{index}" for index in sorted(_past_layer_indexes(past_names))]
+    if int(config.num_layers) != observed_layers:
+        problems.append(
+            f"num_layers {config.num_layers} != {observed_layers} layer components"
+            + (f" ({', '.join(layer_names)})" if layer_names else "")
+        )
+    if graph_heads is None:
+        if opened and not any("symbolic" in item or "rank" in item for item in problems):
+            problems.append(
+                "ONNX graph has no past key input shaped "
+                "[batch, num_kv_heads, seq, head_dim]"
+            )
+    elif int(config.num_kv_heads) != graph_heads:
+        problems.append(
+            f"num_kv_heads {config.num_kv_heads} != {graph_heads} from {heads_from}"
+        )
+    if graph_dim is not None and int(config.head_dim) != graph_dim:
+        problems.append(
+            f"head_dim {config.head_dim} != {graph_dim} from {dim_from}"
+        )
+    if graph_dtype is not None and np.dtype(config.dtype) != graph_dtype:
+        problems.append(
+            f"dtype {np.dtype(config.dtype)} != {graph_type_name}"
+        )
+
+    if problems:
+        raise ValueError(
+            f"ONNX graph does not match ModelConfig in {model_dir}: "
+            + "; ".join(problems)
+        )
+    return {
+        "num_layers": observed_layers,
+        "layer_components": layer_names,
+        "num_kv_heads": graph_heads,
+        "head_dim": graph_dim,
+        "dtype": graph_dtype,
+        "onnx_dtype": graph_type_name,
+        "inputs": inputs,
+        "outputs": outputs,
+        "past_key_values": past_names,
+        "present_outputs": present_names,
+        "external_data": external,
+        "files": existing,
+    }
+
+
 def get_dtype_from_config(config: Dict[str, Any]) -> np.dtype:
     """
     Extract dtype from config dictionary.
@@ -536,5 +927,6 @@ def get_dtype_from_config(config: Dict[str, Any]) -> np.dtype:
 __all__ = [
     "ModelConfig",
     "load_model_config",
+    "validate_config_against_onnx",
     "get_dtype_from_config",
 ]
