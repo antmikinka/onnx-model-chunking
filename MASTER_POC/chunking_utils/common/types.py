@@ -746,6 +746,246 @@ def _coerce_boundary_tensor(value: Any) -> BoundaryTensor:
     raise ValueError(f"boundary tensor must be a BoundaryTensor, got {value!r}")
 
 
+def _coerce_optional_provider(value: Any) -> Optional[str]:
+    """None stays unset. A provider name is stripped."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, str):
+        raise ValueError(f"provider must be a string, got {value!r}")
+    text = value.strip()
+    if not text:
+        return None
+    return text
+
+
+def _coerce_plan_device(value: Any, field_name: str) -> Optional[str]:
+    """None stays unset. xdna is the NPU and rdna is the iGPU."""
+    try:
+        return _coerce_component_device(value)
+    except ValueError as exc:
+        raise ValueError(str(exc).replace("device_preference", field_name)) from exc
+
+
+def _coerce_step_phase(value: Any) -> str:
+    """A step always has a phase. Draft and verify use the scheduler names."""
+    if value is None or value == "":
+        raise ValueError("phase is required")
+    phase = _coerce_component_phase(value)
+    if phase is None:
+        raise ValueError("phase is required")
+    return phase
+
+
+def _step_uses_npu(step: "ExecutionStep") -> bool:
+    """True when the step is placed on an ahead-of-time NPU."""
+    if step.device == "npu":
+        return True
+    if step.provider and _providers_include_npu([step.provider]):
+        return True
+    return False
+
+
+def _reject_plan_cycle(steps: List["ExecutionStep"]) -> None:
+    """Reject a dependency that is missing or that loops."""
+    names = [step.component_name for step in steps]
+    present = set(names)
+    children: Dict[str, List[str]] = {name: [] for name in names}
+    indegree = {name: 0 for name in names}
+    for step in steps:
+        for dependency in step.depends_on:
+            if dependency not in present:
+                raise ValueError(
+                    f"Step {step.component_name!r} depends on {dependency!r}, "
+                    "which is not in the plan."
+                )
+            children[dependency].append(step.component_name)
+            indegree[step.component_name] += 1
+    ready = [name for name in names if indegree[name] == 0]
+    seen = 0
+    while ready:
+        name = ready.pop(0)
+        seen += 1
+        for child in children[name]:
+            indegree[child] -= 1
+            if indegree[child] == 0:
+                ready.append(child)
+    if seen != len(names):
+        raise ValueError("execution plan has a dependency cycle")
+
+
+@dataclass
+class ExecutionStep:
+    """
+    One component in a split execution plan.
+
+    ``phase`` defaults to decode. ``depends_on`` names earlier components.
+    ``resident`` keeps that component loaded. ``device`` uses the AMD names,
+    so xdna is the NPU and rdna is the iGPU.
+    """
+    component_name: str
+    provider: Optional[str] = None
+    device: Optional[str] = None
+    phase: str = "decode"
+    depends_on: List[str] = field(default_factory=list)
+    resident: bool = True
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.component_name, str) or not self.component_name.strip():
+            raise ValueError(
+                f"component_name must be a non-empty string, got {self.component_name!r}"
+            )
+        self.component_name = self.component_name.strip()
+        self.provider = _coerce_optional_provider(self.provider)
+        self.device = _coerce_plan_device(self.device, "device")
+        self.phase = _coerce_step_phase(self.phase)
+        self.depends_on = _copy_name_list(self.depends_on, "depends_on")
+        if self.component_name in self.depends_on:
+            raise ValueError(
+                f"Step {self.component_name!r} depends on itself"
+            )
+        if not isinstance(self.resident, bool):
+            raise ValueError(f"resident must be a boolean, got {self.resident!r}")
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Copy the step so a scheduler can read it without sharing this object."""
+        return {
+            "component_name": self.component_name,
+            "provider": self.provider,
+            "device": self.device,
+            "phase": self.phase,
+            "depends_on": list(self.depends_on),
+            "resident": self.resident,
+        }
+
+
+def _coerce_execution_step(value: Any) -> ExecutionStep:
+    """Copy an ExecutionStep, or build one from a dict."""
+    if isinstance(value, ExecutionStep):
+        return ExecutionStep(
+            component_name=value.component_name,
+            provider=value.provider,
+            device=value.device,
+            phase=value.phase,
+            depends_on=list(value.depends_on),
+            resident=value.resident,
+        )
+    if isinstance(value, dict):
+        return ExecutionStep(**value)
+    raise ValueError(
+        f"execution step must be an ExecutionStep or a dict, got {value!r}"
+    )
+
+
+@dataclass
+class ExecutionPlan:
+    """
+    How a split model runs on AMD hardware.
+
+    Prefill can stay on the NPU while decode stays on the iGPU. ``policy``
+    AUTO with more than one NPU step is rejected, and a sequential or
+    persistent policy is rejected when any step is on the NPU.
+    """
+    steps: List[ExecutionStep] = field(default_factory=list)
+    policy: ExecutionPolicy = ExecutionPolicy.AUTO
+    prefill_device: Optional[str] = None
+    decode_device: Optional[str] = None
+    static_shapes: bool = True
+    warmup_iterations: int = 0
+
+    def __post_init__(self) -> None:
+        if isinstance(self.steps, (str, bytes)) or not isinstance(self.steps, list):
+            raise ValueError(f"steps must be a list, got {self.steps!r}")
+        cleaned: List[ExecutionStep] = []
+        seen = set()
+        for item in self.steps:
+            step = _coerce_execution_step(item)
+            if step.component_name in seen:
+                raise ValueError(
+                    f"execution plan repeats component {step.component_name!r}"
+                )
+            seen.add(step.component_name)
+            cleaned.append(step)
+        self.steps = cleaned
+        _reject_plan_cycle(self.steps)
+        self.policy = _coerce_execution_policy(self.policy)
+        self.prefill_device = _coerce_plan_device(self.prefill_device, "prefill_device")
+        self.decode_device = _coerce_plan_device(self.decode_device, "decode_device")
+        if not isinstance(self.static_shapes, bool):
+            raise ValueError(
+                f"static_shapes must be a boolean, got {self.static_shapes!r}"
+            )
+        self.warmup_iterations = _as_non_negative_int(
+            self.warmup_iterations, "warmup_iterations"
+        )
+        self._reject_unsafe_npu_schedule()
+        self._require_policy_phases()
+
+    def _reject_unsafe_npu_schedule(self) -> None:
+        """Refuse a sequential layer series on an NPU."""
+        npu_steps = [step for step in self.steps if _step_uses_npu(step)]
+        if self.policy in (ExecutionPolicy.SEQUENTIAL, ExecutionPolicy.PERSISTENT) and npu_steps:
+            raise ValueError(
+                f"execution_policy {self.policy.value} is rejected on an NPU provider. "
+                "Sequential layer splitting on NPU is unsafe."
+            )
+        if (
+            self.policy in (ExecutionPolicy.AUTO, ExecutionPolicy.MONOLITHIC)
+            and len(npu_steps) > 1
+        ):
+            raise ValueError(
+                f"execution_policy {self.policy.value} is rejected when more than one "
+                "step is on an NPU provider."
+            )
+
+    def _require_policy_phases(self) -> None:
+        """Hybrid, MoE, and speculative plans name the phases they run."""
+        phases = {step.phase for step in self.steps}
+        if self.policy in (ExecutionPolicy.HYBRID_NPU_IGPU, ExecutionPolicy.PHASE_SPLIT):
+            if "prefill" not in phases or "decode" not in phases:
+                raise ValueError(
+                    f"{self.policy.value} requires a prefill step and a decode step."
+                )
+        if self.policy is ExecutionPolicy.MOE_ROUTING:
+            if "router" not in phases or "expert" not in phases:
+                raise ValueError(
+                    f"{self.policy.value} requires a router step and an expert step."
+                )
+        if self.policy is ExecutionPolicy.SPECULATIVE:
+            if "speculative_draft" not in phases or "verification" not in phases:
+                raise ValueError(
+                    f"{self.policy.value} requires a speculative_draft step and a verification step."
+                )
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Copy the plan. Each step is copied on its own."""
+        return {
+            "steps": [step.to_dict() for step in self.steps],
+            "policy": self.policy.value,
+            "prefill_device": self.prefill_device,
+            "decode_device": self.decode_device,
+            "static_shapes": self.static_shapes,
+            "warmup_iterations": self.warmup_iterations,
+        }
+
+
+def _coerce_execution_plan(value: Any) -> ExecutionPlan:
+    """Copy an ExecutionPlan, or build one from a dict."""
+    if isinstance(value, ExecutionPlan):
+        return ExecutionPlan(
+            steps=list(value.steps),
+            policy=value.policy,
+            prefill_device=value.prefill_device,
+            decode_device=value.decode_device,
+            static_shapes=value.static_shapes,
+            warmup_iterations=value.warmup_iterations,
+        )
+    if isinstance(value, dict):
+        return ExecutionPlan(**value)
+    raise ValueError(
+        f"execution_plan must be an ExecutionPlan or a dict, got {value!r}"
+    )
+
+
 @dataclass
 class SplitResult:
     """
@@ -761,6 +1001,7 @@ class SplitResult:
         model_info: Additional model metadata and information.
         format: The format that was split (safetensors or onnx).
         boundary_tensors: Tensors passed between components, including KV state.
+        execution_plan: How those components run, including device and phase.
     """
     output_dir: str
     num_layers: int
@@ -768,6 +1009,7 @@ class SplitResult:
     model_info: Dict[str, Any]
     format: ModelFormat = ModelFormat.SAFETENSORS
     boundary_tensors: List[BoundaryTensor] = field(default_factory=list)
+    execution_plan: ExecutionPlan = field(default_factory=ExecutionPlan)
 
     def __post_init__(self) -> None:
         if not isinstance(self.format, ModelFormat):
@@ -792,6 +1034,7 @@ class SplitResult:
             seen.add(tensor.name)
             cleaned.append(tensor)
         self.boundary_tensors = cleaned
+        self.execution_plan = _coerce_execution_plan(self.execution_plan)
 
     def boundary_by_name(self) -> Dict[str, BoundaryTensor]:
         """Lookup used when IO binding allocates one buffer per boundary name."""

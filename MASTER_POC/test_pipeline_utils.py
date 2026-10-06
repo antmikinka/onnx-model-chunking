@@ -6361,6 +6361,8 @@ def test_backend():
             ComponentType,
             BoundaryTensor,
             SplitResult,
+            ExecutionStep,
+            ExecutionPlan,
         )
         from pipeline_utils.session_manager import ExecutionPolicy as session_policy
         assert DeviceType is canonical_device
@@ -6654,6 +6656,8 @@ def test_backend():
         )
         assert onnx_result.format is ModelFormat.ONNX
         assert onnx_result.boundary_tensors[0] is hidden
+        assert onnx_result.execution_plan.steps == []
+        assert onnx_result.execution_plan.policy is canonical_policy.AUTO
         if saved_onnx is None:
             sys.modules.pop("chunking_utils.onnx", None)
         else:
@@ -6840,6 +6844,134 @@ def test_backend():
             raise AssertionError("an fp8 cache dtype was accepted")
         except ValueError as exc:
             assert "dtype" in str(exc)
+        from chunking_utils.common import ExecutionPlan as package_plan
+        from chunking_utils import ExecutionStep as root_step
+        from pipeline_utils.session_manager import (
+            ExecutionStep as session_step,
+            ExecutionPlan as session_plan,
+        )
+        assert package_plan is ExecutionPlan
+        assert root_step is ExecutionStep
+        assert session_step is not ExecutionStep
+        assert session_plan is not ExecutionPlan
+        session_kept = session_step(
+            "embedding", "CPUExecutionProvider", "cpu", "embedding"
+        )
+        assert session_kept.device_type == "cpu"
+        assert session_kept.provider == "CPUExecutionProvider"
+        empty_plan = ExecutionPlan()
+        assert empty_plan.steps == []
+        assert empty_plan.policy is canonical_policy.AUTO
+        assert empty_plan.prefill_device is None
+        assert empty_plan.decode_device is None
+        assert empty_plan.static_shapes is True
+        assert empty_plan.warmup_iterations == 0
+        first_split = SplitResult(
+            output_dir="out",
+            num_layers=1,
+            component_files={},
+            model_info={},
+        )
+        second_split = SplitResult(
+            output_dir="out",
+            num_layers=1,
+            component_files={},
+            model_info={},
+        )
+        assert first_split.execution_plan is not second_split.execution_plan
+        first_split.execution_plan.warmup_iterations = 3
+        assert second_split.execution_plan.warmup_iterations == 0
+        prefill = ExecutionStep(
+            component_name="embedding",
+            provider="VitisAIExecutionProvider",
+            device="xdna",
+            phase="prefill",
+        )
+        decode = {
+            "component_name": "layer_0",
+            "provider": "DmlExecutionProvider",
+            "device": "rdna",
+            "phase": "decode",
+            "depends_on": ["embedding"],
+            "resident": True,
+        }
+        draft = ExecutionStep(component_name="draft_head", phase="draft", resident=False)
+        assert prefill.device == "npu"
+        assert prefill.phase == "prefill"
+        assert prefill.resident is True
+        assert draft.phase == "speculative_draft"
+        assert draft.resident is False
+        hybrid = SplitResult(
+            output_dir="out",
+            num_layers=1,
+            component_files={"embedding": "embedding.onnx", "layer_0": "layer_0.onnx"},
+            model_info={},
+            execution_plan={
+                "policy": "hybrid_npu_igpu",
+                "prefill_device": "xdna",
+                "decode_device": "rdna",
+                "static_shapes": True,
+                "warmup_iterations": 2,
+                "steps": [prefill, decode],
+            },
+        )
+        assert hybrid.execution_plan.policy is canonical_policy.HYBRID_NPU_IGPU
+        assert hybrid.execution_plan.prefill_device == "npu"
+        assert hybrid.execution_plan.decode_device == "igpu"
+        assert hybrid.execution_plan.warmup_iterations == 2
+        assert [step.component_name for step in hybrid.execution_plan.steps] == [
+            "embedding",
+            "layer_0",
+        ]
+        assert hybrid.execution_plan.steps[1].device == "igpu"
+        assert hybrid.execution_plan.steps[1].depends_on == ["embedding"]
+        assert hybrid.execution_plan.steps[0] is not prefill
+        recorded_plan = hybrid.execution_plan.to_dict()
+        recorded_plan["steps"][1]["depends_on"].append("norm")
+        assert hybrid.execution_plan.steps[1].depends_on == ["embedding"]
+        assert recorded_plan["policy"] == "hybrid_npu_igpu"
+        try:
+            ExecutionStep(component_name="layer_0", depends_on="embedding")
+            raise AssertionError("a dependency string was accepted")
+        except ValueError as exc:
+            assert "depends_on" in str(exc)
+        try:
+            ExecutionPlan(steps=[prefill, prefill])
+            raise AssertionError("a repeated component was accepted")
+        except ValueError as exc:
+            assert "embedding" in str(exc)
+        try:
+            ExecutionPlan(steps=[
+                ExecutionStep(component_name="layer_0", depends_on=["missing"]),
+            ])
+            raise AssertionError("a missing dependency was accepted")
+        except ValueError as exc:
+            assert "missing" in str(exc)
+        try:
+            ExecutionPlan(
+                policy="sequential",
+                steps=[
+                    ExecutionStep(
+                        component_name="layer_0",
+                        provider="VitisAIExecutionProvider",
+                        device="npu",
+                    ),
+                ],
+            )
+            raise AssertionError("a sequential NPU step was accepted")
+        except ValueError as exc:
+            assert "sequential" in str(exc)
+            assert "NPU" in str(exc)
+        try:
+            ExecutionPlan(policy="hybrid_npu_igpu", steps=[prefill])
+            raise AssertionError("a hybrid plan without decode was accepted")
+        except ValueError as exc:
+            assert "decode" in str(exc)
+        try:
+            ExecutionPlan(warmup_iterations=-1)
+            raise AssertionError("a negative warmup count was accepted")
+        except ValueError as exc:
+            assert "warmup_iterations" in str(exc)
         try:
             SplitConfig(model="weights", output="out", target_device="tpu")
             raise AssertionError("an unknown device was accepted")
@@ -7407,6 +7539,7 @@ def test_backend():
     print("  boundary tensors: hidden, mask, past and present")
     print("  quantization: awq int4 group, matmul nbits, kv dtype")
     print("  kv cache config: dense float16 bnsd, sliding window, paged blocks")
+    print("  execution plan: prefill on npu, decode on igpu")
     print("backend module: OK\n")
     return True
 
