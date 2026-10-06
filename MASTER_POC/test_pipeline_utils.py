@@ -14,10 +14,16 @@ def test_dtypes():
     from pipeline_utils.dtypes import (
         get_numpy_dtype, 
         safe_cast, 
-        ONNX_DTYPE_MAP, 
+        ONNX_DTYPE_MAP,
+        ONNX_ELEMENT_TYPE_TO_NUMPY,
+        NUMPY_TO_ONNX_ELEMENT_TYPE,
+        numpy_dtype_from_onnx_element_type,
         supports_bfloat16,
+        get_bfloat16_dtype,
         get_dtype_info
     )
+    import pipeline_utils
+    from pipeline_utils import io_binding as io_binding_module
     
     print(f"  ONNX_DTYPE_MAP entries: {len(ONNX_DTYPE_MAP)}")
     print(f"  bfloat16 supported: {supports_bfloat16()}")
@@ -47,6 +53,66 @@ def test_dtypes():
     # Test dtype info
     info = get_dtype_info(np.float16)
     print(f"  dtype info for float16: itemsize={info['itemsize']}, is_float={info['is_float']}")
+
+    required_element_types = {
+        1: np.float32,
+        2: np.uint8,
+        3: np.int8,
+        4: np.uint16,
+        5: np.int16,
+        6: np.int32,
+        7: np.int64,
+        9: np.bool_,
+        10: np.float16,
+        11: np.float64,
+        12: np.uint32,
+        13: np.uint64,
+        16: "bfloat16",
+    }
+    for code, expected in required_element_types.items():
+        assert ONNX_ELEMENT_TYPE_TO_NUMPY[code] == expected
+    assert ONNX_ELEMENT_TYPE_TO_NUMPY[14] == np.complex64
+    assert ONNX_ELEMENT_TYPE_TO_NUMPY[15] == np.complex128
+    required_reverse = {
+        np.float32: 1,
+        np.uint8: 2,
+        np.int8: 3,
+        np.uint16: 4,
+        np.int16: 5,
+        np.int32: 6,
+        np.int64: 7,
+        np.bool_: 9,
+        np.float16: 10,
+        np.float64: 11,
+        np.uint32: 12,
+        np.uint64: 13,
+    }
+    for np_type, code in required_reverse.items():
+        assert NUMPY_TO_ONNX_ELEMENT_TYPE[np_type] == code
+        assert ONNX_ELEMENT_TYPE_TO_NUMPY[code] == np_type
+    assert NUMPY_TO_ONNX_ELEMENT_TYPE[np.complex64] == 14
+    assert NUMPY_TO_ONNX_ELEMENT_TYPE[np.complex128] == 15
+    assert io_binding_module.NUMPY_TO_ONNX_ELEMENT_TYPE is NUMPY_TO_ONNX_ELEMENT_TYPE
+    assert pipeline_utils.NUMPY_TO_ONNX_ELEMENT_TYPE is NUMPY_TO_ONNX_ELEMENT_TYPE
+    assert pipeline_utils.ONNX_ELEMENT_TYPE_TO_NUMPY is ONNX_ELEMENT_TYPE_TO_NUMPY
+    assert pipeline_utils.numpy_dtype_from_onnx_element_type is numpy_dtype_from_onnx_element_type
+    assert numpy_dtype_from_onnx_element_type(10) == np.float16
+    assert numpy_dtype_from_onnx_element_type(1) == np.float32
+    import warnings
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        resolved_bf16 = numpy_dtype_from_onnx_element_type(16)
+    if supports_bfloat16():
+        assert resolved_bf16 == get_bfloat16_dtype()
+    else:
+        assert resolved_bf16 == np.float32
+        assert any("bfloat16" in str(item.message) for item in caught)
+    try:
+        numpy_dtype_from_onnx_element_type(99)
+        raise AssertionError("unknown element type should raise")
+    except ValueError as exc:
+        assert "99" in str(exc)
+    print("  numeric TensorProto map round-trips and io_binding shares it")
     
     print("dtypes module: OK\n")
     return True
@@ -2916,9 +2982,13 @@ def test_io_binding():
     # Test dtype mapping
     onnx_type = get_onnx_element_type(np.float16)
     print(f"  np.float16 -> ONNX type: {onnx_type}")
+    assert onnx_type == 10
+    assert NUMPY_TO_ONNX_ELEMENT_TYPE[np.float16] == 10
     
     onnx_type_int = get_onnx_element_type(np.int64)
     print(f"  np.int64 -> ONNX type: {onnx_type_int}")
+    assert onnx_type_int == 7
+    assert get_onnx_element_type(np.dtype(np.float32)) == 1
     
     # Test DeviceBuffer
     buffer = DeviceBuffer(

@@ -77,7 +77,11 @@ import numpy as np
 import onnxruntime as ort
 
 # Import our dtype utilities
-from .dtypes import get_numpy_dtype, ONNX_DTYPE_MAP
+from .dtypes import (
+    get_numpy_dtype,
+    ONNX_DTYPE_MAP,
+    NUMPY_TO_ONNX_ELEMENT_TYPE,
+)
 
 
 # =============================================================================
@@ -398,24 +402,9 @@ def ort_memory_candidates(device_type: str) -> List[OrtMemoryTarget]:
 # NUMPY TO ONNX ELEMENT TYPE MAPPING
 # =============================================================================
 
-# Map numpy dtypes to ONNX TensorProto.DataType values
-# These are the integer constants used by ort.OrtValue.ortvalue_from_numpy
-NUMPY_TO_ONNX_ELEMENT_TYPE = {
-    np.float16: 10,     # FLOAT16
-    np.float32: 1,      # FLOAT
-    np.float64: 11,     # DOUBLE
-    np.int8: 3,         # INT8
-    np.int16: 5,        # INT16
-    np.int32: 6,        # INT32
-    np.int64: 7,        # INT64
-    np.uint8: 2,        # UINT8
-    np.uint16: 4,       # UINT16
-    np.uint32: 12,      # UINT32
-    np.uint64: 13,      # UINT64
-    np.bool_: 9,        # BOOL
-    np.complex64: 14,   # COMPLEX64
-    np.complex128: 15,  # COMPLEX128
-}
+# Numeric TensorProto codes live in dtypes.NUMPY_TO_ONNX_ELEMENT_TYPE.
+# This module imports that map so OrtValue allocation and dtype conversion
+# share one table.
 
 # String dtype names for display
 ONNX_ELEMENT_TYPE_NAMES = {

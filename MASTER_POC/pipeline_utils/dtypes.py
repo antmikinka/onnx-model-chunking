@@ -93,6 +93,46 @@ SPECIAL_TYPES = {
     "float8e5m2": "8-bit float (E5M2), falls back to float16",
 }
 
+# Numeric ONNX TensorProto.DataType codes.
+# 16 (BFLOAT16) stays the string sentinel used by ONNX_DTYPE_MAP. ml_dtypes
+# is optional, so the reverse map has no bfloat16 key.
+# 14 and 15 are COMPLEX64 and COMPLEX128. io_binding already converts those
+# dtypes, so they stay on this shared map.
+ONNX_ELEMENT_TYPE_TO_NUMPY = {
+    1: np.float32,
+    2: np.uint8,
+    3: np.int8,
+    4: np.uint16,
+    5: np.int16,
+    6: np.int32,
+    7: np.int64,
+    9: np.bool_,
+    10: np.float16,
+    11: np.float64,
+    12: np.uint32,
+    13: np.uint64,
+    14: np.complex64,
+    15: np.complex128,
+    16: "bfloat16",
+}
+
+NUMPY_TO_ONNX_ELEMENT_TYPE = {
+    np.float32: 1,
+    np.uint8: 2,
+    np.int8: 3,
+    np.uint16: 4,
+    np.int16: 5,
+    np.int32: 6,
+    np.int64: 7,
+    np.bool_: 9,
+    np.float16: 10,
+    np.float64: 11,
+    np.uint32: 12,
+    np.uint64: 13,
+    np.complex64: 14,
+    np.complex128: 15,
+}
+
 # Short form type mappings (without "tensor()" wrapper)
 SHORT_DTYPE_MAP = {
     "float16": np.float16,
@@ -254,6 +294,36 @@ def get_numpy_dtype(onnx_type: str) -> np.dtype:
     raise ValueError(f"Unrecognized ONNX type: {onnx_type}")
 
 
+def numpy_dtype_from_onnx_element_type(element_type: int):
+    """
+    Get the numpy dtype for an ONNX TensorProto.DataType code.
+
+    Args:
+        element_type: TensorProto.DataType integer, e.g. 1 for FLOAT
+
+    Returns:
+        numpy dtype for that code. BFLOAT16 (16) uses ml_dtypes when
+        it is installed and float32 otherwise.
+
+    Raises:
+        ValueError: If the element type code is not recognized
+    """
+    if element_type not in ONNX_ELEMENT_TYPE_TO_NUMPY:
+        raise ValueError(f"Unrecognized ONNX element type: {element_type}")
+    result = ONNX_ELEMENT_TYPE_TO_NUMPY[element_type]
+    if result == "bfloat16":
+        bf16 = get_bfloat16_dtype()
+        if bf16 is not None:
+            return bf16
+        warnings.warn(
+            "bfloat16 requested but ml_dtypes not available. "
+            "Falling back to float32 to preserve precision.",
+            UserWarning
+        )
+        return np.float32
+    return result
+
+
 def safe_cast(
     array: np.ndarray, 
     target_dtype: np.dtype,
@@ -346,12 +416,15 @@ def get_dtype_info(dtype: np.dtype) -> dict:
 __all__ = [
     # Maps
     "ONNX_DTYPE_MAP",
+    "ONNX_ELEMENT_TYPE_TO_NUMPY",
+    "NUMPY_TO_ONNX_ELEMENT_TYPE",
     "SHORT_DTYPE_MAP",
     "SPECIAL_TYPES",
     "GGUF_DTYPE_MAP",
     "AWQ_DTYPE_MAP",
     # Functions
     "get_numpy_dtype",
+    "numpy_dtype_from_onnx_element_type",
     "safe_cast",
     "get_dtype_info",
     "supports_bfloat16",

@@ -20,9 +20,12 @@ Usage:
 
 from .dtypes import (
     ONNX_DTYPE_MAP,
+    ONNX_ELEMENT_TYPE_TO_NUMPY,
+    NUMPY_TO_ONNX_ELEMENT_TYPE,
     SHORT_DTYPE_MAP,
     SPECIAL_TYPES,
     get_numpy_dtype,
+    numpy_dtype_from_onnx_element_type,
     safe_cast,
     get_dtype_info,
     supports_bfloat16,
@@ -99,7 +102,6 @@ from .io_binding import (
     create_ortvalue_from_numpy,
     ort_memory_candidates,
     allocate_os_shared_memory,
-    NUMPY_TO_ONNX_ELEMENT_TYPE,
     VALID_ORTVALUE_DEVICES,
     DEFAULT_NPU_MAX_SEQ_LEN,
 )
@@ -147,11 +149,14 @@ __version__ = "2.2.0"
 __all__ = [
     # dtypes exports
     "ONNX_DTYPE_MAP",
+    "ONNX_ELEMENT_TYPE_TO_NUMPY",
+    "NUMPY_TO_ONNX_ELEMENT_TYPE",
     "SHORT_DTYPE_MAP",
     "SPECIAL_TYPES",
     "GGUF_DTYPE_MAP",
     "AWQ_DTYPE_MAP",
     "get_numpy_dtype",
+    "numpy_dtype_from_onnx_element_type",
     "safe_cast",
     "get_dtype_info",
     "supports_bfloat16",
@@ -220,7 +225,6 @@ __all__ = [
     "create_ortvalue_from_numpy",
     "ort_memory_candidates",
     "allocate_os_shared_memory",
-    "NUMPY_TO_ONNX_ELEMENT_TYPE",
     "VALID_ORTVALUE_DEVICES",
     "DEFAULT_NPU_MAX_SEQ_LEN",
     # backend exports
