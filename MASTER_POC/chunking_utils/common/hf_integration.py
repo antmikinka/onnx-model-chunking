@@ -3,7 +3,7 @@ HuggingFace and split-ONNX configuration for model chunking.
 
 AutoConfig still detects a Hugging Face architecture. A split directory is
 read from model_info.json, the ONNX graphs, boundary tensors, and external
-data files.
+data files. Weight memory and the static KV cache are estimated separately.
 """
 
 import json
@@ -1353,6 +1353,71 @@ def estimate_model_memory(
     }
 
 
+def _require_positive_int(value: Any, label: str) -> int:
+    """A non-bool positive integer. Zero and negatives are rejected."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{label} must be an integer, got {value!r}")
+    if value <= 0:
+        raise ValueError(f"{label} must be positive, got {value}")
+    return value
+
+
+def estimate_kv_cache_memory(
+    num_layers: int,
+    num_kv_heads: int,
+    head_dim: int,
+    max_seq_len: int,
+    dtype_bytes: int = 2,
+    batch_size: int = 1,
+) -> Dict[str, float]:
+    """
+    Estimate a static key and value cache.
+
+    The layout is ``[batch, num_kv_heads, max_seq_len, head_dim]`` for the
+    key and the same shape for the value. ``dtype_bytes`` is the width of
+    one element. Float16 and bfloat16 use 2, float32 uses 4, and int8 uses 1.
+    A packed int4 cache is not a whole-byte width, so this function does not
+    infer nibble packing from ``dtype_bytes``.
+
+    Args:
+        num_layers: Transformer layers that keep a cache.
+        num_kv_heads: Key and value heads in one layer.
+        head_dim: Width of one head.
+        max_seq_len: Static context length allocated up front.
+        dtype_bytes: Bytes stored for one cache element. The default is
+            float16.
+        batch_size: Sequences allocated in the same pool.
+
+    Returns:
+        Byte totals for both tensors, one layer, and one additional token.
+    """
+    layers = _require_positive_int(num_layers, "num_layers")
+    heads = _require_positive_int(num_kv_heads, "num_kv_heads")
+    width = _require_positive_int(head_dim, "head_dim")
+    seq = _require_positive_int(max_seq_len, "max_seq_len")
+    element = _require_positive_int(dtype_bytes, "dtype_bytes")
+    batch = _require_positive_int(batch_size, "batch_size")
+    one_tensor = batch * layers * heads * seq * width * element
+    total = one_tensor * 2
+    per_token = batch * layers * heads * width * element * 2
+    per_layer = batch * heads * seq * width * element * 2
+    return {
+        "bytes": float(total),
+        "megabytes": total / (1024 ** 2),
+        "gigabytes": total / (1024 ** 3),
+        "bytes_per_token": float(per_token),
+        "per_layer_bytes": float(per_layer),
+        "key_bytes": float(one_tensor),
+        "value_bytes": float(one_tensor),
+        "num_layers": float(layers),
+        "num_kv_heads": float(heads),
+        "head_dim": float(width),
+        "max_seq_len": float(seq),
+        "dtype_bytes": float(element),
+        "batch_size": float(batch),
+    }
+
+
 # Backend NPU order is VitisAI, then RyzenAI. The iGPU follows DirectML,
 # MIGraphX, then ROCm. CUDA is a discrete GPU. CPU is last.
 _NPU_PROVIDERS = ("VitisAIExecutionProvider", "RyzenAIExecutionProvider")
@@ -1517,10 +1582,16 @@ def _kv_cache_bytes(config: Dict[str, Any]) -> int:
         token = _coerce_memory_dtype(cache_dtype).value
     elements = layers * kv_heads * seq * head_dim
     if token == "int4":
-        per_tensor = (elements + 1) // 2
-    else:
-        per_tensor = elements * _KV_ELEMENT_BYTES[token]
-    return 2 * per_tensor
+        return 2 * ((elements + 1) // 2)
+    return int(
+        estimate_kv_cache_memory(
+            layers,
+            kv_heads,
+            head_dim,
+            seq,
+            _KV_ELEMENT_BYTES[token],
+        )["bytes"]
+    )
 
 
 def _plan_is_npu_legal(dtype: TensorDtype, scheme: Optional[str]) -> bool:

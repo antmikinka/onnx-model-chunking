@@ -7889,6 +7889,7 @@ def test_hf_integration():
         check_dependencies,
         _fields_from_hf_config,
         estimate_model_memory,
+        estimate_kv_cache_memory,
         get_model_config,
         get_onnx_dtype as direct_get,
         get_split_model_config,
@@ -8660,6 +8661,68 @@ def test_hf_integration():
         assert "num_params" in str(exc)
 
     print("  execution strategy: npu hybrid, int4 budget, split when the cache does not fit")
+
+    assert common.estimate_kv_cache_memory is estimate_kv_cache_memory
+    cache = estimate_kv_cache_memory(2, 8, 128, 4096)
+    assert cache["bytes"] == heavy_kv["kv_bytes"]
+    assert cache["bytes"] == 2 * 2 * 8 * 4096 * 128 * 2
+    assert cache["megabytes"] == cache["bytes"] / (1024 ** 2)
+    assert cache["gigabytes"] == cache["bytes"] / (1024 ** 3)
+    assert cache["bytes_per_token"] == 2 * 2 * 8 * 128 * 2
+    assert cache["per_layer_bytes"] == cache["bytes"] / 2
+    assert cache["key_bytes"] == cache["value_bytes"] == cache["bytes"] / 2
+    assert cache["dtype_bytes"] == 2.0
+    assert cache["batch_size"] == 1.0
+    assert cache["max_seq_len"] == 4096.0
+    cache["bytes"] = 0
+    again = estimate_kv_cache_memory(2, 8, 128, 4096)
+    assert again["bytes"] == 2 * 2 * 8 * 4096 * 128 * 2
+
+    long_ctx = estimate_kv_cache_memory(32, 8, 128, 8192, 2)
+    assert long_ctx["bytes"] == 1_073_741_824
+    assert long_ctx["megabytes"] == 1024.0
+    assert long_ctx["gigabytes"] == 1.0
+    assert long_ctx["bytes_per_token"] == 2 * 32 * 8 * 128 * 2
+    assert long_ctx["per_layer_bytes"] == long_ctx["bytes"] / 32
+    assert long_ctx["bytes"] > estimate_model_memory(1000, TensorDtype.FLOAT16)["bytes"]
+    wider = estimate_kv_cache_memory(32, 8, 128, 8192, dtype_bytes=4)
+    assert wider["bytes"] == long_ctx["bytes"] * 2
+    assert wider["dtype_bytes"] == 4.0
+    narrow = estimate_kv_cache_memory(32, 8, 128, 8192, 1)
+    assert narrow["bytes"] == long_ctx["bytes"] // 2
+    batched = estimate_kv_cache_memory(2, 8, 128, 4096, batch_size=2)
+    assert batched["bytes"] == again["bytes"] * 2
+    assert batched["bytes_per_token"] == again["bytes_per_token"] * 2
+    assert batched["batch_size"] == 2.0
+
+    for bad_args, label in (
+        ((0, 8, 128, 4096), "num_layers"),
+        ((-1, 8, 128, 4096), "num_layers"),
+        ((True, 8, 128, 4096), "num_layers"),
+        ((2, 1.5, 128, 4096), "num_kv_heads"),
+        ((2, 8, 0, 4096), "head_dim"),
+        ((2, 8, 128, -4), "max_seq_len"),
+        ((2, 8, 128, 4096, 0), "dtype_bytes"),
+        ((2, 8, 128, 4096, -2), "dtype_bytes"),
+        ((2, 8, 128, 4096, True), "dtype_bytes"),
+    ):
+        try:
+            estimate_kv_cache_memory(*bad_args)
+            raise AssertionError(f"a bad {label} was accepted")
+        except ValueError as exc:
+            assert label in str(exc)
+    try:
+        estimate_kv_cache_memory(2, 8, 128, 4096, batch_size=0)
+        raise AssertionError("a zero batch was accepted")
+    except ValueError as exc:
+        assert "batch_size" in str(exc)
+    try:
+        estimate_kv_cache_memory(2, 8, 128, 4096, batch_size=False)
+        raise AssertionError("a boolean batch was accepted")
+    except ValueError as exc:
+        assert "batch_size" in str(exc)
+
+    print("  kv cache memory: long context, float16 bytes, per token")
     print("hf integration: OK\n")
     return True
 
