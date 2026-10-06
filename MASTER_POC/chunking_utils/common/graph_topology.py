@@ -21,7 +21,7 @@ from collections import deque
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from dataclasses import dataclass
 
-from .architecture import get_prefixes
+from .architecture import ArchitectureType, get_prefixes
 from .architecture_detector import detect_architecture
 
 
@@ -85,11 +85,22 @@ class _Label:
         return self.component_type
 
 
+def _prefix_architecture(arch) -> ArchitectureType:
+    """ArchitectureType, or the arch_type on a descriptor."""
+    if isinstance(arch, ArchitectureType):
+        return arch
+    arch_type = getattr(arch, "arch_type", None)
+    if isinstance(arch_type, ArchitectureType):
+        return arch_type
+    raise ValueError(f"arch must be an ArchitectureType, got {arch!r}")
+
+
 def analyze_graph_topology(
     graph,
     config_json=None,
     genai_config=None,
     model_info=None,
+    arch=None,
 ) -> GraphTopology:
     """
     Build topology maps and classify nodes into components.
@@ -104,6 +115,8 @@ def analyze_graph_topology(
         config_json: Hugging Face ``config.json`` object.
         genai_config: GenAI config object.
         model_info: Split ``model_info.json`` object.
+        arch: Optional ArchitectureType or descriptor. When omitted, the
+            architecture is detected from the graph and configs.
 
     Returns:
         GraphTopology with maps, topological order, and component groups.
@@ -114,13 +127,16 @@ def analyze_graph_topology(
         _as_object(genai_config, "genai_config"),
         _as_object(model_info, "model_info"),
     )
-    arch = detect_architecture(
-        graph,
-        config_json=config_json,
-        genai_config=genai_config,
-        model_info=model_info,
-    )
-    prefixes = get_prefixes(arch.arch_type, "onnx")
+    if arch is None:
+        detected = detect_architecture(
+            graph,
+            config_json=config_json,
+            genai_config=genai_config,
+            model_info=model_info,
+        ).arch_type
+    else:
+        detected = _prefix_architecture(arch)
+    prefixes = get_prefixes(detected, "onnx")
     embed_prefix = prefixes.embed_prefix.lower()
     layer_prefix = prefixes.layer_prefix.lower()
     norm_prefix = prefixes.norm_prefix.lower()

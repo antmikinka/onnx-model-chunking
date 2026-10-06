@@ -12699,6 +12699,173 @@ def test_weight_storage():
     return True
 
 
+def test_package_structure():
+    """The ONNX package is the splitter, and splitter.py orchestrates it."""
+    print("=" * 50)
+    print("Testing package structure...")
+    print("=" * 50)
+
+    import json
+    import os
+    import sys
+    import tempfile
+    import types
+    import chunking_utils
+    from chunking_utils.common.architecture import ArchitectureType
+
+    try:
+        import chunking_utils.onnx.splitter as splitter
+    except ModuleNotFoundError:
+        for name in list(sys.modules):
+            if name == "chunking_utils.onnx" or name.startswith("chunking_utils.onnx."):
+                del sys.modules[name]
+        onnx_stub = types.ModuleType("onnx")
+        onnx_stub.ModelProto = type("ModelProto", (), {})
+        onnx_stub.numpy_helper = types.SimpleNamespace()
+        onnx_stub.helper = types.SimpleNamespace()
+        onnx_stub.TensorProto = types.SimpleNamespace()
+        onnx_stub.shape_inference = types.SimpleNamespace()
+        sys.modules["onnx"] = onnx_stub
+        import chunking_utils.onnx.splitter as splitter
+
+    from chunking_utils.onnx import boundary_contract, component_builder, graph_analysis
+    from chunking_utils.onnx import kv_contract, metadata_writer, npu_policy, quantization
+    from chunking_utils.onnx.splitter import (
+        build_boundary_contract,
+        extract_components,
+        extract_kv_cache_info,
+        save_components,
+        split_onnx,
+        write_execution_contract,
+    )
+
+    assert chunking_utils.extract_components is splitter.extract_components
+    assert chunking_utils.extract_components is component_builder.extract_components
+    assert chunking_utils.create_component_onnx is splitter.create_component_onnx
+    assert chunking_utils.collect_boundary_tensors is splitter.collect_boundary_tensors
+    assert chunking_utils.collect_boundary_tensors is boundary_contract.collect_boundary_tensors
+    assert chunking_utils.resolve_tensor_type is splitter.resolve_tensor_type
+    assert chunking_utils.resolve_tensor_type is graph_analysis.resolve_tensor_type
+    assert chunking_utils.extract_quantization_info is quantization.extract_quantization_info
+    assert chunking_utils.extract_kv_cache_info is kv_contract.extract_kv_cache_info
+    assert chunking_utils.extract_execution_policy is npu_policy.extract_execution_policy
+    assert chunking_utils.detect_architecture_from_onnx is graph_analysis.detect_architecture_from_onnx
+    assert chunking_utils.build_boundary_contract is build_boundary_contract
+    assert chunking_utils.save_components is save_components
+    assert chunking_utils.write_execution_contract is write_execution_contract
+    assert write_execution_contract is metadata_writer.write_execution_contract
+    assert build_boundary_contract.__module__ == "chunking_utils.onnx.splitter"
+    assert save_components.__module__ == "chunking_utils.onnx.splitter"
+    assert split_onnx.__module__ == "chunking_utils.onnx.splitter"
+    assert "splitter" not in component_builder.__dict__
+    names = split_onnx.__code__.co_names
+    for required in (
+        "load_onnx_model",
+        "detect_architecture",
+        "extract_components",
+        "build_boundary_contract",
+        "extract_quantization_info",
+        "extract_kv_cache_info",
+        "save_components",
+        "write_execution_contract",
+    ):
+        assert required in names
+
+    class _Node:
+        def __init__(self, name, inputs, outputs):
+            self.name = name
+            self.input = list(inputs)
+            self.output = list(outputs)
+            self.op_type = "Gather"
+
+    class _Graph:
+        def __init__(self, nodes):
+            self.node = list(nodes)
+            self.initializer = []
+            self.output = []
+            self.input = []
+            self.value_info = []
+
+    class _Model:
+        def __init__(self, graph):
+            self.graph = graph
+
+    llama = _Model(_Graph([
+        _Node("/model/embed/Gather", ["input_ids"], ["hidden"]),
+    ]))
+    detected = extract_components(llama)
+    forced = extract_components(llama, ArchitectureType.GPT2)
+    described = extract_components(llama, arch=type("Desc", (), {"arch_type": ArchitectureType.LLAMA})())
+    configured = extract_components(llama, {"num_hidden_layers": 1})
+    assert "embedding" in detected
+    assert "embedding" in described
+    assert "embedding" in configured
+    assert "embedding" not in forced
+    try:
+        extract_components(llama, arch="gpt2")
+        raise AssertionError("a string architecture was accepted")
+    except ValueError as exc:
+        assert "ArchitectureType" in str(exc)
+    try:
+        extract_components(llama, ArchitectureType.LLAMA, arch=ArchitectureType.GPT2)
+        raise AssertionError("two architectures were accepted")
+    except ValueError as exc:
+        assert "disagree" in str(exc)
+
+    empty = extract_kv_cache_info(_Graph([]))
+    with_components = extract_kv_cache_info(_Graph([]), {"layer_0": object()})
+    assert empty == with_components
+    assert empty["num_layers"] == 0
+    try:
+        extract_kv_cache_info(_Graph([]), ["layer_0"])
+        raise AssertionError("a list of components was accepted")
+    except ValueError as exc:
+        assert "dict" in str(exc)
+
+    original_boundaries = splitter.collect_boundary_tensors
+    def fake_boundaries(model, components):
+        return ["from-patch"]
+    splitter.collect_boundary_tensors = fake_boundaries
+    try:
+        assert build_boundary_contract(llama, {}) == ["from-patch"]
+    finally:
+        splitter.collect_boundary_tensors = original_boundaries
+
+    with tempfile.TemporaryDirectory() as directory:
+        info_path = write_execution_contract(directory, {"architecture": "llama"})
+        with open(info_path, encoding="utf-8") as handle:
+            assert json.load(handle)["architecture"] == "llama"
+        file_path = os.path.join(directory, "not_a_dir")
+        with open(file_path, "w", encoding="utf-8") as handle:
+            handle.write("x")
+        try:
+            write_execution_contract(file_path, {})
+            raise AssertionError("a file was accepted as a directory")
+        except ValueError as exc:
+            assert "directory" in str(exc)
+        try:
+            write_execution_contract("  ", {})
+            raise AssertionError("a blank directory was accepted")
+        except ValueError as exc:
+            assert "directory" in str(exc)
+        try:
+            write_execution_contract(directory, ["nope"])
+            raise AssertionError("a list model_info was accepted")
+        except ValueError as exc:
+            assert "dict" in str(exc)
+        try:
+            write_execution_contract(directory, {"bad": {1}})
+            raise AssertionError("a non-JSON model_info was accepted")
+        except ValueError as exc:
+            assert "JSON" in str(exc)
+
+    print("package structure: OK")
+    print("  splitter.py orchestrates the onnx modules")
+    print("  an architecture argument selects component prefixes")
+    print("  kv cache metadata accepts the component map")
+    return True
+
+
 def test_path_manager():
     """ONNX discovery, external data, split directories, and NPU cache paths."""
     print("=" * 50)
@@ -13069,6 +13236,12 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"weight_storage: FAILED - {e}")
         results.append(("weight_storage", False))
+
+    try:
+        results.append(("package_structure", test_package_structure()))
+    except Exception as e:
+        print(f"package_structure: FAILED - {e}")
+        results.append(("package_structure", False))
 
     try:
         results.append(("path_manager", test_path_manager()))
