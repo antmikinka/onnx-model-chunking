@@ -3264,6 +3264,7 @@ def test_backend():
         DEVICE_PROVIDER_MAP,
         BackendConfig,
         DeviceType,
+        LlamaCppBackend,
         OnnxRuntimeBackend,
         _pair_present_to_past,
         _sample_next_token,
@@ -3273,6 +3274,18 @@ def test_backend():
         resolve_execution_policy,
         resolve_onnx_providers,
     )
+    from pipeline_utils.kv_cache import KVCacheManager
+
+    fresh = OnnxRuntimeBackend()
+    assert fresh.kv_cache is None
+    fresh.reset_cache()
+    empty_stats = fresh.get_cache_stats()
+    assert empty_stats["attached"] is False
+    assert empty_stats["sequence_length"] == 0
+    assert empty_stats["current_seq_len"] == 0
+    assert empty_stats["num_layers"] == 0
+    assert empty_stats["total_bytes"] == 0
+    assert empty_stats["total_mb"] == 0.0
 
     unloaded = OnnxRuntimeBackend()
     try:
@@ -3337,6 +3350,10 @@ def test_backend():
     monolithic._tokenizer = _Tokenizer()
     assert monolithic.generate("Hello", max_tokens=2, temperature=0) == "1,2,3,4,4"
     assert greedy.lengths == [3, 4]
+    assert monolithic.kv_cache is None
+    assert monolithic.get_cache_stats()["attached"] is False
+    assert monolithic.get_memory_usage()["kv_cache_attached"] is False
+    assert monolithic.get_memory_usage()["kv_sequence_length"] == 0
     assert monolithic.generate("Hello", max_tokens=0, temperature=0) == "1,2,3"
 
     class _EosTokenizer(_Tokenizer):
@@ -3381,14 +3398,69 @@ def test_backend():
     kv_backend.is_loaded = True
     kv_backend.model = kv_session
     kv_backend._tokenizer = _Tokenizer()
+    assert kv_backend.kv_cache is None
     assert kv_backend.generate("Hello", max_tokens=2, temperature=0) == "1,2,3,3,3"
     assert kv_session.past_lengths == [0, 3]
     assert kv_session.masks == [3, 4]
-    assert kv_backend.get_memory_usage()["split"] is False
+    assert isinstance(kv_backend.kv_cache, KVCacheManager)
+    assert kv_backend.kv_cache.get_sequence_length() == 4
+    assert kv_backend.kv_cache.num_layers == 1
+    assert kv_backend.kv_cache.num_kv_heads == 1
+    assert kv_backend.kv_cache.head_dim == 2
+    kv_stats = kv_backend.get_cache_stats()
+    assert kv_stats["attached"] is True
+    assert kv_stats["num_layers"] == 1
+    assert kv_stats["sequence_length"] == 4
+    assert kv_stats["current_seq_len"] == 4
+    usage = kv_backend.get_memory_usage()
+    assert usage["split"] is False
+    assert usage["kv_cache_attached"] is True
+    assert usage["kv_sequence_length"] == 4
+    kv_backend.reset_cache()
+    assert kv_backend.kv_cache.get_sequence_length() == 0
+    assert kv_backend.get_cache_stats()["sequence_length"] == 0
+    kv_session.past_lengths.clear()
+    kv_session.masks.clear()
+    assert kv_backend.generate("Hello", max_tokens=2, temperature=0) == "1,2,3,3,3"
+    assert kv_session.past_lengths == [0, 3]
+    assert kv_session.masks == [3, 4]
+    kv_backend.cleanup()
+    assert kv_backend.is_loaded is False
+    assert kv_backend.kv_cache is not None
+    assert kv_backend.get_cache_stats()["attached"] is True
+    assert kv_backend.get_cache_stats()["sequence_length"] == 4
 
     class _OddSession(_GreedySession):
         def get_inputs(self):
             return [_Node("input_ids"), _Node("custom_bias")]
+
+    class _LlamaState:
+        def __init__(self):
+            self.resets = 0
+
+        def reset(self):
+            self.resets += 1
+
+    llama = LlamaCppBackend()
+    llama.model = _LlamaState()
+    llama.kv_cache = KVCacheManager(
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=2,
+        dtype=np.float32,
+        max_seq_len=4,
+    )
+    llama.kv_cache.update_from_present(
+        0,
+        np.ones((1, 1, 2, 2), dtype=np.float32),
+        np.ones((1, 1, 2, 2), dtype=np.float32),
+    )
+    assert llama.kv_cache.get_sequence_length() == 2
+    llama.reset_cache()
+    assert llama.model.resets == 1
+    assert llama.kv_cache.get_sequence_length() == 0
+    assert llama.get_memory_usage()["kv_cache_attached"] is True
+    assert llama.get_memory_usage()["kv_sequence_length"] == 0
 
     odd = OnnxRuntimeBackend()
     odd.is_loaded = True
@@ -3458,6 +3530,7 @@ def test_backend():
         assert pipeline.persist_sessions is True
         assert pipeline.providers == ["CPUExecutionProvider"]
         assert pipeline.verbose is False
+        assert split.kv_cache is None
         assert split.generate("Hello", max_tokens=7, temperature=0.2, top_p=0.5) == "split:Hello:7"
         assert pipeline.calls == [("Hello", 7)]
         assert split.get_memory_usage()["sessions"] == 2
@@ -3465,6 +3538,66 @@ def test_backend():
         split.cleanup()
         assert pipeline.cleaned is True
         assert split.is_loaded is False
+
+        preset = KVCacheManager(
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=2,
+            dtype=np.float32,
+            max_seq_len=8,
+        )
+        preset_backend = OnnxRuntimeBackend(BackendConfig(
+            onnx_providers=["CPUExecutionProvider"],
+            execution_policy="monolithic",
+        ))
+        preset_backend.kv_cache = preset
+        preset_backend.load(split_dir)
+        assert created["pipeline"].kv_cache is preset
+        assert preset_backend.kv_cache is preset
+        preset_backend.cleanup()
+
+        class _PipelineWithCache(_FakePipeline):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.kv_cache = KVCacheManager(
+                    num_layers=1,
+                    num_kv_heads=1,
+                    head_dim=2,
+                    dtype=np.float32,
+                    max_seq_len=8,
+                )
+
+        def _cached_pipeline_class():
+            def _factory(*args, **kwargs):
+                cached = _PipelineWithCache(*args, **kwargs)
+                created["cached"] = cached
+                return cached
+            return _factory
+
+        backend_mod._sequential_pipeline_class = _cached_pipeline_class
+        adopted = OnnxRuntimeBackend(BackendConfig(
+            onnx_providers=["CPUExecutionProvider"],
+            execution_policy="monolithic",
+        ))
+        adopted.load(split_dir)
+        assert adopted.kv_cache is created["cached"].kv_cache
+        installed = KVCacheManager(
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=4,
+            dtype=np.float32,
+            max_seq_len=8,
+        )
+        installed_backend = OnnxRuntimeBackend(BackendConfig(
+            onnx_providers=["CPUExecutionProvider"],
+            execution_policy="monolithic",
+        ))
+        installed_backend.kv_cache = installed
+        installed_backend.load(split_dir)
+        assert created["cached"].kv_cache is installed
+        assert installed_backend.kv_cache is installed
+        installed_backend.cleanup()
+        backend_mod._sequential_pipeline_class = _fake_pipeline_class
 
         low_memory = OnnxRuntimeBackend(BackendConfig(low_memory=True))
         low_memory.load(split_dir)

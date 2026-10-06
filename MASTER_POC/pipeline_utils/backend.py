@@ -29,6 +29,8 @@ import warnings
 
 import numpy as np
 
+from .kv_cache import KVCacheManager
+
 
 # =============================================================================
 # ENUMS
@@ -350,6 +352,7 @@ class InferenceBackend(ABC):
         self.model = None
         self.is_loaded = False
         self.model_path: Optional[str] = None
+        self.kv_cache: Optional[KVCacheManager] = None
     
     @property
     @abstractmethod
@@ -401,9 +404,54 @@ class InferenceBackend(ABC):
         pass
     
     def cleanup(self) -> None:
-        """Release resources. Override if needed."""
+        """Release the model. The KV cache object stays attached."""
         self.model = None
         self.is_loaded = False
+
+    def reset_cache(self) -> None:
+        """Clear the attached KV cache. An unset cache is left unset."""
+        cache = self.kv_cache
+        if cache is not None and hasattr(cache, "reset"):
+            cache.reset()
+        pipeline = getattr(self, "_pipeline", None)
+        pipeline_cache = getattr(pipeline, "kv_cache", None) if pipeline is not None else None
+        if (
+            pipeline_cache is not None
+            and pipeline_cache is not cache
+            and hasattr(pipeline_cache, "reset")
+        ):
+            pipeline_cache.reset()
+
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """
+        Report the attached KV cache.
+
+        An unset cache reports ``attached`` false and zero length. An
+        attached cache returns its memory report plus ``attached`` true.
+        """
+        cache = self.kv_cache
+        if cache is None or not hasattr(cache, "get_memory_usage"):
+            return {
+                "attached": False,
+                "sequence_length": 0,
+                "current_seq_len": 0,
+                "num_layers": 0,
+                "total_bytes": 0,
+                "total_mb": 0.0,
+            }
+        stats = dict(cache.get_memory_usage())
+        stats["attached"] = True
+        return stats
+
+    def _kv_usage_fields(self) -> Dict[str, Any]:
+        cache = self.kv_cache
+        if cache is None:
+            return {"kv_cache_attached": False, "kv_sequence_length": 0}
+        length = getattr(cache, "get_sequence_length", None)
+        return {
+            "kv_cache_attached": True,
+            "kv_sequence_length": int(length()) if callable(length) else 0,
+        }
     
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(loaded={self.is_loaded}, device={self.config.device.value})"
@@ -661,6 +709,59 @@ def _store_presents(
         past_state[past_name] = array
 
 
+def _host_kv(tensor: Any) -> np.ndarray:
+    """NumPy view of a cache tensor, including a device buffer."""
+    if isinstance(tensor, np.ndarray):
+        return tensor
+    numpy = getattr(tensor, "numpy", None)
+    if callable(numpy):
+        return np.asarray(numpy())
+    to_numpy = getattr(tensor, "to_numpy", None)
+    if callable(to_numpy):
+        return np.asarray(to_numpy())
+    return np.asarray(tensor)
+
+
+def _valid_kv_prefix(cache: KVCacheManager, layer: int, kind: str) -> np.ndarray:
+    """
+    Feed only the tokens the cache has accepted.
+
+    A static buffer is allocated at ``max_seq_len``. Length zero is a
+    sequence axis of 0, not that full buffer.
+    """
+    key, value = cache.get_past_tensors(layer)
+    array = _host_kv(key if kind == "key" else value)
+    length = int(cache.layer_length(layer))
+    if array.ndim >= 3 and int(array.shape[2]) != length:
+        array = np.ascontiguousarray(array[:, :, :length, ...])
+    return array
+
+
+def _write_presents_to_cache(
+    cache: KVCacheManager,
+    output_names: Sequence[str],
+    values: Sequence[Any],
+    past_names: Sequence[str],
+) -> None:
+    """Store full present tensors with ``update_from_present``."""
+    pending: Dict[int, Dict[str, np.ndarray]] = {}
+    for name, value in zip(output_names, values):
+        if "present" not in str(name).lower():
+            continue
+        past_name = _pair_present_to_past(str(name), past_names)
+        if past_name is None:
+            continue
+        layer = _kv_layer(past_name)
+        kind = _kv_kind(past_name)
+        if layer is None or kind not in ("key", "value"):
+            continue
+        pending.setdefault(layer, {})[kind] = np.asarray(value)
+    for layer, pair in pending.items():
+        if "key" not in pair or "value" not in pair:
+            continue
+        cache.update_from_present(layer, pair["key"], pair["value"])
+
+
 class OnnxRuntimeBackend(InferenceBackend):
     """
     ONNX Runtime backend for split or whole ONNX models.
@@ -708,6 +809,7 @@ class OnnxRuntimeBackend(InferenceBackend):
             )
             self.model = getattr(self._pipeline, "session_manager", None) or self._pipeline
             self._tokenizer = getattr(self._pipeline, "tokenizer", None)
+            self._share_pipeline_cache(self._pipeline)
         else:
             import onnxruntime as ort
 
@@ -750,6 +852,7 @@ class OnnxRuntimeBackend(InferenceBackend):
         """
         if not self.is_loaded:
             raise RuntimeError("Model not loaded. Call load() first.")
+        self.reset_cache()
         if self._is_split:
             if self._pipeline is None:
                 raise RuntimeError(
@@ -795,16 +898,20 @@ class OnnxRuntimeBackend(InferenceBackend):
         if int(prompt_ids.shape[1]) < 1:
             raise ValueError("Prompt tokenized to zero tokens")
         batch = int(prompt_ids.shape[0])
+        self._ensure_monolithic_cache(inputs, past_names, batch)
         past_state = {
             node.name: _empty_kv(node, batch)
             for node in inputs
-            if node.name in past_names
+            if node.name in past_names and self.kv_cache is None
         }
         generated: List[int] = []
         eos = getattr(self._tokenizer, "eos_token_id", None)
         history = prompt_ids
         for step in range(steps):
-            past_len = _past_length(past_state)
+            if self.kv_cache is not None and past_names:
+                past_len = int(self.kv_cache.get_sequence_length())
+            else:
+                past_len = _past_length(past_state)
             if past_names:
                 if step == 0:
                     token_ids = prompt_ids
@@ -834,6 +941,14 @@ class OnnxRuntimeBackend(InferenceBackend):
                     feeds[name] = np.ones((batch, attention_length), dtype=np.int64)
                 elif "position" in lower:
                     feeds[name] = position
+                elif name in past_names and self.kv_cache is not None:
+                    layer = _kv_layer(name)
+                    kind = _kv_kind(name)
+                    if layer is None or kind not in ("key", "value"):
+                        raise RuntimeError(
+                            f"Monolithic ONNX past input '{name}' has no layer or KV kind"
+                        )
+                    feeds[name] = _valid_kv_prefix(self.kv_cache, layer, kind)
                 elif name in past_state:
                     feeds[name] = past_state[name]
                 else:
@@ -850,7 +965,11 @@ class OnnxRuntimeBackend(InferenceBackend):
                 top_p,
             )
             generated.append(next_id)
-            if past_names:
+            if past_names and self.kv_cache is not None:
+                _write_presents_to_cache(
+                    self.kv_cache, output_names, values, past_names
+                )
+            elif past_names:
                 _store_presents(output_names, values, past_names, past_state)
             if eos is not None and next_id == int(eos):
                 break
@@ -873,6 +992,7 @@ class OnnxRuntimeBackend(InferenceBackend):
             usage["split"] = self._is_split
             usage["providers"] = list(self.providers)
             usage["execution_policy"] = self.execution_plan.policy
+            usage.update(self._kv_usage_fields())
             return usage
         return {
             "backend": "onnx_runtime",
@@ -880,7 +1000,54 @@ class OnnxRuntimeBackend(InferenceBackend):
             "split": self._is_split,
             "providers": list(self.providers),
             "execution_policy": self.execution_plan.policy,
+            **self._kv_usage_fields(),
         }
+
+    def _share_pipeline_cache(self, pipeline: Any) -> None:
+        """
+        Use one KV cache for this backend and a split pipeline.
+
+        A cache already set on the backend is installed on the pipeline.
+        Otherwise the pipeline cache is adopted.
+        """
+        pipeline_cache = getattr(pipeline, "kv_cache", None)
+        if self.kv_cache is None:
+            if pipeline_cache is not None:
+                self.kv_cache = pipeline_cache
+            return
+        if pipeline_cache is not self.kv_cache:
+            pipeline.kv_cache = self.kv_cache
+
+    def _ensure_monolithic_cache(
+        self,
+        inputs: Sequence[Any],
+        past_names: Sequence[str],
+        batch: int,
+    ) -> None:
+        """Build a CPU KV cache from past-input shapes when one is unset."""
+        if self.kv_cache is not None or not past_names:
+            return
+        grouped: Dict[int, Any] = {}
+        for node in inputs:
+            if node.name not in past_names:
+                continue
+            layer = _kv_layer(node.name)
+            kind = _kv_kind(node.name)
+            if layer is None or kind not in ("key", "value"):
+                continue
+            grouped.setdefault(layer, node)
+        if not grouped:
+            return
+        sample = _empty_kv(next(iter(grouped.values())), batch)
+        limit = int(self.config.n_ctx) if int(self.config.n_ctx) > 0 else 4096
+        self.kv_cache = KVCacheManager(
+            num_layers=max(grouped) + 1,
+            num_kv_heads=int(sample.shape[1]),
+            head_dim=int(sample.shape[3]),
+            dtype=sample.dtype,
+            batch_size=int(sample.shape[0]),
+            max_seq_len=limit,
+        )
 
     def cleanup(self) -> None:
         """Unload a split pipeline, then drop the session."""
@@ -960,6 +1127,14 @@ class LlamaCppBackend(InferenceBackend):
         )
         
         return output["choices"][0]["text"]
+
+    def reset_cache(self) -> None:
+        """Clear the KV cache and llama.cpp's own state when it has one."""
+        super().reset_cache()
+        model = self.model
+        reset = getattr(model, "reset", None)
+        if callable(reset):
+            reset()
     
     def get_memory_usage(self) -> Dict[str, Any]:
         # llama.cpp doesn't expose direct memory stats
@@ -967,6 +1142,7 @@ class LlamaCppBackend(InferenceBackend):
             "backend": "llama_cpp",
             "n_gpu_layers": self.config.n_gpu_layers,
             "n_ctx": self.config.n_ctx,
+            **self._kv_usage_fields(),
         }
 
 
