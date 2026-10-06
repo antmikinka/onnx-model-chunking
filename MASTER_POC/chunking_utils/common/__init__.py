@@ -41,6 +41,7 @@ _HF_EXPORTS = (
     "get_onnx_dtype",
     "detect_architecture_hf",
     "get_model_config",
+    "get_split_model_config",
     "estimate_model_memory",
     "check_dependencies",
 )
@@ -93,6 +94,7 @@ __all__ = [
     "get_onnx_dtype",
     "detect_architecture_hf",
     "get_model_config",
+    "get_split_model_config",
     "estimate_model_memory",
     "check_dependencies",
 ]

@@ -1,13 +1,16 @@
 """
-HuggingFace Transformers integration for model chunking.
+HuggingFace and split-ONNX configuration for model chunking.
 
-This module provides utilities for integrating with the HuggingFace ecosystem,
-including AutoConfig for architecture detection and accelerate for memory-efficient loading.
+AutoConfig still detects a Hugging Face architecture. A split directory is
+read from model_info.json, the ONNX graphs, boundary tensors, and external
+data files.
 """
 
+import json
 import os
+import re
 import warnings
-from typing import Optional, Dict, Any, Iterable, Tuple
+from typing import Optional, Dict, Any, Iterable, List, Tuple
 
 from .types import TensorDtype, MemoryMode
 from .architecture import architecture_from_string, ArchitectureType
@@ -321,24 +324,815 @@ def _fields_from_hf_config(config: Any) -> Dict[str, Any]:
 
 def get_model_config(model_path: str, trust_remote_code: bool = True) -> Dict[str, Any]:
     """
-    Get model configuration from HuggingFace config.
+    Get model configuration from a split directory or a HuggingFace config.
 
-    The result includes the context length, sliding window, KV heads, head
-    dim, RoPE theta, and MoE counts used to preallocate a cache and plan a
-    static NPU graph.
+    A directory that contains model_info.json or an ONNX graph is read with
+    get_split_model_config. Any other path uses AutoConfig. The result
+    includes the context length, sliding window, KV heads, head dim, RoPE
+    theta, and MoE counts used to preallocate a cache and plan a static NPU
+    graph.
 
     Args:
-        model_path: Path to model or HuggingFace model ID.
+        model_path: Split directory, local model path, or HuggingFace model ID.
         trust_remote_code: Allow custom code from model repos.
 
     Returns:
         Dictionary with model configuration.
     """
+    if _is_split_model_dir(model_path):
+        return get_split_model_config(model_path)
     if not HAS_TRANSFORMERS:
         return {"error": "transformers not installed"}
 
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=trust_remote_code)
     return _fields_from_hf_config(config)
+
+
+# layer_0.onnx and layer_0_of_32.onnx are split layer graphs.
+_LAYER_ONNX_FILE = re.compile(r"^layer_(\d+)(?:_of_\d+)?\.onnx$")
+_LAYER_COMPONENT_NAME = re.compile(r"^layer_(\d+)$")
+# Protobuf field 1 string "location" followed by field 2, the path.
+_EXTERNAL_LOCATION_KEY = b"\x0a\x08location\x12"
+_STRUCTURAL_INFO_KEYS = {
+    "components",
+    "boundary_tensors",
+    "component_files",
+    "execution_plan",
+    "model_info",
+    "architecture",
+    "output_dir",
+    "format",
+    "original_model",
+    "producer",
+    "ir_version",
+    "num_components",
+}
+_ONNX_TYPE_ALIASES = {
+    "tensor(float)": "float32",
+    "float": "float32",
+    "float32": "float32",
+    "fp32": "float32",
+    "tensor(float16)": "float16",
+    "float16": "float16",
+    "fp16": "float16",
+    "half": "float16",
+    "tensor(bfloat16)": "bfloat16",
+    "bfloat16": "bfloat16",
+    "bf16": "bfloat16",
+    "tensor(int8)": "int8",
+    "int8": "int8",
+    "tensor(int4)": "int4",
+    "int4": "int4",
+    "tensor(int64)": "int64",
+    "int64": "int64",
+    "tensor(bool)": "bool",
+    "bool": "bool",
+}
+_ACTIVATION_BOUNDARY_NAMES = {"hidden_states", "attention_mask", "position_ids"}
+
+
+def _is_split_model_dir(model_path: str) -> bool:
+    """True when the path is a directory of ONNX components or model_info.json."""
+    if not isinstance(model_path, str) or not model_path or not os.path.isdir(model_path):
+        return False
+    if os.path.isfile(os.path.join(model_path, "model_info.json")):
+        return True
+    try:
+        names = os.listdir(model_path)
+    except OSError:
+        return False
+    return any(name.endswith(".onnx") for name in names)
+
+
+def _read_varint(data: bytes, pos: int) -> Tuple[Optional[int], int]:
+    """Read one protobuf varint. Returns (None, pos) when it does not fit."""
+    value = 0
+    shift = 0
+    while pos < len(data) and shift <= 63:
+        byte = data[pos]
+        pos += 1
+        value |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return value, pos
+        shift += 7
+    return None, pos
+
+
+def _external_locations(path: str) -> List[str]:
+    """Return ONNX external-data location strings stored in path."""
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read()
+    except OSError:
+        return []
+    refs: List[str] = []
+    start = 0
+    while True:
+        index = data.find(_EXTERNAL_LOCATION_KEY, start)
+        if index < 0:
+            break
+        pos = index + len(_EXTERNAL_LOCATION_KEY)
+        length, pos = _read_varint(data, pos)
+        if length is None or length < 0 or pos + length > len(data):
+            start = index + 1
+            continue
+        try:
+            location = data[pos:pos + length].decode("utf-8")
+        except UnicodeDecodeError:
+            start = pos + length
+            continue
+        if location and location not in refs:
+            refs.append(location)
+        start = pos + length
+    return refs
+
+
+def _load_json_object(path: str, label: str) -> Dict[str, Any]:
+    """Load a JSON object. A missing file is the caller's choice."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{label} is not valid JSON") from exc
+    except OSError as exc:
+        raise ValueError(f"could not read {label}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"{label} must be a dict, got {payload!r}")
+    return payload
+
+
+def _copy_json_value(value: Any) -> Any:
+    """Copy dicts and lists so a caller cannot change the loaded document."""
+    if isinstance(value, dict):
+        return {key: _copy_json_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_copy_json_value(item) for item in value]
+    return value
+
+
+def _nested_model_info(info: Dict[str, Any]) -> Dict[str, Any]:
+    nested = info.get("model_info")
+    if isinstance(nested, dict):
+        return nested
+    return {}
+
+
+def _positive_config_int(value: Any, name: str) -> Optional[int]:
+    """A positive integer. Zero falls through. A negative value raises."""
+    if value is None:
+        return None
+    parsed = _as_config_int(value, name)
+    if parsed == 0:
+        return None
+    if parsed < 0:
+        raise ValueError(f"{name} must be non-negative, got {parsed}")
+    return parsed
+
+
+def _architecture_view(model_dir: str, info: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge config.json under model_info. An architecture dict wins."""
+    view: Dict[str, Any] = {}
+    config_path = os.path.join(model_dir, "config.json")
+    if os.path.isfile(config_path):
+        view.update({
+            key: value
+            for key, value in _load_json_object(config_path, "config.json").items()
+            if key not in _STRUCTURAL_INFO_KEYS and value is not None
+        })
+    nested = _nested_model_info(info)
+    sources = [nested, info]
+    for source in sources:
+        for key, value in source.items():
+            if key in _STRUCTURAL_INFO_KEYS or value is None:
+                continue
+            view[key] = value
+    for source in sources:
+        arch = source.get("architecture")
+        if isinstance(arch, dict):
+            for key, value in arch.items():
+                if value is not None:
+                    view[key] = value
+    model_type = None
+    for source in sources:
+        arch = source.get("architecture")
+        if isinstance(arch, str) and arch.strip():
+            model_type = arch.strip()
+    if model_type:
+        view["model_type"] = model_type
+    elif not view.get("model_type") and isinstance(view.get("strategy"), str):
+        view["model_type"] = view["strategy"]
+    layer_count = None
+    for source in sources:
+        parsed = _positive_config_int(source.get("num_layers"), "num_layers")
+        if parsed is not None:
+            layer_count = parsed
+    if layer_count is not None:
+        view["num_hidden_layers"] = layer_count
+    if view.get("torch_dtype") is None and view.get("dtype") is not None:
+        view["torch_dtype"] = view["dtype"]
+    return view
+
+
+def _name_list(value: Any, label: str) -> Optional[List[str]]:
+    """Copy a list of names. None means the graph will supply the names."""
+    if value is None:
+        return None
+    if isinstance(value, (str, bytes)) or not isinstance(value, list):
+        raise ValueError(f"{label} must be a list of names, got {value!r}")
+    names: List[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(f"{label} entry must be a non-empty string, got {item!r}")
+        names.append(item.strip())
+    return names
+
+
+def _component_type_name(name: str, comp: Dict[str, Any]) -> str:
+    raw = comp.get("type", comp.get("component_type"))
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip().lower()
+    if _LAYER_COMPONENT_NAME.fullmatch(name):
+        return "layer"
+    if name in ("embedding", "embeddings"):
+        return "embedding"
+    if name in ("norm", "lm_head", "model"):
+        return name
+    return "unknown"
+
+
+def _component_layer_id(name: str, comp: Dict[str, Any]) -> Optional[int]:
+    if comp.get("layer_id") is not None:
+        layer_id = _as_config_int(comp["layer_id"], "layer_id")
+        if layer_id < 0:
+            raise ValueError(f"layer_id must be non-negative, got {layer_id}")
+        return layer_id
+    match = _LAYER_COMPONENT_NAME.fullmatch(name)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _component_file(model_dir: str, name: str, comp: Dict[str, Any], files_map: Dict[str, Any]) -> str:
+    filename = None
+    for key in ("file", "file_path"):
+        value = comp.get(key)
+        if isinstance(value, str) and value.strip():
+            filename = value.strip()
+            break
+    if filename is None:
+        mapped = files_map.get(name)
+        if isinstance(mapped, str) and mapped.strip():
+            filename = mapped.strip()
+    if filename is None:
+        filename = f"{name}.onnx"
+    if os.path.isabs(filename):
+        return filename
+    return os.path.join(model_dir, filename)
+
+
+def _files_map(info: Dict[str, Any]) -> Dict[str, Any]:
+    mapped: Dict[str, Any] = {}
+    for source in (_nested_model_info(info), info):
+        raw = source.get("component_files")
+        if isinstance(raw, dict):
+            mapped.update(raw)
+        elif raw is not None:
+            raise ValueError(f"component_files must be a dict, got {raw!r}")
+    return mapped
+
+
+def _component_map(info: Dict[str, Any]) -> Dict[str, Any]:
+    nested = _nested_model_info(info)
+    for source in (info, nested):
+        raw = source.get("components") if isinstance(source, dict) else None
+        if isinstance(raw, dict):
+            return raw
+        if raw is not None:
+            raise ValueError(f"components must be a dict, got {raw!r}")
+    return {}
+
+
+def _blank_component(name: str, path: str, comp: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    body = comp if isinstance(comp, dict) else {}
+    declared_external = body.get("external_data")
+    if declared_external is None:
+        declared_external = body.get("external_data_files")
+    return {
+        "name": name,
+        "type": _component_type_name(name, body),
+        "layer_id": _component_layer_id(name, body),
+        "file": os.path.basename(path),
+        "_path": path,
+        "_declared_inputs": _name_list(body.get("input_names"), f"input_names of {name}"),
+        "_declared_outputs": _name_list(body.get("output_names"), f"output_names of {name}"),
+        "_declared_external": _name_list(declared_external, f"external_data of {name}") or [],
+        "input_names": [],
+        "output_names": [],
+        "inputs": [],
+        "outputs": [],
+        "external_data": [],
+    }
+
+
+def _collect_components(model_dir: str, info: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Declared components, then layer graphs that the manifest omitted."""
+    files_map = _files_map(info)
+    records: List[Dict[str, Any]] = []
+    seen = set()
+    for name, comp in _component_map(info).items():
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"component name must be a non-empty string, got {name!r}")
+        if not isinstance(comp, dict):
+            raise ValueError(f"component {name} must be a dict, got {comp!r}")
+        path = _component_file(model_dir, name.strip(), comp, files_map)
+        records.append(_blank_component(name.strip(), path, comp))
+        seen.add(os.path.abspath(path))
+    if os.path.isdir(model_dir):
+        discovered = []
+        for filename in os.listdir(model_dir):
+            match = _LAYER_ONNX_FILE.match(filename)
+            if not match:
+                continue
+            path = os.path.join(model_dir, filename)
+            if os.path.abspath(path) in seen:
+                continue
+            name = f"layer_{int(match.group(1))}"
+            discovered.append((int(match.group(1)), _blank_component(
+                name,
+                path,
+                {"type": "layer", "layer_id": int(match.group(1)), "file": filename},
+            )))
+        for _index, record in sorted(discovered, key=lambda item: item[0]):
+            records.append(record)
+            seen.add(os.path.abspath(record["_path"]))
+    if not records:
+        monolithic = os.path.join(model_dir, "model.onnx")
+        if os.path.isfile(monolithic):
+            records.append(_blank_component("model", monolithic, {"type": "model", "file": "model.onnx"}))
+    if not records:
+        raise ValueError(f"No ONNX graph found in {model_dir}")
+    return records
+
+
+def _resolve_external(model_dir: str, onnx_path: str, location: str) -> str:
+    if os.path.isabs(location):
+        return location
+    beside = os.path.join(os.path.dirname(onnx_path), location)
+    if os.path.isfile(beside):
+        return beside
+    return os.path.join(model_dir, location)
+
+
+def _attach_external_data(model_dir: str, records: List[Dict[str, Any]]) -> List[str]:
+    """Require every declared or embedded external-data file to exist."""
+    found: List[str] = []
+    for record in records:
+        path = record["_path"]
+        if not os.path.isfile(path):
+            raise ValueError(f"missing component file {record['file']}")
+        locations = list(_external_locations(path))
+        for location in record["_declared_external"]:
+            if location not in locations:
+                locations.append(location)
+        for location in locations:
+            resolved = _resolve_external(model_dir, path, location)
+            if not os.path.isfile(resolved):
+                raise ValueError(
+                    f"missing external data {location} referenced by {record['file']}"
+                )
+            if location not in found:
+                found.append(location)
+        record["external_data"] = locations
+    return found
+
+
+def _open_onnx_session(path: str):
+    """Open a graph for inspection without compiling it."""
+    try:
+        import onnxruntime as ort
+    except ImportError as exc:
+        raise ValueError(
+            "onnxruntime is unavailable, so the ONNX graph cannot be read"
+        ) from exc
+    options = ort.SessionOptions()
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    try:
+        return ort.InferenceSession(
+            path,
+            sess_options=options,
+            providers=["CPUExecutionProvider"],
+        )
+    except Exception as exc:
+        raise ValueError(
+            f"could not read ONNX graph {os.path.basename(path)}: {exc}"
+        ) from exc
+
+
+def _tensor_records(items: Iterable[Any]) -> List[Dict[str, Any]]:
+    records = []
+    for item in items:
+        shape = []
+        for dim in getattr(item, "shape", ()) or ():
+            if isinstance(dim, bool) or not isinstance(dim, int) or dim <= 0:
+                shape.append(None)
+            else:
+                shape.append(int(dim))
+        records.append({
+            "name": str(getattr(item, "name", "")),
+            "shape": shape,
+            "dtype": str(getattr(item, "type", "")),
+        })
+    return records
+
+
+def _read_component_graphs(records: List[Dict[str, Any]]) -> None:
+    for record in records:
+        session = _open_onnx_session(record["_path"])
+        inputs = _tensor_records(session.get_inputs())
+        outputs = _tensor_records(session.get_outputs())
+        input_names = [item["name"] for item in inputs]
+        output_names = [item["name"] for item in outputs]
+        declared_inputs = record["_declared_inputs"]
+        declared_outputs = record["_declared_outputs"]
+        if declared_inputs is not None and declared_inputs != input_names:
+            raise ValueError(
+                f"input_names for {record['name']} do not match the ONNX graph"
+            )
+        if declared_outputs is not None and declared_outputs != output_names:
+            raise ValueError(
+                f"output_names for {record['name']} do not match the ONNX graph"
+            )
+        record["inputs"] = inputs
+        record["outputs"] = outputs
+        record["input_names"] = input_names
+        record["output_names"] = output_names
+
+
+def _is_past_key_name(name: str) -> bool:
+    token = str(name).lower()
+    if ".value" in token:
+        return False
+    return "past" in token and "key" in token
+
+
+def _past_layer_index(name: str) -> int:
+    numbers = re.findall(r"(\d+)", name)
+    if not numbers:
+        return 0
+    return int(numbers[-1])
+
+
+def _canonical_type_name(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    return _ONNX_TYPE_ALIASES.get(value.strip().lower())
+
+
+def _shapes_agree(contract: List[Optional[int]], graph: List[Optional[int]]) -> bool:
+    if len(contract) != len(graph):
+        return False
+    for declared, observed in zip(contract, graph):
+        if declared is None or observed is None:
+            continue
+        if declared != observed:
+            return False
+    return True
+
+
+def _graph_kv_and_dtype(records: List[Dict[str, Any]]) -> Tuple[Optional[int], Optional[int], Optional[str], Optional[str]]:
+    """First concrete past-key heads, head dim, and dtype. Later values must agree."""
+    heads = None
+    head_dim = None
+    dtype_name = None
+    dtype_raw = None
+    for record in records:
+        for item in record["inputs"]:
+            if not _is_past_key_name(item["name"]):
+                continue
+            shape = item["shape"]
+            if len(shape) == 4:
+                if shape[1] is not None:
+                    if heads is None:
+                        heads = shape[1]
+                    elif heads != shape[1]:
+                        raise ValueError(
+                            f"num_key_value_heads {shape[1]} != {heads}"
+                        )
+                if shape[3] is not None:
+                    if head_dim is None:
+                        head_dim = shape[3]
+                    elif head_dim != shape[3]:
+                        raise ValueError(f"head_dim {shape[3]} != {head_dim}")
+            canonical = _canonical_type_name(item["dtype"])
+            if canonical is None:
+                continue
+            if dtype_name is None:
+                dtype_name = canonical
+                dtype_raw = item["dtype"]
+            elif dtype_name != canonical:
+                raise ValueError(f"dtype {item['dtype']} != {dtype_raw}")
+    return heads, head_dim, dtype_name, dtype_raw
+
+
+def _observed_layer_count(records: List[Dict[str, Any]]) -> int:
+    layers = [
+        record for record in records
+        if record["type"] == "layer" or record["layer_id"] is not None
+    ]
+    if layers:
+        return len(layers)
+    indexes = set()
+    for record in records:
+        for item in record["inputs"]:
+            if _is_past_key_name(item["name"]):
+                indexes.add(_past_layer_index(item["name"]))
+    return len(indexes)
+
+
+def _apply_graph_planning_fields(
+    fields: Dict[str, Any],
+    records: List[Dict[str, Any]],
+    dtype_was_set: bool,
+) -> None:
+    heads, head_dim, dtype_name, dtype_raw = _graph_kv_and_dtype(records)
+    if fields["num_key_value_heads"] is None:
+        fields["num_key_value_heads"] = heads
+    elif heads is not None and fields["num_key_value_heads"] != heads:
+        raise ValueError(
+            f"num_key_value_heads {fields['num_key_value_heads']} != {heads}"
+        )
+    if fields["head_dim"] is None:
+        fields["head_dim"] = head_dim
+    elif head_dim is not None and fields["head_dim"] != head_dim:
+        raise ValueError(f"head_dim {fields['head_dim']} != {head_dim}")
+    observed = _observed_layer_count(records)
+    declared = fields["num_hidden_layers"]
+    if declared is None:
+        fields["num_hidden_layers"] = observed or None
+    elif observed and declared != observed:
+        raise ValueError(f"num_layers {declared} != {observed}")
+    canonical = _canonical_type_name(str(fields.get("torch_dtype")))
+    if not dtype_was_set:
+        if dtype_name is not None:
+            fields["torch_dtype"] = dtype_name
+    elif dtype_name is not None and canonical != dtype_name:
+        raise ValueError(f"torch_dtype {fields['torch_dtype']} != {dtype_raw}")
+
+
+def _name_is_stateful(name: str) -> bool:
+    """Past and present KV names carry state. presentation does not."""
+    lowered = name.lower()
+    return (
+        lowered == "past_key_values"
+        or lowered.startswith("past_key_values.")
+        or lowered == "present"
+        or lowered.startswith("present.")
+    )
+
+
+def _boundary_shape(name: str, value: Any) -> List[Optional[int]]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, list):
+        raise ValueError(f"shape of {name!r} must be a list, got {value!r}")
+    dims: List[Optional[int]] = []
+    for dim in value:
+        if dim is None:
+            dims.append(None)
+            continue
+        number = _as_config_int(dim, f"shape of {name}")
+        if number < 0:
+            raise ValueError(f"shape of {name!r} must be non-negative, got {number}")
+        dims.append(number)
+    return dims
+
+
+def _declared_boundary_items(info: Dict[str, Any]) -> Tuple[List[Any], bool]:
+    for source in (info, _nested_model_info(info)):
+        if "boundary_tensors" not in source or source.get("boundary_tensors") is None:
+            continue
+        raw = source["boundary_tensors"]
+        if isinstance(raw, (str, bytes)) or not isinstance(raw, list):
+            raise ValueError(f"boundary_tensors must be a list, got {raw!r}")
+        return raw, True
+    return [], False
+
+
+def _boundary_from_document(item: Any, component_names: set) -> Dict[str, Any]:
+    if not isinstance(item, dict):
+        raise ValueError(f"boundary tensor must be a dict, got {item!r}")
+    name = item.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError(f"boundary tensor name must be a non-empty string, got {name!r}")
+    name = name.strip()
+    dtype = item.get("dtype")
+    if not isinstance(dtype, str) or not dtype.strip():
+        raise ValueError(f"boundary tensor dtype must be a non-empty string, got {dtype!r}")
+    producer = item.get("producer_component")
+    if not isinstance(producer, str) or not producer.strip():
+        raise ValueError(
+            f"producer_component must be a non-empty string, got {producer!r}"
+        )
+    producer = producer.strip()
+    if component_names and producer not in component_names:
+        raise ValueError(
+            f"boundary {name} producer {producer} is not a component"
+        )
+    consumers = _name_list(item.get("consumer_components"), "consumer_components")
+    if consumers is None:
+        raise ValueError("consumer_components must be a list of names, got None")
+    for consumer in consumers:
+        if component_names and consumer not in component_names:
+            raise ValueError(
+                f"boundary {name} consumer {consumer} is not a component"
+            )
+    if "is_stateful" in item and item.get("is_stateful") is not None:
+        if not isinstance(item["is_stateful"], bool):
+            raise ValueError(
+                f"is_stateful must be a bool, got {item['is_stateful']!r}"
+            )
+        stateful = item["is_stateful"]
+    else:
+        stateful = False
+    if _name_is_stateful(name):
+        stateful = True
+    device = item.get("device_preference")
+    if device is not None:
+        if isinstance(device, bool) or not isinstance(device, str):
+            raise ValueError(f"device_preference must be a string, got {device!r}")
+        device = device.strip() or None
+    return {
+        "name": name,
+        "dtype": dtype.strip(),
+        "shape": _boundary_shape(name, item.get("shape")),
+        "producer_component": producer,
+        "consumer_components": consumers,
+        "is_stateful": stateful,
+        "device_preference": device,
+    }
+
+
+def _io_index(records: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    indexed: Dict[str, Dict[str, Any]] = {}
+    for record in records:
+        for item in list(record["inputs"]) + list(record["outputs"]):
+            indexed.setdefault(item["name"], item)
+    return indexed
+
+
+def _check_boundaries_against_graph(
+    boundaries: List[Dict[str, Any]],
+    records: List[Dict[str, Any]],
+) -> None:
+    indexed = _io_index(records)
+    for boundary in boundaries:
+        observed = indexed.get(boundary["name"])
+        if observed is None:
+            continue
+        declared = _canonical_type_name(boundary["dtype"])
+        graph_type = _canonical_type_name(observed["dtype"])
+        if declared and graph_type and declared != graph_type:
+            raise ValueError(
+                f"boundary {boundary['name']} dtype {boundary['dtype']} != {observed['dtype']}"
+            )
+        if not _shapes_agree(boundary["shape"], observed["shape"]):
+            raise ValueError(
+                f"boundary {boundary['name']} shape {boundary['shape']} != {observed['shape']}"
+            )
+
+
+def _synthesized_boundaries(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """KV and cross-component tensors when model_info has no boundary list."""
+    producers: Dict[str, str] = {}
+    consumers: Dict[str, List[str]] = {}
+    indexed: Dict[str, Dict[str, Any]] = {}
+    order: List[str] = []
+    for record in records:
+        for item in record["outputs"]:
+            producers.setdefault(item["name"], record["name"])
+            if item["name"] not in indexed:
+                indexed[item["name"]] = item
+                order.append(item["name"])
+        for item in record["inputs"]:
+            consumers.setdefault(item["name"], []).append(record["name"])
+            if item["name"] not in indexed:
+                indexed[item["name"]] = item
+                order.append(item["name"])
+    boundaries = []
+    for name in order:
+        item = indexed[name]
+        other_consumers = [
+            consumer for consumer in consumers.get(name, [])
+            if consumer != producers.get(name)
+        ]
+        if (
+            not _name_is_stateful(name)
+            and name not in _ACTIVATION_BOUNDARY_NAMES
+            and not other_consumers
+        ):
+            continue
+        boundaries.append({
+            "name": name,
+            "dtype": item["dtype"],
+            "shape": list(item["shape"]),
+            "producer_component": producers.get(name, "external"),
+            "consumer_components": list(consumers.get(name, [])),
+            "is_stateful": _name_is_stateful(name),
+            "device_preference": None,
+        })
+    return boundaries
+
+
+def _boundary_contracts(
+    info: Dict[str, Any],
+    records: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    component_names = {record["name"] for record in records}
+    raw, declared = _declared_boundary_items(info)
+    if not declared:
+        return _synthesized_boundaries(records)
+    boundaries = []
+    seen = set()
+    for item in raw:
+        boundary = _boundary_from_document(item, component_names)
+        if boundary["name"] in seen:
+            raise ValueError(
+                f"boundary_tensors contains a duplicate name {boundary['name']!r}"
+            )
+        seen.add(boundary["name"])
+        boundaries.append(boundary)
+    _check_boundaries_against_graph(boundaries, records)
+    return boundaries
+
+
+def _public_component(record: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "name": record["name"],
+        "type": record["type"],
+        "layer_id": record["layer_id"],
+        "file": record["file"],
+        "input_names": list(record["input_names"]),
+        "output_names": list(record["output_names"]),
+        "inputs": _copy_json_value(record["inputs"]),
+        "outputs": _copy_json_value(record["outputs"]),
+        "external_data": list(record["external_data"]),
+    }
+
+
+def _execution_plan_copy(info: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    for source in (info, _nested_model_info(info)):
+        if "execution_plan" not in source or source.get("execution_plan") is None:
+            continue
+        raw = source["execution_plan"]
+        if not isinstance(raw, dict):
+            raise ValueError(f"execution_plan must be a dict, got {raw!r}")
+        return _copy_json_value(raw)
+    return None
+
+
+def get_split_model_config(model_dir: str) -> Dict[str, Any]:
+    """
+    Read a split ONNX directory for KV preallocation and static graph planning.
+
+    model_info.json supplies the architecture, component list, and boundary
+    contract. config.json fills a field the manifest omits. Each component
+    graph supplies input and output names, shapes, and dtypes. Past-key axis
+    1 and axis 3 are the KV heads and head dim. External data locations named
+    by the graph or the component must exist beside that graph.
+
+    Args:
+        model_dir: Directory containing model_info.json and component ONNX files.
+
+    Returns:
+        Architecture fields plus components, boundary tensors, and external data.
+
+    Raises:
+        FileNotFoundError: If model_dir is not a directory.
+        ValueError: If a graph, boundary, or external data file disagrees.
+    """
+    if not isinstance(model_dir, str) or not os.path.isdir(model_dir):
+        raise FileNotFoundError(f"model directory not found: {model_dir}")
+    info_path = os.path.join(model_dir, "model_info.json")
+    info = _load_json_object(info_path, "model_info.json") if os.path.isfile(info_path) else {}
+    view = _architecture_view(model_dir, info)
+    dtype_was_set = view.get("torch_dtype") is not None or view.get("dtype") is not None
+    fields = _fields_from_hf_config(view)
+    records = _collect_components(model_dir, info)
+    external = _attach_external_data(model_dir, records)
+    _read_component_graphs(records)
+    _apply_graph_planning_fields(fields, records, dtype_was_set)
+    nested = _nested_model_info(info)
+    producer = info.get("producer", nested.get("producer"))
+    ir_version = info.get("ir_version", nested.get("ir_version"))
+    fields.update({
+        "format": "onnx",
+        "producer": producer if isinstance(producer, str) else None,
+        "ir_version": ir_version if isinstance(ir_version, int) and not isinstance(ir_version, bool) else None,
+        "components": [_public_component(record) for record in records],
+        "boundary_tensors": _boundary_contracts(info, records),
+        "external_data": external,
+        "files": [record["file"] for record in records],
+        "execution_plan": _execution_plan_copy(info),
+    })
+    return fields
 
 
 # Weight width in bits. INT4 is two values per byte.

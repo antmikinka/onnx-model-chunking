@@ -7891,6 +7891,7 @@ def test_hf_integration():
         estimate_model_memory,
         get_model_config,
         get_onnx_dtype as direct_get,
+        get_split_model_config,
         get_torch_dtype,
     )
     from chunking_utils.common.types import TensorDtype
@@ -8142,6 +8143,314 @@ def test_hf_integration():
     except ValueError as exc:
         assert "rope_theta" in str(exc)
     print("  hf config: context, sliding window, kv heads, head dim, rope, moe")
+
+    import json
+    import os
+    import tempfile
+
+    assert common.get_split_model_config is get_split_model_config
+
+    def _encode_varint(number):
+        out = bytearray()
+        value = int(number)
+        while True:
+            byte = value & 0x7F
+            value >>= 7
+            if value:
+                out.append(byte | 0x80)
+            else:
+                out.append(byte)
+                return bytes(out)
+
+    def _proto_key(field, wire):
+        return _encode_varint((field << 3) | wire)
+
+    def _proto_int(field, number):
+        return _proto_key(field, 0) + _encode_varint(number)
+
+    def _proto_bytes(field, payload):
+        data = payload.encode() if isinstance(payload, str) else payload
+        return _proto_key(field, 2) + _encode_varint(len(data)) + data
+
+    def _write_past_key_onnx(path, shapes, elem=1, external=None, present=True):
+        def dim(item):
+            if isinstance(item, int):
+                return _proto_bytes(1, _proto_int(1, item))
+            return _proto_bytes(1, _proto_bytes(2, item))
+
+        def value_info(name, dims):
+            shape = b"".join(dim(item) for item in dims)
+            tensor = _proto_int(1, elem) + _proto_bytes(2, shape)
+            return _proto_bytes(1, name) + _proto_bytes(2, _proto_bytes(1, tensor))
+
+        def node(op_type, inputs, outputs):
+            body = b"".join(_proto_bytes(1, item) for item in inputs)
+            body += b"".join(_proto_bytes(2, item) for item in outputs)
+            body += _proto_bytes(4, op_type)
+            return body
+
+        graph = _proto_bytes(2, "g")
+        if external:
+            entry = _proto_bytes(1, "location") + _proto_bytes(2, external)
+            initializer = (
+                _proto_int(1, 1)
+                + _proto_int(2, elem)
+                + _proto_bytes(8, "weights")
+                + _proto_bytes(13, entry)
+                + _proto_int(14, 1)
+            )
+            graph += _proto_bytes(5, initializer)
+        for name, dims in shapes:
+            output = ("present_" if present else "hidden_") + name.replace(".", "_")
+            graph += _proto_bytes(1, node("Identity", [name], [output]))
+            graph += _proto_bytes(11, value_info(name, dims))
+            graph += _proto_bytes(12, value_info(output, dims))
+        model = _proto_int(1, 8) + _proto_bytes(7, graph) + _proto_bytes(8, _proto_int(2, 13))
+        with open(path, "wb") as handle:
+            handle.write(model)
+
+    def _write_json(directory, name, payload):
+        with open(os.path.join(directory, name), "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+
+    try:
+        get_split_model_config(os.path.join(tempfile.gettempdir(), "missing-split-dir"))
+        raise AssertionError("a missing split directory was accepted")
+    except FileNotFoundError as exc:
+        assert "model directory not found" in str(exc)
+    with tempfile.TemporaryDirectory() as directory:
+        try:
+            get_split_model_config(directory)
+            raise AssertionError("an empty directory was accepted")
+        except ValueError as exc:
+            assert "No ONNX graph" in str(exc)
+
+    with tempfile.TemporaryDirectory() as directory:
+        _write_past_key_onnx(
+            os.path.join(directory, "embeddings.onnx"),
+            [("hidden_states", [1, "seq", 32])],
+            elem=1,
+        )
+        _write_past_key_onnx(
+            os.path.join(directory, "layer_0.onnx"),
+            [
+                ("past_key_values.0.key", [1, 2, "seq", 8]),
+                ("past_key_values.0.value", [1, 2, "seq", 8]),
+            ],
+            elem=10,
+            external="weights.onnx.data",
+        )
+        _write_past_key_onnx(
+            os.path.join(directory, "layer_1.onnx"),
+            [
+                ("past_key_values.0.key", [1, 2, "seq", 8]),
+                ("past_key_values.0.value", [1, 2, "seq", 8]),
+            ],
+            elem=10,
+        )
+        with open(os.path.join(directory, "weights.onnx.data"), "wb") as handle:
+            handle.write(b"\x00\x00")
+        _write_json(directory, "config.json", {
+            "max_position_embeddings": 8192,
+            "rope_theta": 10000,
+            "model_type": "ignored",
+        })
+        _write_json(directory, "model_info.json", {
+            "num_layers": 2,
+            "architecture": "llama",
+            "hidden_size": 32,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "max_position_embeddings": 4096,
+            "producer": "test",
+            "ir_version": 8,
+            "components": {
+                "embedding": {"type": "embedding", "file": "embeddings.onnx"},
+                "layer_0": {"type": "layer", "layer_id": 0, "file": "layer_0.onnx"},
+                "layer_1": {"type": "layer", "layer_id": 1, "file": "layer_1.onnx"},
+            },
+            "boundary_tensors": [
+                {
+                    "name": "hidden_states",
+                    "dtype": "float32",
+                    "shape": [1, None, 32],
+                    "producer_component": "embedding",
+                    "consumer_components": ["layer_0"],
+                    "is_stateful": False,
+                },
+                {
+                    "name": "past_key_values.0.key",
+                    "dtype": "float16",
+                    "shape": [1, 2, None, 8],
+                    "producer_component": "layer_0",
+                    "consumer_components": ["layer_1"],
+                    "is_stateful": False,
+                },
+                {
+                    "name": "presentation",
+                    "dtype": "float16",
+                    "shape": [1],
+                    "producer_component": "layer_0",
+                    "consumer_components": ["layer_1"],
+                    "is_stateful": False,
+                },
+            ],
+        })
+        split = get_split_model_config(directory)
+        assert split["format"] == "onnx"
+        assert split["model_type"] == "llama"
+        assert split["num_hidden_layers"] == 2
+        assert split["hidden_size"] == 32
+        assert split["num_attention_heads"] == 4
+        assert split["num_key_value_heads"] == 2
+        assert split["head_dim"] == 8
+        assert split["max_position_embeddings"] == 4096
+        assert split["max_seq_len"] == 4096
+        assert split["rope_theta"] == 10000.0
+        assert split["producer"] == "test"
+        assert split["ir_version"] == 8
+        assert [item["name"] for item in split["components"]] == [
+            "embedding", "layer_0", "layer_1",
+        ]
+        assert split["components"][1]["layer_id"] == 0
+        assert split["components"][1]["external_data"] == ["weights.onnx.data"]
+        assert split["components"][2]["external_data"] == []
+        assert "past_key_values.0.key" in split["components"][1]["input_names"]
+        past = next(
+            item for item in split["components"][1]["inputs"]
+            if item["name"] == "past_key_values.0.key"
+        )
+        assert past["shape"] == [1, 2, None, 8]
+        assert past["dtype"] == "tensor(float16)"
+        assert split["external_data"] == ["weights.onnx.data"]
+        assert split["files"] == ["embeddings.onnx", "layer_0.onnx", "layer_1.onnx"]
+        by_name = {item["name"]: item for item in split["boundary_tensors"]}
+        assert by_name["past_key_values.0.key"]["is_stateful"] is True
+        assert by_name["hidden_states"]["is_stateful"] is False
+        assert by_name["presentation"]["is_stateful"] is False
+        assert by_name["hidden_states"]["producer_component"] == "embedding"
+        split["external_data"].append("extra")
+        split["boundary_tensors"].append({"name": "extra"})
+        again = get_split_model_config(directory)
+        assert again["external_data"] == ["weights.onnx.data"]
+        assert len(again["boundary_tensors"]) == 3
+        via_model = get_model_config(directory)
+        assert via_model["max_seq_len"] == 4096
+        assert via_model["components"][0]["file"] == "embeddings.onnx"
+        os.remove(os.path.join(directory, "weights.onnx.data"))
+        try:
+            get_split_model_config(directory)
+            raise AssertionError("a missing external data file was accepted")
+        except ValueError as exc:
+            assert "missing external data weights.onnx.data" in str(exc)
+
+    with tempfile.TemporaryDirectory() as directory:
+        _write_past_key_onnx(
+            os.path.join(directory, "layer_0.onnx"),
+            [("past_key_values.0.key", [1, 2, "seq", 8])],
+            elem=10,
+        )
+        _write_json(directory, "model_info.json", {
+            "num_layers": 1,
+            "architecture": "llama",
+            "num_key_value_heads": 8,
+            "components": {"layer_0": {"type": "layer", "file": "layer_0.onnx"}},
+            "boundary_tensors": [{
+                "name": "past_key_values.0.key",
+                "dtype": "float16",
+                "shape": [1, 8, None, 8],
+                "producer_component": "layer_0",
+                "consumer_components": [],
+            }],
+        })
+        try:
+            get_split_model_config(directory)
+            raise AssertionError("a KV head mismatch was accepted")
+        except ValueError as exc:
+            assert "num_key_value_heads 8 != 2" in str(exc)
+        info = json.load(open(os.path.join(directory, "model_info.json"), encoding="utf-8"))
+        info["num_key_value_heads"] = 2
+        info["boundary_tensors"][0]["shape"] = [1, 2, None, 16]
+        _write_json(directory, "model_info.json", info)
+        try:
+            get_split_model_config(directory)
+            raise AssertionError("a boundary shape mismatch was accepted")
+        except ValueError as exc:
+            assert "boundary past_key_values.0.key" in str(exc)
+        info["boundary_tensors"][0]["shape"] = [1, 2, None, 8]
+        info["boundary_tensors"].append(dict(info["boundary_tensors"][0]))
+        _write_json(directory, "model_info.json", info)
+        try:
+            get_split_model_config(directory)
+            raise AssertionError("a duplicate boundary was accepted")
+        except ValueError as exc:
+            assert "duplicate" in str(exc)
+        info["boundary_tensors"] = [{
+            "name": "past_key_values.0.key",
+            "dtype": "float16",
+            "shape": [1, 2, None, 8],
+            "producer_component": "missing",
+            "consumer_components": [],
+        }]
+        _write_json(directory, "model_info.json", info)
+        try:
+            get_split_model_config(directory)
+            raise AssertionError("an unknown boundary producer was accepted")
+        except ValueError as exc:
+            assert "producer missing" in str(exc)
+        info["components"]["layer_0"]["input_names"] = ["other"]
+        info["boundary_tensors"][0]["producer_component"] = "layer_0"
+        _write_json(directory, "model_info.json", info)
+        try:
+            get_split_model_config(directory)
+            raise AssertionError("declared input names were not checked")
+        except ValueError as exc:
+            assert "input_names" in str(exc)
+        info["components"]["layer_1"] = {"type": "layer", "layer_id": 1, "file": "layer_1.onnx"}
+        info["num_layers"] = 2
+        info["components"]["layer_0"].pop("input_names")
+        _write_json(directory, "model_info.json", info)
+        try:
+            get_split_model_config(directory)
+            raise AssertionError("a missing component file was accepted")
+        except ValueError as exc:
+            assert "missing component file layer_1.onnx" in str(exc)
+
+    with tempfile.TemporaryDirectory() as directory:
+        _write_past_key_onnx(os.path.join(directory, "model.onnx"), [
+            ("past_key_values.0.key", [1, 4, "seq", 96]),
+            ("past_key_values.0.value", [1, 4, "seq", 96]),
+            ("past_key_values.1.key", [1, 4, "seq", 96]),
+            ("past_key_values.1.value", [1, 4, "seq", 96]),
+        ], elem=10)
+        monolithic = get_split_model_config(directory)
+        assert monolithic["num_hidden_layers"] == 2
+        assert monolithic["num_key_value_heads"] == 4
+        assert monolithic["head_dim"] == 96
+        assert monolithic["torch_dtype"] == "float16"
+        assert monolithic["files"] == ["model.onnx"]
+        past_boundary = next(
+            item for item in monolithic["boundary_tensors"]
+            if item["name"] == "past_key_values.0.key"
+        )
+        assert past_boundary["is_stateful"] is True
+        assert past_boundary["producer_component"] == "external"
+        assert past_boundary["consumer_components"] == ["model"]
+
+    with tempfile.TemporaryDirectory() as directory:
+        _write_json(directory, "model_info.json", {
+            "num_layers": 1,
+            "components": {"layer_0": {"file": "layer_0.onnx"}},
+        })
+        with open(os.path.join(directory, "layer_0.onnx"), "wb") as handle:
+            handle.write(b"not onnx")
+        try:
+            get_split_model_config(directory)
+            raise AssertionError("an unreadable graph was accepted")
+        except ValueError as exc:
+            assert "could not read ONNX graph layer_0.onnx" in str(exc)
+
+    print("  onnx split: components, boundaries, external data, kv shape")
     print("hf integration: OK\n")
     return True
 
