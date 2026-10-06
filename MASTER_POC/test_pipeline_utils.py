@@ -235,6 +235,17 @@ def test_io_binding():
     # Test supported devices
     devices = get_supported_devices()
     print(f"  Supported devices: {devices}")
+    assert devices[0] == "cpu"
+    npu_devices = get_supported_devices([
+        "CPUExecutionProvider",
+        "VitisAIExecutionProvider",
+        "RyzenAIExecutionProvider",
+    ])
+    assert "vitisai" in npu_devices
+    assert "ryzenai" in npu_devices
+    assert npu_devices.index("vitisai") > 0
+    assert npu_devices.index("ryzenai") > 0
+    print(f"  NPU discovery: {npu_devices}")
     
     # Test dtype mapping
     onnx_type = get_onnx_element_type(np.float16)

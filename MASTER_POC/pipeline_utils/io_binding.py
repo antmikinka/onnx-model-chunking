@@ -2076,30 +2076,52 @@ class HeterogeneousIOBindingManager:
 # UTILITY FUNCTIONS
 # =============================================================================
 
-def get_supported_devices() -> List[str]:
+# Execution provider name -> device strings get_supported_devices() reports.
+# VitisAI and RyzenAI are explicit entries. NPU discovery does not depend on
+# the ROCm / MIGraphX iGPU check.
+_PROVIDER_DEVICE_NAMES = {
+    "CUDAExecutionProvider": ("cuda", "cuda_pinned"),
+    "DmlExecutionProvider": ("dml",),
+    "CoreMLExecutionProvider": ("coreml",),
+    "ROCMExecutionProvider": ("rocm", "hip", "hip_pinned", "rocm_pinned"),
+    "MIGraphXExecutionProvider": ("rocm", "hip", "hip_pinned", "rocm_pinned"),
+    "VitisAIExecutionProvider": ("vitisai",),
+    "RyzenAIExecutionProvider": ("ryzenai",),
+}
+
+
+def get_supported_devices(providers: Optional[Sequence[str]] = None) -> List[str]:
     """
-    Get list of device types supported by current ONNX Runtime.
-    
-    Returns:
-        List of device type strings
+    Device types the installed ONNX Runtime execution providers can target.
+
+    ``VitisAIExecutionProvider`` appends ``vitisai``.
+    ``RyzenAIExecutionProvider`` appends ``ryzenai``.
+    CPU is always included. Pass ``providers`` to resolve a known list
+    without querying the local wheel.
     """
-    devices = ["cpu"]  # Always available
-    
-    providers = ort.get_available_providers()
-    
-    if "CUDAExecutionProvider" in providers:
-        devices.append("cuda")
-        devices.append("cuda_pinned")
-    if "DmlExecutionProvider" in providers:
-        devices.append("dml")
-    if "CoreMLExecutionProvider" in providers:
-        devices.append("coreml")
-    if "ROCMExecutionProvider" in providers or "MIGraphXExecutionProvider" in providers:
-        devices.extend(["rocm", "hip", "hip_pinned", "rocm_pinned"])
-    if "VitisAIExecutionProvider" in providers:
-        devices.append("vitisai")
-    if "RyzenAIExecutionProvider" in providers:
-        devices.append("ryzenai")
+    if providers is None:
+        providers = ort.get_available_providers()
+
+    available = {provider.lower() for provider in providers}
+    devices = ["cpu"]
+    seen = {"cpu"}
+
+    def _add(device_name: str) -> None:
+        if device_name not in seen:
+            seen.add(device_name)
+            devices.append(device_name)
+
+    for provider_name, device_names in _PROVIDER_DEVICE_NAMES.items():
+        if provider_name.lower() in available:
+            for device_name in device_names:
+                _add(device_name)
+
+    # A versioned or prefixed NPU provider still contains these tokens.
+    provider_text = " ".join(available)
+    if "vitisai" in provider_text:
+        _add("vitisai")
+    if "ryzenai" in provider_text:
+        _add("ryzenai")
 
     return devices
 
