@@ -6354,6 +6354,8 @@ def test_backend():
             PROVIDER_FALLBACK,
             SplitConfig,
             QuantizationConfig,
+            KVCachePolicy,
+            KVCacheConfig,
             TensorDtype,
             ComponentInfo,
             ComponentType,
@@ -6752,6 +6754,92 @@ def test_backend():
             raise AssertionError("an unknown quantization method was accepted")
         except ValueError as exc:
             assert "sideband" in str(exc)
+        from chunking_utils.common import KVCacheConfig as package_kv
+        from chunking_utils import KVCachePolicy as root_kv_policy
+        from pipeline_utils.kv_cache import KVCachePolicy as manager_kv_policy
+        assert package_kv is KVCacheConfig
+        assert root_kv_policy is KVCachePolicy
+        assert manager_kv_policy is not KVCachePolicy
+        assert manager_kv_policy.DENSE_CONTIGUOUS.value == "dense_contiguous"
+        assert manager_kv_policy.PAGED_BLOCKS.value == "paged_blocks"
+        assert [item.value for item in KVCachePolicy] == [
+            "dense",
+            "sliding_window",
+            "paged",
+            "hybrid_sparse",
+        ]
+        plain_cache = KVCacheConfig()
+        other_cache = SplitConfig(model="weights", output="out")
+        another_cache = SplitConfig(model="weights", output="out")
+        assert plain_cache.dtype is TensorDtype.FLOAT16
+        assert plain_cache.layout == "BNSD"
+        assert plain_cache.max_seq_len == 0
+        assert plain_cache.policy is KVCachePolicy.DENSE
+        assert plain_cache.page_size == 1
+        assert plain_cache.sliding_window is None
+        assert other_cache.kv_cache is not another_cache.kv_cache
+        other_cache.kv_cache.max_seq_len = 32
+        assert another_cache.kv_cache.max_seq_len == 0
+        window = KVCacheConfig(
+            dtype="fp16",
+            layout="bnsd",
+            max_seq_len=8192,
+            policy="sliding",
+            sliding_window=4096,
+        )
+        assert window.dtype is TensorDtype.FLOAT16
+        assert window.layout == "BNSD"
+        assert window.policy is KVCachePolicy.SLIDING_WINDOW
+        assert window.sliding_window == 4096
+        recorded_cache = window.to_dict()
+        recorded_cache["max_seq_len"] = 1
+        assert window.max_seq_len == 8192
+        assert recorded_cache["dtype"] == "float16"
+        assert recorded_cache["policy"] == "sliding_window"
+        paged = SplitConfig(
+            model="weights",
+            output="out",
+            kv_cache={
+                "dtype": "int8",
+                "layout": "BSHD",
+                "max_seq_len": 2048,
+                "policy": "paged_blocks",
+                "page_size": 16,
+            },
+        )
+        assert paged.kv_cache.dtype is TensorDtype.INT8
+        assert paged.kv_cache.layout == "BSHD"
+        assert paged.kv_cache.policy is KVCachePolicy.PAGED
+        assert paged.kv_cache.page_size == 16
+        shared_cache = KVCacheConfig(policy="hybrid_sparse", max_seq_len=1024, page_size=4)
+        one_cache = SplitConfig(model="weights", output="out", kv_cache=shared_cache)
+        two_cache = SplitConfig(model="weights", output="out", kv_cache=shared_cache)
+        assert one_cache.kv_cache is not shared_cache
+        assert one_cache.kv_cache is not two_cache.kv_cache
+        assert one_cache.kv_cache.policy is KVCachePolicy.HYBRID_SPARSE
+        one_cache.kv_cache.page_size = 8
+        assert shared_cache.page_size == 4
+        assert two_cache.kv_cache.page_size == 4
+        try:
+            KVCacheConfig(page_size=0)
+            raise AssertionError("a zero page size was accepted")
+        except ValueError as exc:
+            assert "page_size" in str(exc)
+        try:
+            KVCacheConfig(policy="sliding_window")
+            raise AssertionError("a sliding policy without a window was accepted")
+        except ValueError as exc:
+            assert "sliding_window" in str(exc)
+        try:
+            KVCacheConfig(max_seq_len=-1)
+            raise AssertionError("a negative max sequence length was accepted")
+        except ValueError as exc:
+            assert "max_seq_len" in str(exc)
+        try:
+            KVCacheConfig(dtype="fp8")
+            raise AssertionError("an fp8 cache dtype was accepted")
+        except ValueError as exc:
+            assert "dtype" in str(exc)
         try:
             SplitConfig(model="weights", output="out", target_device="tpu")
             raise AssertionError("an unknown device was accepted")
@@ -7318,6 +7406,7 @@ def test_backend():
     print("  component contract: inputs, shapes, phase, residency")
     print("  boundary tensors: hidden, mask, past and present")
     print("  quantization: awq int4 group, matmul nbits, kv dtype")
+    print("  kv cache config: dense float16 bnsd, sliding window, paged blocks")
     print("backend module: OK\n")
     return True
 

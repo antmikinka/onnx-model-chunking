@@ -379,6 +379,160 @@ def _coerce_quantization(value: Any) -> QuantizationConfig:
     )
 
 
+class KVCachePolicy(str, Enum):
+    """
+    How a split plans to keep past tokens.
+
+    This is the planning name. The runtime cache manager still uses
+    dense_contiguous and paged_blocks for the same two layouts.
+    """
+    DENSE = "dense"
+    SLIDING_WINDOW = "sliding_window"
+    PAGED = "paged"
+    HYBRID_SPARSE = "hybrid_sparse"
+
+
+_KV_POLICY_ALIASES = {
+    "dense": KVCachePolicy.DENSE,
+    "dense_contiguous": KVCachePolicy.DENSE,
+    "contiguous": KVCachePolicy.DENSE,
+    "sliding_window": KVCachePolicy.SLIDING_WINDOW,
+    "sliding": KVCachePolicy.SLIDING_WINDOW,
+    "window": KVCachePolicy.SLIDING_WINDOW,
+    "paged": KVCachePolicy.PAGED,
+    "paged_blocks": KVCachePolicy.PAGED,
+    "paged_attention": KVCachePolicy.PAGED,
+    "blocks": KVCachePolicy.PAGED,
+    "hybrid_sparse": KVCachePolicy.HYBRID_SPARSE,
+    "hybrid": KVCachePolicy.HYBRID_SPARSE,
+    "sparse": KVCachePolicy.HYBRID_SPARSE,
+}
+_KV_LAYOUT_ALIASES = {
+    "bnsd": "BNSD",
+    "bnsh": "BNSD",
+    "batch_heads_seq_dim": "BNSD",
+    "batch_num_seq_dim": "BNSD",
+}
+
+
+def _coerce_kv_policy(value: Any) -> KVCachePolicy:
+    """Accept a planning policy, or a runtime name such as paged_blocks."""
+    if isinstance(value, KVCachePolicy):
+        return value
+    raw = getattr(value, "value", value)
+    if isinstance(raw, bool) or not isinstance(raw, str):
+        raise ValueError(f"KV cache policy must be a KVCachePolicy, got {value!r}")
+    text = raw.strip().lower().replace("-", "_").replace(" ", "_")
+    text = text.split(".")[-1]
+    if text not in _KV_POLICY_ALIASES:
+        known = ", ".join(item.value for item in KVCachePolicy)
+        raise ValueError(
+            f"Unknown KV cache policy {value!r}. Expected one of: {known}"
+        )
+    return _KV_POLICY_ALIASES[text]
+
+
+def _coerce_kv_layout(value: Any) -> str:
+    """Store BNSD for the layout the cache allocates. Other names stay uppercase."""
+    if isinstance(value, bool) or not isinstance(value, str) or not value.strip():
+        raise ValueError(f"layout must be a non-empty string, got {value!r}")
+    token = value.strip().lower().replace("-", "_").replace(" ", "_")
+    if token in _KV_LAYOUT_ALIASES:
+        return _KV_LAYOUT_ALIASES[token]
+    compact = token.replace("_", "")
+    if compact.isalpha():
+        return token.upper()
+    raise ValueError(f"layout {value!r} is not a recognized kv cache layout")
+
+
+def _coerce_non_negative_int(value: Any, field_name: str) -> int:
+    """Reject a bool or a negative count. Zero stays unset."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{field_name} must be an integer, got {value!r}")
+    if value < 0:
+        raise ValueError(f"{field_name} must be non-negative, got {value}")
+    return value
+
+
+def _coerce_page_size(value: Any) -> int:
+    """A page holds at least one token."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"page_size must be an integer, got {value!r}")
+    if value < 1:
+        raise ValueError(f"page_size must be positive, got {value}")
+    return value
+
+
+def _coerce_sliding_window(value: Any) -> Optional[int]:
+    """None stays unset. A window holds at least one token."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"sliding_window must be an integer, got {value!r}")
+    if value < 1:
+        raise ValueError(f"sliding_window must be positive, got {value}")
+    return value
+
+
+@dataclass
+class KVCacheConfig:
+    """
+    Capacity and layout for the KV cache attached to a split.
+
+    ``max_seq_len`` 0 means the capacity is unset. ``layout`` BNSD is batch,
+    heads, sequence, head dim. A sliding-window policy requires
+    ``sliding_window``. ``page_size`` is the paged block length.
+    """
+    dtype: TensorDtype = TensorDtype.FLOAT16
+    layout: str = "BNSD"
+    max_seq_len: int = 0
+    policy: KVCachePolicy = KVCachePolicy.DENSE
+    page_size: int = 1
+    sliding_window: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        coerced = _coerce_quant_dtype(self.dtype, "dtype")
+        if coerced is None:
+            raise ValueError("dtype is required")
+        self.dtype = coerced
+        self.layout = _coerce_kv_layout(self.layout)
+        self.max_seq_len = _coerce_non_negative_int(self.max_seq_len, "max_seq_len")
+        self.policy = _coerce_kv_policy(self.policy)
+        self.page_size = _coerce_page_size(self.page_size)
+        self.sliding_window = _coerce_sliding_window(self.sliding_window)
+        if self.policy is KVCachePolicy.SLIDING_WINDOW and self.sliding_window is None:
+            raise ValueError("sliding_window policy requires a positive sliding_window")
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Copy the record. The dtype and policy are stored as their string values."""
+        return {
+            "dtype": self.dtype.value,
+            "layout": self.layout,
+            "max_seq_len": self.max_seq_len,
+            "policy": self.policy.value,
+            "page_size": self.page_size,
+            "sliding_window": self.sliding_window,
+        }
+
+
+def _coerce_kv_cache(value: Any) -> KVCacheConfig:
+    """Copy a KVCacheConfig, or build one from a dict."""
+    if isinstance(value, KVCacheConfig):
+        return KVCacheConfig(
+            dtype=value.dtype,
+            layout=value.layout,
+            max_seq_len=value.max_seq_len,
+            policy=value.policy,
+            page_size=value.page_size,
+            sliding_window=value.sliding_window,
+        )
+    if isinstance(value, dict):
+        return KVCacheConfig(**value)
+    raise ValueError(
+        f"kv_cache must be a KVCacheConfig or a dict, got {value!r}"
+    )
+
+
 @dataclass
 class SplitConfig:
     """
@@ -400,6 +554,7 @@ class SplitConfig:
         target_device: CPU, GPU, NPU, IPU, or AUTO.
         execution_policy: Monolithic, sequential, persistent, hybrid, or speculative.
         quantization: Weight, activation, and KV scheme, including group size and packing.
+        kv_cache: Cache dtype, layout, capacity, policy, page size, and sliding window.
         low_cpu_mem_usage: Use HuggingFace's low-memory loading.
         
         # HuggingFace integration
@@ -425,6 +580,7 @@ class SplitConfig:
     target_device: DeviceType = DeviceType.AUTO
     execution_policy: ExecutionPolicy = ExecutionPolicy.AUTO
     quantization: QuantizationConfig = field(default_factory=QuantizationConfig)
+    kv_cache: KVCacheConfig = field(default_factory=KVCacheConfig)
     low_cpu_mem_usage: bool = True
     
     # HuggingFace integration
@@ -456,6 +612,7 @@ class SplitConfig:
             cleaned.append(item.strip())
         self.providers = cleaned
         self.quantization = _coerce_quantization(self.quantization)
+        self.kv_cache = _coerce_kv_cache(self.kv_cache)
         self._reject_npu_sequential_split()
 
     def _reject_npu_sequential_split(self) -> None:
