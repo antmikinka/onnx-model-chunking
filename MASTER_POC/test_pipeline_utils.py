@@ -1977,11 +1977,35 @@ def test_config_loader():
     print(f"  to_dict keys: {list(d.keys())}")
     assert config.max_seq_len == 0
     assert d["max_seq_len"] == 0
+    assert config.quantization_method is None
+    assert config.weight_dtype is None
+    assert config.activation_dtype is None
+    assert config.quantization_group_size is None
+    assert config.quantization_format is None
+    assert config.has_zero_point is None
+    assert d["quantization_method"] is None
+    assert d["has_zero_point"] is None
     try:
         ModelConfig(num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=-1).validate()
         raise AssertionError("a negative max_seq_len must be rejected")
     except ValueError as exc:
         assert "max_seq_len must be non-negative" in str(exc)
+    try:
+        ModelConfig(num_layers=1, num_kv_heads=1, head_dim=8, quantization_group_size=0).validate()
+        raise AssertionError("a zero group size must be rejected")
+    except ValueError as exc:
+        assert "quantization_group_size" in str(exc)
+    try:
+        ModelConfig(num_layers=1, num_kv_heads=1, head_dim=8, quantization_group_size=-2).validate()
+        raise AssertionError("a group size below -1 must be rejected")
+    except ValueError as exc:
+        assert "per-channel" in str(exc)
+    ModelConfig(num_layers=1, num_kv_heads=1, head_dim=8, quantization_group_size=-1).validate()
+    try:
+        ModelConfig(num_layers=1, num_kv_heads=1, head_dim=8, has_zero_point="yes").validate()
+        raise AssertionError("a non-boolean zero point must be rejected")
+    except ValueError as exc:
+        assert "has_zero_point" in str(exc)
 
     import json
     import os
@@ -2077,6 +2101,8 @@ def test_config_loader():
         assert genai.num_kv_heads == 4
         assert genai.head_dim == 96
         assert genai.max_seq_len == 0
+        assert genai.quantization_method is None
+        assert genai.quantization_group_size is None
 
     with tempfile.TemporaryDirectory() as directory:
         _write_json(directory, "config.json", {
@@ -2090,6 +2116,8 @@ def test_config_loader():
         assert hf.num_kv_heads == 2
         assert hf.head_dim == 96
         assert hf.max_seq_len == 0
+        assert hf.quantization_method is None
+        assert hf.weight_dtype is None
 
     with tempfile.TemporaryDirectory() as directory:
         _write_json(directory, "model_info.json", {
@@ -2448,8 +2476,145 @@ def test_config_loader():
         except ValueError as exc:
             assert "max_position_embeddings" in str(exc)
 
+    with tempfile.TemporaryDirectory() as directory:
+        payload = dict(hf_base)
+        payload["torch_dtype"] = "float16"
+        _write_json(directory, "config.json", payload)
+        plain = load_model_config(directory)
+        assert plain.quantization_method is None
+        assert plain.weight_dtype is None
+        assert plain.activation_dtype is None
+        assert plain.has_zero_point is None
+    with tempfile.TemporaryDirectory() as directory:
+        payload = dict(hf_base)
+        payload["torch_dtype"] = "float16"
+        payload["quantization_method"] = "rtn"
+        payload["quantization_config"] = {
+            "quant_method": "awq",
+            "bits": 4,
+            "group_size": 128,
+            "zero_point": True,
+            "version": "GEMM",
+        }
+        _write_json(directory, "config.json", payload)
+        awq = load_model_config(directory)
+        assert awq.quantization_method == "rtn"
+        assert awq.weight_dtype == "int4"
+        assert awq.activation_dtype == "fp16"
+        assert awq.quantization_group_size == 128
+        assert awq.quantization_format == "gemm"
+        assert awq.has_zero_point is True
+        assert awq.to_dict()["weight_dtype"] == "int4"
+    with tempfile.TemporaryDirectory() as directory:
+        payload = dict(hf_base)
+        payload["quantization_config"] = {
+            "quant_method": "gptq",
+            "bits": 4,
+            "group_size": -1,
+            "sym": True,
+        }
+        _write_json(directory, "config.json", payload)
+        gptq = load_model_config(directory)
+        assert gptq.quantization_method == "gptq"
+        assert gptq.weight_dtype == "int4"
+        assert gptq.quantization_group_size == -1
+        assert gptq.has_zero_point is False
+        assert gptq.quantization_format is None
+        assert gptq.activation_dtype is None
+    with tempfile.TemporaryDirectory() as directory:
+        payload = dict(hf_base)
+        payload["quantization_config"] = {
+            "quant_method": "quark",
+            "global_quant_config": {
+                "weight": {"dtype": "int4", "group_size": 32, "zero_point": True},
+                "activation": {"dtype": "int8"},
+            },
+        }
+        _write_json(directory, "config.json", payload)
+        quark = load_model_config(directory)
+        assert quark.quantization_method == "quark"
+        assert quark.weight_dtype == "int4"
+        assert quark.activation_dtype == "int8"
+        assert quark.quantization_group_size == 32
+        assert quark.has_zero_point is True
+    with tempfile.TemporaryDirectory() as directory:
+        payload = dict(hf_base)
+        payload["quantization_config"] = {
+            "quant_method": "awq",
+            "bits": 4,
+            "quantization_group_size": 0,
+            "block_size": 64,
+            "weight_dtype": "uint4",
+        }
+        _write_json(directory, "config.json", payload)
+        fallen = load_model_config(directory)
+        assert fallen.quantization_method == "awq"
+        assert fallen.weight_dtype == "uint4"
+        assert fallen.quantization_group_size == 64
+    with tempfile.TemporaryDirectory() as directory:
+        payload = dict(hf_base)
+        payload["quantization_config"] = {
+            "quant_method": "awq",
+            "group_size": "nope",
+        }
+        _write_json(directory, "config.json", payload)
+        try:
+            load_model_config(directory)
+            raise AssertionError("a non-integer group size must be rejected")
+        except ValueError as exc:
+            assert "group_size" in str(exc)
+    with tempfile.TemporaryDirectory() as directory:
+        _write_json(directory, "genai_config.json", {
+            "model": {
+                "type": "llama",
+                "vocab_size": 10,
+                "decoder": {
+                    "num_hidden_layers": 3,
+                    "num_key_value_heads": 4,
+                    "head_size": 96,
+                    "hidden_size": 384,
+                    "num_attention_heads": 4,
+                    "quantization": {
+                        "quant_method": "MatMulNBits",
+                        "bits": 4,
+                        "block_size": 32,
+                        "is_symmetric": True,
+                        "format": "MatMulNBits",
+                        "signed": False,
+                    },
+                },
+            },
+        })
+        nbits = load_model_config(directory)
+        assert nbits.quantization_method == "matmul_nbits"
+        assert nbits.weight_dtype == "uint4"
+        assert nbits.quantization_group_size == 32
+        assert nbits.quantization_format == "matmul_nbits"
+        assert nbits.has_zero_point is False
+    with tempfile.TemporaryDirectory() as directory:
+        _write_json(directory, "model_info.json", {
+            "num_layers": 4,
+            "architecture": "llama",
+            "num_kv_heads": 4,
+            "head_dim": 96,
+            "quantization_method": "rtn",
+            "weight_dtype": "int4",
+            "activation_dtype": "fp16",
+            "quantization_group_size": 32,
+            "quantization_format": "QDQ",
+            "has_zero_point": False,
+        })
+        info_quant = load_model_config(directory, require_all_fields=True)
+        assert info_quant.quantization_method == "rtn"
+        assert info_quant.weight_dtype == "int4"
+        assert info_quant.activation_dtype == "fp16"
+        assert info_quant.quantization_group_size == 32
+        assert info_quant.quantization_format == "qdq"
+        assert info_quant.has_zero_point is False
+
     print("  kv shape: refuse silent 8/128, infer 4 x 96 from ONNX")
     print("  max_seq_len: max_position_embeddings, sequence aliases, unset stays 0")
+    print("  quantization: AWQ, GPTQ, Quark, MatMulNBits, unset stays empty")
     print("  onnx graph: layers, KV axes, dtype, present outputs, external data")
     print("config_loader module: OK\n")
     return True

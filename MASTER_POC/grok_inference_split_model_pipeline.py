@@ -166,9 +166,20 @@ class SequentialModelPipeline:
         try:
             self.config = load_model_config(self.model_dir, t_path)
             self._log(f"  [Config] Loaded from {self.config.source_file}")
+            quant_note = ""
+            method = getattr(self.config, "quantization_method", None)
+            if isinstance(method, str) and method:
+                quant_note = (
+                    f", quant {method}"
+                    f" weights {getattr(self.config, 'weight_dtype', None)}"
+                    f" activations {getattr(self.config, 'activation_dtype', None)}"
+                    f" group {getattr(self.config, 'quantization_group_size', None)}"
+                    f" format {getattr(self.config, 'quantization_format', None)}"
+                )
             self._log(
                 f"  [Config] {self.config.num_layers} layers, {self.config.num_kv_heads} KV heads, "
                 f"{self.config.head_dim} head dim, max_seq_len {self.config.max_seq_len}"
+                f"{quant_note}"
             )
         except FileNotFoundError:
             self._log("  [Warning] No config found, using defaults (may be incorrect)")

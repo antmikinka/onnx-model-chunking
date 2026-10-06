@@ -41,6 +41,15 @@ class ModelConfig:
     # 0 means the config named no static context length. A positive value is
     # the capacity used to preallocate the KV cache once.
     max_seq_len: int = 0
+    # None means the checkpoint did not name a quantization scheme.
+    # A positive group size is the INT4, AWQ, or MatMulNBits block.
+    # -1 means per-channel quantization with one group along K.
+    quantization_method: Optional[str] = None
+    weight_dtype: Optional[str] = None
+    activation_dtype: Optional[str] = None
+    quantization_group_size: Optional[int] = None
+    quantization_format: Optional[str] = None
+    has_zero_point: Optional[bool] = None
     dtype: np.dtype = field(default_factory=lambda: np.float16)
     model_type: str = "unknown"
     
@@ -62,6 +71,17 @@ class ModelConfig:
             raise ValueError(f"head_dim must be positive, got {self.head_dim}")
         if self.max_seq_len < 0:
             raise ValueError(f"max_seq_len must be non-negative, got {self.max_seq_len}")
+        if self.quantization_group_size is not None:
+            group = self.quantization_group_size
+            if isinstance(group, bool) or not isinstance(group, int) or group == 0 or group < -1:
+                raise ValueError(
+                    "quantization_group_size must be positive or -1 for "
+                    f"per-channel, got {group!r}"
+                )
+        if self.has_zero_point is not None and not isinstance(self.has_zero_point, bool):
+            raise ValueError(
+                f"has_zero_point must be a boolean, got {self.has_zero_point!r}"
+            )
         if self.head_dim % 8 != 0:
             warnings.warn(f"head_dim {self.head_dim} is not divisible by 8, may be non-standard")
     
@@ -76,6 +96,12 @@ class ModelConfig:
             "num_attention_heads": self.num_attention_heads,
             "intermediate_size": self.intermediate_size,
             "max_seq_len": self.max_seq_len,
+            "quantization_method": self.quantization_method,
+            "weight_dtype": self.weight_dtype,
+            "activation_dtype": self.activation_dtype,
+            "quantization_group_size": self.quantization_group_size,
+            "quantization_format": self.quantization_format,
+            "has_zero_point": self.has_zero_point,
             "dtype": str(self.dtype),
             "model_type": self.model_type,
             "source_file": self.source_file,
@@ -115,6 +141,7 @@ def _parse_genai_config(config: Dict[str, Any], source: str) -> Optional[ModelCo
                 vocab_size=model.get("vocab_size", 0) if isinstance(model, dict) else 0,
                 model_type=model.get("type", "unknown") if isinstance(model, dict) else "unknown",
                 max_seq_len=_max_seq_len_from(decoder, model, config),
+                **_quantization_from(decoder, model, config),
                 source_file=source,
             )
     except (KeyError, TypeError):
@@ -155,6 +182,7 @@ def _parse_hf_config(config: Dict[str, Any], source: str) -> Optional[ModelConfi
                 intermediate_size=config.get("intermediate_size", 0),
                 model_type=config.get("model_type", "unknown"),
                 max_seq_len=_max_seq_len_from(config),
+                **_quantization_from(config),
                 source_file=source,
             )
     except (KeyError, TypeError):
@@ -217,6 +245,279 @@ def _max_seq_len_from(*sources: Any) -> int:
                 raise ValueError(f"{key} must be non-negative, got {value}")
             return value
     return 0
+
+
+# Short names match the dtype policy used for NPU planning.
+_QUANT_DTYPE_ALIASES = {
+    "float16": "fp16",
+    "fp16": "fp16",
+    "half": "fp16",
+    "float32": "fp32",
+    "fp32": "fp32",
+    "float": "fp32",
+    "bfloat16": "bf16",
+    "bf16": "bf16",
+    "int4": "int4",
+    "uint4": "uint4",
+    "int8": "int8",
+    "uint8": "uint8",
+    "int4x2": "int4",
+    "float8": "fp8",
+    "fp8": "fp8",
+    "float8_e4m3fn": "fp8",
+    "nf4": "nf4",
+    "fp4": "fp4",
+}
+_QUANT_METHOD_ALIASES = {
+    "matmulnbits": "matmul_nbits",
+    "matmul_nbits": "matmul_nbits",
+    "bitsandbytes": "bitsandbytes",
+    "bnb": "bitsandbytes",
+}
+_QUANT_FORMAT_ALIASES = {
+    "matmulnbits": "matmul_nbits",
+    "matmul_nbits": "matmul_nbits",
+    "qdq": "qdq",
+    "qoperator": "qoperator",
+    "gemm": "gemm",
+    "gemv": "gemv",
+    "blocked": "blocked",
+    "awq": "awq",
+    "gptq": "gptq",
+}
+_QUANT_NESTED_KEYS = ("quantization_config", "quantization", "quant_config")
+
+
+def _canon_quant_token(value: Any, aliases: Dict[str, str]) -> Optional[str]:
+    """Return a lowercase planning name. Empty and structured values are absent."""
+    if value is None or isinstance(value, (dict, list, tuple, bool)):
+        return None
+    text = str(value).strip().lower().replace(" ", "").replace("-", "_")
+    if text.startswith("torch."):
+        text = text[6:]
+    if not text:
+        return None
+    return aliases.get(text, text)
+
+
+def _quant_blocks(*sources: Any) -> list:
+    """Nested quantization objects, in source order. The root dict is not one."""
+    blocks = []
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for key in _QUANT_NESTED_KEYS:
+            nested = source.get(key)
+            if not isinstance(nested, dict):
+                continue
+            blocks.append(nested)
+            global_config = nested.get("global_quant_config")
+            if isinstance(global_config, dict):
+                blocks.append(global_config)
+    return blocks
+
+
+def _first_present(dicts: list, keys: tuple) -> tuple:
+    """Return ``(key, value)`` for the first non-empty field, else ``(None, None)``."""
+    for item in dicts:
+        if not isinstance(item, dict):
+            continue
+        for key in keys:
+            if key not in item or item[key] is None:
+                continue
+            if isinstance(item[key], str) and not item[key].strip():
+                continue
+            return key, item[key]
+    return None, None
+
+
+def _child_dict(block: Dict[str, Any], names: tuple) -> Optional[Dict[str, Any]]:
+    for name in names:
+        child = block.get(name)
+        if isinstance(child, dict):
+            return child
+    return None
+
+
+def _group_size_from(dicts: list, keys: tuple) -> Optional[int]:
+    """First positive group size, or -1 for per-channel. Zero is skipped."""
+    for item in dicts:
+        if not isinstance(item, dict):
+            continue
+        for key in keys:
+            if key not in item or item[key] is None:
+                continue
+            if isinstance(item[key], str) and not item[key].strip():
+                continue
+            value = _group_size_value(key, item[key])
+            if value is not None:
+                return value
+    return None
+
+
+def _group_size_value(key: str, raw: Any) -> Optional[int]:
+    """Parse one group size. Zero falls through. -1 is per-channel."""
+    try:
+        value = _as_dim(raw)
+    except ValueError as exc:
+        raise ValueError(f"{key} must be an integer, got {raw!r}") from exc
+    if value is None or value == 0:
+        return None
+    if value < -1:
+        raise ValueError(
+            f"{key} must be positive or -1 for per-channel, got {value}"
+        )
+    return value
+
+
+def _weight_dtype_from_bits(blocks: list) -> Optional[str]:
+    """Map a nested ``bits`` field to int4 or int8. Unsigned flags select uint."""
+    key, raw = _first_present(blocks, ("bits",))
+    if key is None:
+        return None
+    try:
+        bits = _as_dim(raw)
+    except ValueError as exc:
+        raise ValueError(f"bits must be an integer, got {raw!r}") from exc
+    if bits is None or bits <= 0:
+        return None
+    unsigned = False
+    for block in blocks:
+        for flag in ("signed", "is_signed"):
+            if isinstance(block.get(flag), bool) and block[flag] is False:
+                unsigned = True
+    if bits in (4, 8):
+        return f"{'uint' if unsigned else 'int'}{bits}"
+    return None
+
+
+def _quantization_from(*sources: Any) -> Dict[str, Any]:
+    """Read NPU quantization metadata. A config with no scheme stays unset.
+
+    Hugging Face ``quantization_config`` supplies AWQ, GPTQ, and Quark.
+    GenAI and ``model_info.json`` supply the same names, plus a nested
+    ``quantization`` object used by MatMulNBits exports. ``torch_dtype``
+    becomes the activation dtype only after a quantization field is present.
+    """
+    roots = [source for source in sources if isinstance(source, dict)]
+    blocks = _quant_blocks(*sources)
+    searchable = roots + blocks
+
+    method_key, method_raw = _first_present(
+        searchable, ("quantization_method",)
+    )
+    if method_key is None:
+        method_key, method_raw = _first_present(
+            blocks, ("quant_method", "method")
+        )
+    method = _canon_quant_token(method_raw, _QUANT_METHOD_ALIASES)
+
+    weight_key, weight_raw = _first_present(
+        searchable, ("weight_dtype", "weights_dtype")
+    )
+    weight = _canon_quant_token(weight_raw, _QUANT_DTYPE_ALIASES)
+    if weight is None:
+        for block in blocks:
+            child = _child_dict(block, ("weight", "weights"))
+            if child is None:
+                continue
+            _, child_raw = _first_present((child,), ("dtype", "weight_dtype"))
+            weight = _canon_quant_token(child_raw, _QUANT_DTYPE_ALIASES)
+            if weight is not None:
+                break
+    if weight is None:
+        weight = _weight_dtype_from_bits(blocks)
+
+    group = _group_size_from(searchable, ("quantization_group_size",))
+    if group is None:
+        group = _group_size_from(blocks, ("group_size", "block_size"))
+    if group is None:
+        for block in blocks:
+            child = _child_dict(block, ("weight", "weights"))
+            if child is None:
+                continue
+            for key in ("group_size", "block_size", "quantization_group_size"):
+                if key not in child or child[key] is None:
+                    continue
+                group = _group_size_value(key, child[key])
+                if group is not None:
+                    break
+            if group is not None:
+                break
+
+    format_key, format_raw = _first_present(searchable, ("quantization_format",))
+    if format_key is None:
+        format_key, format_raw = _first_present(
+            blocks, ("quant_format", "format", "layout")
+        )
+    quant_format = _canon_quant_token(format_raw, _QUANT_FORMAT_ALIASES)
+    if quant_format is None:
+        for block in blocks:
+            version = block.get("version")
+            if isinstance(version, str) and version.strip().lower() in {"gemm", "gemv"}:
+                quant_format = version.strip().lower()
+                break
+
+    zero_point = None
+    zp_key, zp_raw = _first_present(searchable, ("has_zero_point",))
+    if zp_key is not None:
+        if not isinstance(zp_raw, bool):
+            raise ValueError(f"has_zero_point must be a boolean, got {zp_raw!r}")
+        zero_point = zp_raw
+    if zero_point is None:
+        zp_key, zp_raw = _first_present(blocks, ("zero_point",))
+        if zp_key is not None:
+            zero_point = zp_raw if isinstance(zp_raw, bool) else bool(zp_raw)
+    if zero_point is None:
+        for block in blocks:
+            child = _child_dict(block, ("weight", "weights"))
+            if child is None or "zero_point" not in child or child["zero_point"] is None:
+                continue
+            raw_child = child["zero_point"]
+            zero_point = raw_child if isinstance(raw_child, bool) else bool(raw_child)
+            break
+    if zero_point is None:
+        for block in blocks:
+            for key in ("sym", "symmetric", "is_symmetric"):
+                if isinstance(block.get(key), bool):
+                    zero_point = not block[key]
+                    break
+            if zero_point is not None:
+                break
+
+    activation_key, activation_raw = _first_present(
+        searchable, ("activation_dtype", "act_dtype")
+    )
+    activation = _canon_quant_token(activation_raw, _QUANT_DTYPE_ALIASES)
+    if activation is None:
+        for block in blocks:
+            child = _child_dict(block, ("activation", "activations"))
+            if child is None:
+                continue
+            _, child_raw = _first_present((child,), ("dtype", "activation_dtype"))
+            activation = _canon_quant_token(child_raw, _QUANT_DTYPE_ALIASES)
+            if activation is not None:
+                break
+    if activation is None:
+        _, compute_raw = _first_present(blocks, ("bnb_4bit_compute_dtype", "compute_dtype"))
+        activation = _canon_quant_token(compute_raw, _QUANT_DTYPE_ALIASES)
+
+    quantized = any(
+        value is not None
+        for value in (method, weight, group, quant_format, zero_point, activation)
+    )
+    if activation is None and quantized:
+        _, torch_raw = _first_present(roots, ("torch_dtype",))
+        activation = _canon_quant_token(torch_raw, _QUANT_DTYPE_ALIASES)
+
+    return {
+        "quantization_method": method,
+        "weight_dtype": weight,
+        "activation_dtype": activation,
+        "quantization_group_size": group,
+        "quantization_format": quant_format,
+        "has_zero_point": zero_point,
+    }
 
 
 def _read_field(sources: tuple, keys: tuple) -> Any:
@@ -464,6 +765,7 @@ def _parse_model_info(
         hidden_size=hidden_size or 0,
         num_attention_heads=_as_dim(_read_field(sources, ("num_attention_heads",))) or 0,
         max_seq_len=_max_seq_len_from(*sources),
+        **_quantization_from(*sources),
         model_type=str(config.get("strategy", config.get("model_type", "unknown"))),
         source_file=source,
     )
@@ -487,6 +789,10 @@ def load_model_config(
     ONNX input shaped ``[batch, num_kv_heads, seq, head_dim]``. When that
     shape is also unavailable, ``require_all_fields=True`` raises. Otherwise
     the loader warns and uses the explicit defaults 8 and 128.
+
+    Quantization fields stay unset unless the file names a scheme such as
+    AWQ, GPTQ, Quark, or MatMulNBits. ``quantization_group_size`` -1 means
+    per-channel weights.
     
     Args:
         model_dir: Directory containing model/config files
