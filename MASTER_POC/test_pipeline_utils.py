@@ -1126,6 +1126,110 @@ def test_session_manager():
     assert captured["arena"] is False
     print("  placement: per-component provider and provider_options")
 
+    import statistics
+    import pipeline_utils.session_manager as session_manager_module
+
+    class _CountingSession:
+        def __init__(self):
+            self.calls = 0
+
+        def run(self, output_names, inputs):
+            self.calls += 1
+            return {"y": np.ones((1,), dtype=np.float32)}
+
+        def get_inputs(self):
+            return [type("Input", (), {"name": "x", "shape": [1, 4]})()]
+
+    bench_manager = SessionManager(
+        ".",
+        SessionConfig(providers=["CPUExecutionProvider"]),
+        model_info={"components": {
+            "prefill": {"file": "prefill.onnx"},
+            "decode": {"file": "decode.onnx"},
+        }},
+        available_providers=["CPUExecutionProvider"],
+    )
+    prefill_session = _CountingSession()
+    decode_session = _CountingSession()
+    bench_manager._sessions["prefill"] = prefill_session
+    bench_manager._sessions["decode"] = decode_session
+    feed = {"x": np.zeros((1, 4), dtype=np.float32)}
+    clock_calls = {"n": 0}
+
+    def _clock():
+        clock_calls["n"] += 1
+        tick = clock_calls["n"]
+        if tick == 1:
+            return 0.0
+        if tick == 2:
+            return 0.050
+        return 0.100 + (tick - 3) * 0.001
+
+    original_clock = session_manager_module.time.perf_counter
+    session_manager_module.time.perf_counter = _clock
+    try:
+        cold_result = bench_manager.benchmark_session("prefill", feed)
+        warm_result = bench_manager.benchmark_session("prefill", feed)
+        steady_result = bench_manager.benchmark_session(
+            "decode",
+            feed,
+            exclude_first_run=False,
+            warmup_iterations=2,
+            measured_iterations=5,
+        )
+    finally:
+        session_manager_module.time.perf_counter = original_clock
+    assert cold_result.exclude_first_run is True
+    assert cold_result.warmup_iterations == 2
+    assert cold_result.measured_iterations == 5
+    assert cold_result.cold_run_excluded is True
+    assert cold_result.first_run_ms == 50.0
+    assert len(cold_result.latencies_ms) == 5
+    assert cold_result.mean_ms == statistics.mean(cold_result.latencies_ms)
+    assert cold_result.first_run_ms > max(cold_result.latencies_ms)
+    assert prefill_session.calls == 15
+    assert warm_result.cold_run_excluded is False
+    assert warm_result.first_run_ms is None
+    assert prefill_session.calls == 15
+    assert decode_session.calls == 7
+    assert steady_result.cold_run_excluded is False
+    assert steady_result.first_run_ms is None
+    bench_manager.unload_session("prefill")
+    assert "prefill" not in bench_manager._warmed_sessions
+    bench_manager._sessions["prefill"] = prefill_session
+    clock_calls["n"] = 0
+    before_calls = prefill_session.calls
+    session_manager_module.time.perf_counter = _clock
+    try:
+        reloaded = bench_manager.benchmark_session("prefill", feed)
+    finally:
+        session_manager_module.time.perf_counter = original_clock
+    assert reloaded.cold_run_excluded is True
+    assert prefill_session.calls - before_calls == 8
+    before_calls = prefill_session.calls
+    try:
+        bench_manager.warmup_session("prefill", {"x": np.zeros((1, 3), dtype=np.float32)})
+        raise AssertionError("static shape mismatch was warmed")
+    except ValueError as exc:
+        assert "shape" in str(exc)
+    assert prefill_session.calls == before_calls
+    try:
+        bench_manager.warmup_session("prefill", {"other": feed["x"]})
+        raise AssertionError("missing input was warmed")
+    except ValueError as exc:
+        assert "missing" in str(exc)
+    try:
+        bench_manager.warmup_session("prefill", feed, iterations=-1)
+        raise AssertionError("negative warmup was accepted")
+    except ValueError:
+        pass
+    try:
+        bench_manager.benchmark_session("prefill", feed, measured_iterations=0)
+        raise AssertionError("empty measurement window was accepted")
+    except ValueError:
+        pass
+    print("  warmup: cold run excluded, then 2 warmup and 5 measured")
+
     print("session_manager module: OK\n")
     return True
 

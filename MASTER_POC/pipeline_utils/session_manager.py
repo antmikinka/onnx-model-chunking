@@ -22,11 +22,14 @@ Usage:
 import os
 import json
 import re
+import statistics
 import threading
+import time
 import warnings
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, Iterable, List, Optional, Sequence, Any, Tuple, Union
+import numpy as np
 import onnxruntime as ort
 
 
@@ -758,6 +761,93 @@ def build_provider_assignment(
         provider_options=ep_options,
         profile=profiles[0],
         dropped=dropped,
+    )
+
+
+@dataclass
+class WarmupResult:
+    """One warmup pass. These runs pay for compilation and are not a benchmark."""
+
+    component_name: str
+    iterations: int
+    elapsed_ms: float
+
+
+@dataclass
+class BenchmarkResult:
+    """
+    Steady-state latency for one component.
+
+    ``first_run_ms`` is the cold compilation sample. It is recorded and left
+    out of the measured statistics when ``exclude_first_run`` discards it.
+    """
+
+    component_name: str
+    exclude_first_run: bool
+    warmup_iterations: int
+    measured_iterations: int
+    cold_run_excluded: bool
+    first_run_ms: Optional[float]
+    latencies_ms: List[float]
+    mean_ms: float
+    median_ms: float
+    min_ms: float
+    max_ms: float
+    stdev_ms: float
+
+
+def _concrete_ort_shape(shape: Any) -> Optional[Tuple[int, ...]]:
+    """Return a fully static shape, or None when any axis is symbolic."""
+    if shape is None:
+        return None
+    dims: List[int] = []
+    for dim in shape:
+        if isinstance(dim, int) and dim > 0:
+            dims.append(dim)
+            continue
+        return None
+    return tuple(dims) if dims else None
+
+
+def _validate_dummy_inputs(session: Any, dummy_inputs: Dict[str, np.ndarray]) -> None:
+    """Reject a warmup feed that would recompile or crash a static NPU graph."""
+    if not dummy_inputs:
+        raise ValueError("dummy_inputs is empty")
+    getter = getattr(session, "get_inputs", None)
+    if getter is None:
+        return
+    required = list(getter())
+    missing = [item.name for item in required if item.name not in dummy_inputs]
+    if missing:
+        raise ValueError(f"dummy_inputs is missing session inputs: {missing}")
+    for item in required:
+        value = dummy_inputs[item.name]
+        if not isinstance(value, np.ndarray):
+            raise TypeError(
+                f"dummy input '{item.name}' must be a numpy array, "
+                f"got {type(value).__name__}"
+            )
+        expected = _concrete_ort_shape(getattr(item, "shape", None))
+        if expected is not None and tuple(value.shape) != expected:
+            raise ValueError(
+                f"dummy input '{item.name}' has shape {tuple(value.shape)}, "
+                f"but the session shape is {expected}. "
+                "A static NPU graph cannot change shape during warmup."
+            )
+
+
+def _latency_stats(samples_ms: Sequence[float]) -> Tuple[float, float, float, float, float]:
+    """Mean, median, min, max, and population stdev in milliseconds."""
+    values = [float(sample) for sample in samples_ms]
+    if not values:
+        raise ValueError("measured_iterations produced no samples")
+    spread = statistics.pstdev(values) if len(values) > 1 else 0.0
+    return (
+        statistics.mean(values),
+        statistics.median(values),
+        min(values),
+        max(values),
+        spread,
     )
 
 
@@ -1657,6 +1747,7 @@ class SessionManager:
         self._resolved_providers: Dict[str, str] = {}
         self._static_batch: Optional[int] = None
         self._static_seq: Optional[int] = None
+        self._warmed_sessions: set[str] = set()
         
         # Pre-populate session info (without loading)
         self._discover_sessions()
@@ -1963,6 +2054,97 @@ class SessionManager:
             if session:
                 self._sessions[name] = session
             return session
+
+    def warmup_session(
+        self,
+        name: str,
+        dummy_inputs: Dict[str, np.ndarray],
+        iterations: int = 1,
+    ) -> WarmupResult:
+        """
+        Execute a loaded session so the first-run cost is paid before timing.
+
+        On an NPU that cost is graph compilation, XCLBIN generation, memory
+        planning, operator fallback, and cache initialization. The runs are
+        not a latency result. ``iterations`` defaults to one pass.
+        """
+        if iterations < 0:
+            raise ValueError(f"warmup iterations must be >= 0, got {iterations}")
+        session = self._require_session(name)
+        _validate_dummy_inputs(session, dummy_inputs)
+        if iterations == 0:
+            return WarmupResult(name, 0, 0.0)
+        started = time.perf_counter()
+        for _ in range(iterations):
+            session.run(None, dummy_inputs)
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        self._warmed_sessions.add(name)
+        return WarmupResult(name, iterations, elapsed_ms)
+
+    def benchmark_session(
+        self,
+        name: str,
+        dummy_inputs: Dict[str, np.ndarray],
+        exclude_first_run: bool = True,
+        warmup_iterations: int = 2,
+        measured_iterations: int = 5,
+    ) -> BenchmarkResult:
+        """
+        Measure steady-state latency after NPU first-run setup.
+
+        Defaults match a fair comparison with a precompiled runtime:
+        ``exclude_first_run=True``, ``warmup_iterations=2``,
+        ``measured_iterations=5``. The cold run is stored in
+        ``first_run_ms`` and is not part of the measured mean. Warmup runs
+        are also left out. A session that was already warmed does not
+        discard another sample.
+        """
+        if warmup_iterations < 0:
+            raise ValueError(
+                f"warmup_iterations must be >= 0, got {warmup_iterations}"
+            )
+        if measured_iterations < 1:
+            raise ValueError(
+                f"measured_iterations must be >= 1, got {measured_iterations}"
+            )
+        session = self._require_session(name)
+        _validate_dummy_inputs(session, dummy_inputs)
+        first_run_ms = None
+        cold_run_excluded = False
+        if exclude_first_run and name not in self._warmed_sessions:
+            cold = self.warmup_session(name, dummy_inputs, iterations=1)
+            first_run_ms = cold.elapsed_ms
+            cold_run_excluded = True
+        if warmup_iterations:
+            self.warmup_session(name, dummy_inputs, iterations=warmup_iterations)
+        latencies_ms: List[float] = []
+        for _ in range(measured_iterations):
+            started = time.perf_counter()
+            session.run(None, dummy_inputs)
+            latencies_ms.append((time.perf_counter() - started) * 1000.0)
+        self._warmed_sessions.add(name)
+        mean_ms, median_ms, min_ms, max_ms, stdev_ms = _latency_stats(latencies_ms)
+        return BenchmarkResult(
+            component_name=name,
+            exclude_first_run=exclude_first_run,
+            warmup_iterations=warmup_iterations,
+            measured_iterations=measured_iterations,
+            cold_run_excluded=cold_run_excluded,
+            first_run_ms=first_run_ms,
+            latencies_ms=latencies_ms,
+            mean_ms=mean_ms,
+            median_ms=median_ms,
+            min_ms=min_ms,
+            max_ms=max_ms,
+            stdev_ms=stdev_ms,
+        )
+
+    def _require_session(self, name: str) -> Any:
+        """Return a loaded session, or raise when this component cannot run."""
+        session = self.get_session(name)
+        if session is None:
+            raise RuntimeError(f"Session '{name}' is not loaded")
+        return session
     
     def unload_session(self, name: str) -> bool:
         """
@@ -1986,6 +2168,7 @@ class SessionManager:
         if info is not None:
             info.is_loaded = False
             info.provider_used = None
+        self._warmed_sessions.discard(name)
         return removed
     
     def unload_all(self) -> int:
@@ -1998,6 +2181,7 @@ class SessionManager:
         with self._lock:
             count = len(self._sessions)
             self._sessions.clear()
+            self._warmed_sessions.clear()
             for info in self._session_info.values():
                 info.is_loaded = False
                 info.provider_used = None
@@ -3000,6 +3184,8 @@ __all__ = [
     "StaticBufferAllocation",
     "RuntimeMemoryEstimate",
     "ProviderAssignment",
+    "WarmupResult",
+    "BenchmarkResult",
     # Functions
     "get_available_providers",
     "get_provider_for_device",
