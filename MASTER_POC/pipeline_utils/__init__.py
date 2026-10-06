@@ -63,6 +63,9 @@ from .session_manager import (
     providers_target_npu,
     is_sequential_layer_split,
     validate_npu_execution_policy,
+    infer_component_phase,
+    EXECUTION_PHASES,
+    RESIDENT_POLICIES,
     SUPPORTED_PROVIDERS,
     PROVIDER_CATEGORIES,
 )
@@ -164,6 +167,9 @@ __all__ = [
     "providers_target_npu",
     "is_sequential_layer_split",
     "validate_npu_execution_policy",
+    "infer_component_phase",
+    "EXECUTION_PHASES",
+    "RESIDENT_POLICIES",
     "SUPPORTED_PROVIDERS",
     "PROVIDER_CATEGORIES",
     # io_binding exports

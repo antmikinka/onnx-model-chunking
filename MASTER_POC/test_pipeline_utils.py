@@ -164,6 +164,7 @@ def test_session_manager():
         ExecutionPolicy,
         ExecutionPlan,
         ExecutionStep,
+        infer_component_phase,
         provider_profile_for,
         filter_session_providers,
         get_available_providers,
@@ -1338,6 +1339,175 @@ def test_session_manager():
             providers=["RyzenAIExecutionProvider"],
         )
         assert "cacheDir" not in blocked_assignment.provider_options[0]
+
+    assert infer_component_phase("expert_0") == "expert"
+    assert infer_component_phase("speculative_draft_0") == "speculative_draft"
+    assert infer_component_phase("layer_0") is None
+    assert ExecutionStep(
+        "router", "CPUExecutionProvider", "cpu", "moe_router"
+    ).phase == "router"
+    bare = SessionInfo("bare", "bare.onnx")
+    assert bare.phase is None
+    assert bare.execution_group is None
+    assert bare.device_preference is None
+    assert bare.resident_policy == "auto"
+    assert bare.resolved_resident_policy() == "on_demand"
+
+    phase_components = {
+        "prefill": {
+            "file": "prefill.onnx",
+            "phase": "prefill",
+            "device_preference": "npu",
+            "execution_group": "context",
+            "resident_policy": "resident",
+        },
+        "decode": {
+            "file": "decode.onnx",
+            "phase": "decode",
+            "device_preference": "igpu",
+            "execution_group": "token",
+        },
+        "router": {
+            "file": "router.onnx",
+            "phase": "moe_router",
+            "device_preference": "npu",
+            "execution_group": "moe",
+        },
+        "expert_0": {
+            "file": "expert_0.onnx",
+            "phase": "expert_execution",
+            "device_preference": "igpu",
+            "execution_group": "moe",
+            "resident_policy": "on_demand",
+        },
+        "expert_1": {
+            "file": "expert_1.onnx",
+            "phase": "expert",
+            "device_preference": "igpu",
+            "execution_group": "moe",
+            "resident_policy": "evict",
+        },
+        "kv": {
+            "file": "kv.onnx",
+            "phase": "kv-cache",
+            "device_preference": "npu",
+            "execution_group": "context",
+            "resident_policy": "resident",
+        },
+        "draft": {
+            "file": "draft.onnx",
+            "phase": "speculative draft",
+            "device_preference": "igpu",
+            "execution_group": "speculative",
+        },
+        "verify": {
+            "file": "verify.onnx",
+            "phase": "verification",
+            "device_preference": "xdna",
+            "execution_group": "speculative",
+        },
+    }
+    phase_loader = SessionManager(
+        ".",
+        SessionConfig(
+            providers=[
+                "VitisAIExecutionProvider",
+                "DmlExecutionProvider",
+                "CPUExecutionProvider",
+            ],
+            execution_policy=ExecutionPolicy.HYBRID_NPU_IGPU_PHASE_SPLIT,
+        ),
+        model_info={"components": phase_components},
+        available_providers=[
+            "VitisAIExecutionProvider",
+            "DmlExecutionProvider",
+            "RyzenAIExecutionProvider",
+            "CPUExecutionProvider",
+        ],
+    )
+    assert phase_loader.get_session_info("router").phase == "router"
+    assert phase_loader.get_session_info("expert_0").phase == "expert"
+    assert phase_loader.get_session_info("kv").phase == "kv_cache"
+    assert phase_loader.get_session_info("draft").phase == "speculative_draft"
+    assert phase_loader.get_session_info("verify").device_preference == "npu"
+    assert phase_loader.get_session_info("draft").resolved_resident_policy() == "on_demand"
+    assert phase_loader.get_session_info("kv").resolved_resident_policy() == "resident"
+    assert phase_loader.get_session_info("decode").execution_group == "token"
+
+    prefill_loaded = phase_loader.load_phase("prefill")
+    assert list(prefill_loaded) == ["prefill"]
+    assert prefill_loaded["prefill"].scheduled_provider == "VitisAIExecutionProvider"
+    assert prefill_loaded["prefill"].device_type == "npu"
+    assert prefill_loaded["prefill"].resident is True
+    decode_loaded = phase_loader.load_phase("decode")
+    assert decode_loaded["decode"].scheduled_provider == "DmlExecutionProvider"
+    assert decode_loaded["decode"].device_type == "igpu"
+    assert phase_loader.get_session_info("prefill").resident is True
+
+    phase_loader._sessions["draft"] = object()
+    phase_loader._session_info["draft"].is_loaded = True
+    phase_loader._sessions["kv"] = object()
+    phase_loader._session_info["kv"].is_loaded = True
+    verified = phase_loader.load_phase("verification")
+    assert list(verified) == ["verify"]
+    assert verified["verify"].device_preference == "npu"
+    assert verified["verify"].scheduled_provider == "VitisAIExecutionProvider"
+    assert "draft" not in phase_loader.get_loaded_sessions()
+    assert "kv" in phase_loader.get_loaded_sessions()
+
+    experts = phase_loader.load_phase("expert_execution")
+    assert list(experts) == ["expert_0", "expert_1"]
+    assert experts["expert_0"].scheduled_provider == "DmlExecutionProvider"
+    assert experts["expert_0"].resident is False
+    assert experts["expert_1"].resident is False
+    assert "expert_1" not in phase_loader.get_loaded_sessions()
+    assert phase_loader.get_session_info("kv").is_loaded is True
+    routed = phase_loader.load_phase("moe_router")
+    assert list(routed) == ["router"]
+    assert routed["router"].phase == "router"
+    try:
+        phase_loader.load_phase("expert", execution_group="missing")
+        raise AssertionError("an empty execution group was loaded")
+    except ValueError as exc:
+        assert "expert" in str(exc)
+    try:
+        SessionManager(
+            ".",
+            SessionConfig(providers=["CPUExecutionProvider"]),
+            model_info={"components": {"a": {"file": "a.onnx", "phase": "sideband"}}},
+        )
+        raise AssertionError("an unknown phase was accepted")
+    except ValueError as exc:
+        assert "sideband" in str(exc)
+
+    grouped = SessionManager(
+        ".",
+        SessionConfig(
+            providers=["CPUExecutionProvider"],
+            execution_policy=ExecutionPolicy.SPLIT_CPU_MEMORY_OPTIMIZED,
+        ),
+        model_info={"components": {
+            "prefill": {"file": "prefill.onnx"},
+            "decode": {"file": "decode.onnx"},
+        }},
+    )
+    grouped.load_from_plan(ExecutionPlan(steps=[
+        ExecutionStep(
+            "prefill", "CPUExecutionProvider", "cpu", "prefill",
+            execution_group="context", device_preference="cpu",
+            resident_policy="resident",
+        ),
+        ExecutionStep(
+            "decode", "CPUExecutionProvider", "cpu", "decode",
+            depends_on=["prefill"], resident=False,
+        ),
+    ]))
+    assert grouped.get_session_info("prefill").execution_group == "context"
+    assert grouped.get_session_info("prefill").device_preference == "cpu"
+    assert grouped.get_session_info("prefill").resident_policy == "resident"
+    assert grouped.get_session_info("decode").resident_policy == "on_demand"
+    assert grouped.sessions_for_phase("speculative_draft") == []
+    print("  phases: prefill, decode, router, expert, kv cache, draft, verification")
 
     print("session_manager module: OK\n")
     return True

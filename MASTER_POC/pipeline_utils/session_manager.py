@@ -1297,9 +1297,13 @@ class SessionInfo:
         input_types: Dict of input name to ONNX type string
         output_types: Dict of output name to ONNX type string
         provider_used: Actual provider being used (only when loaded)
-        phase: Scheduler phase from the active execution plan
+        phase: Scheduler phase. Prefill, decode, router, expert, kv_cache,
+            speculative_draft, and verification are the AMD phases.
+        execution_group: Sessions that stay together across a phase load.
+        device_preference: npu, igpu, gpu, cpu, or auto. None uses the manager list.
+        resident_policy: auto, resident, on_demand, or evict. auto follows the phase.
         device_type: Device the plan assigned (npu, igpu, gpu, cpu)
-        resident: Whether the plan keeps this session loaded
+        resident: Whether this session is kept loaded across phases
         scheduled_provider: Provider the plan resolved for this step
         input_shapes: Declared input shapes, including symbolic dimensions
         output_shapes: Declared output shapes, including symbolic dimensions
@@ -1320,9 +1324,29 @@ class SessionInfo:
     output_dtypes: Dict[str, str] = field(default_factory=dict)
     provider_used: Optional[str] = None
     phase: Optional[str] = None
+    execution_group: Optional[str] = None
+    device_preference: Optional[str] = None
+    resident_policy: str = "auto"
     device_type: Optional[str] = None
     resident: bool = False
     scheduled_provider: Optional[str] = None
+
+    def resolved_resident_policy(self) -> str:
+        """
+        Return the residency this session should use.
+
+        ``auto`` follows the phase. Prefill, decode, the router, and the KV
+        cache stay resident. Experts, speculative drafts, and verification
+        load for that phase and can be evicted when another phase runs.
+        """
+        policy = _coerce_resident_policy(self.resident_policy)
+        if policy != "auto":
+            return policy
+        if self.phase in PHASE_RESIDENT_DEFAULT:
+            return PHASE_RESIDENT_DEFAULT[self.phase]
+        if self.resident:
+            return "resident"
+        return "on_demand"
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
@@ -1342,23 +1366,117 @@ class SessionInfo:
             "output_dtypes": self.output_dtypes,
             "provider_used": self.provider_used,
             "phase": self.phase,
+            "execution_group": self.execution_group,
+            "device_preference": self.device_preference,
+            "resident_policy": self.resident_policy,
             "device_type": self.device_type,
             "resident": self.resident,
             "scheduled_provider": self.scheduled_provider,
         }
 
 
-# Phases a heterogeneous schedule can assign. Embedding is accepted because
-# the token path starts there; the other six are the scheduler's device phases.
+# Phases a heterogeneous schedule can assign. Embedding, norm, and lm_head
+# stay because the token path uses them. The AMD schedule is phase-based:
+# prefill, decode, the MoE router, expert execution, the KV cache, a
+# speculative draft, and verification. Aliases collapse onto these names.
 EXECUTION_PHASES = frozenset({
     "prefill",
     "decode",
     "router",
     "expert",
+    "kv_cache",
+    "speculative_draft",
+    "verification",
     "norm",
     "lm_head",
     "embedding",
 })
+
+PHASE_ALIASES = {
+    "prefill": "prefill",
+    "decode": "decode",
+    "router": "router",
+    "moe_router": "router",
+    "moe": "router",
+    "expert": "expert",
+    "expert_execution": "expert",
+    "experts": "expert",
+    "kv_cache": "kv_cache",
+    "kv_cache_management": "kv_cache",
+    "kv": "kv_cache",
+    "speculative_draft": "speculative_draft",
+    "speculative": "speculative_draft",
+    "draft": "speculative_draft",
+    "verification": "verification",
+    "verify": "verification",
+    "norm": "norm",
+    "lm_head": "lm_head",
+    "embedding": "embedding",
+}
+
+RESIDENT_POLICIES = frozenset({"auto", "resident", "on_demand", "evict"})
+
+# auto follows the phase. Context that the next token still needs stays
+# loaded. Experts, drafts, and verification are loaded for that phase only.
+PHASE_RESIDENT_DEFAULT = {
+    "prefill": "resident",
+    "decode": "resident",
+    "router": "resident",
+    "expert": "on_demand",
+    "kv_cache": "resident",
+    "speculative_draft": "on_demand",
+    "verification": "on_demand",
+    "norm": "resident",
+    "lm_head": "resident",
+    "embedding": "resident",
+}
+
+DEVICE_PREFERENCES = frozenset({"auto", "npu", "igpu", "gpu", "cpu"})
+
+_DEVICE_PREFERENCE_ALIASES = {
+    "auto": "auto",
+    "npu": "npu",
+    "xdna": "npu",
+    "igpu": "igpu",
+    "rdna": "igpu",
+    "gpu": "gpu",
+    "cpu": "cpu",
+}
+
+_DEVICE_PROVIDER_ORDER = {
+    "npu": [
+        "RyzenAIExecutionProvider",
+        "VitisAIExecutionProvider",
+        "OpenVINOExecutionProvider",
+        "CoreMLExecutionProvider",
+    ],
+    "igpu": [
+        "DmlExecutionProvider",
+        "ROCmExecutionProvider",
+        "MIGraphXExecutionProvider",
+    ],
+    "gpu": [
+        "CUDAExecutionProvider",
+        "TensorrtExecutionProvider",
+        "ROCmExecutionProvider",
+        "MIGraphXExecutionProvider",
+    ],
+    "cpu": ["CPUExecutionProvider"],
+}
+
+_PHASE_NAME_PREFIXES = (
+    "speculative_draft",
+    "kv_cache",
+    "verification",
+    "prefill",
+    "decode",
+    "router",
+    "expert",
+    "embedding",
+    "lm_head",
+    "norm",
+    "draft",
+)
 
 _IGPU_PROVIDER_MARKERS = ("rocm", "migraphx", "dml", "directml")
 _DISCRETE_GPU_MARKERS = ("cuda", "tensorrt")
@@ -1381,13 +1499,56 @@ def device_type_for_provider(provider: Any) -> str:
 def _coerce_phase(phase: Any) -> str:
     """Normalize a phase name and reject ones the scheduler does not know."""
     value = getattr(phase, "value", phase)
-    text = str(value).strip().lower()
+    text = str(value).strip().lower().replace("-", "_").replace(" ", "_")
+    text = PHASE_ALIASES.get(text, text)
     if text not in EXECUTION_PHASES:
         allowed = ", ".join(sorted(EXECUTION_PHASES))
         raise ValueError(
             f"Unknown execution phase '{phase}'. Expected one of: {allowed}"
         )
     return text
+
+
+def _coerce_resident_policy(policy: Any) -> str:
+    """Normalize a residency policy."""
+    text = str(policy if policy is not None else "auto").strip().lower().replace("-", "_")
+    if text == "transient":
+        text = "on_demand"
+    if text not in RESIDENT_POLICIES:
+        allowed = ", ".join(sorted(RESIDENT_POLICIES))
+        raise ValueError(
+            f"Unknown resident_policy '{policy}'. Expected one of: {allowed}"
+        )
+    return text
+
+
+def _coerce_device_preference(preference: Any) -> Optional[str]:
+    """Normalize a device preference. None means the manager provider list."""
+    if preference is None or preference == "":
+        return None
+    text = str(preference).strip().lower()
+    if text not in _DEVICE_PREFERENCE_ALIASES:
+        allowed = ", ".join(sorted(DEVICE_PREFERENCES))
+        raise ValueError(
+            f"Unknown device_preference '{preference}'. Expected one of: {allowed}"
+        )
+    return _DEVICE_PREFERENCE_ALIASES[text]
+
+
+def infer_component_phase(name: str) -> Optional[str]:
+    """
+    Read a phase from a component name.
+
+    ``expert_0`` is the expert phase. ``layer_0`` is not a phase: sequential
+    layer names stay unassigned so they are not treated as an NPU schedule.
+    """
+    text = str(name).strip().lower().replace("-", "_")
+    if text in PHASE_ALIASES:
+        return PHASE_ALIASES[text]
+    for prefix in _PHASE_NAME_PREFIXES:
+        if text.startswith(prefix + "_"):
+            return _coerce_phase(prefix)
+    return None
 
 
 def _step_targets_npu(step: "ExecutionStep") -> bool:
@@ -1400,8 +1561,11 @@ class ExecutionStep:
     """
     One component in a heterogeneous run.
 
-    ``phase`` is prefill, decode, router, expert, norm, lm_head, or embedding.
-    ``depends_on`` names earlier steps. ``resident`` keeps the session loaded.
+    ``phase`` is prefill, decode, router, expert, kv_cache, speculative_draft,
+    verification, norm, lm_head, or embedding. ``moe_router`` and
+    ``expert_execution`` are accepted aliases. ``depends_on`` names earlier
+    steps. ``resident`` keeps the session loaded. ``resident_policy`` overrides
+    that when it is not ``auto``.
     """
 
     component_name: str
@@ -1412,6 +1576,9 @@ class ExecutionStep:
     output_buffers: List[str] = field(default_factory=list)
     resident: bool = True
     provider_options: Optional[Dict[str, Any]] = None
+    execution_group: Optional[str] = None
+    device_preference: Optional[str] = None
+    resident_policy: str = "auto"
 
     def __post_init__(self) -> None:
         self.component_name = str(self.component_name)
@@ -1421,6 +1588,12 @@ class ExecutionStep:
         self.depends_on = [str(name) for name in self.depends_on]
         self.output_buffers = [str(name) for name in self.output_buffers]
         self.resident = bool(self.resident)
+        if self.execution_group is None or str(self.execution_group).strip() == "":
+            self.execution_group = None
+        else:
+            self.execution_group = str(self.execution_group)
+        self.device_preference = _coerce_device_preference(self.device_preference)
+        self.resident_policy = _coerce_resident_policy(self.resident_policy)
         if self.provider_options is None:
             self.provider_options = {}
         elif isinstance(self.provider_options, dict):
@@ -1960,6 +2133,23 @@ class SessionManager:
             if os.path.exists(filepath):
                 file_size = os.path.getsize(filepath)
             
+            declared_phase = comp_info.get("phase")
+            phase = (
+                _coerce_phase(declared_phase)
+                if declared_phase not in (None, "")
+                else infer_component_phase(name)
+            )
+            preference = _coerce_device_preference(comp_info.get("device_preference"))
+            group = comp_info.get("execution_group")
+            if group is None or str(group).strip() == "":
+                group = None
+            else:
+                group = str(group)
+            device_type = None
+            if "provider" in comp_info:
+                device_type = device_type_for_provider(comp_info["provider"])
+            if preference not in (None, "auto"):
+                device_type = preference
             self._session_info[name] = SessionInfo(
                 name=name,
                 file_path=filepath,
@@ -1971,6 +2161,13 @@ class SessionManager:
                 output_shapes=_copy_shape_map(comp_info.get("output_shapes")),
                 input_dtypes=_copy_dtype_map(comp_info.get("input_dtypes")),
                 output_dtypes=_copy_dtype_map(comp_info.get("output_dtypes")),
+                phase=phase,
+                execution_group=group,
+                device_preference=preference,
+                resident_policy=_coerce_resident_policy(
+                    comp_info.get("resident_policy", "auto")
+                ),
+                device_type=device_type,
             )
     
     def provider_assignment(
@@ -2087,7 +2284,50 @@ class SessionManager:
             elif isinstance(raw_options, list):
                 options = list(raw_options)
             return [component["provider"]], options, True
+        info = self._session_info.get(name)
+        if info is not None and info.device_preference not in (None, "auto"):
+            return self._providers_for_preference(info.device_preference), None, True
         return None
+
+    def _providers_for_preference(self, preference: str) -> List[str]:
+        """
+        Providers for a device preference, limited to ones this process can run.
+
+        A provider that is both available and listed on the session config
+        wins. Otherwise the first available provider for that device is used.
+        CPU is appended when it can run.
+        """
+        selected = _coerce_device_preference(preference)
+        if selected in (None, "auto"):
+            return [_provider_name(provider) for provider in self.config.providers]
+        available = self._available_providers
+        if available is None:
+            available = ort.get_available_providers()
+        available_names = {_provider_name(provider) for provider in available}
+        configured = {_provider_name(provider) for provider in self.config.providers}
+        ordered = _DEVICE_PROVIDER_ORDER[selected]
+        chosen = [
+            name for name in ordered
+            if name in available_names and name in configured
+        ]
+        if not chosen:
+            chosen = [name for name in ordered if name in available_names]
+        if not chosen:
+            warnings.warn(
+                f"No {selected} execution provider is available. "
+                "Falling back to CPU.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+            if "CPUExecutionProvider" in available_names:
+                return ["CPUExecutionProvider"]
+            raise RuntimeError(f"No execution provider is available for '{selected}'")
+        if (
+            "CPUExecutionProvider" not in chosen
+            and "CPUExecutionProvider" in available_names
+        ):
+            chosen.append("CPUExecutionProvider")
+        return chosen
 
     def _load_single_session(
         self,
@@ -2528,6 +2768,14 @@ class SessionManager:
                 info.phase = step.phase
                 info.device_type = step.device_type
                 info.resident = step.resident
+                if step.execution_group is not None:
+                    info.execution_group = step.execution_group
+                if step.device_preference is not None:
+                    info.device_preference = step.device_preference
+                if step.resident_policy != "auto":
+                    info.resident_policy = step.resident_policy
+                elif not step.resident:
+                    info.resident_policy = "on_demand"
                 if not step.resident:
                     assignment = self.provider_assignment(step.component_name)
                     info.scheduled_provider = (
@@ -2557,6 +2805,94 @@ class SessionManager:
         if self.execution_plan is None:
             raise RuntimeError("No execution plan is loaded")
         return self.execution_plan.steps_for_phase(phase)
+
+    def _sessions_in_phase(
+        self,
+        phase: str,
+        execution_group: Optional[str] = None,
+    ) -> List[str]:
+        """Component names in one phase, in plan order then discovery order."""
+        selected = _coerce_phase(phase)
+        names: List[str] = []
+        if self.execution_plan is not None:
+            for step in self.execution_plan.ordered_steps():
+                info = self._session_info.get(step.component_name)
+                if info is None or info.phase != selected:
+                    continue
+                if execution_group is not None and info.execution_group != execution_group:
+                    continue
+                names.append(step.component_name)
+        seen = set(names)
+        for name, info in self._session_info.items():
+            if name in seen or info.phase != selected:
+                continue
+            if execution_group is not None and info.execution_group != execution_group:
+                continue
+            names.append(name)
+        return names
+
+    def load_phase(
+        self,
+        phase: str,
+        execution_group: Optional[str] = None,
+    ) -> Dict[str, SessionInfo]:
+        """
+        Load every session that belongs to one phase.
+
+        Resident sessions from other phases stay loaded. On-demand sessions
+        from other phases are unloaded, which is how experts, drafts, and
+        verification stay off the NPU until that phase runs. ``auto`` uses
+        the phase default. An optional ``execution_group`` limits the load
+        to one group inside the phase.
+        """
+        selected = _coerce_phase(phase)
+        members = self._sessions_in_phase(selected, execution_group)
+        if not members:
+            group = f" in group '{execution_group}'" if execution_group else ""
+            raise ValueError(f"No sessions are assigned to phase '{selected}'{group}")
+        with self._lock:
+            self._install_available_providers()
+            self._enforce_execution_policy()
+            member_set = set(members)
+            for name, info in self._session_info.items():
+                if name in member_set or info.phase is None:
+                    continue
+                if info.resolved_resident_policy() in {"on_demand", "evict"}:
+                    self._drop_session(name)
+                    info.resident = False
+            loaded: Dict[str, SessionInfo] = {}
+            loaded_count = 0
+            for name in members:
+                info = self._session_info[name]
+                policy = info.resolved_resident_policy()
+                if policy == "evict":
+                    self._drop_session(name)
+                    info.resident = False
+                    loaded[name] = info
+                    continue
+                info.resident = policy == "resident"
+                if name in self._sessions:
+                    if info.device_preference not in (None, "auto"):
+                        info.device_type = info.device_preference
+                    loaded[name] = info
+                    loaded_count += 1
+                    continue
+                session = self._load_single_session(name)
+                if info.device_preference not in (None, "auto"):
+                    info.device_type = info.device_preference
+                elif info.scheduled_provider:
+                    info.device_type = device_type_for_provider(info.scheduled_provider)
+                if info.scheduled_provider:
+                    self._resolved_providers[name] = info.scheduled_provider
+                if session is not None:
+                    self._sessions[name] = session
+                    loaded_count += 1
+                loaded[name] = info
+            print(
+                f"  [SessionManager] Phase '{selected}': "
+                f"{loaded_count} loaded, {len(members)} scheduled"
+            )
+            return loaded
 
     def placement(self, component_name: str) -> ExecutionStep:
         """Return the plan step for a component."""
@@ -3386,6 +3722,11 @@ __all__ = [
     "NPU_SEQUENTIAL_SPLIT_ERROR",
     "NPU_PROVIDER_MARKERS",
     "EXECUTION_PHASES",
+    "PHASE_ALIASES",
+    "RESIDENT_POLICIES",
+    "PHASE_RESIDENT_DEFAULT",
+    "DEVICE_PREFERENCES",
+    "infer_component_phase",
     "resolve_static_shape",
     "COMPILED_GRAPH_FACTOR",
     "COMPILED_GRAPH_FLOOR_MB",
