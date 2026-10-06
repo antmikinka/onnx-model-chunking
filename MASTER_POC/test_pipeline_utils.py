@@ -3362,6 +3362,30 @@ def test_backend():
     monolithic._tokenizer = _EosTokenizer()
     assert monolithic.generate("Hello", max_tokens=5, temperature=0) == "1,2,3,4"
 
+    stream_session = _GreedySession()
+    stream_backend = OnnxRuntimeBackend()
+    stream_backend.is_loaded = True
+    stream_backend._is_split = False
+    stream_backend.model = stream_session
+    stream_backend._tokenizer = _Tokenizer()
+    streamed = []
+
+    def _on_token(text, index):
+        streamed.append((text, index, list(stream_session.lengths)))
+
+    assert stream_backend.generate("Hello", 2, _on_token, temperature=0) == "1,2,3,4,4"
+    assert streamed == [("4", 0, [3]), ("4", 1, [3, 4])]
+    streamed.clear()
+    assert stream_backend.generate(
+        "Hello", max_tokens=0, temperature=0, stream_callback=_on_token
+    ) == "1,2,3"
+    assert streamed == []
+    stream_backend._tokenizer = _EosTokenizer()
+    assert stream_backend.generate(
+        "Hello", max_tokens=5, temperature=0, stream_callback=_on_token
+    ) == "1,2,3,4"
+    assert streamed == [("4", 0, [3, 4, 3])]
+
     class _KvSession:
         def __init__(self):
             self.past_lengths = []
@@ -3462,6 +3486,58 @@ def test_backend():
     assert llama.get_memory_usage()["kv_cache_attached"] is True
     assert llama.get_memory_usage()["kv_sequence_length"] == 0
 
+    class _StreamingLlama:
+        def __init__(self):
+            self.stream_flags = []
+
+        def __call__(
+            self,
+            prompt,
+            max_tokens=50,
+            temperature=0.7,
+            top_p=0.9,
+            echo=False,
+            stream=False,
+        ):
+            self.stream_flags.append(stream)
+            if stream:
+                return [
+                    {"choices": [{"text": "hi"}]},
+                    {"choices": [{"text": ""}]},
+                    {"choices": [{"text": "!"}]},
+                ]
+            return {"choices": [{"text": "hi!"}]}
+
+    llama_stream = LlamaCppBackend()
+    llama_stream.is_loaded = True
+    llama_stream.model = _StreamingLlama()
+    llama_pieces = []
+    assert llama_stream.generate(
+        "Hello",
+        max_tokens=2,
+        stream_callback=lambda text, index: llama_pieces.append((text, index)),
+        temperature=0,
+    ) == "hi!"
+    assert llama_pieces == [("hi", 0), ("!", 1)]
+    assert llama_stream.generate("Hello", max_tokens=2, temperature=0) == "hi!"
+    assert llama_stream.model.stream_flags == [True, False]
+
+    class _PlainLlama:
+        def __call__(self, prompt, max_tokens=50, temperature=0.7, top_p=0.9, echo=False, stream=False):
+            if stream:
+                raise TypeError("stream is not supported")
+            return {"choices": [{"text": "done"}]}
+
+    plain = LlamaCppBackend()
+    plain.is_loaded = True
+    plain.model = _PlainLlama()
+    plain_pieces = []
+    assert plain.generate(
+        "Hello",
+        stream_callback=lambda text, index: plain_pieces.append((text, index)),
+    ) == "done"
+    assert plain_pieces == [("done", 0)]
+
     odd = OnnxRuntimeBackend()
     odd.is_loaded = True
     odd.model = _OddSession()
@@ -3533,6 +3609,46 @@ def test_backend():
         assert split.kv_cache is None
         assert split.generate("Hello", max_tokens=7, temperature=0.2, top_p=0.5) == "split:Hello:7"
         assert pipeline.calls == [("Hello", 7)]
+        fallback_tokens = []
+        assert split.generate(
+            "Hello",
+            max_tokens=7,
+            stream_callback=lambda text, index: fallback_tokens.append((text, index)),
+        ) == "split:Hello:7"
+        assert fallback_tokens == [("split:Hello:7", 0)]
+        assert pipeline.calls == [("Hello", 7), ("Hello", 7)]
+
+        class _StreamingPipeline(_FakePipeline):
+            def generate(self, prompt, max_new_tokens=20, stream_callback=None):
+                self.calls.append((prompt, max_new_tokens, stream_callback is not None))
+                if stream_callback is not None:
+                    stream_callback("tok", 0)
+                    stream_callback("en", 1)
+                return "token"
+
+        def _streaming_pipeline_class():
+            def _factory(*args, **kwargs):
+                streaming_pipeline = _StreamingPipeline(*args, **kwargs)
+                created["streaming"] = streaming_pipeline
+                return streaming_pipeline
+            return _factory
+
+        backend_mod._sequential_pipeline_class = _streaming_pipeline_class
+        streaming = OnnxRuntimeBackend(BackendConfig(
+            onnx_providers=["CPUExecutionProvider"],
+            execution_policy="monolithic",
+        ))
+        streaming.load(split_dir)
+        streamed_split = []
+        assert streaming.generate(
+            "Hello",
+            max_tokens=2,
+            stream_callback=lambda text, index: streamed_split.append((text, index)),
+        ) == "token"
+        assert streamed_split == [("tok", 0), ("en", 1)]
+        assert created["streaming"].calls == [("Hello", 2, True)]
+        streaming.cleanup()
+        backend_mod._sequential_pipeline_class = _fake_pipeline_class
         assert split.get_memory_usage()["sessions"] == 2
         assert split.get_memory_usage()["split"] is True
         split.cleanup()

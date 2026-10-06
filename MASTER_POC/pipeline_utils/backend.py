@@ -19,8 +19,9 @@ Usage:
 from abc import ABC, abstractmethod
 from enum import Enum
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Any, Union, Sequence, Tuple
+from typing import Optional, List, Dict, Any, Union, Sequence, Tuple, Callable
 import importlib
+import inspect
 import json
 import os
 import re
@@ -381,6 +382,7 @@ class InferenceBackend(ABC):
         self, 
         prompt: str, 
         max_tokens: int = 50,
+        stream_callback: Optional[Callable[[str, int], None]] = None,
         temperature: float = 0.7,
         top_p: float = 0.9,
     ) -> str:
@@ -390,6 +392,9 @@ class InferenceBackend(ABC):
         Args:
             prompt: Input prompt
             max_tokens: Maximum tokens to generate
+            stream_callback: Called with each new token's text and its
+                0-based index as soon as that token is sampled. None
+                leaves generation silent.
             temperature: Sampling temperature
             top_p: Nucleus sampling threshold
             
@@ -540,6 +545,66 @@ def _prompt_token_ids(tokenizer: Any, prompt: str) -> np.ndarray:
     if ids.ndim != 2:
         raise RuntimeError(f"Tokenizer input_ids must be 2D, got shape {ids.shape}")
     return np.ascontiguousarray(ids, dtype=np.int64)
+
+
+def _emit_stream_token(
+    callback: Optional[Callable[[str, int], None]],
+    text: str,
+    index: int,
+) -> None:
+    """Report one generated piece. A missing callback does nothing."""
+    if callback is None:
+        return
+    callback(text, int(index))
+
+
+def _accepts_parameter(func: Any, name: str) -> bool:
+    """True when ``func`` has an explicit parameter of this name."""
+    try:
+        signature = inspect.signature(func)
+    except (TypeError, ValueError):
+        return False
+    return name in signature.parameters
+
+
+def _stream_llama_piece(chunk: Any) -> str:
+    """Text from one llama.cpp stream chunk."""
+    if isinstance(chunk, str):
+        return chunk
+    if not isinstance(chunk, dict):
+        return ""
+    choices = chunk.get("choices") or []
+    if choices and isinstance(choices[0], dict):
+        return str(choices[0].get("text") or "")
+    if "text" in chunk:
+        return str(chunk.get("text") or "")
+    return ""
+
+
+def _generate_with_pipeline(
+    pipeline: Any,
+    prompt: str,
+    max_tokens: int,
+    stream_callback: Optional[Callable[[str, int], None]],
+) -> str:
+    """
+    Run a split pipeline.
+
+    A pipeline that accepts ``stream_callback`` emits each token itself.
+    Any other pipeline still returns its text, and this emits that text
+    once at index 0 when a callback was requested.
+    """
+    generate = pipeline.generate
+    if stream_callback is not None and _accepts_parameter(generate, "stream_callback"):
+        return generate(
+            prompt,
+            max_new_tokens=max_tokens,
+            stream_callback=stream_callback,
+        )
+    text = generate(prompt, max_new_tokens=max_tokens)
+    if stream_callback is not None and text:
+        stream_callback(text, 0)
+    return text
 
 
 def _decode_ids(tokenizer: Any, token_ids: Sequence[int]) -> str:
@@ -841,6 +906,7 @@ class OnnxRuntimeBackend(InferenceBackend):
         self,
         prompt: str,
         max_tokens: int = 50,
+        stream_callback: Optional[Callable[[str, int], None]] = None,
         temperature: float = 0.7,
         top_p: float = 0.9,
     ) -> str:
@@ -849,6 +915,7 @@ class OnnxRuntimeBackend(InferenceBackend):
 
         A split model returns the text from ``SequentialModelPipeline.generate``.
         A monolithic session returns the decoded prompt plus the new tokens.
+        ``stream_callback`` receives each new token as soon as it is sampled.
         """
         if not self.is_loaded:
             raise RuntimeError("Model not loaded. Call load() first.")
@@ -859,8 +926,12 @@ class OnnxRuntimeBackend(InferenceBackend):
                     "Split ONNX model has no SequentialModelPipeline. "
                     "Call load() on a model directory."
                 )
-            return self._pipeline.generate(prompt, max_new_tokens=max_tokens)
-        return self._monolithic_generate(prompt, max_tokens, temperature, top_p)
+            return _generate_with_pipeline(
+                self._pipeline, prompt, max_tokens, stream_callback
+            )
+        return self._monolithic_generate(
+            prompt, max_tokens, temperature, top_p, stream_callback
+        )
 
     def _monolithic_generate(
         self,
@@ -868,6 +939,7 @@ class OnnxRuntimeBackend(InferenceBackend):
         max_tokens: int,
         temperature: float = 0.7,
         top_p: float = 0.9,
+        stream_callback: Optional[Callable[[str, int], None]] = None,
     ) -> str:
         """
         Prefill one ONNX session, then decode one token at a time.
@@ -965,6 +1037,11 @@ class OnnxRuntimeBackend(InferenceBackend):
                 top_p,
             )
             generated.append(next_id)
+            _emit_stream_token(
+                stream_callback,
+                _decode_ids(self._tokenizer, [next_id]),
+                len(generated) - 1,
+            )
             if past_names and self.kv_cache is not None:
                 _write_presents_to_cache(
                     self.kv_cache, output_names, values, past_names
@@ -1111,22 +1188,56 @@ class LlamaCppBackend(InferenceBackend):
         self, 
         prompt: str, 
         max_tokens: int = 50,
+        stream_callback: Optional[Callable[[str, int], None]] = None,
         temperature: float = 0.7,
         top_p: float = 0.9,
     ) -> str:
-        """Generate text using llama.cpp."""
+        """Generate text using llama.cpp. A callback receives each streamed piece."""
         if not self.is_loaded:
             raise RuntimeError("Model not loaded. Call load() first.")
-        
-        output = self.model(
-            prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            echo=False,
-        )
-        
-        return output["choices"][0]["text"]
+
+        if stream_callback is None:
+            output = self.model(
+                prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                echo=False,
+            )
+            return output["choices"][0]["text"]
+
+        try:
+            stream = self.model(
+                prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                echo=False,
+                stream=True,
+            )
+        except TypeError:
+            output = self.model(
+                prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                echo=False,
+            )
+            text = output["choices"][0]["text"]
+            if text:
+                stream_callback(text, 0)
+            return text
+
+        pieces: List[str] = []
+        index = 0
+        for chunk in stream:
+            text = _stream_llama_piece(chunk)
+            if not text:
+                continue
+            stream_callback(text, index)
+            pieces.append(text)
+            index += 1
+        return "".join(pieces)
 
     def reset_cache(self) -> None:
         """Clear the KV cache and llama.cpp's own state when it has one."""

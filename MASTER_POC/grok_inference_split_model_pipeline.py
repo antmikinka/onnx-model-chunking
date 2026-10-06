@@ -30,7 +30,7 @@ import json
 import argparse
 import gc
 import time
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional, Tuple, Callable
 import numpy as np
 
 import onnxruntime as ort
@@ -563,13 +563,20 @@ class SequentialModelPipeline:
                 present_value_format=present_val_fmt
             )
         
-    def generate(self, prompt: str, max_new_tokens: int = 20) -> str:
+    def generate(
+        self,
+        prompt: str,
+        max_new_tokens: int = 20,
+        stream_callback: Optional[Callable[[str, int], None]] = None,
+    ) -> str:
         """
         Generate text using the sequential pipeline with proper prefill/decode.
         
         Args:
             prompt: Text prompt
             max_new_tokens: Number of tokens to generate
+            stream_callback: Called with each new token's text and its
+                0-based index as soon as that token is chosen.
             
         Returns:
             Generated text
@@ -680,6 +687,8 @@ class SequentialModelPipeline:
             generated_token_ids.append(last_token_id)
             
             token_text = self.tokenizer.decode([last_token_id])
+            if stream_callback is not None:
+                stream_callback(token_text, token_idx)
             self._log(f"  Generated: '{token_text}' (id={last_token_id})")
             
             # Check for EOS
