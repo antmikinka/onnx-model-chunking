@@ -37,6 +37,14 @@ NPU static KV cache:
   (default 4096). attention_mask(valid_tokens) rewrites a fixed
   (batch, max_seq_len) mask: 1 for the written prefix, 0 for padding.
 
+Weight streaming:
+- AsyncIOBindingManager preallocates an active buffer and a shadow buffer.
+- prefetch() copies the next layer into the shadow buffer on a worker
+  thread, using hipMemcpyAsync when the HIP runtime is present.
+- swap_and_bind() exchanges the two pointers and binds the buffer that
+  just finished streaming. The NPU keeps computing on the active buffer
+  while the shadow fill runs.
+
 IMPORTANT MEMORY TRADEOFF CLARIFICATION:
 - I/O Binding does NOT reduce RAM usage
 - It reduces DATA COPY latency between CPU and device
@@ -57,8 +65,10 @@ Usage:
 
 import ctypes
 import os
+import queue
 import threading
 import warnings
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, Dict, List, Optional, Sequence, Tuple, Any, Union
@@ -1579,6 +1589,31 @@ def _configure_hip_library(library: Any) -> None:
     if hasattr(library, "hipHostFree"):
         library.hipHostFree.argtypes = [ctypes.c_void_p]
         library.hipHostFree.restype = ctypes.c_int
+    memcpy_async = getattr(library, "hipMemcpyAsync", None)
+    if memcpy_async is not None:
+        memcpy_async.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        ]
+        memcpy_async.restype = ctypes.c_int
+    memcpy = getattr(library, "hipMemcpy", None)
+    if memcpy is not None:
+        memcpy.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_int,
+        ]
+        memcpy.restype = ctypes.c_int
+    if hasattr(library, "hipStreamSynchronize"):
+        library.hipStreamSynchronize.argtypes = [ctypes.c_void_p]
+        library.hipStreamSynchronize.restype = ctypes.c_int
+    if hasattr(library, "hipDeviceSynchronize"):
+        library.hipDeviceSynchronize.argtypes = []
+        library.hipDeviceSynchronize.restype = ctypes.c_int
 
 
 def _hip_allocate(
@@ -2072,6 +2107,315 @@ class HeterogeneousIOBindingManager:
         )
 
 
+# hipMemcpyDefault: let the driver pick host/device direction for the copy.
+_HIP_MEMCPY_DEFAULT = 4
+
+
+def _hip_dma_copy(dst: int, src: int, nbytes: int) -> bool:
+    """
+    Copy ``nbytes`` with hipMemcpyAsync and wait for the DMA to finish.
+
+    Returns False when the HIP runtime is absent or the copy fails, so the
+    caller can fill the shadow buffer in process memory instead.
+    """
+    if nbytes < 0 or dst == 0 or src == 0:
+        return False
+    library = _load_hip_library()
+    if library is None:
+        return False
+    memcpy_async = getattr(library, "hipMemcpyAsync", None)
+    try:
+        if memcpy_async is not None:
+            status = memcpy_async(
+                ctypes.c_void_p(dst),
+                ctypes.c_void_p(src),
+                ctypes.c_size_t(nbytes),
+                ctypes.c_int(_HIP_MEMCPY_DEFAULT),
+                None,
+            )
+            if status != 0:
+                return False
+            synchronize = getattr(library, "hipStreamSynchronize", None)
+            if synchronize is not None:
+                return int(synchronize(None)) == 0
+            device_sync = getattr(library, "hipDeviceSynchronize", None)
+            if device_sync is not None:
+                return int(device_sync()) == 0
+            return True
+        memcpy = getattr(library, "hipMemcpy", None)
+        if memcpy is None:
+            return False
+        status = memcpy(
+            ctypes.c_void_p(dst),
+            ctypes.c_void_p(src),
+            ctypes.c_size_t(nbytes),
+            ctypes.c_int(_HIP_MEMCPY_DEFAULT),
+        )
+        return int(status) == 0
+    except Exception:
+        return False
+
+
+@dataclass
+class WeightDoubleBuffer:
+    """Active OrtValue bound to the NPU, and the shadow OrtValue being filled."""
+
+    name: str
+    shape: Tuple[int, ...]
+    dtype: np.dtype
+    active: DeviceBuffer
+    shadow: DeviceBuffer
+
+    def __post_init__(self) -> None:
+        if isinstance(self.dtype, str):
+            self.dtype = np.dtype(self.dtype)
+
+
+class AsyncIOBindingManager:
+    """
+    Stream the next layer's weights while the current layer runs.
+
+    Each weight has two preallocated OrtValues. ``prefetch`` fills the shadow
+    buffer on a worker thread. ``swap_and_bind`` waits for that fill, exchanges
+    the two pointers, and binds the buffer that just became active. The
+    allocation happens at registration time, so the worker does not call
+    ``_create_ort_value`` on the overlap path.
+    """
+
+    def __init__(
+        self,
+        device_type: str = "vitisai",
+        device_id: int = 0,
+        max_workers: int = 1,
+        memory_mode: Union[MemoryMode, str] = MemoryMode.NPU_STATIC,
+        max_seq_len: int = DEFAULT_NPU_MAX_SEQ_LEN,
+    ):
+        if max_workers <= 0:
+            raise ValueError(f"max_workers must be positive, got {max_workers}")
+        self.device_type = (device_type or "vitisai").lower()
+        self.device_id = device_id
+        self._allocator = IOBindingManager(
+            self.device_type,
+            device_id,
+            auto_reallocate=False,
+            memory_mode=memory_mode,
+            max_seq_len=max_seq_len,
+        )
+        self._executor = ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="npu-weight-dma",
+        )
+        self._slots: Dict[str, WeightDoubleBuffer] = {}
+        self._lock = threading.RLock()
+        # One shadow fill may sit ready while the NPU reads the active buffer.
+        self._ready: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=1)
+        self._inflight: Optional[Future] = None
+        self._copy_method = "inplace"
+        self._closed = False
+
+    @property
+    def copy_method(self) -> str:
+        """``hipMemcpyAsync`` when the last shadow fill used HIP DMA, else ``inplace``."""
+        return self._copy_method
+
+    def register_weight(
+        self,
+        name: str,
+        shape: Tuple[int, ...],
+        dtype: np.dtype,
+    ) -> WeightDoubleBuffer:
+        """Preallocate the active and shadow OrtValues for one weight tensor."""
+        with self._lock:
+            self._require_open()
+            if name in self._slots:
+                raise ValueError(f"Weight '{name}' is already registered")
+            parsed = tuple(int(dim) for dim in shape)
+            if not parsed or any(dim <= 0 for dim in parsed):
+                raise ValueError(f"Weight '{name}' needs a positive shape, got {shape}")
+            if isinstance(dtype, str):
+                dtype = np.dtype(dtype)
+            # Separate arrays. A CPU OrtValue aliases the numpy buffer, so
+            # one shared zeros array would make both slots the same pointer.
+            active = self._allocator.allocate_buffer(
+                f"{name}#active",
+                parsed,
+                dtype,
+                data=np.zeros(parsed, dtype=dtype),
+                is_dynamic=False,
+            )
+            shadow = self._allocator.allocate_buffer(
+                f"{name}#shadow",
+                parsed,
+                dtype,
+                data=np.zeros(parsed, dtype=dtype),
+                is_dynamic=False,
+            )
+            slot = WeightDoubleBuffer(
+                name=name,
+                shape=parsed,
+                dtype=dtype,
+                active=active,
+                shadow=shadow,
+            )
+            self._slots[name] = slot
+            return slot
+
+    def register_layer(self, specs: Dict[str, Tuple[Tuple[int, ...], np.dtype]]) -> None:
+        """Register every weight tensor used by a repeated layer chunk."""
+        for name, (shape, dtype) in specs.items():
+            self.register_weight(name, shape, dtype)
+
+    def prefetch(self, weights: Dict[str, np.ndarray]) -> Future:
+        """
+        Stream ``weights`` into the shadow buffers on the worker pool.
+
+        Call this while layer N executes. The main thread returns as soon as
+        the copy is queued. A second prefetch before ``swap_buffers`` raises,
+        because the double buffer only has one shadow slot.
+        """
+        with self._lock:
+            self._require_open()
+            if self._inflight is not None and not self._inflight.done():
+                raise RuntimeError(
+                    "Shadow prefetch is already running. swap_buffers() before "
+                    "queueing another layer."
+                )
+            if not self._ready.empty():
+                raise RuntimeError(
+                    "Shadow buffer is full. swap_buffers() before prefetching "
+                    "the next layer."
+                )
+            payload: Dict[str, np.ndarray] = {}
+            for name, array in weights.items():
+                if name not in self._slots:
+                    raise KeyError(f"Weight '{name}' is not registered")
+                slot = self._slots[name]
+                incoming = np.ascontiguousarray(array, dtype=slot.dtype)
+                if tuple(incoming.shape) != slot.shape:
+                    raise StaticShapeError(
+                        f"Weight '{name}' is preallocated as {slot.shape}. "
+                        f"Refusing to reallocate for {tuple(incoming.shape)}."
+                    )
+                payload[name] = incoming
+            if not payload:
+                raise ValueError("prefetch requires at least one weight")
+            future = self._executor.submit(self._fill_shadow, payload)
+            self._inflight = future
+            return future
+
+    def _fill_shadow(self, payload: Dict[str, np.ndarray]) -> str:
+        method = "inplace"
+        try:
+            for name, array in payload.items():
+                slot = self._slots[name]
+                method = self._copy_into_shadow(slot.shadow, array)
+            self._ready.put({"ok": True, "names": list(payload), "method": method})
+            return method
+        except Exception as exc:
+            self._ready.put({"ok": False, "error": exc, "names": list(payload)})
+            raise
+
+    def _copy_into_shadow(self, buffer: DeviceBuffer, array: np.ndarray) -> str:
+        if buffer.ort_value is None:
+            raise RuntimeError(f"Shadow buffer '{buffer.name}' is not allocated")
+        source = np.ascontiguousarray(array)
+        dst = int(buffer.ort_value.data_ptr())
+        if _hip_dma_copy(dst, int(source.ctypes.data), int(source.nbytes)):
+            return "hipMemcpyAsync"
+        self._allocator._write_into_existing(buffer, source)
+        return "inplace"
+
+    def swap_buffers(self) -> Dict[str, DeviceBuffer]:
+        """
+        Wait until the shadow fill finishes, then exchange active and shadow.
+
+        After the swap, ``active`` is the buffer the NPU should read and
+        ``shadow`` is free for the next layer's DMA.
+        """
+        message = self._ready.get()
+        future = self._inflight
+        self._inflight = None
+        if future is not None:
+            try:
+                future.result()
+            except Exception:
+                if message.get("ok"):
+                    raise
+        if not message.get("ok"):
+            raise message["error"]
+        self._copy_method = str(message.get("method", self._copy_method))
+        swapped: Dict[str, DeviceBuffer] = {}
+        with self._lock:
+            for name in message["names"]:
+                slot = self._slots[name]
+                slot.active, slot.shadow = slot.shadow, slot.active
+                swapped[name] = slot.active
+        return swapped
+
+    def bind_active(
+        self,
+        io_binding: Any,
+        names: Optional[Sequence[str]] = None,
+    ) -> Dict[str, DeviceBuffer]:
+        """Bind the active OrtValue for each weight. Does not allocate."""
+        with self._lock:
+            selected = list(names) if names is not None else list(self._slots)
+            bound: Dict[str, DeviceBuffer] = {}
+            for name in selected:
+                slot = self._slots[name]
+                if slot.active.ort_value is None:
+                    raise RuntimeError(f"Weight '{name}' has no active OrtValue")
+                io_binding.bind_ortvalue_input(name, slot.active.ort_value)
+                bound[name] = slot.active
+            return bound
+
+    def swap_and_bind(
+        self,
+        io_binding: Any,
+    ) -> Dict[str, DeviceBuffer]:
+        """Swap in the streamed shadow buffer and bind those pointers."""
+        active = self.swap_buffers()
+        self.bind_active(io_binding, list(active))
+        return active
+
+    def active_buffer(self, name: str) -> DeviceBuffer:
+        with self._lock:
+            return self._slots[name].active
+
+    def shadow_buffer(self, name: str) -> DeviceBuffer:
+        with self._lock:
+            return self._slots[name].shadow
+
+    def close(self) -> None:
+        """Wait for the current shadow fill and stop the worker pool."""
+        if self._closed:
+            return
+        self._closed = True
+        inflight = self._inflight
+        if inflight is not None:
+            try:
+                inflight.result()
+            except Exception:
+                pass
+        self._executor.shutdown(wait=True)
+
+    def _require_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("AsyncIOBindingManager is closed")
+
+    def __enter__(self) -> "AsyncIOBindingManager":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        self.close()
+
+    def __repr__(self) -> str:
+        return (
+            f"AsyncIOBindingManager(device={self.device_type}:{self.device_id}, "
+            f"weights={len(self._slots)}, copy={self._copy_method})"
+        )
+
+
 # =============================================================================
 # UTILITY FUNCTIONS
 # =============================================================================
@@ -2149,7 +2493,9 @@ __all__ = [
     # Classes
     "IOBindingManager",
     "HeterogeneousIOBindingManager",
+    "AsyncIOBindingManager",
     "DeviceBuffer",
+    "WeightDoubleBuffer",
     "SharedBuffer",
     "MemoryMode",
     "MemoryPlacement",

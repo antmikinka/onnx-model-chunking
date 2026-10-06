@@ -50,7 +50,9 @@ from .session_manager import (
 from .io_binding import (
     IOBindingManager,
     HeterogeneousIOBindingManager,
+    AsyncIOBindingManager,
     DeviceBuffer,
+    WeightDoubleBuffer,
     SharedBuffer,
     MemoryMode,
     MemoryPlacement,
@@ -127,7 +129,9 @@ __all__ = [
     # io_binding exports
     "IOBindingManager",
     "HeterogeneousIOBindingManager",
+    "AsyncIOBindingManager",
     "DeviceBuffer",
+    "WeightDoubleBuffer",
     "SharedBuffer",
     "MemoryMode",
     "MemoryPlacement",

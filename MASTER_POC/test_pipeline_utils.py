@@ -533,6 +533,51 @@ def test_io_binding():
     assert bridge.deallocate_shared() >= 1
     print(f"  shared bridge kind: {shared.allocation_kind.value}, ptr={shared.data_ptr:#x}")
 
+    from pipeline_utils.io_binding import AsyncIOBindingManager
+
+    class _WeightBinding:
+        def __init__(self):
+            self.inputs = []
+
+        def bind_ortvalue_input(self, name, value):
+            self.inputs.append((name, value, int(value.data_ptr())))
+
+    with AsyncIOBindingManager(device_type="cpu", max_workers=1) as stream:
+        stream.register_layer({"q_proj": ((2, 4), np.float32)})
+        active_ptr = int(stream.active_buffer("q_proj").ort_value.data_ptr())
+        shadow_ptr = int(stream.shadow_buffer("q_proj").ort_value.data_ptr())
+        assert active_ptr != shadow_ptr
+        layer0 = np.arange(8, dtype=np.float32).reshape(2, 4)
+        first = stream.prefetch({"q_proj": layer0})
+        assert np.array_equal(
+            stream.active_buffer("q_proj").to_numpy(),
+            np.zeros((2, 4), dtype=np.float32),
+        )
+        first_binding = _WeightBinding()
+        swapped = stream.swap_and_bind(first_binding)
+        assert int(swapped["q_proj"].ort_value.data_ptr()) == shadow_ptr
+        assert first_binding.inputs[0][2] == shadow_ptr
+        assert np.array_equal(swapped["q_proj"].to_numpy(), layer0)
+        layer1 = layer0 + 10
+        second = stream.prefetch({"q_proj": layer1})
+        try:
+            stream.prefetch({"q_proj": layer1})
+            raise AssertionError("a second shadow fill was queued")
+        except RuntimeError:
+            pass
+        second.result()
+        second_binding = _WeightBinding()
+        swapped_back = stream.swap_and_bind(second_binding)
+        assert np.array_equal(swapped_back["q_proj"].to_numpy(), layer1)
+        assert int(swapped_back["q_proj"].ort_value.data_ptr()) == active_ptr
+        assert second_binding.inputs[0][2] == active_ptr
+        try:
+            stream.prefetch({"q_proj": np.zeros((3, 3), dtype=np.float32)})
+            raise AssertionError("weight shape change was accepted")
+        except StaticShapeError:
+            pass
+        print(f"  async shadow swap copy={stream.copy_method} ptr={active_ptr:#x}<->{shadow_ptr:#x}")
+
     print("io_binding module: OK\n")
     return True
 
