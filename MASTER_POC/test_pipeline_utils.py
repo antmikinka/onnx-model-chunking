@@ -1509,6 +1509,122 @@ def test_session_manager():
     assert grouped.sessions_for_phase("speculative_draft") == []
     print("  phases: prefill, decode, router, expert, kv cache, draft, verification")
 
+    defaults = SessionConfig()
+    assert defaults.device_id == 0
+    assert defaults.provider_options is None
+    assert defaults.use_available_providers_only is True
+    assert defaults.cache_dir is None
+    assert defaults.warmup is False
+    assert defaults.static_shapes is True
+    assert defaults.memory_policy == "auto"
+    assert defaults.execution_policy == "auto"
+    assert defaults.resolved_execution_policy() == ExecutionPolicy.MONOLITHIC_ONLY
+    assert defaults.execution_policy == ExecutionPolicy.AUTO
+    assert defaults.resolved_memory_policy() == "persistent"
+    npu_defaults = SessionConfig(providers=["VitisAIExecutionProvider"])
+    assert npu_defaults.resolved_memory_policy() == "npu_static"
+    cuda_options = SessionConfig(
+        providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+        provider_options=[{"device_id": "4"}, {}],
+    )
+    assert cuda_options.ort_providers()[0][1]["device_id"] == "4"
+    try:
+        SessionConfig(
+            providers=["CPUExecutionProvider"],
+            provider_options=[{}, {}],
+        )
+        raise AssertionError("mismatched provider_options were accepted")
+    except ValueError as exc:
+        assert "same length" in str(exc)
+    try:
+        SessionConfig(memory_policy="sticky")
+        raise AssertionError("unknown memory policy was accepted")
+    except ValueError as exc:
+        assert "sticky" in str(exc)
+
+    surface = SessionManager(
+        ".",
+        SessionConfig(
+            providers=["CPUExecutionProvider"],
+            execution_policy="auto",
+            warmup=True,
+            static_shapes=True,
+            memory_policy="auto",
+        ),
+        model_info={"components": {
+            "embedding": {"file": "embedding.onnx", "device_preference": "cpu"},
+            "layer_0": {"file": "layer_0.onnx"},
+            "lm_head": {"file": "lm_head.onnx", "phase": "lm_head"},
+        }},
+    )
+    assert surface.filter_available_providers() == ["CPUExecutionProvider"]
+    assert surface.get_execution_order() == ["embedding", "layer_0", "lm_head"]
+    assert surface.get_session_info("embedding").execution_order == 0
+    assert surface.get_session_info("lm_head").execution_order == 2
+    assert surface.get_session_info("embedding").device_affinity == "cpu"
+    assert surface.get_session_info("lm_head").phase == "lm_head"
+    try:
+        surface.load_component("missing")
+        raise AssertionError("unknown component was loaded")
+    except KeyError:
+        pass
+    assert surface.load_component("embedding") is None
+    plan = surface.estimate_memory_plan()
+    assert plan["memory_policy"] == "persistent"
+    assert plan["execution_policy"] == "monolithic_only"
+    assert plan["static_shapes"] is True
+    assert plan["warmup"] is True
+    assert plan["order"] == ["embedding", "layer_0", "lm_head"]
+    assert plan["components"]["embedding"]["estimated_runtime_memory_mb"] > 0
+    assert surface.get_session_info("embedding").estimated_runtime_memory_mb > 0
+    assert surface.get_session_info("embedding").warmed_up is False
+    assert surface.get_session_info("embedding").compiled is False
+
+    class _WarmSession:
+        def __init__(self):
+            self.calls = 0
+        def get_inputs(self):
+            item = type("Input", (), {"name": "x", "shape": [1, 3]})()
+            return [item]
+        def run(self, _outputs, feed):
+            self.calls += 1
+            return [feed["x"]]
+
+    warm_session = _WarmSession()
+    surface._sessions["embedding"] = warm_session
+    surface._session_info["embedding"].is_loaded = True
+    feed = {"x": np.zeros((1, 3), dtype=np.float32)}
+    warmed = surface.warmup_component("embedding", feed)
+    assert warmed.iterations == 1
+    assert warm_session.calls == 1
+    assert surface.get_session_info("embedding").warmed_up is True
+    assert surface.get_session_info("embedding").compiled is True
+    surface.unload_session("embedding")
+    assert surface.get_session_info("embedding").warmed_up is False
+    assert surface.get_session_info("embedding").compiled is False
+
+    from pipeline_utils.io_binding import IOBindingManager, MemoryMode
+    binding = surface.attach_io_binding_manager(IOBindingManager(device_type="cpu"))
+    assert binding.memory_mode == MemoryMode.PERSISTENT
+    npu_surface = SessionManager(
+        ".",
+        SessionConfig(
+            providers=["VitisAIExecutionProvider"],
+            use_available_providers_only=False,
+            memory_policy="auto",
+        ),
+        model_info={"components": {"model": {"file": "model.onnx", "phase": "prefill"}}},
+        available_providers=["CPUExecutionProvider"],
+    )
+    assert npu_surface.filter_available_providers() == ["VitisAIExecutionProvider"]
+    assert npu_surface.config.providers == ["VitisAIExecutionProvider"]
+    npu_binding = npu_surface.attach_io_binding_manager(
+        IOBindingManager(device_type="cpu")
+    )
+    assert npu_binding.memory_mode == MemoryMode.NPU_STATIC
+    assert npu_surface.estimate_memory_plan()["memory_policy"] == "npu_static"
+    print("  session surface: providers, phase load, warmup, memory plan, io attach")
+
     print("session_manager module: OK\n")
     return True
 

@@ -96,6 +96,7 @@ class ExecutionPolicy(Enum):
     iGPU, or MoE expert routing. The split values are for CPU and GPU.
     """
 
+    AUTO = "auto"
     MONOLITHIC_ONLY = "monolithic_only"
     SPLIT_CPU_MEMORY_OPTIMIZED = "split_cpu_memory_optimized"
     SPLIT_GPU_PERSISTENT = "split_gpu_persistent"
@@ -161,6 +162,28 @@ def coerce_execution_policy(policy: Union[ExecutionPolicy, str]) -> ExecutionPol
         raise ValueError(
             f"Unknown execution policy '{policy}'. Expected one of: {allowed}"
         ) from exc
+
+
+MEMORY_POLICIES = frozenset({
+    "auto",
+    "minimal",
+    "persistent",
+    "io_bound",
+    "npu_static",
+})
+
+
+def _coerce_memory_policy(policy: Any) -> str:
+    """Normalize a memory policy. ``resident`` is the persistent mode."""
+    text = str(policy if policy is not None else "auto").strip().lower().replace("-", "_")
+    if text == "resident":
+        text = "persistent"
+    if text not in MEMORY_POLICIES:
+        allowed = ", ".join(sorted(MEMORY_POLICIES))
+        raise ValueError(
+            f"Unknown memory policy '{policy}'. Expected one of: {allowed}"
+        )
+    return text
 
 
 def validate_npu_execution_policy(
@@ -991,9 +1014,20 @@ class SessionConfig:
         intra_op_threads: Number of threads within a single op.
             0 uses the profile value.
         memory_limit_mb: Optional memory limit for the active device allocator.
-        device_id: Optional device index override for the selected profile.
+        device_id: Device index passed to the execution provider. 0 is the
+            default device. An explicit profile whose device is already
+            non-zero keeps that id when this field is left at 0.
+        provider_options: One option dict per provider, in the same order as
+            ``providers``. None leaves each provider on its profile.
+        use_available_providers_only: Drop providers this process cannot load.
         cache_dir: Compile-cache directory. The manager uses
             ``<model_dir>/.ort_cache`` when this is omitted and caching is on.
+        warmup: When true, a loaded component is not treated as compiled
+            until ``warmup_component`` has run.
+        static_shapes: Keep ONNX shape checking on and freeze symbolic
+            batch and sequence axes for IO binding.
+        memory_policy: auto, minimal, persistent, io_bound, or npu_static.
+            auto uses npu_static on an NPU target and persistent otherwise.
         enable_provider_cache: Reuse compiled graphs across loads. VitisAI and
             RyzenAI receive ``cacheDir`` and ``cacheKey`` when this is true
             and a directory is set.
@@ -1004,8 +1038,9 @@ class SessionConfig:
         disable_shape_check: Disable node shape checking for dynamic shapes.
             AOT NPU profiles keep shape checking on.
         execution_policy: How this model may be split across sessions.
-            NPU targets reject sequential layer splits. Phase-split and MoE
-            routing are the allowed NPU exceptions.
+            ``auto`` resolves to monolithic execution, which still rejects a
+            sequential NPU layer split. Phase-split and MoE routing are the
+            allowed NPU exceptions.
 
     NPU-Specific Options (for VitisAIExecutionProvider):
         npu_graph_capture: Enable NPU graph capture for faster inference (default: True)
@@ -1021,18 +1056,63 @@ class SessionConfig:
             - "optimized": Slower compilation, maximum optimization
     """
     providers: List[str] = field(default_factory=lambda: ['CPUExecutionProvider'])
-    execution_policy: ExecutionPolicy = ExecutionPolicy.MONOLITHIC_ONLY
+    execution_policy: Union[ExecutionPolicy, str] = "auto"
     profile: Optional[ProviderProfile] = None
     optimization_level: Optional[str] = None  # None = use the provider profile
     inter_op_threads: int = 0  # 0 = profile default
     intra_op_threads: int = 0  # 0 = profile default
     memory_limit_mb: Optional[int] = None
-    device_id: Optional[int] = None
+    device_id: int = 0
+    provider_options: Optional[List[Dict[str, Any]]] = None
+    use_available_providers_only: bool = True
     cache_dir: Optional[str] = None
+    warmup: bool = False
+    static_shapes: bool = True
+    memory_policy: str = "auto"
     enable_provider_cache: bool = True
     enable_profiling: bool = False
     profile_dir: Optional[str] = None
-    disable_shape_check: bool = True  # Ignored for AOT NPU profiles
+    disable_shape_check: bool = True  # Ignored when static_shapes is set
+
+    def __post_init__(self) -> None:
+        if self.device_id is None:
+            self.device_id = 0
+        else:
+            self.device_id = int(self.device_id)
+        self.memory_policy = _coerce_memory_policy(self.memory_policy)
+        if self.provider_options is not None:
+            if len(self.provider_options) != len(self.providers):
+                raise ValueError(
+                    "provider_options and providers must be the same length, "
+                    f"got {len(self.provider_options)} and {len(self.providers)}"
+                )
+            self.provider_options = [
+                dict(options or {}) for options in self.provider_options
+            ]
+
+    def _device_id_override(self) -> Optional[int]:
+        """
+        Device index to write onto a profile.
+
+        The default 0 does not replace an explicit profile that already
+        names another device.
+        """
+        if int(self.device_id) != 0:
+            return int(self.device_id)
+        if self.profile is not None and int(self.profile.device_id) != 0:
+            return None
+        return int(self.device_id)
+
+    def _provider_option_list(self) -> List[Dict[str, Any]]:
+        """Option dicts aligned with ``providers``. Missing entries are empty."""
+        if not self.provider_options:
+            return [{} for _ in self.providers]
+        if len(self.provider_options) != len(self.providers):
+            raise ValueError(
+                "provider_options and providers must be the same length, "
+                f"got {len(self.provider_options)} and {len(self.providers)}"
+            )
+        return [dict(options or {}) for options in self.provider_options]
 
     # NPU-specific options (P1.2: NPU Session Options)
     npu_graph_capture: bool = True
@@ -1055,10 +1135,11 @@ class SessionConfig:
             profile.optimization_level = self.optimization_level
         if self.memory_limit_mb is not None:
             profile.memory_limit_mb = self.memory_limit_mb
-        if self.device_id is not None:
-            profile.device_id = int(self.device_id)
+        chosen_device = self._device_id_override()
+        if chosen_device is not None:
+            profile.device_id = chosen_device
             if "device_id" in profile.provider_options:
-                profile.provider_options["device_id"] = str(self.device_id)
+                profile.provider_options["device_id"] = str(chosen_device)
         _apply_cache_switch(
             profile,
             enabled=self.enable_provider_cache,
@@ -1107,14 +1188,23 @@ class SessionConfig:
         Each accelerator gets its own option dict. CPU stays a bare name.
         """
         prepared: List[Any] = []
-        for provider in self.providers:
+        extras = self._provider_option_list()
+        for index, provider in enumerate(self.providers):
             profile = provider_profile_for(provider)
-            if self.device_id is not None:
-                profile.device_id = int(self.device_id)
+            chosen_device = self._device_id_override()
+            if chosen_device is not None:
+                profile.device_id = chosen_device
                 if "device_id" in profile.provider_options:
-                    profile.provider_options["device_id"] = str(self.device_id)
+                    profile.provider_options["device_id"] = str(chosen_device)
             if self.memory_limit_mb is not None:
                 profile.memory_limit_mb = self.memory_limit_mb
+            extra = extras[index]
+            if extra:
+                if extra.get("device_id") is not None:
+                    profile.device_id = int(extra["device_id"])
+                profile.provider_options.update(extra)
+                if "device_id" in profile.provider_options:
+                    profile.provider_options["device_id"] = str(profile.device_id)
             _apply_cache_switch(
                 profile,
                 enabled=self.enable_provider_cache,
@@ -1193,10 +1283,9 @@ class SessionConfig:
             if profile_prefix:
                 opts.profile_file_prefix = profile_prefix
 
-        if profile.device_type in _STATIC_SHAPE_DEVICES:
-            if self.disable_shape_check:
-                _warn_static_npu_shapes(profile.name)
-        elif self.disable_shape_check:
+        if profile.device_type in _STATIC_SHAPE_DEVICES and self.disable_shape_check:
+            _warn_static_npu_shapes(profile.name)
+        elif not self.static_shapes and self.disable_shape_check:
             opts.add_session_config_entry("session.disable_node_shape_check", "1")
 
         selected_providers = self.providers if providers is None else providers
@@ -1261,9 +1350,32 @@ class SessionConfig:
         return os.path.join(directory, "ort_profile")
 
     def resolved_execution_policy(self) -> ExecutionPolicy:
-        """Return ``execution_policy`` as an enum, accepting its string value."""
-        self.execution_policy = coerce_execution_policy(self.execution_policy)
-        return self.execution_policy
+        """
+        Return the policy the NPU guard uses.
+
+        ``auto`` stays stored as auto and behaves as monolithic execution.
+        A sequential layer split on an NPU is still rejected.
+        """
+        policy = coerce_execution_policy(self.execution_policy)
+        self.execution_policy = policy
+        if policy is ExecutionPolicy.AUTO:
+            return ExecutionPolicy.MONOLITHIC_ONLY
+        return policy
+
+    def resolved_memory_policy(self) -> str:
+        """
+        Return the memory mode for this config.
+
+        ``auto`` uses a static NPU pool when an NPU provider is selected and
+        persistent residency otherwise.
+        """
+        policy = _coerce_memory_policy(self.memory_policy)
+        self.memory_policy = policy
+        if policy != "auto":
+            return policy
+        if providers_target_npu(self.providers):
+            return "npu_static"
+        return "persistent"
 
     def validate_execution_policy(
         self,
@@ -1302,6 +1414,11 @@ class SessionInfo:
         execution_group: Sessions that stay together across a phase load.
         device_preference: npu, igpu, gpu, cpu, or auto. None uses the manager list.
         resident_policy: auto, resident, on_demand, or evict. auto follows the phase.
+        execution_order: Position in ``get_execution_order``.
+        device_affinity: Device this component runs on (npu, igpu, gpu, cpu).
+        estimated_runtime_memory_mb: Five-term estimate, filled by the memory plan.
+        compiled: True after a warmup has compiled the graph.
+        warmed_up: True after ``warmup_component`` or ``warmup_session``.
         device_type: Device the plan assigned (npu, igpu, gpu, cpu)
         resident: Whether this session is kept loaded across phases
         scheduled_provider: Provider the plan resolved for this step
@@ -1324,9 +1441,14 @@ class SessionInfo:
     output_dtypes: Dict[str, str] = field(default_factory=dict)
     provider_used: Optional[str] = None
     phase: Optional[str] = None
+    execution_order: int = 0
     execution_group: Optional[str] = None
     device_preference: Optional[str] = None
+    device_affinity: Optional[str] = None
     resident_policy: str = "auto"
+    estimated_runtime_memory_mb: float = 0.0
+    compiled: bool = False
+    warmed_up: bool = False
     device_type: Optional[str] = None
     resident: bool = False
     scheduled_provider: Optional[str] = None
@@ -1366,9 +1488,14 @@ class SessionInfo:
             "output_dtypes": self.output_dtypes,
             "provider_used": self.provider_used,
             "phase": self.phase,
+            "execution_order": self.execution_order,
             "execution_group": self.execution_group,
             "device_preference": self.device_preference,
+            "device_affinity": self.device_affinity,
             "resident_policy": self.resident_policy,
+            "estimated_runtime_memory_mb": self.estimated_runtime_memory_mb,
+            "compiled": self.compiled,
+            "warmed_up": self.warmed_up,
             "device_type": self.device_type,
             "resident": self.resident,
             "scheduled_provider": self.scheduled_provider,
@@ -2084,6 +2211,7 @@ class SessionManager:
         self._static_batch: Optional[int] = None
         self._static_seq: Optional[int] = None
         self._warmed_sessions: set[str] = set()
+        self._io_manager: Any = None
         
         # Pre-populate session info (without loading)
         self._discover_sessions()
@@ -2102,8 +2230,27 @@ class SessionManager:
         if available is None:
             available = ort.get_available_providers()
         previous = [_provider_name(provider) for provider in self.config.providers]
+        option_list = self.config.provider_options
+        if option_list is not None and len(option_list) != len(previous):
+            raise ValueError(
+                "provider_options and providers must be the same length, "
+                f"got {len(option_list)} and {len(previous)}"
+            )
+        if not self.config.use_available_providers_only:
+            self.provider_profile = self.config.active_profile(
+                cache_dir=os.path.join(self.model_dir, ".ort_cache")
+            )
+            return
         kept, dropped = filter_session_providers(self.config.providers, available)
         kept_names = [_provider_name(provider) for provider in kept]
+        if option_list is not None:
+            available_names = {_provider_name(provider) for provider in available}
+            kept_options = [
+                options
+                for provider, options in zip(self.config.providers, option_list)
+                if _provider_name(provider) in available_names
+            ]
+            self.config.provider_options = kept_options or [{}]
         if dropped:
             warnings.warn(
                 "Dropped unavailable execution providers: "
@@ -2168,7 +2315,11 @@ class SessionManager:
                     comp_info.get("resident_policy", "auto")
                 ),
                 device_type=device_type,
+                device_affinity=(
+                    preference if preference not in (None, "auto") else device_type
+                ),
             )
+        self._assign_execution_order()
     
     def provider_assignment(
         self,
@@ -2185,9 +2336,12 @@ class SessionManager:
         """
         if providers is None and name not in self._session_info:
             raise KeyError(f"Session '{name}' is not in this model")
-        available = self._available_providers
-        if available is None:
-            available = ort.get_available_providers()
+        if self.config.use_available_providers_only:
+            available = self._available_providers
+            if available is None:
+                available = ort.get_available_providers()
+        else:
+            available = None
         cache_dir = self.provider_profile.cache_dir
         if providers is not None:
             assignment = build_provider_assignment(
@@ -2484,6 +2638,7 @@ class SessionManager:
             session.run(None, dummy_inputs)
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         self._warmed_sessions.add(name)
+        self._sync_runtime_flags(name)
         return WarmupResult(name, iterations, elapsed_ms)
 
     def benchmark_session(
@@ -2528,6 +2683,7 @@ class SessionManager:
             session.run(None, dummy_inputs)
             latencies_ms.append((time.perf_counter() - started) * 1000.0)
         self._warmed_sessions.add(name)
+        self._sync_runtime_flags(name)
         mean_ms, median_ms, min_ms, max_ms, stdev_ms = _latency_stats(latencies_ms)
         return BenchmarkResult(
             component_name=name,
@@ -2573,6 +2729,8 @@ class SessionManager:
         if info is not None:
             info.is_loaded = False
             info.provider_used = None
+            info.warmed_up = False
+            info.compiled = False
         self._warmed_sessions.discard(name)
         return removed
     
@@ -2590,6 +2748,8 @@ class SessionManager:
             for info in self._session_info.values():
                 info.is_loaded = False
                 info.provider_used = None
+                info.warmed_up = False
+                info.compiled = False
             return count
     
     def get_session_info(self, name: str) -> Optional[SessionInfo]:
@@ -2737,7 +2897,163 @@ class SessionManager:
                 ordered.append(name)
         
         return ordered
-    
+
+    def filter_available_providers(self) -> List[str]:
+        """
+        Return the providers this manager will pass to ONNX Runtime.
+
+        When ``use_available_providers_only`` is true, names missing from
+        this process are removed and CPU is kept as the fallback. When it
+        is false, the configured list is returned unchanged.
+        """
+        if not self.config.use_available_providers_only:
+            return [_provider_name(provider) for provider in self.config.providers]
+        self._install_available_providers()
+        return [_provider_name(provider) for provider in self.config.providers]
+
+    def load_component(
+        self,
+        name: str,
+        providers: Optional[List[str]] = None,
+        provider_options: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[ort.InferenceSession]:
+        """
+        Load one component.
+
+        ``providers`` and ``provider_options`` override the phase, the plan,
+        and the manager list for this call. A component that is already
+        loaded is returned as-is unless a provider list is passed.
+        """
+        if name not in self._session_info:
+            raise KeyError(f"Session '{name}' is not in this model")
+        with self._lock:
+            if providers is None and name in self._sessions:
+                self._sync_runtime_flags(name)
+                return self._sessions[name]
+            session = self._load_single_session(name, providers, provider_options)
+            if session is not None:
+                self._sessions[name] = session
+            self._sync_runtime_flags(name)
+            return session
+
+    def warmup_component(
+        self,
+        name: str,
+        dummy_inputs: Dict[str, np.ndarray],
+    ) -> WarmupResult:
+        """
+        Compile and warm one loaded component.
+
+        This is the single-pass form of ``warmup_session``. It marks the
+        component warmed and compiled so a later benchmark can skip the
+        cold run. ``config.warmup`` records that this step is required
+        before the component is treated as ready.
+        """
+        return self.warmup_session(name, dummy_inputs, iterations=1)
+
+    def get_execution_order(self) -> List[str]:
+        """
+        Return component names in run order and store that index.
+
+        A loaded plan supplies dependency order. Otherwise embedding, layers,
+        norm, and lm_head come first.
+        """
+        return self._assign_execution_order()
+
+    def estimate_memory_plan(self) -> Dict[str, Any]:
+        """
+        Estimate runtime memory for every component in execution order.
+
+        Each ``SessionInfo.estimated_runtime_memory_mb`` is updated. The
+        model total counts the shared KV pool once. ``memory_policy`` is the
+        resolved mode, not the raw ``auto`` value.
+        """
+        order = self.get_execution_order()
+        components: Dict[str, Any] = {}
+        for name in order:
+            estimate = self.estimate_runtime_memory(name)
+            info = self._session_info[name]
+            info.estimated_runtime_memory_mb = estimate.total_mb
+            self._sync_runtime_flags(name)
+            components[name] = {
+                "phase": info.phase,
+                "execution_order": info.execution_order,
+                "device_affinity": info.device_affinity,
+                "resident_policy": info.resolved_resident_policy(),
+                "estimated_runtime_memory_mb": estimate.total_mb,
+                "weights_mb": estimate.weights_mb,
+                "compiled_graph_mb": estimate.compiled_graph_mb,
+                "activation_mb": estimate.activation_mb,
+                "kv_cache_mb": estimate.kv_cache_mb,
+                "provider_workspace_mb": estimate.provider_workspace_mb,
+                "compiled": info.compiled,
+                "warmed_up": info.warmed_up,
+            }
+        return {
+            "memory_policy": self.config.resolved_memory_policy(),
+            "execution_policy": self.config.resolved_execution_policy().value,
+            "static_shapes": self.config.static_shapes,
+            "warmup": self.config.warmup,
+            "order": order,
+            "components": components,
+            "total_runtime_mb": self.estimate_model_runtime_memory_mb(),
+            "kv_cache_mb": self._model_kv_cache_mb(),
+        }
+
+    def attach_io_binding_manager(self, io_manager: Any) -> Any:
+        """
+        Keep an IO binding manager and apply ``memory_policy`` to its mode.
+
+        Later ``prepare_io_binding`` calls can omit the manager and use this
+        one. Symbolic shapes are frozen when ``static_shapes`` is true.
+        """
+        if io_manager is None:
+            raise ValueError("io_manager is required")
+        self._io_manager = io_manager
+        mode_name = self.config.resolved_memory_policy()
+        mapping = {
+            "minimal": "MINIMAL",
+            "persistent": "PERSISTENT",
+            "io_bound": "IO_BOUND",
+            "npu_static": "NPU_STATIC",
+        }
+        if mode_name in mapping and (
+            hasattr(io_manager, "memory_mode") or hasattr(io_manager, "mode")
+        ):
+            from .io_binding import MemoryMode
+            resolved = getattr(MemoryMode, mapping[mode_name])
+            if hasattr(io_manager, "memory_mode"):
+                io_manager.memory_mode = resolved
+            if hasattr(io_manager, "mode"):
+                io_manager.mode = resolved
+        return io_manager
+
+    def _assign_execution_order(self) -> List[str]:
+        """Write ``execution_order`` from the current component order."""
+        names = self.get_component_names()
+        for index, name in enumerate(names):
+            info = self._session_info.get(name)
+            if info is not None:
+                info.execution_order = index
+        return names
+
+    def _sync_runtime_flags(self, name: str) -> None:
+        """Copy warmup, compile, and device affinity onto SessionInfo."""
+        info = self._session_info.get(name)
+        if info is None:
+            return
+        info.warmed_up = name in self._warmed_sessions
+        if info.warmed_up:
+            info.compiled = True
+        elif not info.is_loaded:
+            info.compiled = False
+        if info.device_preference not in (None, "auto"):
+            info.device_affinity = info.device_preference
+        elif info.device_type:
+            info.device_affinity = info.device_type
+        elif info.scheduled_provider:
+            info.device_affinity = device_type_for_provider(info.scheduled_provider)
+
     def load_from_plan(self, plan: ExecutionPlan) -> Dict[str, SessionInfo]:
         """
         Schedule and load sessions from an execution plan.
@@ -2783,6 +3099,7 @@ class SessionManager:
                     )
                     self._resolved_providers[step.component_name] = info.scheduled_provider
                     self._drop_session(step.component_name)
+                    self._sync_runtime_flags(step.component_name)
                     loaded[step.component_name] = info
                     continue
                 session = self._load_single_session(step.component_name)
@@ -2791,7 +3108,9 @@ class SessionManager:
                 )
                 if session is not None:
                     self._sessions[step.component_name] = session
+                self._sync_runtime_flags(step.component_name)
                 loaded[step.component_name] = info
+            self._assign_execution_order()
             return loaded
 
     def execution_order(self) -> List[ExecutionStep]:
@@ -2868,12 +3187,14 @@ class SessionManager:
                 if policy == "evict":
                     self._drop_session(name)
                     info.resident = False
+                    self._sync_runtime_flags(name)
                     loaded[name] = info
                     continue
                 info.resident = policy == "resident"
                 if name in self._sessions:
                     if info.device_preference not in (None, "auto"):
                         info.device_type = info.device_preference
+                    self._sync_runtime_flags(name)
                     loaded[name] = info
                     loaded_count += 1
                     continue
@@ -2887,6 +3208,7 @@ class SessionManager:
                 if session is not None:
                     self._sessions[name] = session
                     loaded_count += 1
+                self._sync_runtime_flags(name)
                 loaded[name] = info
             print(
                 f"  [SessionManager] Phase '{selected}': "
@@ -2992,17 +3314,26 @@ class SessionManager:
     def prepare_io_binding(
         self,
         component_name: str,
-        io_manager: Any,
-        static_shapes: bool = True,
+        io_manager: Any = None,
+        static_shapes: Optional[bool] = None,
     ) -> PreparedIO:
         """
         Allocate this component's inputs and outputs on ``io_manager``.
 
         ``static_shapes`` replaces symbolic batch and sequence axes with the
-        static batch and ``max_seq_len``. An NPU output that a later iGPU
-        step consumes is allocated once and reused. When the session is
-        loaded, those buffers are bound to it.
+        static batch and ``max_seq_len``. None uses ``config.static_shapes``.
+        An omitted manager uses the one passed to ``attach_io_binding_manager``.
+        An NPU output that a later iGPU step consumes is allocated once and
+        reused. When the session is loaded, those buffers are bound to it.
         """
+        if io_manager is None:
+            io_manager = self._io_manager
+        if io_manager is None:
+            raise ValueError(
+                "Pass io_manager or call attach_io_binding_manager first"
+            )
+        if static_shapes is None:
+            static_shapes = self.config.static_shapes
         metadata = self.get_io_metadata(component_name)
         batch_size = self._static_batch or 1
         max_seq_len = self._sequence_limit(io_manager)
@@ -3722,6 +4053,7 @@ __all__ = [
     "NPU_SEQUENTIAL_SPLIT_ERROR",
     "NPU_PROVIDER_MARKERS",
     "EXECUTION_PHASES",
+    "MEMORY_POLICIES",
     "PHASE_ALIASES",
     "RESIDENT_POLICIES",
     "PHASE_RESIDENT_DEFAULT",
