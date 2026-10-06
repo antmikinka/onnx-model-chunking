@@ -8747,7 +8747,9 @@ def test_architecture():
         architecture_from_string,
         classify_qwen_family,
         get_architecture_descriptor,
+        QUANTIZED_OP_PATTERNS,
         get_prefixes,
+        quantized_op_scheme,
         get_prefixes_tuple,
     )
     from chunking_utils.common.types import ComponentInfo, ComponentType
@@ -9092,7 +9094,43 @@ def test_architecture():
     except ValueError as exc:
         assert "arch" in str(exc)
 
+    assert common.QUANTIZED_OP_PATTERNS is QUANTIZED_OP_PATTERNS
+    assert common.quantized_op_scheme is quantized_op_scheme
+    assert QUANTIZED_OP_PATTERNS == {
+        "MatMulNBits": "int4_weight",
+        "QLinearMatMul": "int8_quantized",
+        "AWQMatMul": "awq_int4",
+    }
+    q_proj = "/model/layers.0/self_attn/q_proj/MatMulNBits"
+    gate_proj = "/model/layers.0/mlp/gate_proj/MatMulNBits"
+    layer_prefix = get_prefixes(ArchitectureType.LLAMA, "onnx").layer_prefix
+    assert layer_prefix == "/model/layers."
+    assert layer_prefix in q_proj
+    assert layer_prefix in gate_proj
+    assert quantized_op_scheme(q_proj) == "int4_weight"
+    assert quantized_op_scheme(gate_proj) == "int4_weight"
+    assert quantized_op_scheme("MatMulNBits") == "int4_weight"
+    assert quantized_op_scheme("matmulnbits") == "int4_weight"
+    assert quantized_op_scheme("MatMulNBits_k_6_0") == "int4_weight"
+    assert quantized_op_scheme("/model/layers.1/mlp/down_proj/QLinearMatMul") == "int8_quantized"
+    assert quantized_op_scheme("QLinearMatMul") == "int8_quantized"
+    assert quantized_op_scheme("model.layers.2.mlp.gate_proj.AWQMatMul") == "awq_int4"
+    assert quantized_op_scheme("AWQMatMul") == "awq_int4"
+    assert quantized_op_scheme("/model/layers.0/self_attn/q_proj/MatMul") is None
+    assert quantized_op_scheme("MatMul") is None
+    try:
+        quantized_op_scheme("  ")
+        raise AssertionError("a blank node name was accepted")
+    except ValueError as exc:
+        assert "node name" in str(exc)
+    try:
+        quantized_op_scheme(None)
+        raise AssertionError("a missing node name was accepted")
+    except ValueError as exc:
+        assert "node name" in str(exc)
+
     print("  architecture prefixes: dense llama record, moe router and expert, hybrid mtp head")
+    print("  quantized onnx nodes: MatMulNBits int4, QLinearMatMul int8, AWQMatMul awq")
     print("  architecture descriptor: gqa, moe counts, sliding window, tied embeddings, hybrid attention")
     print("architecture prefixes: OK\n")
     return True

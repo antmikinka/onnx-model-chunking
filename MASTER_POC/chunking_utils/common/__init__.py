@@ -16,6 +16,8 @@ from .architecture import (
     ArchitectureDescriptor,
     ARCHITECTURE_DESCRIPTORS,
     get_architecture_descriptor,
+    QUANTIZED_OP_PATTERNS,
+    quantized_op_scheme,
 )
 from .types import (
     ModelFormat,
@@ -77,6 +79,8 @@ __all__ = [
     "ArchitectureDescriptor",
     "ARCHITECTURE_DESCRIPTORS",
     "get_architecture_descriptor",
+    "QUANTIZED_OP_PATTERNS",
+    "quantized_op_scheme",
     # Types
     "ModelFormat",
     "TensorDtype",

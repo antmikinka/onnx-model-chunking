@@ -181,6 +181,36 @@ ONNX_PREFIXES: Dict[ArchitectureType, ArchitecturePrefixes] = {
 }
 
 
+# Quantized ONNX ops keep the same layer prefix. The node name ends in the op.
+QUANTIZED_OP_PATTERNS = {
+    "MatMulNBits": "int4_weight",
+    "QLinearMatMul": "int8_quantized",
+    "AWQMatMul": "awq_int4",
+}
+
+
+def quantized_op_scheme(name: str) -> Optional[str]:
+    """
+    Return the weight scheme for a quantized ONNX op type or node path.
+
+    ``/model/layers.0/self_attn/q_proj/MatMulNBits`` is int4_weight. A plain
+    MatMul is not a quantized op. An empty name is rejected.
+    """
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("node name must be a non-empty string")
+    segment = name.strip().rsplit("/", 1)[-1]
+    if "." in segment:
+        tail = segment.rsplit(".", 1)[-1]
+    else:
+        tail = segment
+    folded = tail.lower()
+    for op, scheme in sorted(QUANTIZED_OP_PATTERNS.items(), key=lambda item: len(item[0]), reverse=True):
+        op_folded = op.lower()
+        if folded == op_folded or folded.startswith(op_folded + "_"):
+            return scheme
+    return None
+
+
 def get_prefixes(
     arch: ArchitectureType,
     format: str  # "safetensors" or "onnx"
