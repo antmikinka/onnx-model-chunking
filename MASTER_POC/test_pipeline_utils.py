@@ -2103,6 +2103,7 @@ def test_config_loader():
         assert genai.max_seq_len == 0
         assert genai.quantization_method is None
         assert genai.quantization_group_size is None
+        assert genai.dtype == np.dtype(np.float16)
 
     with tempfile.TemporaryDirectory() as directory:
         _write_json(directory, "config.json", {
@@ -2485,6 +2486,7 @@ def test_config_loader():
         assert plain.weight_dtype is None
         assert plain.activation_dtype is None
         assert plain.has_zero_point is None
+        assert plain.dtype == np.dtype(np.float16)
     with tempfile.TemporaryDirectory() as directory:
         payload = dict(hf_base)
         payload["torch_dtype"] = "float16"
@@ -2611,10 +2613,102 @@ def test_config_loader():
         assert info_quant.quantization_group_size == 32
         assert info_quant.quantization_format == "qdq"
         assert info_quant.has_zero_point is False
+        assert info_quant.dtype == np.dtype(np.float16)
+
+    from pipeline_utils.config_loader import get_dtype_from_config
+    from pipeline_utils.dtypes import get_numpy_dtype
+
+    with tempfile.TemporaryDirectory() as directory:
+        payload = dict(hf_base)
+        payload["torch_dtype"] = "float16"
+        payload["dtype"] = "float32"
+        _write_json(directory, "config.json", payload)
+        preferred = load_model_config(directory)
+        assert preferred.dtype == np.dtype(np.float16)
+        assert preferred.to_dict()["dtype"] == str(np.dtype(np.float16))
+    with tempfile.TemporaryDirectory() as directory:
+        payload = dict(hf_base)
+        payload["torch_dtype"] = ""
+        payload["dtype"] = "fp32"
+        _write_json(directory, "config.json", payload)
+        aliased = load_model_config(directory)
+        assert aliased.dtype == np.dtype(np.float32)
+    with tempfile.TemporaryDirectory() as directory:
+        payload = dict(hf_base)
+        payload["torch_dtype"] = "bfloat16"
+        _write_json(directory, "config.json", payload)
+        bf16_config = load_model_config(directory)
+        assert bf16_config.dtype == np.dtype(get_numpy_dtype("bfloat16"))
+    with tempfile.TemporaryDirectory() as directory:
+        payload = dict(hf_base)
+        payload["torch_dtype"] = "nope"
+        payload["dtype"] = "float32"
+        _write_json(directory, "config.json", payload)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            recovered = load_model_config(directory)
+        assert recovered.dtype == np.dtype(np.float32)
+        assert any("torch_dtype" in str(item.message) for item in caught)
+    with tempfile.TemporaryDirectory() as directory:
+        _write_json(directory, "genai_config.json", {
+            "model": {
+                "type": "llama",
+                "vocab_size": 10,
+                "torch_dtype": "float16",
+                "decoder": {
+                    "num_hidden_layers": 3,
+                    "num_key_value_heads": 4,
+                    "head_size": 96,
+                    "hidden_size": 384,
+                    "num_attention_heads": 4,
+                    "dtype": "float32",
+                },
+            },
+        })
+        genai_dtype = load_model_config(directory)
+        assert genai_dtype.dtype == np.dtype(np.float16)
+    with tempfile.TemporaryDirectory() as directory:
+        _write_json(directory, "genai_config.json", {
+            "model": {
+                "type": "llama",
+                "vocab_size": 10,
+                "decoder": {
+                    "num_hidden_layers": 3,
+                    "num_key_value_heads": 4,
+                    "head_size": 96,
+                    "hidden_size": 384,
+                    "num_attention_heads": 4,
+                    "dtype": "float32",
+                },
+            },
+        })
+        decoder_dtype = load_model_config(directory)
+        assert decoder_dtype.dtype == np.dtype(np.float32)
+        assert get_dtype_from_config({"model": {"decoder": {"dtype": "bf16"}}}) == np.dtype(
+            get_numpy_dtype("bfloat16")
+        )
+    with tempfile.TemporaryDirectory() as directory:
+        _write_json(directory, "model_info.json", {
+            "num_layers": 4,
+            "architecture": "llama",
+            "num_kv_heads": 4,
+            "head_dim": 96,
+            "dtype": "float64",
+        })
+        info_dtype = load_model_config(directory, require_all_fields=True)
+        assert info_dtype.dtype == np.dtype(np.float64)
+    with tempfile.TemporaryDirectory() as directory:
+        _write_json(directory, "model_info.json", {
+            "num_layers": 4,
+            "architecture": {"dtype": "float32", "num_kv_heads": 4, "head_dim": 96},
+        })
+        arch_dtype = load_model_config(directory, require_all_fields=True)
+        assert arch_dtype.dtype == np.dtype(np.float32)
 
     print("  kv shape: refuse silent 8/128, infer 4 x 96 from ONNX")
     print("  max_seq_len: max_position_embeddings, sequence aliases, unset stays 0")
     print("  quantization: AWQ, GPTQ, Quark, MatMulNBits, unset stays empty")
+    print("  dtype: torch_dtype, dtype, decoder dtype, missing stays float16")
     print("  onnx graph: layers, KV axes, dtype, present outputs, external data")
     print("config_loader module: OK\n")
     return True

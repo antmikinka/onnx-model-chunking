@@ -50,7 +50,7 @@ class ModelConfig:
     quantization_group_size: Optional[int] = None
     quantization_format: Optional[str] = None
     has_zero_point: Optional[bool] = None
-    dtype: np.dtype = field(default_factory=lambda: np.float16)
+    dtype: np.dtype = field(default_factory=lambda: np.dtype(np.float16))
     model_type: str = "unknown"
     
     # Source info
@@ -142,6 +142,7 @@ def _parse_genai_config(config: Dict[str, Any], source: str) -> Optional[ModelCo
                 model_type=model.get("type", "unknown") if isinstance(model, dict) else "unknown",
                 max_seq_len=_max_seq_len_from(decoder, model, config),
                 **_quantization_from(decoder, model, config),
+                dtype=get_dtype_from_config(config),
                 source_file=source,
             )
     except (KeyError, TypeError):
@@ -183,6 +184,7 @@ def _parse_hf_config(config: Dict[str, Any], source: str) -> Optional[ModelConfi
                 model_type=config.get("model_type", "unknown"),
                 max_seq_len=_max_seq_len_from(config),
                 **_quantization_from(config),
+                dtype=get_dtype_from_config(config),
                 source_file=source,
             )
     except (KeyError, TypeError):
@@ -766,6 +768,7 @@ def _parse_model_info(
         num_attention_heads=_as_dim(_read_field(sources, ("num_attention_heads",))) or 0,
         max_seq_len=_max_seq_len_from(*sources),
         **_quantization_from(*sources),
+        dtype=get_dtype_from_config(config),
         model_type=str(config.get("strategy", config.get("model_type", "unknown"))),
         source_file=source,
     )
@@ -792,7 +795,8 @@ def load_model_config(
 
     Quantization fields stay unset unless the file names a scheme such as
     AWQ, GPTQ, Quark, or MatMulNBits. ``quantization_group_size`` -1 means
-    per-channel weights.
+    per-channel weights. ``dtype`` is read from ``torch_dtype``, ``dtype``,
+    or ``model.decoder.dtype``. A file that names none of them stays float16.
     
     Args:
         model_dir: Directory containing model/config files
@@ -1236,32 +1240,83 @@ def validate_config_against_onnx(
     }
 
 
+# Names Hugging Face and GenAI use for the same numpy dtypes.
+_CONFIG_DTYPE_ALIASES = {
+    "fp16": "float16",
+    "half": "float16",
+    "torch.float16": "float16",
+    "fp32": "float32",
+    "torch.float32": "float32",
+    "fp64": "float64",
+    "torch.float64": "float64",
+    "bf16": "bfloat16",
+    "torch.bfloat16": "bfloat16",
+}
+
+
+def _dtype_sources(config: Any) -> list:
+    """Root, then model, decoder, and an architecture dict."""
+    if not isinstance(config, dict):
+        return []
+    sources = [config]
+    model = config.get("model")
+    if isinstance(model, dict):
+        sources.append(model)
+        nested = model.get("decoder")
+        if isinstance(nested, dict):
+            sources.append(nested)
+    decoder = config.get("decoder")
+    if isinstance(decoder, dict) and decoder not in sources:
+        sources.append(decoder)
+    architecture = config.get("architecture")
+    if isinstance(architecture, dict):
+        sources.append(architecture)
+    return sources
+
+
+def _config_dtype_name(value: Any) -> Optional[str]:
+    """Return a dtype string ``get_numpy_dtype`` can read."""
+    if value is None or isinstance(value, (dict, list, tuple, bool)):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    key = text.lower().replace(" ", "")
+    return _CONFIG_DTYPE_ALIASES.get(key, key)
+
+
 def get_dtype_from_config(config: Dict[str, Any]) -> np.dtype:
     """
-    Extract dtype from config dictionary.
-    
+    Extract the compute dtype from a config dictionary.
+
+    ``torch_dtype`` wins over ``dtype`` on the same object. A GenAI file
+    stores the value at ``model.decoder.dtype``. An unknown name is skipped.
+    When every field is missing, the result is float16.
+
     Args:
         config: Configuration dictionary
-        
+
     Returns:
         numpy dtype
     """
     from .dtypes import get_numpy_dtype
-    
-    # Check common dtype fields
-    dtype_str = config.get("torch_dtype", "")
-    if not dtype_str:
-        dtype_str = config.get("dtype", "")
-    if not dtype_str:
-        dtype_str = config.get("model", {}).get("decoder", {}).get("dtype", "")
-    
-    if dtype_str:
-        try:
-            return get_numpy_dtype(dtype_str)
-        except ValueError:
-            pass
-    
-    return np.float16  # Default
+
+    for source in _dtype_sources(config):
+        for key in ("torch_dtype", "dtype"):
+            if key not in source:
+                continue
+            name = _config_dtype_name(source[key])
+            if name is None:
+                continue
+            try:
+                return np.dtype(get_numpy_dtype(name))
+            except ValueError:
+                warnings.warn(
+                    f"{key} {source[key]!r} is not a recognized dtype. "
+                    f"Trying the next dtype field.",
+                    UserWarning,
+                )
+    return np.dtype(np.float16)
 
 
 # =============================================================================
