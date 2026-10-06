@@ -3266,6 +3266,7 @@ def test_backend():
         DeviceType,
         LlamaCppBackend,
         OnnxRuntimeBackend,
+        filter_onnx_providers,
         _pair_present_to_past,
         _sample_next_token,
         _sequential_pipeline_class,
@@ -3958,6 +3959,25 @@ def test_backend():
     except RuntimeError as exc:
         assert "VitisAIExecutionProvider" in str(exc)
 
+    kept, dropped = filter_onnx_providers(
+        ["VitisAIExecutionProvider", "CPUExecutionProvider"],
+        ["CPUExecutionProvider"],
+    )
+    assert kept == ["CPUExecutionProvider"]
+    assert dropped == ["VitisAIExecutionProvider"]
+    assert filter_onnx_providers([], ["CPUExecutionProvider"]) == (
+        ["CPUExecutionProvider"],
+        [],
+    )
+    real_available = ort.get_available_providers
+    ort.get_available_providers = lambda: ["CPUExecutionProvider"]
+    try:
+        kept, dropped = filter_onnx_providers(["ROCmExecutionProvider", "CPUExecutionProvider"])
+        assert kept == ["CPUExecutionProvider"]
+        assert dropped == ["ROCmExecutionProvider"]
+    finally:
+        ort.get_available_providers = real_available
+
     real_available = ort.get_available_providers
     ort.get_available_providers = lambda: [
         "CPUExecutionProvider",
@@ -3976,6 +3996,81 @@ def test_backend():
     finally:
         ort.get_available_providers = real_available
         ort.InferenceSession = real_session
+
+    ort.get_available_providers = lambda: ["CPUExecutionProvider"]
+    ort.InferenceSession = _PatchedSession
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            cpu_only = OnnxRuntimeBackend(BackendConfig(
+                device=DeviceType.NPU,
+                execution_policy="monolithic",
+            ))
+            cpu_only.load(model_file.name)
+            assert captured["providers"] == ["CPUExecutionProvider"]
+            assert cpu_only.providers == ["CPUExecutionProvider"]
+            assert cpu_only.dropped_providers == [
+                "VitisAIExecutionProvider",
+                "RyzenAIExecutionProvider",
+            ]
+            assert any(
+                "Dropped unavailable execution providers" in str(item.message)
+                and "VitisAIExecutionProvider" in str(item.message)
+                for item in caught
+            )
+            cpu_only.cleanup()
+        opted_out = OnnxRuntimeBackend(BackendConfig(
+            device=DeviceType.NPU,
+            execution_policy="monolithic",
+            use_available_providers_only=False,
+        ))
+        opted_out.load(model_file.name)
+        assert captured["providers"] == [
+            "VitisAIExecutionProvider",
+            "RyzenAIExecutionProvider",
+            "CPUExecutionProvider",
+        ]
+        assert opted_out.dropped_providers == []
+        opted_out.cleanup()
+
+        backend_mod._sequential_pipeline_class = _fake_pipeline_class
+        filtered_dir = tempfile.mkdtemp(prefix="onnx-filter-")
+        try:
+            filtered = OnnxRuntimeBackend(BackendConfig(
+                device=DeviceType.NPU,
+                execution_policy="hybrid",
+                prefill_device=DeviceType.NPU,
+                decode_device=DeviceType.GPU,
+                npu_layer_range=(0, 1),
+            ))
+            filtered.load(filtered_dir)
+            received = created["pipeline"]
+            assert received.providers == ["CPUExecutionProvider"]
+            assert received.phase_providers["prefill"] == ["CPUExecutionProvider"]
+            assert received.phase_providers["decode"] == ["CPUExecutionProvider"]
+            assert received.component_providers["layer_0"] == ["CPUExecutionProvider"]
+            assert "VitisAIExecutionProvider" in filtered.dropped_providers
+            assert "ROCmExecutionProvider" in filtered.dropped_providers
+            filtered.cleanup()
+
+            raw = OnnxRuntimeBackend(BackendConfig(
+                device=DeviceType.NPU,
+                execution_policy="hybrid",
+                prefill_device=DeviceType.NPU,
+                decode_device=DeviceType.GPU,
+                use_available_providers_only=False,
+            ))
+            raw.load(filtered_dir)
+            assert created["pipeline"].phase_providers["prefill"][0] == "VitisAIExecutionProvider"
+            assert created["pipeline"].phase_providers["decode"][0] == "ROCmExecutionProvider"
+            assert raw.dropped_providers == []
+            raw.cleanup()
+        finally:
+            os.rmdir(filtered_dir)
+    finally:
+        ort.get_available_providers = real_available
+        ort.InferenceSession = real_session
+        backend_mod._sequential_pipeline_class = original_factory
 
     backend_mod._sequential_pipeline_class = _fake_pipeline_class
     ort.get_available_providers = lambda: [

@@ -18,7 +18,7 @@ Usage:
 
 from abc import ABC, abstractmethod
 from enum import Enum
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Optional, List, Dict, Any, Union, Sequence, Tuple, Callable
 import importlib
 import inspect
@@ -97,6 +97,8 @@ class BackendConfig:
     # ONNX-specific. None uses DEVICE_PROVIDER_MAP for ``device``.
     onnx_providers: Optional[List[str]] = None
     onnx_optimization_level: str = "DISABLE"
+    # Drop names this ONNX Runtime build cannot load before creating a session.
+    use_available_providers_only: bool = True
     
     # Memory
     low_memory: bool = False
@@ -127,43 +129,100 @@ def _available_execution_providers() -> List[str]:
     return list(ort.get_available_providers())
 
 
+def _raw_providers_for_device(device: Union[DeviceType, str]) -> List[str]:
+    """Device preference order, including providers this process cannot run."""
+    kind = _coerce_device(device)
+    if kind not in DEVICE_PROVIDER_MAP:
+        raise ValueError(f"No provider map entry for {kind}")
+    mapped = DEVICE_PROVIDER_MAP[kind]
+    if mapped is not None:
+        return list(mapped)
+    selected: List[str] = []
+    for candidate in _AUTO_DEVICE_ORDER:
+        for provider in DEVICE_PROVIDER_MAP[candidate]:
+            if provider == "CPUExecutionProvider" or provider in selected:
+                continue
+            selected.append(provider)
+    selected.append("CPUExecutionProvider")
+    return selected
+
+
+def filter_onnx_providers(
+    providers: Optional[Sequence[str]],
+    available: Optional[Sequence[str]] = None,
+) -> Tuple[List[str], List[str]]:
+    """
+    Keep requested providers that this ONNX Runtime build can load.
+
+    ``available`` defaults to ``ort.get_available_providers()``. Order is
+    preserved. An empty intersection becomes ``CPUExecutionProvider``. The
+    second list is the provider names that were removed.
+    """
+    if available is None:
+        available = _available_execution_providers()
+    installed = set(available)
+    kept: List[str] = []
+    dropped: List[str] = []
+    for provider in providers or []:
+        name = str(provider)
+        if name in installed:
+            kept.append(name)
+        else:
+            dropped.append(name)
+    if not kept:
+        kept = ["CPUExecutionProvider"]
+    return kept, dropped
+
+
+def _warn_dropped_providers(dropped: Sequence[str], kept: Sequence[str]) -> None:
+    """Tell the caller which names will not be passed to ONNX Runtime."""
+    if not dropped:
+        return
+    warnings.warn(
+        "Dropped unavailable execution providers: "
+        + ", ".join(dropped)
+        + ". Using "
+        + ", ".join(kept)
+        + ".",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+
+
+def _filter_provider_map(
+    mapping: Dict[str, List[str]],
+    available: Sequence[str],
+) -> Tuple[Dict[str, List[str]], List[str]]:
+    """Filter every phase or component list with ``filter_onnx_providers``."""
+    filtered: Dict[str, List[str]] = {}
+    dropped: List[str] = []
+    for name, providers in mapping.items():
+        kept, gone = filter_onnx_providers(providers, available)
+        filtered[name] = kept
+        dropped.extend(gone)
+    return filtered, dropped
+
+
 def providers_for_device(
     device: Union[DeviceType, str],
     available: Optional[Sequence[str]] = None,
+    filter_to_available: bool = True,
 ) -> List[str]:
     """
     Provider list for one device.
 
     Names follow ``DEVICE_PROVIDER_MAP`` and stay in that order. A provider
-    this process cannot run is left out. ``AUTO`` walks NPU, then GPU, then
-    CPU and keeps the first installed accelerator from each, with CPU last.
+    this process cannot run is left out unless ``filter_to_available`` is
+    false. ``AUTO`` walks NPU, then GPU, then CPU and keeps the installed
+    accelerators, with CPU last.
     """
-    kind = _coerce_device(device)
-    if kind not in DEVICE_PROVIDER_MAP:
-        raise ValueError(f"No provider map entry for {kind}")
+    raw = _raw_providers_for_device(device)
+    if not filter_to_available:
+        return raw
     if available is None:
         available = _available_execution_providers()
-    installed = set(available)
-    mapped = DEVICE_PROVIDER_MAP[kind]
-    if mapped is None:
-        selected: List[str] = []
-        for candidate in _AUTO_DEVICE_ORDER:
-            for provider in DEVICE_PROVIDER_MAP[candidate]:
-                if provider == "CPUExecutionProvider" or provider in selected:
-                    continue
-                if provider in installed:
-                    selected.append(provider)
-        if "CPUExecutionProvider" in installed or not selected:
-            selected.append("CPUExecutionProvider")
-        return selected
-    selected = [provider for provider in mapped if provider in installed]
-    if selected:
-        return selected
-    if "CPUExecutionProvider" in mapped:
-        return ["CPUExecutionProvider"]
-    raise RuntimeError(
-        f"No mapped provider for {kind.value} is available. Available: {list(available)}"
-    )
+    kept, _dropped = filter_onnx_providers(raw, available)
+    return kept
 
 
 def resolve_onnx_providers(
@@ -174,20 +233,28 @@ def resolve_onnx_providers(
     Providers a backend should pass to ONNX Runtime.
 
     An ``onnx_providers`` list is the caller override. Otherwise the device
-    map selects the list. An override whose names are all missing raises.
+    map selects the list. When ``use_available_providers_only`` is true, names
+    missing from ``ort.get_available_providers()`` are removed. An override
+    whose names are all missing raises. When the flag is false, the requested
+    list is returned unchanged.
     """
+    if not config.use_available_providers_only:
+        explicit = list(config.onnx_providers or [])
+        if explicit:
+            return explicit
+        return _raw_providers_for_device(config.device)
     if available is None:
         available = _available_execution_providers()
     explicit = list(config.onnx_providers or [])
     if explicit:
         installed = set(available)
-        selected = [provider for provider in explicit if provider in installed]
-        if selected:
-            return selected
-        raise RuntimeError(
-            f"None of the requested providers {explicit} are available. "
-            f"Available: {list(available)}"
-        )
+        if not any(provider in installed for provider in explicit):
+            raise RuntimeError(
+                f"None of the requested providers {explicit} are available. "
+                f"Available: {list(available)}"
+            )
+        kept, _dropped = filter_onnx_providers(explicit, available)
+        return kept
     return providers_for_device(config.device, available)
 
 
@@ -280,12 +347,17 @@ def resolve_execution_policy(config: "BackendConfig") -> str:
 def _hybrid_component_providers(
     config: "BackendConfig",
     available: Sequence[str],
+    filter_to_available: bool = True,
 ) -> Tuple[Dict[str, List[str]], Optional[Tuple[int, int]]]:
     """Layer-range and MoE pins. Exact layer names win over the ``layer_*`` fallback."""
     components: Dict[str, List[str]] = {}
     span = _coerce_layer_range(config.npu_layer_range)
-    cpu = providers_for_device(DeviceType.CPU, available)
-    npu = providers_for_device(DeviceType.NPU, available)
+    cpu = providers_for_device(
+        DeviceType.CPU, available, filter_to_available=filter_to_available
+    )
+    npu = providers_for_device(
+        DeviceType.NPU, available, filter_to_available=filter_to_available
+    )
     if span is not None:
         components["layer_*"] = list(cpu)
         start, end = span
@@ -308,7 +380,8 @@ def build_execution_plan(
     A monolithic plan leaves the provider maps empty. Hybrid and sequential
     plans record prefill, decode, the NPU layer span, and the MoE pins.
     """
-    if available is None:
+    filter_to_available = config.use_available_providers_only
+    if available is None and filter_to_available:
         available = _available_execution_providers()
     policy = resolve_execution_policy(config)
     prefill = _coerce_device(config.prefill_device)
@@ -322,12 +395,19 @@ def build_execution_plan(
             prefill_device=prefill,
             decode_device=decode,
         )
-    components, span = _hybrid_component_providers(config, available)
+    installed = list(available or [])
+    components, span = _hybrid_component_providers(
+        config, installed, filter_to_available=filter_to_available
+    )
     return HybridExecutionPlan(
         policy=policy,
         phase_providers={
-            "prefill": providers_for_device(prefill, available),
-            "decode": providers_for_device(decode, available),
+            "prefill": providers_for_device(
+                prefill, installed, filter_to_available=filter_to_available
+            ),
+            "decode": providers_for_device(
+                decode, installed, filter_to_available=filter_to_available
+            ),
         },
         component_providers=components,
         npu_layer_range=span,
@@ -915,6 +995,7 @@ class OnnxRuntimeBackend(InferenceBackend):
         self._pipeline = None
         self._tokenizer = None
         self.providers = resolve_onnx_providers(self.config)
+        self.dropped_providers: List[str] = []
         self.execution_plan = build_execution_plan(self.config)
 
     @property
@@ -933,6 +1014,7 @@ class OnnxRuntimeBackend(InferenceBackend):
         self._pipeline = None
         self.providers = resolve_onnx_providers(self.config)
         self.execution_plan = build_execution_plan(self.config)
+        self._apply_available_providers()
         if self._is_split:
             pipeline_cls = _sequential_pipeline_class()
             plan = self.execution_plan
@@ -974,6 +1056,61 @@ class OnnxRuntimeBackend(InferenceBackend):
                     stacklevel=2,
                 )
         self.is_loaded = True
+
+    def _apply_available_providers(self) -> None:
+        """
+        Check ``ort.get_available_providers()`` before a session is created.
+
+        Phase and component lists are filtered with the same set. Dropped
+        names are kept on ``dropped_providers`` and reported once. With
+        ``use_available_providers_only`` off, the requested lists pass through.
+        """
+        if not self.config.use_available_providers_only:
+            self.dropped_providers = []
+            return
+        available = _available_execution_providers()
+        requested = (
+            list(self.config.onnx_providers)
+            if self.config.onnx_providers
+            else _raw_providers_for_device(self.config.device)
+        )
+        _kept, requested_dropped = filter_onnx_providers(requested, available)
+        plan = self.execution_plan
+        if plan.policy != "monolithic":
+            for device in (plan.prefill_device, plan.decode_device):
+                _phase_kept, phase_gone = filter_onnx_providers(
+                    _raw_providers_for_device(device), available
+                )
+                requested_dropped.extend(phase_gone)
+            if plan.component_providers:
+                for device in (DeviceType.NPU, DeviceType.CPU):
+                    _pin_kept, pin_gone = filter_onnx_providers(
+                        _raw_providers_for_device(device), available
+                    )
+                    requested_dropped.extend(pin_gone)
+        self.providers, session_dropped = filter_onnx_providers(self.providers, available)
+        phase, phase_dropped = _filter_provider_map(
+            self.execution_plan.phase_providers, available
+        )
+        components, component_dropped = _filter_provider_map(
+            self.execution_plan.component_providers, available
+        )
+        self.execution_plan = replace(
+            self.execution_plan,
+            phase_providers=phase,
+            component_providers=components,
+        )
+        dropped: List[str] = []
+        for name in (
+            list(requested_dropped)
+            + phase_dropped
+            + component_dropped
+            + session_dropped
+        ):
+            if name not in dropped:
+                dropped.append(name)
+        self.dropped_providers = dropped
+        _warn_dropped_providers(dropped, self.providers)
 
     def generate(
         self,
@@ -1467,6 +1604,7 @@ __all__ = [
     "detect_model_format",
     "get_backend_for_model",
     "providers_for_device",
+    "filter_onnx_providers",
     "resolve_onnx_providers",
     "resolve_execution_policy",
     "build_execution_plan",
