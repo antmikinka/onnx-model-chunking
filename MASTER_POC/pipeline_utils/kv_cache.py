@@ -2371,21 +2371,15 @@ def _symmetric_scale(values: np.ndarray, qmax: float) -> float:
 
 
 def _quantize_bf16(values: np.ndarray) -> np.ndarray:
-    storage = _bf16_storage_dtype()
-    if storage != np.dtype(np.uint16):
-        return np.ascontiguousarray(values, dtype=storage)
-    bits = _as_float32(values).view(np.uint32).astype(np.uint64)
-    rounded = (
-        bits + np.uint64(0x7FFF) + ((bits >> np.uint64(16)) & np.uint64(1))
-    ) >> np.uint64(16)
-    return np.ascontiguousarray(rounded.astype(np.uint16))
+    from .dtypes import float32_to_bfloat16
+
+    return float32_to_bfloat16(values)
 
 
 def _dequantize_bf16(stored: np.ndarray) -> np.ndarray:
-    if stored.dtype != np.dtype(np.uint16):
-        return np.asarray(stored, dtype=np.float32)
-    wide = np.ascontiguousarray(stored, dtype=np.uint16).astype(np.uint32) << np.uint32(16)
-    return wide.view(np.float32)
+    from .dtypes import bfloat16_to_float32
+
+    return bfloat16_to_float32(stored)
 
 
 def _quantize_fp8(values: np.ndarray, scale: float) -> np.ndarray:

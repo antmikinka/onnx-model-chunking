@@ -41,6 +41,102 @@ def get_bfloat16_dtype():
     return None
 
 
+def _is_bfloat16_dtype(dtype) -> bool:
+    """True for ml_dtypes.bfloat16 or the dtype get_bfloat16_dtype() returns."""
+    try:
+        resolved = np.dtype(dtype)
+    except TypeError:
+        return False
+    native = get_bfloat16_dtype()
+    if native is not None:
+        try:
+            if resolved == np.dtype(native):
+                return True
+        except TypeError:
+            pass
+    return "bfloat16" in resolved.name.lower()
+
+
+def _round_float32_to_bf16_bits(values: np.ndarray) -> np.ndarray:
+    """Round float32 values to the nearest even bfloat16 and return uint16 bits.
+
+    Bfloat16 keeps the top 16 bits of float32. The low bit of that half selects
+    round-to-nearest-even. A NaN whose payload sits only in the discarded bits
+    gets a quiet bit in the kept half so the result stays a NaN.
+    """
+    bits = np.ascontiguousarray(values, dtype=np.float32).view(np.uint32).astype(np.uint64)
+    nan = (bits & np.uint64(0x7FFFFFFF)) > np.uint64(0x7F800000)
+    bits = np.where(nan, bits | np.uint64(0x00400000), bits)
+    rounded = (
+        bits + np.uint64(0x7FFF) + ((bits >> np.uint64(16)) & np.uint64(1))
+    ) >> np.uint64(16)
+    return np.ascontiguousarray(rounded.astype(np.uint16))
+
+
+def bfloat16_to_uint16_view(arr: np.ndarray) -> np.ndarray:
+    """View bfloat16 storage as uint16 bits.
+
+    Accepts a native bfloat16 array or a uint16 container. The result shares
+    memory with ``arr`` so a cache can be transported without a copy.
+    """
+    array = np.asarray(arr)
+    if array.dtype == np.dtype(np.uint16):
+        return array.view(np.uint16)
+    if not _is_bfloat16_dtype(array.dtype):
+        raise ValueError(
+            "bfloat16_to_uint16_view expects bfloat16 or uint16 bit storage, "
+            f"got {array.dtype}"
+        )
+    if array.dtype.itemsize != np.dtype(np.uint16).itemsize:
+        raise ValueError(f"bfloat16 dtype {array.dtype} is not a 16-bit container")
+    return array.view(np.uint16)
+
+
+def uint16_view_to_bfloat16(arr: np.ndarray) -> np.ndarray:
+    """View uint16 bfloat16 bits as the native dtype, or keep the uint16 container.
+
+    NumPy has no built-in bfloat16. When ml_dtypes is absent the uint16 array
+    is the bfloat16 value. When ml_dtypes is present the same bits are viewed
+    as that dtype.
+    """
+    array = np.asarray(arr)
+    if _is_bfloat16_dtype(array.dtype):
+        return array
+    if array.dtype != np.dtype(np.uint16):
+        raise ValueError(
+            f"uint16_view_to_bfloat16 expects uint16 bit storage, got {array.dtype}"
+        )
+    native = get_bfloat16_dtype()
+    if native is None:
+        return array
+    native_dtype = np.dtype(native)
+    if native_dtype.itemsize != np.dtype(np.uint16).itemsize:
+        raise ValueError(f"bfloat16 dtype {native_dtype} is not a 16-bit container")
+    return array.view(native_dtype)
+
+
+def bfloat16_to_float32(arr: np.ndarray) -> np.ndarray:
+    """Expand bfloat16 values to float32.
+
+    ``arr`` is native bfloat16 or a uint16 bit container. Each code is placed
+    in the high half of a float32 and the low half is zero.
+    """
+    bits = bfloat16_to_uint16_view(arr)
+    wide = np.ascontiguousarray(bits).astype(np.uint32) << np.uint32(16)
+    return wide.view(np.float32)
+
+
+def float32_to_bfloat16(arr: np.ndarray) -> np.ndarray:
+    """Round numeric values to bfloat16.
+
+    The result is ml_dtypes.bfloat16 when that dtype is installed. Otherwise
+    it is the uint16 bit container used to transport bfloat16 through NumPy
+    and ORT session boundaries.
+    """
+    values = np.ascontiguousarray(arr, dtype=np.float32)
+    return uint16_view_to_bfloat16(_round_float32_to_bf16_bits(values))
+
+
 # =============================================================================
 # FLOAT8 SUPPORT DETECTION
 # =============================================================================
@@ -246,7 +342,7 @@ ONNX_DTYPE_MAP = {
 
 # Types that require special handling or have precision implications
 SPECIAL_TYPES = {
-    "bfloat16": "Uses ml_dtypes if available, else falls back to float32",
+    "bfloat16": "Session dtype uses ml_dtypes if available, else float32. Transport stores round-to-nearest-even bits in uint16 when the native dtype is absent.",
     "int4": "Signed 4-bit values, two per int8 byte. INT4_BLOCKWISE records the group, scale, and zero point.",
     "uint4": "Unsigned 4-bit values, two per uint8 byte. UINT4_BLOCKWISE records the group, scale, and zero point.",
     "float8e4m3fn": "OCP E4M3FN. Uses ml_dtypes when available, else uint8 codes dequantized at the session boundary.",
@@ -1192,6 +1288,10 @@ __all__ = [
     "get_dtype_info",
     "supports_bfloat16",
     "get_bfloat16_dtype",
+    "bfloat16_to_float32",
+    "float32_to_bfloat16",
+    "bfloat16_to_uint16_view",
+    "uint16_view_to_bfloat16",
     "FP8_E4M3",
     "FP8_E5M2",
     "FP8_E4M3FNUZ",
