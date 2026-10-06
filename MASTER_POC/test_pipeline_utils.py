@@ -10790,8 +10790,8 @@ def test_quantization_metadata():
     def fake_create(model, component, name):
         return types.SimpleNamespace(
             graph=types.SimpleNamespace(
-                input=[types.SimpleNamespace(name="hidden")],
-                output=[types.SimpleNamespace(name="hidden_out")],
+                input=[types.SimpleNamespace(name=f"{name}_in")],
+                output=[types.SimpleNamespace(name=f"{name}_out")],
             )
         )
 
@@ -11583,8 +11583,8 @@ def test_execution_policy():
     def fake_create(model, component, name):
         return types.SimpleNamespace(
             graph=types.SimpleNamespace(
-                input=[types.SimpleNamespace(name="hidden")],
-                output=[types.SimpleNamespace(name="hidden_out")],
+                input=[types.SimpleNamespace(name=f"{name}_in")],
+                output=[types.SimpleNamespace(name=f"{name}_out")],
             )
         )
 
@@ -11651,6 +11651,437 @@ def test_execution_policy():
     print("  hybrid phase split: npu prefill, igpu decode")
     print("  resident embedding, norm, lm_head; streamed layer")
     print("  model_info: execution_policy saved")
+    return True
+
+
+def test_split_validation():
+    """PSNR, boundary contracts, and component IO are validated before files are written."""
+    print("=" * 50)
+    print("Testing split validation...")
+    print("=" * 50)
+
+    import json
+    import math
+    import os
+    import sys
+    import tempfile
+    import types
+    import warnings
+    import chunking_utils
+
+    try:
+        from chunking_utils.onnx.validator import (
+            compute_psnr,
+            validate_boundary_contracts,
+            validate_component_io,
+            verify_split_correctness,
+        )
+        import chunking_utils.onnx.splitter as splitter
+    except ModuleNotFoundError:
+        for name in list(sys.modules):
+            if name == "chunking_utils.onnx" or name.startswith("chunking_utils.onnx."):
+                del sys.modules[name]
+        onnx_stub = types.ModuleType("onnx")
+        onnx_stub.ModelProto = type("ModelProto", (), {})
+        onnx_stub.numpy_helper = types.SimpleNamespace()
+        onnx_stub.helper = types.SimpleNamespace()
+        onnx_stub.TensorProto = types.SimpleNamespace()
+        onnx_stub.shape_inference = types.SimpleNamespace()
+        sys.modules["onnx"] = onnx_stub
+        from chunking_utils.onnx.validator import (
+            compute_psnr,
+            validate_boundary_contracts,
+            validate_component_io,
+            verify_split_correctness,
+        )
+        import chunking_utils.onnx.splitter as splitter
+
+    from chunking_utils.onnx.types import ComponentInfo
+
+    assert chunking_utils.compute_psnr is compute_psnr
+    assert chunking_utils.verify_split_correctness is verify_split_correctness
+    assert chunking_utils.validate_boundary_contracts is validate_boundary_contracts
+    assert chunking_utils.validate_component_io is validate_component_io
+
+    reference = [0.0, 1.0]
+    assert math.isinf(compute_psnr(reference, [0.0, 1.0]))
+    assert math.isinf(compute_psnr([[1.0, 2.0], [3.0, 4.0]], [[1.0, 2.0], [3.0, 4.0]]))
+    changed = [0.0, 1.1]
+    measured = compute_psnr(reference, changed, data_range=1.0)
+    mse = ((0.1 ** 2) / 2.0)
+    expected = 20.0 * math.log10(1.0 / math.sqrt(mse))
+    assert math.isclose(measured, expected)
+    assert compute_psnr([0.0, 0.0], [0.0, 1.0]) == 0.0
+    ranged = compute_psnr([0.0, 0.0], [0.0, 1.0], data_range=1.0)
+    assert ranged > 0.0
+
+    def _check(ref, cand, **kwargs):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            info = verify_split_correctness(ref, cand, **kwargs)
+        return info, caught
+
+    exact, caught = _check(reference, list(reference))
+    assert caught == []
+    assert exact["exact"] is True
+    assert exact["psnr_db"] is None
+    assert exact["mse"] == 0.0
+    assert exact["quality"] == "production"
+    assert exact["passed"] is True
+    assert exact["production_ready"] is True
+    assert exact["min_psnr_db"] == 35.0
+    assert exact["production_psnr_db"] == 40.0
+    exact["outputs"]["output"]["quality"] = "failed"
+    again, _ = _check(reference, list(reference))
+    assert again["outputs"]["output"]["quality"] == "production"
+    assert again is not exact
+
+    equal, caught = _check(reference, changed, min_psnr=measured, production_psnr=measured + 1.0)
+    assert equal["passed"] is False
+    assert equal["quality"] == "failed"
+    assert any("PSNR verification failed" in str(item.message) for item in caught)
+    good, caught = _check(
+        reference,
+        changed,
+        min_psnr=measured - 0.1,
+        production_psnr=measured + 1.0,
+    )
+    assert good["passed"] is True
+    assert good["production_ready"] is False
+    assert good["quality"] == "good"
+    assert caught == []
+    production, _ = _check(
+        reference,
+        changed,
+        min_psnr=measured - 1.0,
+        production_psnr=measured - 0.1,
+    )
+    assert production["production_ready"] is True
+    assert production["quality"] == "production"
+    json.dumps(production)
+
+    worst, caught = _check(
+        {"logits": reference, "hidden": reference},
+        {"hidden": reference, "logits": changed},
+        min_psnr=measured - 0.1,
+        production_psnr=measured + 1.0,
+    )
+    assert worst["passed"] is True
+    assert worst["production_ready"] is False
+    assert worst["outputs"]["hidden"]["exact"] is True
+    assert worst["outputs"]["logits"]["quality"] == "good"
+    assert caught == []
+
+    import numpy as np
+    many, _ = _check(
+        [np.array([1.0, 2.0]), np.array([3.0])],
+        [np.array([1.0, 2.0]), np.array([3.0])],
+    )
+    assert set(many["outputs"]) == {"output_0", "output_1"}
+    assert many["exact"] is True
+
+    try:
+        verify_split_correctness(reference, [0.0])
+        raise AssertionError("a shape mismatch was accepted")
+    except ValueError as exc:
+        assert "shape" in str(exc)
+    try:
+        compute_psnr([True, False], [True, False])
+        raise AssertionError("a bool array was accepted")
+    except ValueError as exc:
+        assert "numeric" in str(exc)
+    try:
+        compute_psnr([0.0, float("nan")], [0.0, 1.0])
+        raise AssertionError("a NaN was accepted")
+    except ValueError as exc:
+        assert "finite" in str(exc)
+    try:
+        compute_psnr([], [])
+        raise AssertionError("an empty array was accepted")
+    except ValueError as exc:
+        assert "at least one" in str(exc)
+    try:
+        compute_psnr(reference, changed, data_range=0)
+        raise AssertionError("a zero data range was accepted")
+    except ValueError as exc:
+        assert "data_range" in str(exc)
+    try:
+        compute_psnr(reference, changed, data_range=True)
+        raise AssertionError("a bool data range was accepted")
+    except ValueError as exc:
+        assert "data_range" in str(exc)
+    try:
+        verify_split_correctness(reference, changed, min_psnr=True)
+        raise AssertionError("a bool threshold was accepted")
+    except ValueError as exc:
+        assert "min_psnr" in str(exc)
+    try:
+        verify_split_correctness(reference, changed, min_psnr=40.0, production_psnr=35.0)
+        raise AssertionError("a production threshold below the minimum was accepted")
+    except ValueError as exc:
+        assert "production_psnr" in str(exc)
+    try:
+        verify_split_correctness({"logits": reference}, {"hidden": reference})
+        raise AssertionError("disagreeing output names were accepted")
+    except ValueError as exc:
+        assert "output names" in str(exc)
+    try:
+        verify_split_correctness({}, {})
+        raise AssertionError("an empty output map was accepted")
+    except ValueError as exc:
+        assert "at least one" in str(exc)
+
+    components = {
+        "embedding": {"input_names": ["input_ids"], "output_names": ["hidden"]},
+        "layer_0": {
+            "input_names": ["hidden", "past_key_values.0.key"],
+            "output_names": ["logits"],
+        },
+    }
+    hidden = {
+        "name": "hidden",
+        "dtype": "float16",
+        "shape": [1, None, 8],
+        "producer": "embedding",
+        "consumers": ["layer_0"],
+        "is_stateful": False,
+        "zero_copy": True,
+        "device_preference": None,
+        "cache_role": None,
+    }
+    past = {
+        "name": "past_key_values.0.key",
+        "dtype": "float16",
+        "shape": [1, 8, 128, 64],
+        "producer": "external",
+        "consumers": ["layer_0"],
+        "is_stateful": True,
+        "zero_copy": True,
+        "device_preference": "npu",
+        "cache_role": "past_key",
+    }
+    contracts = validate_boundary_contracts([hidden, past], components)
+    assert contracts[0]["name"] == "hidden"
+    assert contracts[0]["shape"] == [1, None, 8]
+    assert contracts[1]["cache_role"] == "past_key"
+    assert contracts[1]["device_preference"] == "npu"
+    assert contracts[1]["zero_copy"] is True
+    contracts[0]["shape"].append(1)
+    again_contracts = validate_boundary_contracts([hidden, past], components)
+    assert again_contracts[0]["shape"] == [1, None, 8]
+    assert again_contracts is not contracts
+    io = validate_component_io(components, [hidden, past])
+    assert io["crossings"] == [
+        {"name": "hidden", "producer": "embedding", "consumers": ["layer_0"]},
+    ]
+    io["components"]["embedding"]["output_names"].append("extra")
+    fresh_io = validate_component_io(components, [hidden, past])
+    assert fresh_io["components"]["embedding"]["output_names"] == ["hidden"]
+    json.dumps(fresh_io)
+    mask = dict(hidden)
+    mask["name"] = "attention_mask"
+    mask_components = {
+        "embedding": {"input_names": ["input_ids"], "output_names": ["attention_mask"]},
+        "layer_0": {"input_names": ["attention_mask"], "output_names": ["logits"]},
+    }
+    mask_contracts = validate_boundary_contracts([mask], mask_components)
+    assert mask_contracts[0]["dtype"] == "float16"
+    assert mask_contracts[0]["dtype"] != "int64"
+
+    try:
+        validate_boundary_contracts([hidden, hidden], components)
+        raise AssertionError("a duplicate boundary was accepted")
+    except ValueError as exc:
+        assert "duplicate" in str(exc)
+    missing_producer = dict(hidden)
+    missing_producer["producer"] = "norm"
+    try:
+        validate_boundary_contracts([missing_producer], components)
+        raise AssertionError("an unknown producer was accepted")
+    except ValueError as exc:
+        assert "producer" in str(exc)
+    quiet_past = dict(past)
+    quiet_past["is_stateful"] = False
+    try:
+        validate_boundary_contracts([quiet_past], components)
+        raise AssertionError("a past tensor was accepted as stateless")
+    except ValueError as exc:
+        assert "stateful" in str(exc)
+    igpu = dict(past)
+    igpu["device_preference"] = "igpu"
+    try:
+        validate_boundary_contracts([igpu], components)
+        raise AssertionError("a stateful tensor on the igpu was accepted")
+    except ValueError as exc:
+        assert "npu" in str(exc)
+    copied = dict(hidden)
+    copied["zero_copy"] = False
+    try:
+        validate_boundary_contracts([copied], components)
+        raise AssertionError("a handoff without zero-copy was accepted")
+    except ValueError as exc:
+        assert "zero_copy" in str(exc)
+    broken_shape = dict(hidden)
+    broken_shape["shape"] = [True]
+    try:
+        validate_boundary_contracts([broken_shape], components)
+        raise AssertionError("a bool shape was accepted")
+    except ValueError as exc:
+        assert "dimension" in str(exc)
+    try:
+        validate_boundary_contracts("hidden", components)
+        raise AssertionError("a boundary string was accepted")
+    except ValueError as exc:
+        assert "list" in str(exc)
+    try:
+        validate_component_io(["embedding"], [hidden])
+        raise AssertionError("a component list was accepted")
+    except ValueError as exc:
+        assert "dict" in str(exc)
+    blank = {
+        "embedding": {"input_names": [" "], "output_names": ["hidden"]},
+        "layer_0": {"input_names": ["hidden"], "output_names": ["logits"]},
+    }
+    try:
+        validate_component_io(blank, [hidden])
+        raise AssertionError("a blank input name was accepted")
+    except ValueError as exc:
+        assert "input_names" in str(exc)
+    try:
+        validate_component_io(components, [])
+        raise AssertionError("a missing crossing was accepted")
+    except ValueError as exc:
+        assert "not a boundary" in str(exc)
+    absent = dict(hidden)
+    absent["name"] = "other"
+    try:
+        validate_boundary_contracts([absent], components)
+        raise AssertionError("a boundary missing from the producer outputs was accepted")
+    except ValueError as exc:
+        assert "not an output" in str(exc)
+
+    class _SplitModel:
+        def __init__(self, graph):
+            self.graph = graph
+            self.ir_version = 8
+            self.producer_name = "test"
+
+    class _Node:
+        def __init__(self, name):
+            self.name = name
+            self.op_type = "MatMul"
+            self.input = ["hidden"]
+            self.output = ["hidden_out"]
+
+    split_graph = types.SimpleNamespace(
+        node=[_Node("/model/layers.0/MatMul")],
+        initializer=[],
+        input=[],
+        output=[],
+        value_info=[],
+    )
+    original_load = splitter.load_onnx_model
+    original_extract = splitter.extract_components
+    original_create = splitter.create_component_onnx
+    original_boundaries = splitter.collect_boundary_tensors
+    original_save = getattr(splitter.onnx, "save", None)
+    original_infer = getattr(splitter.shape_inference, "infer_shapes", None)
+
+    def fake_load(path):
+        return _SplitModel(split_graph)
+
+    def fake_infer(model):
+        return model
+
+    def fake_extract(model, **kwargs):
+        return {
+            "embedding": ComponentInfo(component_type="embedding", node_indices=[0]),
+            "layer_0": ComponentInfo(component_type="layer", layer_id=0, node_indices=[0]),
+        }
+
+    def fake_create(model, component, name):
+        if name == "embedding":
+            inputs, outputs = ["input_ids"], ["hidden"]
+        else:
+            inputs, outputs = ["hidden"], ["logits"]
+        return types.SimpleNamespace(
+            graph=types.SimpleNamespace(
+                input=[types.SimpleNamespace(name=item) for item in inputs],
+                output=[types.SimpleNamespace(name=item) for item in outputs],
+            )
+        )
+
+    def fake_boundaries(model, components):
+        return []
+
+    saved_files = []
+
+    def fake_save(model, filepath, **kwargs):
+        saved_files.append(filepath)
+
+    splitter.load_onnx_model = fake_load
+    splitter.extract_components = fake_extract
+    splitter.create_component_onnx = fake_create
+    splitter.collect_boundary_tensors = fake_boundaries
+    splitter.onnx.save = fake_save
+    splitter.shape_inference.infer_shapes = fake_infer
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            model_path = os.path.join(directory, "model.onnx")
+            output_path = os.path.join(directory, "out")
+            os.makedirs(output_path)
+            with open(model_path, "w", encoding="utf-8") as handle:
+                handle.write("onnx")
+            saved_files.clear()
+            try:
+                splitter.split_onnx(model=model_path, output=output_path, split_only=True)
+                raise AssertionError("a missing crossing was written")
+            except ValueError as exc:
+                assert "not a boundary" in str(exc)
+            assert saved_files == []
+            assert not os.path.exists(os.path.join(output_path, "model.onnx", "embeddings.onnx"))
+
+            from chunking_utils.common.types import BoundaryTensor
+
+            def fake_boundaries_ok(model, components):
+                return [BoundaryTensor(
+                    name="hidden",
+                    dtype="float16",
+                    shape=[1, 4],
+                    producer_component="embedding",
+                    consumer_components=["layer_0"],
+                    is_stateful=False,
+                    zero_copy=True,
+                )]
+
+            splitter.collect_boundary_tensors = fake_boundaries_ok
+            saved_files.clear()
+            result = splitter.split_onnx(model=model_path, output=output_path, split_only=True)
+            info_path = os.path.join(result.output_dir, "model_info.json")
+            saved = json.load(open(info_path, encoding="utf-8"))
+            assert saved["boundary_tensors"][0]["name"] == "hidden"
+            assert saved["components"]["embedding"]["output_names"] == ["hidden"]
+            assert saved["components"]["layer_0"]["input_names"] == ["hidden"]
+            assert len(saved_files) == 2
+    finally:
+        splitter.load_onnx_model = original_load
+        splitter.extract_components = original_extract
+        splitter.create_component_onnx = original_create
+        splitter.collect_boundary_tensors = original_boundaries
+        if original_save is None:
+            del splitter.onnx.save
+        else:
+            splitter.onnx.save = original_save
+        if original_infer is None:
+            if hasattr(splitter.shape_inference, "infer_shapes"):
+                del splitter.shape_inference.infer_shapes
+        else:
+            splitter.shape_inference.infer_shapes = original_infer
+
+    print("split validation: OK")
+    print("  psnr above 35 dB is good and above 40 dB is production")
+    print("  boundary contract: producer, consumers, stateful NPU zero-copy")
+    print("  component IO is checked before a file is written")
     return True
 
 
@@ -12012,6 +12443,12 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"execution_policy: FAILED - {e}")
         results.append(("execution_policy", False))
+
+    try:
+        results.append(("split_validation", test_split_validation()))
+    except Exception as e:
+        print(f"split_validation: FAILED - {e}")
+        results.append(("split_validation", False))
 
     try:
         results.append(("path_manager", test_path_manager()))

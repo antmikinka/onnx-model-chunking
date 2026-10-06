@@ -25,6 +25,12 @@ from .splitter import (
     extract_execution_policy,
     detect_architecture_from_onnx,
 )
+from .validator import (
+    compute_psnr,
+    verify_split_correctness,
+    validate_boundary_contracts,
+    validate_component_io,
+)
 from .merger import merge_onnx
 from .loader import load_onnx_model, resolve_model_path
 from .types import ComponentInfo, OnnxSplitResult
@@ -45,6 +51,10 @@ __all__ = [
     "extract_quantization_info",
     "extract_kv_cache_info",
     "extract_execution_policy",
+    "compute_psnr",
+    "verify_split_correctness",
+    "validate_boundary_contracts",
+    "validate_component_io",
     # Architecture detection
     "detect_architecture_from_onnx",
     # Types

@@ -27,6 +27,7 @@ from ..common.architecture import (
 from ..common.architecture_detector import detect_architecture
 from ..common.graph_topology import analyze_graph_topology
 from ..common.types import BoundaryTensor, ComponentType, ModelFormat, SplitConfig
+from .validator import validate_boundary_contracts, validate_component_io
 
 from .types import ComponentInfo, OnnxSplitResult
 from .loader import load_onnx_model
@@ -1929,6 +1930,8 @@ def split_onnx(
     - norm.onnx
     - lm_head.onnx
     - model_info.json, including quantization_info, kv_cache_info, and execution_policy
+
+    Boundary contracts and component IO are validated before any component file is written.
     
     Args:
         model: Path to ONNX model file or directory. Required if config not provided.
@@ -2000,8 +2003,9 @@ def split_onnx(
     print(f"Output directory: {output_dir}")
     
     component_files: Dict[str, str] = {}
+    prepared = []
     
-    # Save each component
+    # Capture I/O, then validate, then write. A bad contract raises first.
     for comp_name, comp_info in sorted(components.items()):
         # Determine filename
         if comp_info.component_type == "layer":
@@ -2023,7 +2027,12 @@ def split_onnx(
         # Capture I/O metadata
         comp_info.input_names = [i.name for i in component_model.graph.input]
         comp_info.output_names = [o.name for o in component_model.graph.output]
-        
+        prepared.append((comp_name, comp_info, filename, filepath, component_model))
+
+    validate_component_io(components, boundaries)
+    validate_boundary_contracts(boundaries, components)
+
+    for comp_name, comp_info, filename, filepath, component_model in prepared:
         # Save (with external data for large models)
         try:
             data_filename = filename + ".data"
