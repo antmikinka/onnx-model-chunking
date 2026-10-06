@@ -12085,6 +12085,618 @@ def test_split_validation():
     return True
 
 
+def test_weight_storage():
+    """Shared, hard-linked, and streamed weights are deduplicated before files are written."""
+    print("=" * 50)
+    print("Testing weight storage...")
+    print("=" * 50)
+
+    import hashlib
+    import json
+    import os
+    import sys
+    import tempfile
+    import types
+    import warnings
+    import chunking_utils
+
+    try:
+        from chunking_utils.onnx.weight_store import (
+            WeightStrategy,
+            coerce_weight_strategy,
+            plan_weight_storage,
+            store_component_weights,
+        )
+        import chunking_utils.onnx.weight_store as weight_store
+        import chunking_utils.onnx.splitter as splitter
+    except ModuleNotFoundError:
+        for name in list(sys.modules):
+            if name == "chunking_utils.onnx" or name.startswith("chunking_utils.onnx."):
+                del sys.modules[name]
+        onnx_stub = types.ModuleType("onnx")
+        onnx_stub.ModelProto = type("ModelProto", (), {})
+        onnx_stub.numpy_helper = types.SimpleNamespace()
+        onnx_stub.helper = types.SimpleNamespace()
+        onnx_stub.TensorProto = types.SimpleNamespace()
+        onnx_stub.shape_inference = types.SimpleNamespace()
+        sys.modules["onnx"] = onnx_stub
+        from chunking_utils.onnx.weight_store import (
+            WeightStrategy,
+            coerce_weight_strategy,
+            plan_weight_storage,
+            store_component_weights,
+        )
+        import chunking_utils.onnx.weight_store as weight_store
+        import chunking_utils.onnx.splitter as splitter
+
+    from chunking_utils.onnx.types import ComponentInfo
+
+    assert chunking_utils.WeightStrategy is WeightStrategy
+    assert chunking_utils.coerce_weight_strategy is coerce_weight_strategy
+    assert chunking_utils.plan_weight_storage is plan_weight_storage
+    assert chunking_utils.store_component_weights is store_component_weights
+    assert WeightStrategy.COPY.value == "copy"
+    assert WeightStrategy.HARDLINK.value == "hardlink"
+    assert WeightStrategy.MANIFEST.value == "manifest"
+    assert WeightStrategy.STREAMING.value == "streaming"
+    assert coerce_weight_strategy(WeightStrategy.COPY) is WeightStrategy.COPY
+    assert coerce_weight_strategy("hard-link") is WeightStrategy.HARDLINK
+    assert coerce_weight_strategy("HARD LINK") is WeightStrategy.HARDLINK
+
+    payload = b"shared-weight"
+    other = b"other-bytes"
+    mask = b"\x00\x01"
+
+    def _components(first, second=None, first_name="embed.weight", second_name="head.weight"):
+        items = [{
+            "name": "embedding",
+            "file": "embeddings.onnx",
+            "initializers": [{"name": first_name, "data": first}],
+        }]
+        if second is not None:
+            items.append({
+                "name": "lm_head",
+                "file": "lm_head.onnx",
+                "initializers": [{"name": second_name, "data": second}],
+            })
+        return items
+
+    def _store(directory, components, **kwargs):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            record = store_component_weights(components, directory, **kwargs)
+        return record, caught
+
+    with tempfile.TemporaryDirectory() as directory:
+        missing = os.path.join(directory, "not-yet")
+        planned_components = _components(payload, payload)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            planned = plan_weight_storage(
+                planned_components,
+                missing,
+                strategy=WeightStrategy.COPY,
+                size_threshold=1,
+            )
+        assert not os.path.exists(missing)
+        assert planned_components[0]["initializers"][0]["data"] == payload
+        assert any("weight strategy copy duplicates 1 initializer payload" in str(item.message) for item in caught)
+        assert planned["deduplicated"] is False
+        assert planned["shared_file"] is None
+        assert planned["manifest"] is None
+        assert planned["files"][0]["bytes"] == len(payload)
+        assert "_data" not in planned["files"][0]
+        planned["components"][0]["slices"].append({"name": "extra"})
+        again = plan_weight_storage(
+            _components(payload, payload),
+            missing,
+            strategy="copy",
+            size_threshold=1,
+        )
+        assert len(again["components"][0]["slices"]) == 1
+        assert again is not planned
+        json.dumps(again)
+
+        copy_dir = os.path.join(directory, "copy")
+        copied, caught = _store(copy_dir, _components(payload, payload), strategy="copy", size_threshold=1)
+        assert copied["strategy"] == "copy"
+        assert copied["deduplicated"] is False
+        assert any("duplicates 1 initializer payload" in str(item.message) for item in caught)
+        embedding_data = os.path.join(copy_dir, "embeddings.onnx.data")
+        head_data = os.path.join(copy_dir, "lm_head.onnx.data")
+        assert open(embedding_data, "rb").read() == payload
+        assert open(head_data, "rb").read() == payload
+        assert not os.path.samefile(embedding_data, head_data)
+        assert not os.path.exists(os.path.join(copy_dir, "weights"))
+        assert copied["components"][0]["slices"][0]["location"] == "embeddings.onnx.data"
+        assert copied["components"][0]["slices"][0]["offset"] == 0
+        distinct, caught = _store(
+            os.path.join(directory, "distinct"),
+            _components(payload, other),
+            strategy=WeightStrategy.COPY,
+            size_threshold=1,
+        )
+        assert caught == []
+        assert distinct["files"][0]["bytes"] == len(payload)
+        assert distinct["files"][1]["bytes"] == len(other)
+        same_component = [{
+            "name": "embedding",
+            "file": "embeddings.onnx",
+            "initializers": [
+                {"name": "a", "data": payload},
+                {"name": "b", "data": payload},
+            ],
+        }]
+        once, caught = _store(os.path.join(directory, "once"), same_component, strategy="copy", size_threshold=1)
+        assert caught == []
+        assert once["files"][0]["bytes"] == len(payload)
+        assert once["components"][0]["slices"][0]["offset"] == 0
+        assert once["components"][0]["slices"][1]["offset"] == 0
+
+        kept = _components(b"abcd", None)
+        inline, _ = _store(os.path.join(directory, "inline"), kept, strategy="copy", size_threshold=5)
+        assert inline["components"][0]["slices"] == []
+        assert kept[0]["initializers"][0]["data"] == b"abcd"
+        external, _ = _store(
+            os.path.join(directory, "threshold"),
+            _components(b"abcd"),
+            strategy="copy",
+            size_threshold=4,
+        )
+        assert external["files"][0]["bytes"] == 4
+
+        link_dir = os.path.join(directory, "link")
+        linked, caught = _store(
+            link_dir,
+            _components(payload, payload, first_name="attention_mask"),
+            strategy="hardlink",
+            size_threshold=1,
+        )
+        assert caught == []
+        assert linked["deduplicated"] is True
+        assert linked["shared_file"] == "weights/shared.bin"
+        assert linked["manifest"] == "weights/manifest.json"
+        shared = os.path.join(link_dir, "weights", "shared.bin")
+        assert os.path.getsize(shared) == len(payload)
+        assert os.path.samefile(shared, os.path.join(link_dir, "embeddings.onnx.data"))
+        assert os.path.samefile(shared, os.path.join(link_dir, "lm_head.onnx.data"))
+        assert os.stat(shared).st_nlink >= 3
+        assert linked["components"][0]["slices"][0]["name"] == "attention_mask"
+        assert linked["components"][0]["slices"][0]["digest"] == hashlib.sha256(payload).hexdigest()
+        assert linked["components"][1]["slices"][0]["offset"] == 0
+        assert linked["components"][0]["slices"][0]["location"] == "embeddings.onnx.data"
+        manifest = json.load(open(os.path.join(link_dir, "weights", "manifest.json"), encoding="utf-8"))
+        assert manifest["strategy"] == "hardlink"
+        assert manifest["tensors"][0]["name"] == "attention_mask"
+        assert link_dir and linked["components"][0]["slices"][0]["digest"] != "int64"
+
+        manifest_dir = os.path.join(directory, "manifest")
+        shared_record, caught = _store(
+            manifest_dir,
+            _components(b"aaaa", b"bb"),
+            strategy="manifest",
+            size_threshold=1,
+            chunk_size=4,
+        )
+        assert caught == []
+        assert shared_record["chunk_size"] is None
+        assert shared_record["deduplicated"] is True
+        assert shared_record["components"][0]["slices"][0]["offset"] == 0
+        assert shared_record["components"][1]["slices"][0]["offset"] == 4
+        assert shared_record["components"][0]["slices"][0]["location"] == "weights/shared.bin"
+        manifest_file = os.path.join(manifest_dir, "weights", "shared.bin")
+        assert os.path.getsize(manifest_file) == 6
+        assert not os.path.exists(os.path.join(manifest_dir, "embeddings.onnx.data"))
+        written = json.load(open(os.path.join(manifest_dir, "weights", "manifest.json"), encoding="utf-8"))
+        assert written["file"] == "weights/shared.bin"
+        assert len(written["tensors"]) == 2
+        assert shared_record["components"][0]["data_file"] == "weights/shared.bin"
+
+        stream_dir = os.path.join(directory, "stream")
+        streamed, caught = _store(
+            stream_dir,
+            _components(b"aaaa", b"bbbb"),
+            strategy=WeightStrategy.STREAMING,
+            size_threshold=1,
+            chunk_size=6,
+        )
+        assert caught == []
+        assert streamed["chunk_size"] == 6
+        assert streamed["deduplicated"] is True
+        assert len(streamed["files"]) == 2
+        assert streamed["components"][0]["slices"][0]["location"] == "weights/chunks/chunk_000000.bin"
+        assert streamed["components"][1]["slices"][0]["location"] == "weights/chunks/chunk_000001.bin"
+        stream_doc = json.load(open(os.path.join(stream_dir, "weights", "stream.json"), encoding="utf-8"))
+        assert stream_doc["chunks"][0]["bytes"] == 4
+        packed, _ = _store(
+            os.path.join(directory, "packed"),
+            _components(b"aa", b"bb"),
+            strategy="streaming",
+            size_threshold=1,
+            chunk_size=6,
+        )
+        assert len(packed["files"]) == 1
+        assert packed["files"][0]["bytes"] == 4
+        assert packed["components"][0]["slices"][0]["location"] == packed["components"][1]["slices"][0]["location"]
+        oversized, caught = _store(
+            os.path.join(directory, "over"),
+            _components(b"c" * 10),
+            strategy="streaming",
+            size_threshold=1,
+            chunk_size=4,
+        )
+        assert oversized["files"][0]["bytes"] == 10
+        assert any("own chunk" in str(item.message) and "embed.weight" in str(item.message) for item in caught)
+
+        viewed = [{
+            "name": "embedding",
+            "file": "embeddings.onnx",
+            "initializers": [{"name": "embed.weight", "data": memoryview(payload)}],
+        }]
+        viewed_record, _ = _store(os.path.join(directory, "view"), viewed, strategy="manifest", size_threshold=1)
+        assert viewed_record["files"][0]["bytes"] == len(payload)
+        assert viewed[0]["initializers"][0]["data"] == b""
+        assert viewed[0]["initializers"][0]["external_data"][0]["key"] == "location"
+        assert viewed[0]["initializers"][0]["external_data"][0]["value"] == "weights/shared.bin"
+
+        class _Entry:
+            def __init__(self):
+                self.key = ""
+                self.value = ""
+
+        class _External(list):
+            def add(self):
+                item = _Entry()
+                self.append(item)
+                return item
+
+        class _Tensor:
+            def __init__(self):
+                self.name = "embed.weight"
+                self.raw_data = payload
+                self.external_data = _External()
+                self.cleared = False
+
+            def ClearField(self, field):
+                assert field == "raw_data"
+                self.cleared = True
+                self.raw_data = b""
+
+        tensor = _Tensor()
+        proto_components = [{
+            "name": "embedding",
+            "file": "embeddings.onnx",
+            "initializers": [tensor],
+        }]
+        proto, _ = _store(os.path.join(directory, "proto"), proto_components, strategy="copy", size_threshold=1)
+        assert tensor.cleared is True
+        assert tensor.raw_data == b""
+        assert [(item.key, item.value) for item in tensor.external_data] == [
+            ("location", "embeddings.onnx.data"),
+            ("offset", "0"),
+            ("length", str(len(payload))),
+        ]
+        assert proto["components"][0]["slices"][0]["length"] == len(payload)
+
+        original_link = weight_store.os.link
+
+        def _fail_link(*_args, **_kwargs):
+            raise OSError("exdev")
+
+        weight_store.os.link = _fail_link
+        try:
+            failed, caught = _store(
+                os.path.join(directory, "fallback"),
+                _components(payload, payload),
+                strategy="hardlink",
+                size_threshold=1,
+            )
+        finally:
+            weight_store.os.link = original_link
+        assert any("weight hardlink failed" in str(item.message) for item in caught)
+        assert failed["files"][1]["hardlink_of"] is None
+        fallback_shared = os.path.join(directory, "fallback", "weights", "shared.bin")
+        fallback_copy = os.path.join(directory, "fallback", "embeddings.onnx.data")
+        assert open(fallback_shared, "rb").read() == open(fallback_copy, "rb").read() == payload
+        assert not os.path.samefile(fallback_shared, fallback_copy)
+
+        named = store_component_weights(
+            {"embedding": {"file": "embeddings.onnx", "initializers": [{"name": "embed.weight", "data": mask}]}},
+            os.path.join(directory, "named"),
+            strategy="manifest",
+            size_threshold=1,
+        )
+        assert named["components"][0]["slices"][0]["name"] == "embed.weight"
+        assert named["components"][0]["slices"][0]["length"] == len(mask)
+
+        duplicate_init = [{
+            "name": "embedding",
+            "file": "embeddings.onnx",
+            "initializers": [
+                {"name": "embed.weight", "data": payload},
+                {"name": "embed.weight", "data": other},
+            ],
+        }]
+        try:
+            store_component_weights(duplicate_init, os.path.join(directory, "dup-init"), size_threshold=1)
+            raise AssertionError("a duplicate initializer was accepted")
+        except ValueError as exc:
+            assert "duplicate" in str(exc)
+        try:
+            store_component_weights(_components(payload) + _components(other), directory, size_threshold=1)
+            raise AssertionError("a duplicate component was accepted")
+        except ValueError as exc:
+            assert "duplicate" in str(exc)
+        try:
+            store_component_weights(
+                [{"name": " ", "file": "embeddings.onnx", "initializers": []}],
+                directory,
+            )
+            raise AssertionError("a blank component name was accepted")
+        except ValueError as exc:
+            assert "component name" in str(exc)
+        try:
+            store_component_weights(
+                [{"name": "embedding", "file": "embeddings.onnx", "initializers": [{"name": " ", "data": payload}]}],
+                directory,
+                size_threshold=1,
+            )
+            raise AssertionError("a blank initializer name was accepted")
+        except ValueError as exc:
+            assert "initializer name" in str(exc)
+        try:
+            store_component_weights(
+                [{"name": "embedding", "file": "embeddings.onnx", "initializers": [{"name": "w", "data": "text"}]}],
+                directory,
+                size_threshold=1,
+            )
+            raise AssertionError("a text payload was accepted")
+        except ValueError as exc:
+            assert "bytes" in str(exc)
+        try:
+            store_component_weights([], directory)
+            raise AssertionError("an empty component list was accepted")
+        except ValueError as exc:
+            assert "at least one" in str(exc)
+        try:
+            store_component_weights("embedding", directory)
+            raise AssertionError("a component string was accepted")
+        except ValueError as exc:
+            assert "dict" in str(exc)
+        try:
+            coerce_weight_strategy("banana")
+            raise AssertionError("an unknown strategy was accepted")
+        except ValueError as exc:
+            assert "hardlink" in str(exc)
+        try:
+            coerce_weight_strategy(True)
+            raise AssertionError("a bool strategy was accepted")
+        except ValueError as exc:
+            assert "WeightStrategy" in str(exc)
+        try:
+            coerce_weight_strategy(" ")
+            raise AssertionError("a blank strategy was accepted")
+        except ValueError as exc:
+            assert "WeightStrategy" in str(exc)
+        try:
+            store_component_weights(_components(payload), directory, size_threshold=True)
+            raise AssertionError("a bool threshold was accepted")
+        except ValueError as exc:
+            assert "integer" in str(exc)
+        try:
+            store_component_weights(_components(payload), directory, size_threshold=-1)
+            raise AssertionError("a negative threshold was accepted")
+        except ValueError as exc:
+            assert "non-negative" in str(exc)
+        try:
+            store_component_weights(_components(payload), directory, strategy="streaming", chunk_size=0)
+            raise AssertionError("a zero chunk size was accepted")
+        except ValueError as exc:
+            assert "positive" in str(exc)
+        try:
+            store_component_weights(_components(payload), directory, strategy="copy", chunk_size=True)
+            raise AssertionError("a bool chunk size was accepted")
+        except ValueError as exc:
+            assert "integer" in str(exc)
+        try:
+            store_component_weights(_components(payload), " ")
+            raise AssertionError("a blank output directory was accepted")
+        except ValueError as exc:
+            assert "directory" in str(exc)
+        occupied = os.path.join(directory, "occupied")
+        with open(occupied, "w", encoding="utf-8") as handle:
+            handle.write("file")
+        try:
+            store_component_weights(_components(payload), occupied, size_threshold=1)
+            raise AssertionError("a file was accepted as the output directory")
+        except ValueError as exc:
+            assert "directory" in str(exc)
+        try:
+            store_component_weights(
+                [{"name": "embedding", "file": "../embeddings.onnx", "initializers": []}],
+                directory,
+            )
+            raise AssertionError("a parent path was accepted")
+        except ValueError as exc:
+            assert "base name" in str(exc)
+        try:
+            store_component_weights(
+                [{"name": "embedding", "file": "nested/embeddings.onnx", "initializers": []}],
+                directory,
+            )
+            raise AssertionError("a nested file name was accepted")
+        except ValueError as exc:
+            assert "base name" in str(exc)
+        try:
+            store_component_weights(
+                [{"name": "embedding", "model": types.SimpleNamespace()}],
+                directory,
+            )
+            raise AssertionError("a model without a graph was accepted")
+        except ValueError as exc:
+            assert "graph" in str(exc)
+        try:
+            store_component_weights(
+                {"embedding": {"name": "layer_0", "initializers": []}},
+                directory,
+            )
+            raise AssertionError("a mismatched component name was accepted")
+        except ValueError as exc:
+            assert "component name" in str(exc)
+        empty_model, caught = _store(
+            os.path.join(directory, "empty-model"),
+            [{"name": "embedding", "file": "embeddings.onnx", "model": types.SimpleNamespace(graph=types.SimpleNamespace())}],
+            strategy="copy",
+            size_threshold=1,
+        )
+        assert caught == []
+        assert empty_model["components"][0]["slices"] == []
+
+    class _SplitModel:
+        def __init__(self, graph):
+            self.graph = graph
+            self.ir_version = 8
+            self.producer_name = "test"
+
+    class _Node:
+        def __init__(self, name):
+            self.name = name
+            self.op_type = "MatMul"
+            self.input = ["hidden"]
+            self.output = ["hidden_out"]
+
+    class _Weight:
+        def __init__(self, name, data):
+            self.name = name
+            self.raw_data = data
+            self.external_data = None
+
+    split_graph = types.SimpleNamespace(
+        node=[_Node("/model/layers.0/MatMul")],
+        initializer=[],
+        input=[],
+        output=[],
+        value_info=[],
+    )
+    original_load = splitter.load_onnx_model
+    original_extract = splitter.extract_components
+    original_create = splitter.create_component_onnx
+    original_boundaries = splitter.collect_boundary_tensors
+    original_save = getattr(splitter.onnx, "save", None)
+    original_infer = getattr(splitter.shape_inference, "infer_shapes", None)
+
+    def fake_load(path):
+        return _SplitModel(split_graph)
+
+    def fake_infer(model):
+        return model
+
+    def fake_extract(model, **kwargs):
+        return {
+            "embedding": ComponentInfo(component_type="embedding", node_indices=[0]),
+            "layer_0": ComponentInfo(component_type="layer", layer_id=0, node_indices=[0]),
+        }
+
+    def fake_create(model, component, name):
+        if name == "embedding":
+            inputs, outputs = ["input_ids"], ["hidden"]
+        else:
+            inputs, outputs = ["hidden"], ["logits"]
+        return types.SimpleNamespace(
+            graph=types.SimpleNamespace(
+                input=[types.SimpleNamespace(name=item) for item in inputs],
+                output=[types.SimpleNamespace(name=item) for item in outputs],
+                initializer=[_Weight("attention_mask", payload)],
+            )
+        )
+
+    from chunking_utils.common.types import BoundaryTensor
+
+    def fake_boundaries(model, components):
+        return [BoundaryTensor(
+            name="hidden",
+            dtype="float16",
+            shape=[1, 4],
+            producer_component="embedding",
+            consumer_components=["layer_0"],
+            is_stateful=False,
+            zero_copy=True,
+        )]
+
+    saved_files = []
+
+    def fake_save(model, filepath, **kwargs):
+        saved_files.append(filepath)
+
+    splitter.load_onnx_model = fake_load
+    splitter.extract_components = fake_extract
+    splitter.create_component_onnx = fake_create
+    splitter.collect_boundary_tensors = fake_boundaries
+    splitter.onnx.save = fake_save
+    splitter.shape_inference.infer_shapes = fake_infer
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            model_path = os.path.join(directory, "model.onnx")
+            with open(model_path, "w", encoding="utf-8") as handle:
+                handle.write("onnx")
+            bad_output = os.path.join(directory, "bad")
+            try:
+                splitter.split_onnx(
+                    model=model_path,
+                    output=bad_output,
+                    split_only=True,
+                    weight_strategy="banana",
+                )
+                raise AssertionError("an unknown strategy was written")
+            except ValueError as exc:
+                assert "Unknown weight strategy" in str(exc)
+            assert saved_files == []
+            assert not os.path.exists(os.path.join(bad_output, "model.onnx", "embeddings.onnx"))
+
+            output_path = os.path.join(directory, "out")
+            result = splitter.split_onnx(
+                model=model_path,
+                output=output_path,
+                split_only=True,
+                weight_strategy="manifest",
+                weight_size_threshold=1,
+            )
+            info_path = os.path.join(result.output_dir, "model_info.json")
+            saved = json.load(open(info_path, encoding="utf-8"))
+            assert saved["weight_storage"]["strategy"] == "manifest"
+            assert saved["weight_storage"]["deduplicated"] is True
+            assert saved["weight_storage"]["shared_file"] == "weights/shared.bin"
+            shared_path = os.path.join(result.output_dir, "weights", "shared.bin")
+            assert os.path.getsize(shared_path) == len(payload)
+            assert not os.path.exists(os.path.join(result.output_dir, "embeddings.onnx.data"))
+            slices = saved["weight_storage"]["components"]
+            assert slices[0]["slices"][0]["name"] == "attention_mask"
+            assert slices[0]["slices"][0]["digest"] == slices[1]["slices"][0]["digest"]
+            assert slices[0]["slices"][0]["offset"] == 0
+            assert len(saved_files) == 2
+            json.dumps(saved["weight_storage"])
+    finally:
+        splitter.load_onnx_model = original_load
+        splitter.extract_components = original_extract
+        splitter.create_component_onnx = original_create
+        splitter.collect_boundary_tensors = original_boundaries
+        if original_save is None:
+            del splitter.onnx.save
+        else:
+            splitter.onnx.save = original_save
+        if original_infer is None:
+            if hasattr(splitter.shape_inference, "infer_shapes"):
+                del splitter.shape_inference.infer_shapes
+        else:
+            splitter.shape_inference.infer_shapes = original_infer
+
+    print("weight storage: OK")
+    print("  hardlink, manifest, and streaming store a shared payload once")
+    print("  copy warns when a payload is duplicated")
+    print("  model_info.json keeps the weight storage record")
+    return True
+
+
 def test_path_manager():
     """ONNX discovery, external data, split directories, and NPU cache paths."""
     print("=" * 50)
@@ -12449,6 +13061,12 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"split_validation: FAILED - {e}")
         results.append(("split_validation", False))
+
+    try:
+        results.append(("weight_storage", test_weight_storage()))
+    except Exception as e:
+        print(f"weight_storage: FAILED - {e}")
+        results.append(("weight_storage", False))
 
     try:
         results.append(("path_manager", test_path_manager()))

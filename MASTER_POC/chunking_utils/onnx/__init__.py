@@ -31,6 +31,12 @@ from .validator import (
     validate_boundary_contracts,
     validate_component_io,
 )
+from .weight_store import (
+    WeightStrategy,
+    coerce_weight_strategy,
+    plan_weight_storage,
+    store_component_weights,
+)
 from .merger import merge_onnx
 from .loader import load_onnx_model, resolve_model_path
 from .types import ComponentInfo, OnnxSplitResult
@@ -55,6 +61,10 @@ __all__ = [
     "verify_split_correctness",
     "validate_boundary_contracts",
     "validate_component_io",
+    "WeightStrategy",
+    "coerce_weight_strategy",
+    "plan_weight_storage",
+    "store_component_weights",
     # Architecture detection
     "detect_architecture_from_onnx",
     # Types

@@ -28,6 +28,13 @@ from ..common.architecture_detector import detect_architecture
 from ..common.graph_topology import analyze_graph_topology
 from ..common.types import BoundaryTensor, ComponentType, ModelFormat, SplitConfig
 from .validator import validate_boundary_contracts, validate_component_io
+from .weight_store import (
+    SIZE_THRESHOLD,
+    STREAMING_CHUNK_SIZE,
+    WeightStrategy,
+    coerce_weight_strategy,
+    store_component_weights,
+)
 
 from .types import ComponentInfo, OnnxSplitResult
 from .loader import load_onnx_model
@@ -1919,6 +1926,9 @@ def split_onnx(
     output: Optional[str] = None,
     config: Optional[SplitConfig] = None,
     split_only: bool = False,
+    weight_strategy: Any = None,
+    weight_size_threshold: Optional[int] = None,
+    weight_chunk_size: Optional[int] = None,
     **kwargs
 ) -> OnnxSplitResult:
     """
@@ -1929,9 +1939,10 @@ def split_onnx(
     - layer_0_of_N.onnx, layer_1_of_N.onnx, ... (one per layer!)
     - norm.onnx
     - lm_head.onnx
-    - model_info.json, including quantization_info, kv_cache_info, and execution_policy
+    - model_info.json, including quantization_info, kv_cache_info, execution_policy, and weight_storage
 
     Boundary contracts and component IO are validated before any component file is written.
+    External weights use the selected weight strategy before those files are written.
     
     Args:
         model: Path to ONNX model file or directory. Required if config not provided.
@@ -1960,6 +1971,14 @@ def split_onnx(
             split_only=split_only,
             **kwargs
         )
+
+    # A bad strategy raises before the model is loaded or any file is written.
+    if weight_strategy is None:
+        strategy = WeightStrategy.COPY
+    else:
+        strategy = coerce_weight_strategy(weight_strategy)
+    if weight_size_threshold is None:
+        weight_size_threshold = SIZE_THRESHOLD
     
     model_path = config.model
     
@@ -2032,22 +2051,39 @@ def split_onnx(
     validate_component_io(components, boundaries)
     validate_boundary_contracts(boundaries, components)
 
+    # Store weights before the component graphs are written. COPY keeps one
+    # data file per component. The other strategies store each payload once.
+    if prepared:
+        weight_storage = store_component_weights(
+            [
+                {"name": comp_name, "file": filename, "model": component_model}
+                for comp_name, _comp_info, filename, _filepath, component_model in prepared
+            ],
+            output_dir,
+            strategy=strategy,
+            size_threshold=weight_size_threshold,
+            chunk_size=weight_chunk_size,
+        )
+    else:
+        if strategy is WeightStrategy.STREAMING and weight_chunk_size is None:
+            empty_chunk = STREAMING_CHUNK_SIZE
+        elif strategy is WeightStrategy.STREAMING:
+            empty_chunk = weight_chunk_size
+        else:
+            empty_chunk = None
+        weight_storage = {
+            "strategy": strategy.value,
+            "size_threshold": weight_size_threshold,
+            "chunk_size": empty_chunk,
+            "deduplicated": strategy is not WeightStrategy.COPY,
+            "shared_file": None,
+            "manifest": None,
+            "files": [],
+            "components": [],
+        }
+
     for comp_name, comp_info, filename, filepath, component_model in prepared:
-        # Save (with external data for large models)
-        try:
-            data_filename = filename + ".data"
-            onnx.save(
-                component_model,
-                filepath,
-                save_as_external_data=True,
-                all_tensors_to_one_file=True,
-                location=data_filename,
-                size_threshold=1024 * 1024  # 1MB threshold
-            )
-        except Exception:
-            # Fallback: save without external data
-            onnx.save(component_model, filepath)
-        
+        onnx.save(component_model, filepath)
         component_files[comp_name] = filepath
         print(f"  Saved {filename} ({len(comp_info.node_indices)} nodes, {len(comp_info.initializer_names)} initializers)")
     
@@ -2075,6 +2111,7 @@ def split_onnx(
         "quantization_info": quantization_info,
         "kv_cache_info": kv_cache_info,
         "execution_policy": execution_policy,
+        "weight_storage": weight_storage,
     }
     
     info_path = os.path.join(output_dir, "model_info.json")
