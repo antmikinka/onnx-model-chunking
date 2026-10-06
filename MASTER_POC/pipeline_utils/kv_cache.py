@@ -30,7 +30,7 @@ Usage:
 
 from enum import Enum
 import re
-from typing import Dict, Tuple, Optional, Any, List
+from typing import Dict, Iterable, Tuple, Optional, Any, List, Sequence
 import numpy as np
 import onnxruntime as ort
 
@@ -43,6 +43,15 @@ from .io_binding import (
     MemoryPlacement,
     SharedBuffer,
 )
+
+
+class KVCachePolicy(Enum):
+    """How many past tokens stay resident, and how they are packed."""
+
+    DENSE_CONTIGUOUS = "dense_contiguous"
+    SLIDING_WINDOW = "sliding_window"
+    PAGED_BLOCKS = "paged_blocks"
+    HYBRID_SPARSE = "hybrid_sparse"
 
 
 class KVCacheBackend(Enum):
@@ -76,6 +85,34 @@ _BACKEND_DEVICE = {
 }
 
 _SEQ_AXIS = 2
+
+_POLICY_ALIASES = {
+    "dense": KVCachePolicy.DENSE_CONTIGUOUS,
+    "contiguous": KVCachePolicy.DENSE_CONTIGUOUS,
+    "sliding": KVCachePolicy.SLIDING_WINDOW,
+    "window": KVCachePolicy.SLIDING_WINDOW,
+    "paged": KVCachePolicy.PAGED_BLOCKS,
+    "paged_attention": KVCachePolicy.PAGED_BLOCKS,
+    "blocks": KVCachePolicy.PAGED_BLOCKS,
+    "hybrid": KVCachePolicy.HYBRID_SPARSE,
+    "sparse": KVCachePolicy.HYBRID_SPARSE,
+}
+
+
+def coerce_kv_policy(policy: Any) -> KVCachePolicy:
+    """Accept the enum or its string value."""
+    if isinstance(policy, KVCachePolicy):
+        return policy
+    text = str(policy).strip().lower().replace("-", "_")
+    if text in _POLICY_ALIASES:
+        return _POLICY_ALIASES[text]
+    try:
+        return KVCachePolicy(text)
+    except ValueError as exc:
+        allowed = ", ".join(item.value for item in KVCachePolicy)
+        raise ValueError(
+            f"Unknown KV cache policy '{policy}'. Expected one of: {allowed}"
+        ) from exc
 
 
 def coerce_kv_backend(backend: Any) -> KVCacheBackend:
@@ -207,6 +244,113 @@ def _write_window(
         resident.update_inplace(np.ascontiguousarray(host))
 
 
+class _PageState:
+    """Host-side block table over a fixed KV allocation."""
+
+    def __init__(self, physical_blocks: int):
+        self.free = list(range(int(physical_blocks)))
+        self.table: List[int] = []
+        self.fill: List[int] = []
+        self.write_pos = 0
+        self.resident = 0
+
+    def ensure(self, logical: int, max_seq_len: Optional[int]) -> int:
+        while len(self.table) <= logical:
+            self.table.append(-1)
+            self.fill.append(0)
+        if self.table[logical] < 0:
+            if not self.free:
+                raise ValueError(
+                    f"Paged KV cache is full at max_seq_len {max_seq_len}"
+                )
+            self.table[logical] = int(self.free.pop(0))
+        return int(self.table[logical])
+
+
+def _resolve_layer_policies(
+    policy: KVCachePolicy,
+    layer_policies: Optional[Sequence[Any]],
+    num_layers: int,
+) -> List[KVCachePolicy]:
+    if layer_policies is None:
+        return [policy] * num_layers
+    resolved = [coerce_kv_policy(item) for item in layer_policies]
+    if len(resolved) != num_layers:
+        raise ValueError(
+            f"layer_policies has {len(resolved)} entries for {num_layers} layers"
+        )
+    return resolved
+
+
+def _apply_policy_capacity(cache: "KVCacheManager") -> None:
+    """Check policy arguments and give a CPU sliding window a fixed buffer."""
+    if cache.block_size <= 0:
+        raise ValueError(f"block_size must be positive, got {cache.block_size}")
+    if cache.sink_size < 0:
+        raise ValueError(f"sink_size must be >= 0, got {cache.sink_size}")
+    if cache.retrieval_blocks < 0:
+        raise ValueError(
+            f"retrieval_blocks must be >= 0, got {cache.retrieval_blocks}"
+        )
+    kinds = set(cache._layer_policies)
+    needs_window = (
+        KVCachePolicy.SLIDING_WINDOW in kinds
+        or KVCachePolicy.HYBRID_SPARSE in kinds
+    )
+    if needs_window and (cache.window_size is None or cache.window_size <= 0):
+        raise ValueError(
+            "window_size must be positive for sliding_window and hybrid_sparse"
+        )
+    needs_pool = (
+        KVCachePolicy.PAGED_BLOCKS in kinds
+        or KVCachePolicy.HYBRID_SPARSE in kinds
+    )
+    if needs_pool and cache.max_seq_len is None:
+        raise ValueError("paged_blocks and hybrid_sparse require max_seq_len")
+    if KVCachePolicy.SLIDING_WINDOW in kinds and cache.max_seq_len is None:
+        if kinds != {KVCachePolicy.SLIDING_WINDOW}:
+            raise ValueError("mixed layer_policies require max_seq_len")
+        cache.max_seq_len = int(cache.window_size)
+    if (
+        cache.window_size is not None
+        and cache.max_seq_len is not None
+        and int(cache.window_size) > int(cache.max_seq_len)
+    ):
+        raise ValueError(
+            f"window_size {cache.window_size} exceeds max_seq_len {cache.max_seq_len}"
+        )
+    if KVCachePolicy.HYBRID_SPARSE in kinds and cache.max_seq_len is not None:
+        budget = (
+            int(cache.sink_size)
+            + int(cache.window_size)
+            + int(cache.retrieval_blocks) * int(cache.block_size)
+        )
+        if budget > int(cache.max_seq_len):
+            raise ValueError(
+                f"hybrid_sparse keeps {budget} tokens, which exceeds "
+                f"max_seq_len {cache.max_seq_len}"
+            )
+    if KVCachePolicy.PAGED_BLOCKS in kinds and cache.max_seq_len is not None:
+        if int(cache.max_seq_len) // int(cache.block_size) < 1:
+            raise ValueError(
+                f"block_size {cache.block_size} exceeds max_seq_len {cache.max_seq_len}"
+            )
+
+
+def _read_prefix(storage: Any, length: int) -> np.ndarray:
+    data = _as_numpy(storage)
+    return np.array(data[:, :, :length, :], copy=True)
+
+
+def _cat_seq(parts: Sequence[np.ndarray]) -> np.ndarray:
+    present = [part for part in parts if part.shape[_SEQ_AXIS] > 0]
+    if not present:
+        return np.ascontiguousarray(parts[0])
+    if len(present) == 1:
+        return np.ascontiguousarray(present[0])
+    return np.concatenate(present, axis=_SEQ_AXIS)
+
+
 class KVCacheManager:
     """
     Manages KV (Key-Value) cache state for incremental transformer decoding.
@@ -231,7 +375,10 @@ class KVCacheManager:
         batch_size: Batch size (default 1)
         backend: KVCacheBackend value
         max_seq_len: Preallocated sequence capacity, when the cache is static
-        current_seq_len: Tokens written into the static buffer
+        current_seq_len: Tokens resident in the cache
+        policy: KVCachePolicy. Dense keeps every token. Sliding window,
+            paged blocks, and hybrid sparse keep a bounded working set
+            inside the same allocation.
     """
 
     def __init__(
@@ -244,6 +391,12 @@ class KVCacheManager:
         backend: Any = KVCacheBackend.CPU,
         max_seq_len: Optional[int] = None,
         device_id: int = 0,
+        policy: Any = KVCachePolicy.DENSE_CONTIGUOUS,
+        window_size: Optional[int] = None,
+        block_size: int = 16,
+        sink_size: int = 0,
+        retrieval_blocks: int = 0,
+        layer_policies: Optional[Sequence[Any]] = None,
     ):
         """
         Initialize the KV cache manager.
@@ -261,6 +414,16 @@ class KVCacheManager:
                 without it grows by replacing arrays. Device backends
                 default to the NPU window of 4096.
             device_id: Device index for the OrtValue allocation
+            policy: dense_contiguous, sliding_window, paged_blocks,
+                or hybrid_sparse. The default keeps the dense prefix.
+            window_size: Tokens retained by sliding_window and the recent
+                portion of hybrid_sparse
+            block_size: Tokens per paged block and per retrieved block
+            sink_size: Leading tokens hybrid_sparse never evicts
+            retrieval_blocks: Extra blocks hybrid_sparse can pin
+            layer_policies: Optional per-layer policies. Length must match
+                ``num_layers``. Full-attention layers stay dense while
+                sliding layers drop history.
         """
         self.num_layers = num_layers
         self.num_kv_heads = num_kv_heads
@@ -269,6 +432,14 @@ class KVCacheManager:
         self.batch_size = batch_size
         self.backend = coerce_kv_backend(backend)
         self.device_id = int(device_id)
+        self.policy = coerce_kv_policy(policy)
+        self.window_size = None if window_size is None else int(window_size)
+        self.block_size = int(block_size)
+        self.sink_size = int(sink_size)
+        self.retrieval_blocks = int(retrieval_blocks)
+        self._layer_policies = _resolve_layer_policies(
+            self.policy, layer_policies, num_layers
+        )
         if max_seq_len is None:
             self.max_seq_len = (
                 None
@@ -280,11 +451,20 @@ class KVCacheManager:
             if limit <= 0:
                 raise ValueError(f"max_seq_len must be positive, got {limit}")
             self.max_seq_len = limit
+        _apply_policy_capacity(self)
         self._static = self.max_seq_len is not None
 
         self._cache: Dict[int, Dict[str, Any]] = {}
         self._seq_len = 0
         self._layer_len: List[int] = [0] * self.num_layers
+        self._mask_layer = 0
+        self._pinned: List[set] = [set() for _ in range(self.num_layers)]
+        self._seen: List[int] = [0] * self.num_layers
+        self._seen_published = 0
+        self._sink_held: List[int] = [0] * self.num_layers
+        self._retrieved_len: List[int] = [0] * self.num_layers
+        self._physical_blocks = 0
+        self._pages: List["_PageState"] = []
         self._binder: Optional[IOBindingManager] = None
         self._bridge: Optional[HeterogeneousIOBindingManager] = None
         self._shared: List[SharedBuffer] = []
@@ -321,6 +501,8 @@ class KVCacheManager:
         """
         self._seq_len = 0
         self._layer_len = [0] * self.num_layers
+        self._mask_layer = 0
+        self._reset_policy_state()
         if self.device_resident:
             if not self._cache:
                 if self._binder is not None:
@@ -378,8 +560,133 @@ class KVCacheManager:
             )
         self._layer_len[layer_idx] = int(new_len)
         self._seq_len = int(new_len)
-        if self._binder is not None:
-            self._binder.set_valid_sequence_length(self._seq_len, "kv")
+        self._mask_layer = layer_idx
+        if self._binder is None:
+            return
+        if self.policy_for(layer_idx) is KVCachePolicy.PAGED_BLOCKS:
+            self._binder.get_static_kv_pool("kv").valid_seq_len = int(new_len)
+            return
+        self._binder.set_valid_sequence_length(self._seq_len, "kv")
+
+    def _reset_policy_state(self) -> None:
+        """Clear resident tokens. Pin requests stay, because they are config."""
+        self._seen = [0] * self.num_layers
+        self._seen_published = 0
+        self._sink_held = [0] * self.num_layers
+        self._retrieved_len = [0] * self.num_layers
+        physical = 0
+        if self.max_seq_len and self.block_size:
+            physical = int(self.max_seq_len) // int(self.block_size)
+        self._physical_blocks = physical
+        self._pages = [_PageState(physical) for _ in range(self.num_layers)]
+
+    def policy_for(self, layer_idx: int) -> KVCachePolicy:
+        """Retention policy for one transformer layer."""
+        if layer_idx < 0 or layer_idx >= self.num_layers:
+            raise KeyError(
+                f"Layer {layer_idx} not in cache (have {self.num_layers} layers)"
+            )
+        return self._layer_policies[layer_idx]
+
+    def layer_length(self, layer_idx: int) -> int:
+        """Resident tokens in one layer."""
+        if layer_idx < 0 or layer_idx >= self.num_layers:
+            raise KeyError(
+                f"Layer {layer_idx} not in cache (have {self.num_layers} layers)"
+            )
+        if self.policy_for(layer_idx) is KVCachePolicy.PAGED_BLOCKS:
+            return int(self._pages[layer_idx].resident)
+        if self._static:
+            return int(self._layer_len[layer_idx])
+        if layer_idx not in self._cache:
+            return 0
+        return int(_tensor_shape(self._cache[layer_idx]["key"])[_SEQ_AXIS])
+
+    def layer_seen_tokens(self, layer_idx: int) -> int:
+        """Tokens accepted by one layer, including ones already evicted."""
+        if layer_idx < 0 or layer_idx >= self.num_layers:
+            raise KeyError(
+                f"Layer {layer_idx} not in cache (have {self.num_layers} layers)"
+            )
+        return int(self._seen[layer_idx])
+
+    @property
+    def seen_tokens(self) -> int:
+        """Tokens accepted by the layer updated most recently."""
+        return int(self._seen_published)
+
+    def block_tables(self, layer_idx: int) -> np.ndarray:
+        """
+        Logical-to-physical block ids for one layer.
+
+        Shape is ``(batch, logical_blocks)``. ``-1`` is an empty slot.
+        Paged layers use this instead of assuming the sequence axis is
+        one dense prefix.
+        """
+        if self.policy_for(layer_idx) is not KVCachePolicy.PAGED_BLOCKS:
+            raise ValueError(
+                f"Layer {layer_idx} uses {self.policy_for(layer_idx).value}, "
+                "which has no block table"
+            )
+        logical = self._pages[layer_idx].table
+        table = np.full((self.batch_size, len(logical)), -1, dtype=np.int32)
+        if logical:
+            table[:, :] = np.asarray(logical, dtype=np.int32)[None, :]
+        return table
+
+    def release_blocks(self, layer_idx: int, logical_block_ids: Iterable[int]) -> None:
+        """
+        Return paged blocks to the free list.
+
+        The KV tensor is not reallocated. A later token can reuse the
+        physical page.
+        """
+        if self.policy_for(layer_idx) is not KVCachePolicy.PAGED_BLOCKS:
+            raise ValueError(
+                f"release_blocks applies to paged_blocks, not "
+                f"{self.policy_for(layer_idx).value}"
+            )
+        state = self._pages[layer_idx]
+        for block_id in logical_block_ids:
+            logical = int(block_id)
+            if logical < 0 or logical >= len(state.table):
+                raise ValueError(
+                    f"Layer {layer_idx} has no logical block {logical}"
+                )
+            physical = state.table[logical]
+            if physical < 0:
+                raise ValueError(
+                    f"Layer {layer_idx} logical block {logical} is already free"
+                )
+            state.resident -= int(state.fill[logical])
+            state.fill[logical] = 0
+            state.table[logical] = -1
+            state.free.append(int(physical))
+            state.free.sort()
+        self._commit_length(layer_idx, state.resident)
+        self._store_custom_mask(self._physical_mask(layer_idx))
+
+    def pin_blocks(self, layer_idx: int, logical_block_ids: Iterable[int]) -> None:
+        """
+        Keep these logical blocks in a hybrid_sparse layer.
+
+        The ids are applied on the next update that still contains those
+        tokens, which is the prefill present for a fresh cache.
+        """
+        if self.policy_for(layer_idx) is not KVCachePolicy.HYBRID_SPARSE:
+            raise ValueError(
+                f"pin_blocks applies to hybrid_sparse, not "
+                f"{self.policy_for(layer_idx).value}"
+            )
+        chosen = {int(block_id) for block_id in logical_block_ids}
+        if any(block_id < 0 for block_id in chosen):
+            raise ValueError("logical block ids must be >= 0")
+        if len(chosen) > self.retrieval_blocks:
+            raise ValueError(
+                f"pin_blocks received {len(chosen)} blocks, retrieval_blocks "
+                f"is {self.retrieval_blocks}"
+            )
+        self._pinned[layer_idx] = chosen
 
     def _layer_position(self, layer_idx: int) -> int:
         if layer_idx not in self._cache:
@@ -578,6 +885,11 @@ class KVCacheManager:
             Number of tokens currently in the cache (0 if empty)
         """
         if self._static:
+            if (
+                self.num_layers > 0
+                and self.policy_for(self._mask_layer) is KVCachePolicy.PAGED_BLOCKS
+            ):
+                return int(self._seq_len)
             if self._binder is not None:
                 return int(self._binder.get_static_kv_pool("kv").valid_seq_len)
             return int(self._seq_len)
@@ -805,6 +1117,13 @@ class KVCacheManager:
         the same length as a 0-d int64.
         """
         valid = self.get_sequence_length()
+        if (
+            self.num_layers > 0
+            and self.policy_for(self._mask_layer) is KVCachePolicy.PAGED_BLOCKS
+        ):
+            mask = self._physical_mask(self._mask_layer)
+            self._store_custom_mask(mask)
+            return mask
         if self._binder is not None:
             return self._binder.attention_mask(valid, "kv")
         width = int(self.max_seq_len if self.max_seq_len is not None else valid)
@@ -869,6 +1188,8 @@ class KVCacheManager:
                 )
 
         if not self._static:
+            self._seen[layer_idx] = int(key_shape[_SEQ_AXIS])
+            self._seen_published = self._seen[layer_idx]
             self._cache[layer_idx]["key"] = present_key
             self._cache[layer_idx]["value"] = present_value
             return
@@ -880,6 +1201,12 @@ class KVCacheManager:
         if key_is_resident and value_is_resident:
             if valid_seq_len is not None:
                 self._commit_length(layer_idx, int(valid_seq_len))
+            return
+
+        if self.policy_for(layer_idx) is not KVCachePolicy.DENSE_CONTIGUOUS:
+            self._update_bounded(
+                layer_idx, stored_key, stored_value, present_key, present_value
+            )
             return
 
         position = self._layer_len[layer_idx]
@@ -903,6 +1230,227 @@ class KVCacheManager:
             if window is not None:
                 _write_window(stored_value, window, start)
         self._commit_length(layer_idx, new_len)
+        self._seen[layer_idx] = int(new_len)
+        self._seen_published = int(new_len)
+
+    def _append_position(self, layer_idx: int) -> int:
+        if self.policy_for(layer_idx) is KVCachePolicy.PAGED_BLOCKS:
+            return int(self._pages[layer_idx].write_pos)
+        return int(self._layer_len[layer_idx])
+
+    def _update_bounded(
+        self,
+        layer_idx: int,
+        stored_key: Any,
+        stored_value: Any,
+        present_key: Any,
+        present_value: Any,
+    ) -> None:
+        """Apply sliding, paged, or hybrid retention without resizing storage."""
+        position = self._append_position(layer_idx)
+        key_np = _as_numpy(present_key)
+        value_np = _as_numpy(present_value)
+        key_window, _, _ = _placement(key_np, position)
+        value_window, _, _ = _placement(value_np, position)
+        if key_window is None or value_window is None:
+            return
+        if self.policy_for(layer_idx) is KVCachePolicy.PAGED_BLOCKS:
+            self._paged_append(layer_idx, stored_key, stored_value, key_window, value_window)
+        else:
+            self._compact_append(
+                layer_idx, stored_key, stored_value, key_window, value_window
+            )
+        self._seen[layer_idx] += int(key_window.shape[_SEQ_AXIS])
+        self._seen_published = int(self._seen[layer_idx])
+
+    def _compact_append(
+        self,
+        layer_idx: int,
+        stored_key: Any,
+        stored_value: Any,
+        added_key: np.ndarray,
+        added_value: np.ndarray,
+    ) -> None:
+        prior = int(self._layer_len[layer_idx])
+        if prior:
+            key = np.concatenate(
+                [_read_prefix(stored_key, prior), np.ascontiguousarray(added_key)],
+                axis=_SEQ_AXIS,
+            )
+            value = np.concatenate(
+                [_read_prefix(stored_value, prior), np.ascontiguousarray(added_value)],
+                axis=_SEQ_AXIS,
+            )
+        else:
+            key = np.ascontiguousarray(added_key)
+            value = np.ascontiguousarray(added_value)
+        key, value = self._retain(layer_idx, key, value, prior)
+        if key.shape[_SEQ_AXIS] > int(self.max_seq_len):
+            raise ValueError(
+                f"Layer {layer_idx}: retained sequence {key.shape[_SEQ_AXIS]} "
+                f"exceeds max_seq_len {self.max_seq_len}"
+            )
+        if key.shape[_SEQ_AXIS]:
+            _write_window(stored_key, key, 0)
+            _write_window(stored_value, value, 0)
+        self._commit_length(layer_idx, int(key.shape[_SEQ_AXIS]))
+
+    def _retain(
+        self,
+        layer_idx: int,
+        key: np.ndarray,
+        value: np.ndarray,
+        prior_len: int,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        policy = self.policy_for(layer_idx)
+        if policy is KVCachePolicy.SLIDING_WINDOW:
+            window = int(self.window_size)
+            if key.shape[_SEQ_AXIS] > window:
+                key = key[:, :, -window:, :]
+                value = value[:, :, -window:, :]
+            self._sink_held[layer_idx] = 0
+            self._retrieved_len[layer_idx] = 0
+            return np.ascontiguousarray(key), np.ascontiguousarray(value)
+        if prior_len == 0:
+            return self._retain_hybrid_prefill(layer_idx, key, value)
+        return self._retain_hybrid_decode(layer_idx, key, value)
+
+    def _retain_hybrid_prefill(
+        self,
+        layer_idx: int,
+        key: np.ndarray,
+        value: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        seq = int(key.shape[_SEQ_AXIS])
+        sink_n = min(int(self.sink_size), seq)
+        available = max(0, seq - sink_n)
+        window_n = min(int(self.window_size), available)
+        recent_start = seq - window_n
+        retrieved_k, retrieved_v, retrieved_n = self._gather_pinned(
+            layer_idx, key, value, sink_n, recent_start, seq
+        )
+        kept_key = _cat_seq(
+            [key[:, :, :sink_n, :], retrieved_k, key[:, :, recent_start:, :]]
+        )
+        kept_value = _cat_seq(
+            [value[:, :, :sink_n, :], retrieved_v, value[:, :, recent_start:, :]]
+        )
+        self._sink_held[layer_idx] = sink_n
+        self._retrieved_len[layer_idx] = retrieved_n
+        return kept_key, kept_value
+
+    def _retain_hybrid_decode(
+        self,
+        layer_idx: int,
+        key: np.ndarray,
+        value: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        sink_n = int(self._sink_held[layer_idx])
+        retrieved_n = int(self._retrieved_len[layer_idx])
+        split = sink_n + retrieved_n
+        recent_key = key[:, :, split:, :]
+        recent_value = value[:, :, split:, :]
+        window = int(self.window_size)
+        if recent_key.shape[_SEQ_AXIS] > window:
+            recent_key = recent_key[:, :, -window:, :]
+            recent_value = recent_value[:, :, -window:, :]
+        kept_key = _cat_seq(
+            [key[:, :, :sink_n, :], key[:, :, sink_n:split, :], recent_key]
+        )
+        kept_value = _cat_seq(
+            [value[:, :, :sink_n, :], value[:, :, sink_n:split, :], recent_value]
+        )
+        return kept_key, kept_value
+
+    def _gather_pinned(
+        self,
+        layer_idx: int,
+        key: np.ndarray,
+        value: np.ndarray,
+        sink_n: int,
+        recent_start: int,
+        seq: int,
+    ) -> Tuple[np.ndarray, np.ndarray, int]:
+        key_parts: List[np.ndarray] = []
+        value_parts: List[np.ndarray] = []
+        for block_id in sorted(self._pinned[layer_idx]):
+            start = int(block_id) * int(self.block_size)
+            end = min(seq, start + int(self.block_size))
+            if start >= seq or end <= start:
+                raise ValueError(
+                    f"Layer {layer_idx}: pinned block {block_id} is outside "
+                    f"the present sequence of {seq}"
+                )
+            keep_lo = max(start, sink_n)
+            keep_hi = min(end, recent_start)
+            if keep_hi > keep_lo:
+                key_parts.append(key[:, :, keep_lo:keep_hi, :])
+                value_parts.append(value[:, :, keep_lo:keep_hi, :])
+        if not key_parts:
+            empty = key[:, :, :0, :]
+            return empty, value[:, :, :0, :], 0
+        gathered_key = np.concatenate(key_parts, axis=_SEQ_AXIS)
+        gathered_value = np.concatenate(value_parts, axis=_SEQ_AXIS)
+        limit = int(self.retrieval_blocks) * int(self.block_size)
+        if gathered_key.shape[_SEQ_AXIS] > limit:
+            raise ValueError(
+                f"Layer {layer_idx}: pinned tokens {gathered_key.shape[_SEQ_AXIS]} "
+                f"exceed retrieval_blocks capacity {limit}"
+            )
+        return gathered_key, gathered_value, int(gathered_key.shape[_SEQ_AXIS])
+
+    def _paged_append(
+        self,
+        layer_idx: int,
+        stored_key: Any,
+        stored_value: Any,
+        added_key: np.ndarray,
+        added_value: np.ndarray,
+    ) -> None:
+        state = self._pages[layer_idx]
+        remaining = int(added_key.shape[_SEQ_AXIS])
+        source = 0
+        position = int(state.write_pos)
+        while remaining:
+            logical = position // int(self.block_size)
+            offset = position % int(self.block_size)
+            physical = state.ensure(logical, self.max_seq_len)
+            room = int(self.block_size) - offset
+            take = min(room, remaining)
+            dest = physical * int(self.block_size) + offset
+            _write_window(stored_key, added_key[:, :, source:source + take, :], dest)
+            _write_window(stored_value, added_value[:, :, source:source + take, :], dest)
+            state.fill[logical] += take
+            state.resident += take
+            position += take
+            source += take
+            remaining -= take
+        state.write_pos = position
+        self._commit_length(layer_idx, state.resident)
+        self._store_custom_mask(self._physical_mask(layer_idx))
+
+    def _physical_mask(self, layer_idx: int) -> np.ndarray:
+        width = int(self.max_seq_len)
+        mask = np.zeros((self.batch_size, width), dtype=np.int64)
+        state = self._pages[layer_idx]
+        for logical, physical in enumerate(state.table):
+            if physical < 0:
+                continue
+            start = int(physical) * int(self.block_size)
+            filled = int(state.fill[logical])
+            if filled:
+                mask[:, start:start + filled] = 1
+        return mask
+
+    def _store_custom_mask(self, mask: np.ndarray) -> np.ndarray:
+        if self._binder is None:
+            return mask
+        pool = self._binder.get_static_kv_pool("kv")
+        pool.valid_seq_len = int(self._seq_len)
+        buffer = self._binder.get_buffer(pool.mask_name)
+        if buffer is not None and buffer.ort_value is not None:
+            _refresh_ort_contents(buffer.ort_value, mask)
+        return mask
 
     def inject_into_registry(
         self,
@@ -991,6 +1539,11 @@ class KVCacheManager:
             "max_seq_len": self.max_seq_len,
             "current_seq_len": seq_len,
             "static": self._static,
+            "policy": self.policy.value,
+            "window_size": self.window_size,
+            "block_size": self.block_size,
+            "sink_size": self.sink_size,
+            "seen_tokens": self.seen_tokens,
             "storage": "device_buffer" if self.device_resident else "numpy",
         }
 
@@ -1000,7 +1553,8 @@ class KVCacheManager:
         return (
             f"KVCacheManager(layers={self.num_layers}, heads={self.num_kv_heads}, "
             f"head_dim={self.head_dim}, seq_len={seq_len}, "
-            f"backend={self.backend.value}, memory={mem['total_mb']:.2f}MB)"
+            f"backend={self.backend.value}, policy={self.policy.value}, "
+            f"memory={mem['total_mb']:.2f}MB)"
         )
 
 
@@ -1193,4 +1747,10 @@ def _same_storage(stored: Any, incoming: Any) -> bool:
 # CONVENIENCE EXPORTS
 # =============================================================================
 
-__all__ = ["KVCacheManager", "KVCacheBackend", "coerce_kv_backend"]
+__all__ = [
+    "KVCacheManager",
+    "KVCacheBackend",
+    "KVCachePolicy",
+    "coerce_kv_backend",
+    "coerce_kv_policy",
+]

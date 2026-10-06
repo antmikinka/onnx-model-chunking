@@ -58,7 +58,7 @@ def test_kv_cache():
     print("Testing kv_cache module...")
     print("=" * 50)
     
-    from pipeline_utils.kv_cache import KVCacheManager, KVCacheBackend
+    from pipeline_utils.kv_cache import KVCacheManager, KVCacheBackend, KVCachePolicy
     from pipeline_utils.io_binding import DeviceBuffer
     
     # Create cache manager
@@ -100,6 +100,7 @@ def test_kv_cache():
     cache.reset()
     print(f"  After reset: seq_len = {cache.get_sequence_length()}")
     assert cache.backend is KVCacheBackend.CPU
+    assert cache.policy is KVCachePolicy.DENSE_CONTIGUOUS
     assert isinstance(cache.get_past_tensors(0)[0], np.ndarray)
     assert cache.get_memory_usage()["storage"] == "numpy"
     assert cache.get_memory_usage()["static"] is False
@@ -363,6 +364,162 @@ def test_kv_cache():
     assert host.get_device_tensors(0)[0] is key_ort
     print("  device KV: vitisai, ryzenai, rocm, cuda, pinned host, hybrid NPU/iGPU")
     print("  zero-copy bind: allocate_device_cache, get_device_tensors, bind_cache_to_session")
+
+    def seq_tokens(seq, value_at=None):
+        data = np.empty((1, 2, seq, 4), dtype=np.float16)
+        for index in range(seq):
+            data[:, :, index, :] = index if value_at is None else value_at
+        return data
+
+    def values_at(storage, count):
+        host = storage.to_numpy() if hasattr(storage, "to_numpy") else storage
+        return [int(host[0, 0, index, 0]) for index in range(count)]
+
+    sliding = KVCacheManager(
+        num_layers=1,
+        num_kv_heads=2,
+        head_dim=4,
+        dtype=np.float16,
+        max_seq_len=8,
+        policy=KVCachePolicy.SLIDING_WINDOW,
+        window_size=4,
+    )
+    sliding_key = sliding.get_past_tensors(0)[0]
+    sliding.update_from_present(0, seq_tokens(6), seq_tokens(6).copy())
+    assert sliding.current_seq_len == 4
+    assert sliding.seen_tokens == 6
+    assert values_at(sliding_key, 4) == [2, 3, 4, 5]
+    sliding.update_from_present(0, seq_tokens(1, value_at=6), seq_tokens(1, value_at=6))
+    assert sliding.get_past_tensors(0)[0] is sliding_key
+    assert tuple(sliding_key.shape) == (1, 2, 8, 4)
+    assert sliding.current_seq_len == 4
+    assert sliding.seen_tokens == 7
+    assert values_at(sliding_key, 4) == [3, 4, 5, 6]
+    assert int(sliding.attention_mask()[0, 3]) == 1
+    assert int(sliding.attention_mask()[0, 4]) == 0
+
+    window_only = KVCacheManager(
+        num_layers=1,
+        num_kv_heads=2,
+        head_dim=4,
+        dtype=np.float16,
+        policy="sliding",
+        window_size=4,
+    )
+    assert window_only.max_seq_len == 4
+    assert window_only.static
+    window_key = window_only.get_past_tensors(0)[0]
+    window_only.update_from_present(0, seq_tokens(6), seq_tokens(6).copy())
+    assert window_only.get_past_tensors(0)[0] is window_key
+    assert window_only.current_seq_len == 4
+
+    device_window = KVCacheManager(
+        num_layers=1,
+        num_kv_heads=2,
+        head_dim=4,
+        dtype=np.float16,
+        backend=KVCacheBackend.VITISAI,
+        max_seq_len=8,
+        policy=KVCachePolicy.SLIDING_WINDOW,
+        window_size=4,
+    )
+    device_key = device_window.get_past_tensors(0)[0]
+    device_ptr = int(device_key.ort_value.data_ptr())
+    device_window.update_from_present(0, seq_tokens(6), seq_tokens(6).copy())
+    device_window.update_from_present(0, seq_tokens(1, value_at=6), seq_tokens(1, value_at=6))
+    assert int(device_key.ort_value.data_ptr()) == device_ptr
+    assert device_window.current_seq_len == 4
+    assert values_at(device_key, 4) == [3, 4, 5, 6]
+
+    paged = KVCacheManager(
+        num_layers=1,
+        num_kv_heads=2,
+        head_dim=4,
+        dtype=np.float16,
+        max_seq_len=8,
+        policy=KVCachePolicy.PAGED_BLOCKS,
+        block_size=4,
+    )
+    paged_key = paged.get_past_tensors(0)[0]
+    paged.update_from_present(0, seq_tokens(8), seq_tokens(8).copy())
+    assert paged.current_seq_len == 8
+    assert np.array_equal(paged.block_tables(0)[0], np.array([0, 1], dtype=np.int32))
+    assert values_at(paged_key, 8) == list(range(8))
+    paged.release_blocks(0, [0])
+    assert paged.current_seq_len == 4
+    assert int(paged.block_tables(0)[0, 0]) == -1
+    assert int(paged.block_tables(0)[0, 1]) == 1
+    released = paged.attention_mask()
+    assert int(released[0, 0]) == 0
+    assert int(released[0, 4]) == 1
+    assert paged.get_past_tensors(0)[0] is paged_key
+    paged.update_from_present(0, seq_tokens(4, value_at=9), seq_tokens(4, value_at=9))
+    assert paged.current_seq_len == 8
+    assert paged.seen_tokens == 12
+    table = paged.block_tables(0)[0]
+    assert int(table[0]) == -1
+    assert int(table[1]) == 1
+    assert int(table[2]) == 0
+    assert values_at(paged_key, 4) == [9, 9, 9, 9]
+    assert values_at(paged_key, 8)[4:] == [4, 5, 6, 7]
+    try:
+        paged.update_from_present(0, seq_tokens(1, value_at=3), seq_tokens(1, value_at=3))
+        raise AssertionError("a full paged cache accepted another token")
+    except ValueError as exc:
+        assert "max_seq_len" in str(exc)
+    assert paged.get_past_tensors(0)[0] is paged_key
+
+    hybrid = KVCacheManager(
+        num_layers=1,
+        num_kv_heads=2,
+        head_dim=4,
+        dtype=np.float16,
+        max_seq_len=16,
+        policy=KVCachePolicy.HYBRID_SPARSE,
+        window_size=4,
+        sink_size=2,
+        block_size=4,
+        retrieval_blocks=1,
+    )
+    hybrid.pin_blocks(0, [1])
+    hybrid.update_from_present(0, seq_tokens(10), seq_tokens(10).copy())
+    assert hybrid.layer_length(0) == 8
+    assert values_at(hybrid.get_past_tensors(0)[0], 8) == [0, 1, 4, 5, 6, 7, 8, 9]
+    assert hybrid.seen_tokens == 10
+    hybrid.update_from_present(0, seq_tokens(1, value_at=10), seq_tokens(1, value_at=10))
+    assert values_at(hybrid.get_past_tensors(0)[0], 8) == [0, 1, 4, 5, 7, 8, 9, 10]
+    assert hybrid.seen_tokens == 11
+    assert hybrid.get_past_tensors(0)[0].shape[2] == 16
+
+    mixed = KVCacheManager(
+        num_layers=2,
+        num_kv_heads=2,
+        head_dim=4,
+        dtype=np.float16,
+        max_seq_len=8,
+        layer_policies=[KVCachePolicy.SLIDING_WINDOW, KVCachePolicy.DENSE_CONTIGUOUS],
+        window_size=3,
+    )
+    mixed.update_from_present(0, seq_tokens(6), seq_tokens(6).copy())
+    mixed.update_from_present(1, seq_tokens(6), seq_tokens(6).copy())
+    assert mixed.policy_for(0) is KVCachePolicy.SLIDING_WINDOW
+    assert mixed.policy_for(1) is KVCachePolicy.DENSE_CONTIGUOUS
+    assert mixed.layer_length(0) == 3
+    assert mixed.layer_length(1) == 6
+    assert values_at(mixed.get_past_tensors(0)[0], 3) == [3, 4, 5]
+    assert values_at(mixed.get_past_tensors(1)[0], 6) == [0, 1, 2, 3, 4, 5]
+
+    try:
+        KVCacheManager(1, 1, 1, policy="tape")
+        raise AssertionError("unknown KV policy was accepted")
+    except ValueError as exc:
+        assert "tape" in str(exc)
+    try:
+        KVCacheManager(1, 1, 1, policy=KVCachePolicy.SLIDING_WINDOW)
+        raise AssertionError("sliding window without window_size was accepted")
+    except ValueError as exc:
+        assert "window_size" in str(exc)
+    print("  policies: sliding window, paged blocks, hybrid sparse")
 
     print("kv_cache module: OK\n")
     return True
