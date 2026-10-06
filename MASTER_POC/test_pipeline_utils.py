@@ -6353,6 +6353,8 @@ def test_backend():
             ExecutionPolicy as canonical_policy,
             PROVIDER_FALLBACK,
             SplitConfig,
+            QuantizationConfig,
+            TensorDtype,
             ComponentInfo,
             ComponentType,
             BoundaryTensor,
@@ -6658,6 +6660,98 @@ def test_backend():
             sys.modules.pop("chunking_utils.onnx.types", None)
         else:
             sys.modules["chunking_utils.onnx.types"] = saved_onnx_types
+        from chunking_utils.common import QuantizationConfig as package_quant
+        from chunking_utils import QuantizationConfig as root_quant
+        assert package_quant is QuantizationConfig is root_quant
+        plain_quant = SplitConfig(model="weights", output="out")
+        other_quant = SplitConfig(model="weights", output="out")
+        assert plain_quant.quantization.method is None
+        assert plain_quant.quantization.weight_dtype is None
+        assert plain_quant.quantization.activation_dtype is None
+        assert plain_quant.quantization.kv_cache_dtype is None
+        assert plain_quant.quantization.group_size is None
+        assert plain_quant.quantization.has_zero_point is False
+        assert plain_quant.quantization.packing_format is None
+        assert plain_quant.quantization is not other_quant.quantization
+        plain_quant.quantization.group_size = 32
+        assert other_quant.quantization.group_size is None
+        awq = QuantizationConfig(
+            method="AWQ",
+            weight_dtype="int4",
+            activation_dtype="fp16",
+            kv_cache_dtype="float16",
+            group_size=128,
+            packing_format="gemm",
+        )
+        assert awq.method == "awq"
+        assert awq.weight_dtype is TensorDtype.INT4
+        assert awq.activation_dtype is TensorDtype.FLOAT16
+        assert awq.kv_cache_dtype is TensorDtype.FLOAT16
+        assert awq.group_size == 128
+        assert awq.has_zero_point is False
+        assert awq.packing_format == "gemm"
+        shared = QuantizationConfig(method="awq", weight_dtype="int4", group_size=128)
+        one = SplitConfig(model="weights", output="out", quantization=shared)
+        two = SplitConfig(model="weights", output="out", quantization=shared)
+        assert one.quantization is not shared
+        assert one.quantization is not two.quantization
+        assert one.quantization.packing_format == "awq"
+        one.quantization.group_size = 64
+        assert two.quantization.group_size == 128
+        assert shared.group_size == 128
+        gptq = SplitConfig(
+            model="weights",
+            output="out",
+            quantization={
+                "method": "gptq",
+                "weight_dtype": "int4",
+                "group_size": -1,
+                "has_zero_point": False,
+            },
+        )
+        assert gptq.quantization.method == "gptq"
+        assert gptq.quantization.weight_dtype is TensorDtype.INT4
+        assert gptq.quantization.group_size == -1
+        assert gptq.quantization.packing_format == "gptq"
+        nbits = QuantizationConfig(
+            method="matmulnbits",
+            weight_dtype=TensorDtype.INT4,
+            activation_dtype="int8",
+            kv_cache_dtype="fp16",
+            group_size=32,
+            has_zero_point=True,
+        )
+        assert nbits.method == "matmul_nbits"
+        assert nbits.activation_dtype is TensorDtype.INT8
+        assert nbits.kv_cache_dtype is TensorDtype.FLOAT16
+        assert nbits.group_size == 32
+        assert nbits.has_zero_point is True
+        assert nbits.packing_format == "matmul_nbits"
+        recorded = nbits.to_dict()
+        recorded["group_size"] = 0
+        assert nbits.group_size == 32
+        assert recorded["weight_dtype"] == "int4"
+        assert recorded["packing_format"] == "matmul_nbits"
+        try:
+            QuantizationConfig(group_size=0)
+            raise AssertionError("a zero group size was accepted")
+        except ValueError as exc:
+            assert "group_size" in str(exc)
+        try:
+            QuantizationConfig(has_zero_point="yes")
+            raise AssertionError("a zero-point string was accepted")
+        except ValueError as exc:
+            assert "has_zero_point" in str(exc)
+        try:
+            QuantizationConfig(weight_dtype="fp8")
+            raise AssertionError("an fp8 weight dtype was accepted")
+        except ValueError as exc:
+            assert "weight_dtype" in str(exc)
+        try:
+            QuantizationConfig(method="sideband")
+            raise AssertionError("an unknown quantization method was accepted")
+        except ValueError as exc:
+            assert "sideband" in str(exc)
         try:
             SplitConfig(model="weights", output="out", target_device="tpu")
             raise AssertionError("an unknown device was accepted")
@@ -7223,6 +7317,7 @@ def test_backend():
     print("  execution policy: monolithic, sequential rejected on NPU, hybrid and moe allowed")
     print("  component contract: inputs, shapes, phase, residency")
     print("  boundary tensors: hidden, mask, past and present")
+    print("  quantization: awq int4 group, matmul nbits, kv dtype")
     print("backend module: OK\n")
     return True
 

@@ -184,6 +184,201 @@ def _auto_provider_fallback() -> List[str]:
     return selected
 
 
+# Planning names shared with model-config quantization. Sub-byte layouts
+# stay on TensorDtype.INT4; the packing name records AWQ, GPTQ, or MatMulNBits.
+_QUANT_METHOD_ALIASES = {
+    "awq": "awq",
+    "gptq": "gptq",
+    "matmulnbits": "matmul_nbits",
+    "matmul_nbits": "matmul_nbits",
+    "rtn": "rtn",
+    "qdq": "qdq",
+    "quark": "quark",
+    "bitsandbytes": "bitsandbytes",
+    "bnb": "bitsandbytes",
+}
+_QUANT_PACKING_ALIASES = {
+    "awq": "awq",
+    "awq_int4": "awq",
+    "awq_w4a16": "awq",
+    "gptq": "gptq",
+    "gptq_int4": "gptq",
+    "matmulnbits": "matmul_nbits",
+    "matmul_nbits": "matmul_nbits",
+    "blocked": "blocked",
+    "int4_blockwise": "blocked",
+    "qdq": "qdq",
+    "qoperator": "qoperator",
+    "gemm": "gemm",
+    "gemv": "gemv",
+}
+_METHOD_DEFAULT_PACKING = {
+    "awq": "awq",
+    "gptq": "gptq",
+    "matmul_nbits": "matmul_nbits",
+}
+_TENSOR_DTYPE_ALIASES = {
+    "float32": TensorDtype.FLOAT32,
+    "fp32": TensorDtype.FLOAT32,
+    "float": TensorDtype.FLOAT32,
+    "float16": TensorDtype.FLOAT16,
+    "fp16": TensorDtype.FLOAT16,
+    "half": TensorDtype.FLOAT16,
+    "bfloat16": TensorDtype.BFLOAT16,
+    "bf16": TensorDtype.BFLOAT16,
+    "int8": TensorDtype.INT8,
+    "uint8": TensorDtype.INT8,
+    "int4": TensorDtype.INT4,
+    "uint4": TensorDtype.INT4,
+    "int4x2": TensorDtype.INT4,
+    "nf4": TensorDtype.INT4,
+    "fp4": TensorDtype.INT4,
+    "auto": TensorDtype.AUTO,
+}
+
+
+def _normalize_quant_token(value: Any) -> str:
+    """Lowercase a planning name and drop torch. prefixes and separators."""
+    text = str(value).strip().lower().replace(" ", "").replace("-", "_")
+    if text.startswith("torch."):
+        text = text[6:]
+    return text
+
+
+def _coerce_quant_method(value: Any) -> Optional[str]:
+    """Accept an AWQ, GPTQ, MatMulNBits, or related method name."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, str):
+        raise ValueError(f"quantization method must be a string, got {value!r}")
+    text = _normalize_quant_token(value)
+    if not text:
+        return None
+    if text not in _QUANT_METHOD_ALIASES:
+        known = ", ".join(sorted(set(_QUANT_METHOD_ALIASES.values())))
+        raise ValueError(
+            f"Unknown quantization method {value!r}. Expected one of: {known}"
+        )
+    return _QUANT_METHOD_ALIASES[text]
+
+
+def _coerce_quant_dtype(value: Any, field_name: str) -> Optional[TensorDtype]:
+    """Accept a TensorDtype or a short name such as fp16 or int4."""
+    if value is None:
+        return None
+    if isinstance(value, TensorDtype):
+        return value
+    if isinstance(value, bool) or not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a TensorDtype, got {value!r}")
+    text = _normalize_quant_token(value)
+    if text not in _TENSOR_DTYPE_ALIASES:
+        known = ", ".join(item.value for item in TensorDtype)
+        raise ValueError(
+            f"Unknown {field_name} {value!r}. Expected one of: {known}"
+        )
+    return _TENSOR_DTYPE_ALIASES[text]
+
+
+def _coerce_group_size(value: Any) -> Optional[int]:
+    """None stays unset. A positive int is a group. -1 is per-channel."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"group_size must be an integer, got {value!r}")
+    if value == 0 or value < -1:
+        raise ValueError(
+            f"group_size must be positive or -1 for per-channel, got {value}"
+        )
+    return value
+
+
+def _coerce_packing_format(value: Any) -> Optional[str]:
+    """Accept AWQ, GPTQ, MatMulNBits, blocked, QDQ, GEMM, or GEMV packing."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, str):
+        raise ValueError(f"packing_format must be a string, got {value!r}")
+    text = _normalize_quant_token(value)
+    if not text:
+        return None
+    if text not in _QUANT_PACKING_ALIASES:
+        known = ", ".join(sorted(set(_QUANT_PACKING_ALIASES.values())))
+        raise ValueError(
+            f"Unknown packing_format {value!r}. Expected one of: {known}"
+        )
+    return _QUANT_PACKING_ALIASES[text]
+
+
+@dataclass
+class QuantizationConfig:
+    """
+    Weight, activation, and KV quantization for an AMD NPU split.
+
+    ``group_size`` -1 is per-channel. ``packing_format`` names AWQ, GPTQ, or
+    MatMulNBits when the method does not already imply that layout. INT4 and
+    INT8 stay on ``TensorDtype``; the packing name records how those values
+    are stored.
+    """
+    method: Optional[str] = None
+    weight_dtype: Optional[TensorDtype] = None
+    activation_dtype: Optional[TensorDtype] = None
+    kv_cache_dtype: Optional[TensorDtype] = None
+    group_size: Optional[int] = None
+    has_zero_point: bool = False
+    packing_format: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        self.method = _coerce_quant_method(self.method)
+        self.weight_dtype = _coerce_quant_dtype(self.weight_dtype, "weight_dtype")
+        self.activation_dtype = _coerce_quant_dtype(
+            self.activation_dtype, "activation_dtype"
+        )
+        self.kv_cache_dtype = _coerce_quant_dtype(self.kv_cache_dtype, "kv_cache_dtype")
+        self.group_size = _coerce_group_size(self.group_size)
+        if not isinstance(self.has_zero_point, bool):
+            raise ValueError(
+                f"has_zero_point must be a boolean, got {self.has_zero_point!r}"
+            )
+        self.packing_format = _coerce_packing_format(self.packing_format)
+        if self.packing_format is None and self.method in _METHOD_DEFAULT_PACKING:
+            self.packing_format = _METHOD_DEFAULT_PACKING[self.method]
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Copy the record. Dtypes are stored as their string values."""
+        return {
+            "method": self.method,
+            "weight_dtype": None if self.weight_dtype is None else self.weight_dtype.value,
+            "activation_dtype": (
+                None if self.activation_dtype is None else self.activation_dtype.value
+            ),
+            "kv_cache_dtype": (
+                None if self.kv_cache_dtype is None else self.kv_cache_dtype.value
+            ),
+            "group_size": self.group_size,
+            "has_zero_point": self.has_zero_point,
+            "packing_format": self.packing_format,
+        }
+
+
+def _coerce_quantization(value: Any) -> QuantizationConfig:
+    """Copy a QuantizationConfig, or build one from a dict."""
+    if isinstance(value, QuantizationConfig):
+        return QuantizationConfig(
+            method=value.method,
+            weight_dtype=value.weight_dtype,
+            activation_dtype=value.activation_dtype,
+            kv_cache_dtype=value.kv_cache_dtype,
+            group_size=value.group_size,
+            has_zero_point=value.has_zero_point,
+            packing_format=value.packing_format,
+        )
+    if isinstance(value, dict):
+        return QuantizationConfig(**value)
+    raise ValueError(
+        f"quantization must be a QuantizationConfig or a dict, got {value!r}"
+    )
+
+
 @dataclass
 class SplitConfig:
     """
@@ -204,6 +399,7 @@ class SplitConfig:
         providers: ONNX Runtime provider fallback, first choice first.
         target_device: CPU, GPU, NPU, IPU, or AUTO.
         execution_policy: Monolithic, sequential, persistent, hybrid, or speculative.
+        quantization: Weight, activation, and KV scheme, including group size and packing.
         low_cpu_mem_usage: Use HuggingFace's low-memory loading.
         
         # HuggingFace integration
@@ -228,6 +424,7 @@ class SplitConfig:
     providers: List[str] = field(default_factory=list)
     target_device: DeviceType = DeviceType.AUTO
     execution_policy: ExecutionPolicy = ExecutionPolicy.AUTO
+    quantization: QuantizationConfig = field(default_factory=QuantizationConfig)
     low_cpu_mem_usage: bool = True
     
     # HuggingFace integration
@@ -258,6 +455,7 @@ class SplitConfig:
                 )
             cleaned.append(item.strip())
         self.providers = cleaned
+        self.quantization = _coerce_quantization(self.quantization)
         self._reject_npu_sequential_split()
 
     def _reject_npu_sequential_split(self) -> None:
