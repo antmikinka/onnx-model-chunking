@@ -9176,6 +9176,7 @@ def test_path_manager():
         find_external_data_files,
         find_onnx_model,
         get_cache_dir,
+        get_npu_cache_dir,
         resolve_npu_artifact_cache,
         sanitize_model_name,
         validate_split_model,
@@ -9191,6 +9192,8 @@ def test_path_manager():
     assert chunking_utils.validate_split_model is validate_split_model
     assert common.validate_split_model_dir is validate_split_model_dir
     assert common.get_cache_dir is get_cache_dir
+    assert common.get_npu_cache_dir is get_npu_cache_dir
+    assert chunking_utils.get_npu_cache_dir is get_npu_cache_dir
     assert common.resolve_npu_artifact_cache is resolve_npu_artifact_cache
     assert chunking_utils.find_onnx_model is find_onnx_model
     assert chunking_utils.resolve_npu_artifact_cache is resolve_npu_artifact_cache
@@ -9359,6 +9362,17 @@ def test_path_manager():
         from_file = resolve_npu_artifact_cache(model)
         assert from_file == artifact
 
+        npu = get_npu_cache_dir(mono)
+        assert npu == os.path.join(mono, ".npu_cache", "vitisai")
+        assert os.path.isdir(npu)
+        assert get_npu_cache_dir(mono) == npu
+        ryzen = get_npu_cache_dir(mono, "RyzenAI")
+        assert ryzen == os.path.join(mono, ".npu_cache", "ryzenai")
+        assert ryzen != npu
+        assert os.path.isdir(ryzen)
+        assert get_npu_cache_dir(model) == npu
+        assert get_npu_cache_dir(model, "VitisAI") == npu
+
     for label, func, bad in (
         ("directory", find_onnx_model, "  "),
         ("model_path", find_external_data, None),
@@ -9367,6 +9381,7 @@ def test_path_manager():
         ("directory", validate_split_model_dir, ""),
         ("base_dir", get_cache_dir, ""),
         ("model_dir", resolve_npu_artifact_cache, None),
+        ("model_dir", get_npu_cache_dir, "  "),
     ):
         try:
             if func is get_cache_dir:
@@ -9381,11 +9396,22 @@ def test_path_manager():
         raise AssertionError("an empty model folder was accepted")
     except ValueError as exc:
         assert "model_id" in str(exc)
+    try:
+        get_npu_cache_dir(root, "  ")
+        raise AssertionError("a blank provider was accepted")
+    except ValueError as exc:
+        assert "provider" in str(exc)
+    try:
+        get_npu_cache_dir(root, "../escape")
+        raise AssertionError("a provider path was accepted")
+    except ValueError as exc:
+        assert "provider" in str(exc)
 
     print("  onnx discovery: model.onnx, embeddings, no nested cache")
     print("  external data: embedded location, then onnx.data sibling")
     print("  split dir: model_info.json and component files")
     print("  cache: sanitized model folder, .ort_cache xclbin and vitisai")
+    print("  npu cache: .npu_cache provider folder, same path on second call")
     print("path manager: OK\n")
     return True
 

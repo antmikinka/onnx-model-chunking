@@ -12,6 +12,7 @@ from .path_manager import (
     validate_split_model,
     validate_split_model_dir,
     get_cache_dir,
+    get_npu_cache_dir,
     resolve_npu_artifact_cache,
 )
 from .architecture import (
@@ -84,6 +85,7 @@ __all__ = [
     "validate_split_model",
     "validate_split_model_dir",
     "get_cache_dir",
+    "get_npu_cache_dir",
     "resolve_npu_artifact_cache",
     # Architecture
     "ArchitectureType",

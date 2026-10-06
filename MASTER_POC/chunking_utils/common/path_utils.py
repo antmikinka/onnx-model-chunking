@@ -6,8 +6,9 @@ including detection of local vs remote paths and sanitization
 of model names for safe filesystem usage.
 
 Model discovery and the NPU artifact cache live in path_manager.py.
-This module names the external weight files that sit beside a graph
-and checks a split directory against model_info.json.
+This module names the external weight files that sit beside a graph,
+checks a split directory against model_info.json, and creates the
+provider folder under ``.npu_cache`` used for NPU compilation.
 """
 
 import json
@@ -174,3 +175,41 @@ def validate_split_model(directory: str) -> Dict[str, Any]:
             result["errors"].append(f"Missing: {comp_file}")
     result["valid"] = len(result["errors"]) == 0
     return result
+
+
+def get_npu_cache_dir(model_dir: str, provider: str = "VitisAI") -> str:
+    """Get or create the NPU compilation cache directory.
+
+    Compiled artifacts such as XCLBIN files and Vitis AI caches are
+    stored at ``<model_dir>/.npu_cache/<provider>``. The provider name
+    is lowercased, so the default VitisAI provider uses ``vitisai``.
+    An ONNX file uses its parent directory. The returned directory is
+    the invalidation path for that provider: removing it drops only
+    that provider's compiled artifacts.
+
+    Args:
+        model_dir: Model directory or ONNX file.
+        provider: Execution provider whose cache folder to create.
+
+    Returns:
+        Path to the provider compilation cache directory.
+    """
+    if not isinstance(model_dir, str) or not model_dir.strip():
+        raise ValueError("model_dir must be a non-empty string")
+    if not isinstance(provider, str) or not provider.strip():
+        raise ValueError("provider must be a non-empty string")
+    folder = provider.strip().lower()
+    if (
+        folder in {".", ".."}
+        or "/" in folder
+        or "\\" in folder
+        or os.sep in folder
+        or (os.altsep and os.altsep in folder)
+        or os.path.basename(folder) != folder
+    ):
+        raise ValueError("provider must be a single cache folder name")
+    raw = os.path.normpath(model_dir.strip())
+    root = os.path.dirname(raw) if os.path.isfile(raw) else raw
+    cache_dir = os.path.join(root, ".npu_cache", folder)
+    os.makedirs(cache_dir, exist_ok=True)
+    return cache_dir

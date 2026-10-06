@@ -3,7 +3,8 @@ Path manager for model discovery, split directories, and NPU caches.
 
 ``path_utils`` still answers whether a name is a local path and how to
 sanitize it. This module finds the ONNX graph, its external weight file,
-a split directory, a model cache folder, and the NPU artifact cache.
+a split directory, a model cache folder, the NPU artifact cache,
+and the provider compilation cache under ``.npu_cache``.
 """
 
 import json
@@ -12,6 +13,7 @@ from typing import List, Optional
 
 from .path_utils import (
     find_external_data_files as _candidate_external_data_files,
+    get_npu_cache_dir,
     is_local_path,
     sanitize_model_name,
     validate_split_model,
@@ -27,6 +29,7 @@ __all__ = [
     "validate_split_model",
     "validate_split_model_dir",
     "get_cache_dir",
+    "get_npu_cache_dir",
     "resolve_npu_artifact_cache",
 ]
 
