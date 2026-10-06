@@ -1985,6 +1985,35 @@ def test_config_loader():
     assert config.has_zero_point is None
     assert d["quantization_method"] is None
     assert d["has_zero_point"] is None
+    assert config.is_moe is False
+    assert config.num_experts == 0
+    assert config.num_experts_per_token == 0
+    assert config.attention_variant == "dense"
+    assert config.architecture_extras == {}
+    assert d["is_moe"] is False
+    assert d["num_experts"] == 0
+    assert d["attention_variant"] == "dense"
+    assert d["architecture_extras"] == {}
+    try:
+        ModelConfig(num_layers=1, num_kv_heads=1, head_dim=8, num_experts=-1).validate()
+        raise AssertionError("a negative expert count must be rejected")
+    except ValueError as exc:
+        assert "num_experts" in str(exc)
+    try:
+        ModelConfig(
+            num_layers=1, num_kv_heads=1, head_dim=8, num_experts=2, num_experts_per_token=4
+        ).validate()
+        raise AssertionError("selecting more experts than exist must be rejected")
+    except ValueError as exc:
+        assert "num_experts_per_token" in str(exc)
+    try:
+        ModelConfig(num_layers=1, num_kv_heads=1, head_dim=8, attention_variant="").validate()
+        raise AssertionError("an empty attention variant must be rejected")
+    except ValueError as exc:
+        assert "attention_variant" in str(exc)
+    ModelConfig(
+        num_layers=1, num_kv_heads=1, head_dim=8, is_moe=True, num_experts=8, num_experts_per_token=2
+    ).validate()
     try:
         ModelConfig(num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=-1).validate()
         raise AssertionError("a negative max_seq_len must be rejected")
@@ -2104,6 +2133,9 @@ def test_config_loader():
         assert genai.quantization_method is None
         assert genai.quantization_group_size is None
         assert genai.dtype == np.dtype(np.float16)
+        assert genai.is_moe is False
+        assert genai.attention_variant == "dense"
+        assert genai.architecture_extras == {}
 
     with tempfile.TemporaryDirectory() as directory:
         _write_json(directory, "config.json", {
@@ -2119,6 +2151,10 @@ def test_config_loader():
         assert hf.max_seq_len == 0
         assert hf.quantization_method is None
         assert hf.weight_dtype is None
+        assert hf.is_moe is False
+        assert hf.num_experts == 0
+        assert hf.attention_variant == "dense"
+        assert hf.architecture_extras == {}
 
     with tempfile.TemporaryDirectory() as directory:
         _write_json(directory, "model_info.json", {
@@ -2705,10 +2741,195 @@ def test_config_loader():
         arch_dtype = load_model_config(directory, require_all_fields=True)
         assert arch_dtype.dtype == np.dtype(np.float32)
 
+    with tempfile.TemporaryDirectory() as directory:
+        payload = dict(hf_base)
+        payload.update({
+            "num_experts": 0,
+            "num_local_experts": 128,
+            "num_experts_per_tok": 8,
+            "moe_intermediate_size": 1408,
+            "router_aux_loss_coef": 0.25,
+        })
+        _write_json(directory, "config.json", payload)
+        qwen_moe = load_model_config(directory)
+        assert qwen_moe.is_moe is True
+        assert qwen_moe.num_experts == 128
+        assert qwen_moe.num_experts_per_token == 8
+        assert qwen_moe.attention_variant == "dense"
+        assert qwen_moe.architecture_extras["num_local_experts"] == 128
+        assert qwen_moe.architecture_extras["moe_intermediate_size"] == 1408
+        assert qwen_moe.architecture_extras["router_aux_loss_coef"] == 0.25
+        assert "sliding_window" not in qwen_moe.architecture_extras
+        assert qwen_moe.to_dict()["num_experts"] == 128
+    with tempfile.TemporaryDirectory() as directory:
+        payload = dict(hf_base)
+        payload.update({
+            "model_type": "mixtral",
+            "num_local_experts": 8,
+            "num_experts_per_tok": 2,
+            "router_aux_loss_coef": 0,
+        })
+        _write_json(directory, "config.json", payload)
+        mixtral = load_model_config(directory)
+        assert mixtral.is_moe is True
+        assert mixtral.num_experts == 8
+        assert mixtral.num_experts_per_token == 2
+        assert mixtral.architecture_extras["num_local_experts"] == 8
+        assert mixtral.architecture_extras["router_aux_loss_coef"] == 0.0
+    with tempfile.TemporaryDirectory() as directory:
+        payload = dict(hf_base)
+        payload["is_moe"] = True
+        _write_json(directory, "config.json", payload)
+        flagged = load_model_config(directory)
+        assert flagged.is_moe is True
+        assert flagged.num_experts == 0
+    with tempfile.TemporaryDirectory() as directory:
+        payload = dict(hf_base)
+        payload["num_experts"] = "nope"
+        _write_json(directory, "config.json", payload)
+        try:
+            load_model_config(directory)
+            raise AssertionError("a non-integer expert count must be rejected")
+        except ValueError as exc:
+            assert "num_experts" in str(exc)
+    with tempfile.TemporaryDirectory() as directory:
+        payload = dict(hf_base)
+        payload.update({"num_experts": 4, "num_experts_per_tok": 8})
+        _write_json(directory, "config.json", payload)
+        try:
+            load_model_config(directory)
+            raise AssertionError("too many experts per token must be rejected")
+        except ValueError as exc:
+            assert "num_experts_per_token" in str(exc)
+    with tempfile.TemporaryDirectory() as directory:
+        payload = dict(hf_base)
+        payload.update({
+            "sliding_window": 4096,
+            "use_linear_attention": False,
+        })
+        _write_json(directory, "config.json", payload)
+        sliding = load_model_config(directory)
+        assert sliding.is_moe is False
+        assert sliding.attention_variant == "sliding_window"
+        assert sliding.architecture_extras["sliding_window"] == 4096
+        assert sliding.architecture_extras["use_linear_attention"] is False
+    with tempfile.TemporaryDirectory() as directory:
+        payload = dict(hf_base)
+        payload["sliding_window"] = 0
+        _write_json(directory, "config.json", payload)
+        unset_window = load_model_config(directory)
+        assert unset_window.attention_variant == "dense"
+        assert unset_window.architecture_extras == {}
+    with tempfile.TemporaryDirectory() as directory:
+        payload = dict(hf_base)
+        payload["use_linear_attention"] = True
+        _write_json(directory, "config.json", payload)
+        linear = load_model_config(directory)
+        assert linear.attention_variant == "linear"
+        assert linear.architecture_extras["use_linear_attention"] is True
+    with tempfile.TemporaryDirectory() as directory:
+        payload = dict(hf_base)
+        payload["use_sparse_attention"] = True
+        _write_json(directory, "config.json", payload)
+        sparse = load_model_config(directory)
+        assert sparse.attention_variant == "sparse"
+        assert sparse.architecture_extras["use_sparse_attention"] is True
+    with tempfile.TemporaryDirectory() as directory:
+        payload = dict(hf_base)
+        payload.update({
+            "attention_type": "full_attention",
+            "sliding_window": 2048,
+            "use_linear_attention": True,
+            "layer_types": ["linear_attention", "full_attention"],
+            "moe": {"num_experts": 64, "num_experts_per_tok": 4},
+        })
+        _write_json(directory, "config.json", payload)
+        hybrid = load_model_config(directory)
+        assert hybrid.is_moe is True
+        assert hybrid.num_experts == 64
+        assert hybrid.num_experts_per_token == 4
+        assert hybrid.attention_variant == "hybrid"
+        assert hybrid.architecture_extras["attention_type"] == "full_attention"
+        assert hybrid.architecture_extras["sliding_window"] == 2048
+        assert hybrid.architecture_extras["use_linear_attention"] is True
+        assert hybrid.architecture_extras["layer_types"] == ["linear_attention", "full_attention"]
+    with tempfile.TemporaryDirectory() as directory:
+        payload = dict(hf_base)
+        payload["attention_type"] = "chunked"
+        _write_json(directory, "config.json", payload)
+        chunked = load_model_config(directory)
+        assert chunked.attention_variant == "chunked"
+        assert chunked.architecture_extras["attention_type"] == "chunked"
+    with tempfile.TemporaryDirectory() as directory:
+        payload = dict(hf_base)
+        payload["use_linear_attention"] = "yes"
+        _write_json(directory, "config.json", payload)
+        try:
+            load_model_config(directory)
+            raise AssertionError("a non-boolean linear flag must be rejected")
+        except ValueError as exc:
+            assert "use_linear_attention" in str(exc)
+    with tempfile.TemporaryDirectory() as directory:
+        payload = dict(hf_base)
+        payload["sliding_window"] = -4
+        _write_json(directory, "config.json", payload)
+        try:
+            load_model_config(directory)
+            raise AssertionError("a negative sliding window must be rejected")
+        except ValueError as exc:
+            assert "sliding_window" in str(exc)
+    with tempfile.TemporaryDirectory() as directory:
+        _write_json(directory, "genai_config.json", {
+            "model": {
+                "type": "qwen3_moe",
+                "vocab_size": 10,
+                "decoder": {
+                    "num_hidden_layers": 3,
+                    "num_key_value_heads": 4,
+                    "head_size": 96,
+                    "hidden_size": 384,
+                    "num_attention_heads": 4,
+                    "num_local_experts": 32,
+                    "num_experts_per_tok": 4,
+                    "attention_type": "linear",
+                    "moe_intermediate_size": 768,
+                },
+            },
+        })
+        genai_moe = load_model_config(directory)
+        assert genai_moe.is_moe is True
+        assert genai_moe.num_experts == 32
+        assert genai_moe.num_experts_per_token == 4
+        assert genai_moe.attention_variant == "linear"
+        assert genai_moe.architecture_extras["num_local_experts"] == 32
+        assert genai_moe.architecture_extras["moe_intermediate_size"] == 768
+        assert genai_moe.architecture_extras["attention_type"] == "linear"
+    with tempfile.TemporaryDirectory() as directory:
+        _write_json(directory, "model_info.json", {
+            "num_layers": 4,
+            "architecture": {
+                "num_kv_heads": 4,
+                "head_dim": 96,
+                "num_experts": 16,
+                "num_experts_per_token": 2,
+                "attention_type": "sparse",
+            },
+            "sliding_window": 1024,
+        })
+        info_moe = load_model_config(directory, require_all_fields=True)
+        assert info_moe.is_moe is True
+        assert info_moe.num_experts == 16
+        assert info_moe.num_experts_per_token == 2
+        assert info_moe.attention_variant == "hybrid"
+        assert info_moe.architecture_extras["attention_type"] == "sparse"
+        assert info_moe.architecture_extras["sliding_window"] == 1024
+        assert info_moe.architecture_extras["use_sparse_attention"] is True
+
     print("  kv shape: refuse silent 8/128, infer 4 x 96 from ONNX")
     print("  max_seq_len: max_position_embeddings, sequence aliases, unset stays 0")
     print("  quantization: AWQ, GPTQ, Quark, MatMulNBits, unset stays empty")
     print("  dtype: torch_dtype, dtype, decoder dtype, missing stays float16")
+    print("  architecture: moe experts, hybrid attention, dense stays empty")
     print("  onnx graph: layers, KV axes, dtype, present outputs, external data")
     print("config_loader module: OK\n")
     return True

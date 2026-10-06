@@ -50,6 +50,13 @@ class ModelConfig:
     quantization_group_size: Optional[int] = None
     quantization_format: Optional[str] = None
     has_zero_point: Optional[bool] = None
+    # False and 0 mean the file did not describe a mixture of experts.
+    # attention_variant stays "dense" until the file names another pattern.
+    is_moe: bool = False
+    num_experts: int = 0
+    num_experts_per_token: int = 0
+    attention_variant: str = "dense"
+    architecture_extras: Dict[str, Any] = field(default_factory=dict)
     dtype: np.dtype = field(default_factory=lambda: np.dtype(np.float16))
     model_type: str = "unknown"
     
@@ -82,6 +89,30 @@ class ModelConfig:
             raise ValueError(
                 f"has_zero_point must be a boolean, got {self.has_zero_point!r}"
             )
+        if isinstance(self.num_experts, bool) or not isinstance(self.num_experts, int) or self.num_experts < 0:
+            raise ValueError(f"num_experts must be non-negative, got {self.num_experts!r}")
+        if (
+            isinstance(self.num_experts_per_token, bool)
+            or not isinstance(self.num_experts_per_token, int)
+            or self.num_experts_per_token < 0
+        ):
+            raise ValueError(
+                "num_experts_per_token must be non-negative, "
+                f"got {self.num_experts_per_token!r}"
+            )
+        if self.num_experts > 0 and self.num_experts_per_token > self.num_experts:
+            raise ValueError(
+                "num_experts_per_token must not exceed num_experts, "
+                f"got {self.num_experts_per_token} and {self.num_experts}"
+            )
+        if not isinstance(self.attention_variant, str) or not self.attention_variant.strip():
+            raise ValueError(
+                f"attention_variant must be a non-empty string, got {self.attention_variant!r}"
+            )
+        if not isinstance(self.architecture_extras, dict):
+            raise ValueError(
+                f"architecture_extras must be a dict, got {self.architecture_extras!r}"
+            )
         if self.head_dim % 8 != 0:
             warnings.warn(f"head_dim {self.head_dim} is not divisible by 8, may be non-standard")
     
@@ -102,6 +133,11 @@ class ModelConfig:
             "quantization_group_size": self.quantization_group_size,
             "quantization_format": self.quantization_format,
             "has_zero_point": self.has_zero_point,
+            "is_moe": self.is_moe,
+            "num_experts": self.num_experts,
+            "num_experts_per_token": self.num_experts_per_token,
+            "attention_variant": self.attention_variant,
+            "architecture_extras": dict(self.architecture_extras),
             "dtype": str(self.dtype),
             "model_type": self.model_type,
             "source_file": self.source_file,
@@ -142,6 +178,7 @@ def _parse_genai_config(config: Dict[str, Any], source: str) -> Optional[ModelCo
                 model_type=model.get("type", "unknown") if isinstance(model, dict) else "unknown",
                 max_seq_len=_max_seq_len_from(decoder, model, config),
                 **_quantization_from(decoder, model, config),
+                **_architecture_from(decoder, model, config),
                 dtype=get_dtype_from_config(config),
                 source_file=source,
             )
@@ -184,6 +221,7 @@ def _parse_hf_config(config: Dict[str, Any], source: str) -> Optional[ModelConfi
                 model_type=config.get("model_type", "unknown"),
                 max_seq_len=_max_seq_len_from(config),
                 **_quantization_from(config),
+                **_architecture_from(config),
                 dtype=get_dtype_from_config(config),
                 source_file=source,
             )
@@ -522,6 +560,236 @@ def _quantization_from(*sources: Any) -> Dict[str, Any]:
     }
 
 
+# Expert count aliases. ``num_local_experts`` is the Mixtral name.
+_EXPERT_COUNT_KEYS = (
+    "num_experts",
+    "num_local_experts",
+    "n_routed_experts",
+    "n_experts",
+)
+_EXPERTS_PER_TOKEN_KEYS = (
+    "num_experts_per_token",
+    "num_experts_per_tok",
+    "num_selected_experts",
+    "moe_top_k",
+)
+_MOE_INTERMEDIATE_KEYS = (
+    "moe_intermediate_size",
+    "expert_intermediate_size",
+)
+_ARCH_NESTED_KEYS = ("moe", "moe_config", "expert_config", "attention", "attention_config")
+_ATTENTION_ALIASES = {
+    "dense": "dense",
+    "full": "dense",
+    "full_attention": "dense",
+    "causal": "dense",
+    "standard": "dense",
+    "mha": "dense",
+    "gqa": "dense",
+    "sliding": "sliding_window",
+    "sliding_window": "sliding_window",
+    "sliding_attention": "sliding_window",
+    "swa": "sliding_window",
+    "linear": "linear",
+    "linear_attention": "linear",
+    "gated_deltanet": "linear",
+    "sparse": "sparse",
+    "sparse_attention": "sparse",
+    "hybrid": "hybrid",
+    "mixed": "hybrid",
+}
+_LAYER_ATTENTION_KINDS = {
+    "full_attention": "dense",
+    "full": "dense",
+    "dense": "dense",
+    "causal": "dense",
+    "linear_attention": "linear",
+    "linear": "linear",
+    "gated_deltanet": "linear",
+    "sparse": "sparse",
+    "sparse_attention": "sparse",
+    "sliding_attention": "sliding_window",
+    "sliding_window": "sliding_window",
+    "sliding": "sliding_window",
+}
+
+
+def _arch_token(value: Any) -> Optional[str]:
+    """Lowercase an architecture name. Structured values are absent."""
+    if value is None or isinstance(value, (dict, list, tuple, bool)):
+        return None
+    text = str(value).strip().lower().replace(" ", "").replace("-", "_")
+    return text or None
+
+
+def _positive_int_from(dicts: list, keys: tuple) -> tuple:
+    """First positive integer. Zero and null fall through to the next key."""
+    for key in keys:
+        for item in dicts:
+            if not isinstance(item, dict) or key not in item or item[key] is None:
+                continue
+            if isinstance(item[key], str) and not item[key].strip():
+                continue
+            try:
+                value = _as_dim(item[key])
+            except ValueError as exc:
+                raise ValueError(f"{key} must be an integer, got {item[key]!r}") from exc
+            if value is None or value == 0:
+                continue
+            if value < 0:
+                raise ValueError(f"{key} must be non-negative, got {value}")
+            return key, value
+    return None, 0
+
+
+def _optional_bool(dicts: list, keys: tuple) -> tuple:
+    """First boolean flag. A present non-boolean value is rejected."""
+    for key in keys:
+        for item in dicts:
+            if not isinstance(item, dict) or key not in item or item[key] is None:
+                continue
+            value = item[key]
+            if isinstance(value, bool):
+                return key, value
+            if isinstance(value, dict):
+                continue
+            raise ValueError(f"{key} must be a boolean, got {value!r}")
+    return None, None
+
+
+def _optional_float(dicts: list, keys: tuple) -> tuple:
+    """First numeric coefficient, including zero. Booleans are rejected."""
+    for key in keys:
+        for item in dicts:
+            if not isinstance(item, dict) or key not in item or item[key] is None:
+                continue
+            value = item[key]
+            if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+                raise ValueError(f"{key} must be a number, got {value!r}")
+            if isinstance(value, str):
+                text = value.strip()
+                if not text:
+                    continue
+                try:
+                    value = float(text)
+                except ValueError as exc:
+                    raise ValueError(f"{key} must be a number, got {value!r}") from exc
+            return key, float(value)
+    return None, None
+
+
+def _layer_types_from(dicts: list) -> Optional[list]:
+    """Return layer attention names when the file lists them."""
+    for item in dicts:
+        if not isinstance(item, dict) or "layer_types" not in item or item["layer_types"] is None:
+            continue
+        raw = item["layer_types"]
+        if isinstance(raw, str) and not raw.strip():
+            continue
+        if not isinstance(raw, (list, tuple)):
+            raise ValueError(f"layer_types must be a list, got {raw!r}")
+        return [str(entry) for entry in raw]
+    return None
+
+
+def _architecture_from(*sources: Any) -> Dict[str, Any]:
+    """Read MoE and hybrid-attention fields. A dense file stays at the defaults.
+
+    ``num_experts`` and ``num_local_experts`` set the expert count. Zero falls
+    through. ``num_experts_per_tok`` is the per-token selection. More than one
+    attention mechanism, or an explicit hybrid name, sets ``attention_variant``
+    to hybrid. Other recognized keys are copied into ``architecture_extras``.
+    """
+    roots = [source for source in sources if isinstance(source, dict)]
+    nested = []
+    for source in roots:
+        for key in _ARCH_NESTED_KEYS:
+            child = source.get(key)
+            if isinstance(child, dict):
+                nested.append(child)
+    searchable = roots + nested
+
+    expert_key, num_experts = _positive_int_from(searchable, _EXPERT_COUNT_KEYS)
+    _, per_token = _positive_int_from(searchable, _EXPERTS_PER_TOKEN_KEYS)
+    _, moe_flag = _optional_bool(searchable, ("is_moe",))
+    if moe_flag is None:
+        _, moe_flag = _optional_bool(searchable, ("moe",))
+    is_moe = num_experts > 0 or per_token > 0 or moe_flag is True
+
+    _, moe_intermediate = _positive_int_from(searchable, _MOE_INTERMEDIATE_KEYS)
+    coef_key, coef = _optional_float(
+        searchable, ("router_aux_loss_coef", "router_aux_loss_coeff")
+    )
+    _, sliding = _positive_int_from(searchable, ("sliding_window", "sliding_window_size"))
+    _, linear_flag = _optional_bool(searchable, ("use_linear_attention",))
+    _, sparse_flag = _optional_bool(searchable, ("use_sparse_attention",))
+    attention_key, attention_raw = _first_present(
+        searchable, ("attention_variant", "attention_type", "attn_type")
+    )
+    attention_text = _arch_token(attention_raw)
+    named = None if attention_text is None else _ATTENTION_ALIASES.get(attention_text, attention_text)
+    layer_types = _layer_types_from(searchable)
+
+    mechanisms = set()
+    if isinstance(layer_types, list):
+        for entry in layer_types:
+            kind = _LAYER_ATTENTION_KINDS.get(_arch_token(entry) or "")
+            if kind == "linear" and linear_flag is False:
+                continue
+            if kind == "sparse" and sparse_flag is False:
+                continue
+            if kind:
+                mechanisms.add(kind)
+    if linear_flag is True or (linear_flag is not False and named == "linear"):
+        mechanisms.add("linear")
+    if sparse_flag is True or (sparse_flag is not False and named == "sparse"):
+        mechanisms.add("sparse")
+    if sliding > 0 or named == "sliding_window":
+        mechanisms.add("sliding_window")
+    if named == "dense":
+        mechanisms.add("dense")
+    if named == "hybrid" or len(mechanisms) > 1:
+        variant = "hybrid"
+    elif len(mechanisms) == 1:
+        variant = next(iter(mechanisms))
+    elif named:
+        variant = named
+    else:
+        variant = "dense"
+
+    extras: Dict[str, Any] = {}
+    if expert_key == "num_local_experts":
+        extras["num_local_experts"] = num_experts
+    elif expert_key not in (None, "num_experts"):
+        extras[expert_key] = num_experts
+    if moe_intermediate > 0:
+        extras["moe_intermediate_size"] = moe_intermediate
+    if coef_key is not None:
+        extras["router_aux_loss_coef"] = coef
+    if attention_key is not None and attention_text:
+        extras["attention_type"] = attention_text
+    if sliding > 0:
+        extras["sliding_window"] = sliding
+    if linear_flag is not None:
+        extras["use_linear_attention"] = linear_flag
+    elif "linear" in mechanisms:
+        extras["use_linear_attention"] = True
+    if sparse_flag is not None:
+        extras["use_sparse_attention"] = sparse_flag
+    elif "sparse" in mechanisms:
+        extras["use_sparse_attention"] = True
+    if layer_types is not None:
+        extras["layer_types"] = layer_types
+
+    return {
+        "is_moe": is_moe,
+        "num_experts": num_experts,
+        "num_experts_per_token": per_token,
+        "attention_variant": variant,
+        "architecture_extras": extras,
+    }
+
+
 def _read_field(sources: tuple, keys: tuple) -> Any:
     """Return the first present non-null value for ``keys``."""
     for source in sources:
@@ -768,6 +1036,7 @@ def _parse_model_info(
         num_attention_heads=_as_dim(_read_field(sources, ("num_attention_heads",))) or 0,
         max_seq_len=_max_seq_len_from(*sources),
         **_quantization_from(*sources),
+        **_architecture_from(*sources),
         dtype=get_dtype_from_config(config),
         model_type=str(config.get("strategy", config.get("model_type", "unknown"))),
         source_file=source,
@@ -797,6 +1066,9 @@ def load_model_config(
     AWQ, GPTQ, Quark, or MatMulNBits. ``quantization_group_size`` -1 means
     per-channel weights. ``dtype`` is read from ``torch_dtype``, ``dtype``,
     or ``model.decoder.dtype``. A file that names none of them stays float16.
+    Dense checkpoints leave ``is_moe`` false, ``num_experts`` 0, and
+    ``attention_variant`` dense. Mixture-of-experts counts and hybrid
+    attention keys are stored on those fields and in ``architecture_extras``.
     
     Args:
         model_dir: Directory containing model/config files

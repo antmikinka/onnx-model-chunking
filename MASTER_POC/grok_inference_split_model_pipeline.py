@@ -176,10 +176,19 @@ class SequentialModelPipeline:
                     f" group {getattr(self.config, 'quantization_group_size', None)}"
                     f" format {getattr(self.config, 'quantization_format', None)}"
                 )
+            arch_note = ""
+            variant = getattr(self.config, "attention_variant", "dense")
+            if isinstance(variant, str) and variant and variant != "dense":
+                arch_note = f", attention {variant}"
+            if getattr(self.config, "is_moe", False) is True:
+                arch_note += (
+                    f", moe experts {getattr(self.config, 'num_experts', 0)}"
+                    f" per_token {getattr(self.config, 'num_experts_per_token', 0)}"
+                )
             self._log(
                 f"  [Config] {self.config.num_layers} layers, {self.config.num_kv_heads} KV heads, "
                 f"{self.config.head_dim} head dim, max_seq_len {self.config.max_seq_len}"
-                f"{quant_note}"
+                f"{quant_note}{arch_note}"
             )
         except FileNotFoundError:
             self._log("  [Warning] No config found, using defaults (may be incorrect)")
