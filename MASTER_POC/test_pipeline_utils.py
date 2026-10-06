@@ -9173,6 +9173,7 @@ def test_path_manager():
     import chunking_utils.common as common
     from chunking_utils.common.path_manager import (
         find_external_data,
+        find_external_data_files,
         find_onnx_model,
         get_cache_dir,
         resolve_npu_artifact_cache,
@@ -9183,6 +9184,8 @@ def test_path_manager():
 
     assert common.find_onnx_model is find_onnx_model
     assert common.find_external_data is find_external_data
+    assert common.find_external_data_files is find_external_data_files
+    assert chunking_utils.find_external_data_files is find_external_data_files
     assert common.validate_split_model_dir is validate_split_model_dir
     assert common.get_cache_dir is get_cache_dir
     assert common.resolve_npu_artifact_cache is resolve_npu_artifact_cache
@@ -9230,6 +9233,31 @@ def test_path_manager():
         os.remove(sibling)
         assert find_external_data(model) is None
 
+        named = os.path.join(root, "named")
+        os.makedirs(named)
+        graph = os.path.join(named, "model.onnx")
+        with open(graph, "wb") as handle:
+            handle.write(b"graph")
+        onnx_data = graph + ".data"
+        base_data = os.path.splitext(graph)[0] + ".data"
+        underscore = os.path.splitext(graph)[0] + "_data"
+        for path, payload in (
+            (onnx_data, b"onnx-data"),
+            (base_data, b"base-data"),
+            (underscore, b"underscore"),
+        ):
+            with open(path, "wb") as handle:
+                handle.write(payload)
+        expected = [onnx_data, base_data, underscore]
+        assert find_external_data_files(graph) == expected
+        assert find_external_data_files(named) == expected
+        os.remove(base_data)
+        os.remove(underscore)
+        assert find_external_data_files(graph) == [onnx_data]
+        os.remove(onnx_data)
+        assert find_external_data_files(graph) == []
+        assert find_external_data_files(os.path.join(root, "missing.onnx")) == []
+
         layers = os.path.join(root, "layers")
         os.makedirs(layers)
         embed = os.path.join(layers, "embeddings.onnx")
@@ -9275,6 +9303,7 @@ def test_path_manager():
     for label, func, bad in (
         ("directory", find_onnx_model, "  "),
         ("model_path", find_external_data, None),
+        ("model_path", find_external_data_files, "  "),
         ("directory", validate_split_model_dir, ""),
         ("base_dir", get_cache_dir, ""),
         ("model_dir", resolve_npu_artifact_cache, None),

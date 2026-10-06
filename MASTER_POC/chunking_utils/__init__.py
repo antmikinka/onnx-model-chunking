@@ -100,6 +100,7 @@ from .common.path_utils import (
 from .common.path_manager import (
     find_onnx_model,
     find_external_data,
+    find_external_data_files,
     validate_split_model_dir,
     get_cache_dir,
     resolve_npu_artifact_cache,
@@ -260,6 +261,7 @@ __all__ = [
     "sanitize_model_name",
     "find_onnx_model",
     "find_external_data",
+    "find_external_data_files",
     "validate_split_model_dir",
     "get_cache_dir",
     "resolve_npu_artifact_cache",

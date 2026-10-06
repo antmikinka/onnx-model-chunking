@@ -10,7 +10,11 @@ import json
 import os
 from typing import List, Optional
 
-from .path_utils import is_local_path, sanitize_model_name
+from .path_utils import (
+    find_external_data_files as _candidate_external_data_files,
+    is_local_path,
+    sanitize_model_name,
+)
 
 # Re-exported so callers can use one path module.
 __all__ = [
@@ -18,6 +22,7 @@ __all__ = [
     "sanitize_model_name",
     "find_onnx_model",
     "find_external_data",
+    "find_external_data_files",
     "validate_split_model_dir",
     "get_cache_dir",
     "resolve_npu_artifact_cache",
@@ -176,6 +181,30 @@ def find_external_data(model_path: str) -> Optional[str]:
     if os.path.isfile(sibling):
         return os.path.normpath(sibling)
     return None
+
+
+def find_external_data_files(model_path: str) -> List[str]:
+    """
+    Find all .data files associated with an ONNX model.
+
+    A directory is resolved to its ONNX graph first. The graph is then
+    checked for ``<model>.onnx.data``, ``<base>.data``, and
+    ``<base>_data``.
+
+    Args:
+        model_path: ONNX file or model directory.
+
+    Returns:
+        Existing external data files, in candidate order.
+    """
+    raw = os.path.normpath(_require_text(model_path, "model_path"))
+    target = raw
+    if os.path.isdir(raw):
+        model = find_onnx_model(raw)
+        if model is None:
+            return []
+        target = model
+    return _candidate_external_data_files(target)
 
 
 def validate_split_model_dir(directory: str) -> bool:
