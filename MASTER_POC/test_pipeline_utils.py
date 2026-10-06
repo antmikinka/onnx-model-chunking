@@ -7883,6 +7883,7 @@ def test_hf_integration():
         ONNX_DTYPE_MAP as direct_map,
         TORCH_DTYPE_MAP,
         check_dependencies,
+        estimate_model_memory,
         get_onnx_dtype as direct_get,
         get_torch_dtype,
     )
@@ -7927,6 +7928,92 @@ def test_hf_integration():
         except ImportError as exc:
             assert "torch" in str(exc)
     print("  onnx dtype: float, float16, bfloat16, int8, int4")
+
+    assert common.estimate_model_memory is estimate_model_memory
+    plain = estimate_model_memory(1000, TensorDtype.FLOAT16)
+    assert plain["bytes"] == 2000
+    assert plain["dtype"] == "float16"
+    assert plain["bytes_per_param"] == 2
+    assert plain["overhead_bytes"] == 0
+    assert plain["quantization"] is None
+    assert plain["megabytes"] == 2000 / (1024 ** 2)
+    packed = estimate_model_memory(1000, "int4")
+    assert packed["bytes"] == 500
+    assert packed["weight_bytes"] == 500
+    assert packed["bytes_per_param"] == 0.5
+    assert packed["overhead_bytes"] == 0
+    odd = estimate_model_memory(3, TensorDtype.INT4)
+    assert odd["weight_bytes"] == 2
+    assert odd["bytes"] == 2
+    awq = estimate_model_memory(256, "fp16", quantization="awq")
+    assert awq["quantization"] == "awq"
+    assert awq["dtype"] == "int4"
+    assert awq["group_size"] == 128
+    assert awq["packing"] == "int32"
+    assert awq["weight_bytes"] == 128
+    assert awq["scale_bytes"] == 4
+    assert awq["zero_point_bytes"] == 8
+    assert awq["overhead_bytes"] == 12
+    assert awq["bytes"] == 140
+    gptq = estimate_model_memory(256, TensorDtype.FLOAT16, quantization="gptq", group_size=128)
+    assert gptq["quantization"] == "gptq"
+    assert gptq["packing"] == "int32"
+    assert gptq["weight_bytes"] == awq["weight_bytes"]
+    assert gptq["zero_point_bytes"] == 8
+    assert gptq["bytes"] == 140
+    nbits = estimate_model_memory(256, TensorDtype.INT4, quantization="matmulnbits")
+    assert nbits["quantization"] == "matmul_nbits"
+    assert nbits["group_size"] == 128
+    assert nbits["packing"] == "block"
+    assert nbits["weight_bytes"] == 128
+    assert nbits["scale_bytes"] == 4
+    assert nbits["zero_point_bytes"] == 2
+    assert nbits["bytes"] == 134
+    partial = estimate_model_memory(100, TensorDtype.FLOAT16, quantization="matmul_nbits", group_size=128)
+    assert partial["weight_bytes"] == 64
+    assert partial["scale_bytes"] == 2
+    assert partial["zero_point_bytes"] == 1
+    assert partial["bytes"] == 67
+    assert partial["bytes"] > estimate_model_memory(100, TensorDtype.INT4)["bytes"]
+    blocked = estimate_model_memory(32, TensorDtype.INT4, quantization="int4_blockwise")
+    assert blocked["quantization"] == "blocked"
+    assert blocked["group_size"] == 32
+    assert blocked["weight_bytes"] == 16
+    assert blocked["scale_bytes"] == 2
+    assert blocked["zero_point_bytes"] == 1
+    assert blocked["bytes"] == 19
+    int8_awq = estimate_model_memory(128, TensorDtype.INT8, quantization="awq")
+    assert int8_awq["dtype"] == "int8"
+    assert int8_awq["bytes_per_param"] == 1
+    assert int8_awq["weight_bytes"] == 128
+    assert int8_awq["group_size"] == 128
+    assert int8_awq["scale_bytes"] == 2
+    assert int8_awq["zero_point_bytes"] == 4
+    qdq = estimate_model_memory(10, TensorDtype.INT8, quantization="qdq")
+    assert qdq["group_size"] is None
+    assert qdq["weight_bytes"] == 10
+    assert qdq["scale_bytes"] == 4
+    assert qdq["zero_point_bytes"] == 1
+    assert qdq["bytes"] == 15
+    copied = estimate_model_memory(256, TensorDtype.FLOAT16, quantization="awq")
+    awq["weight_bytes"] = 0
+    assert copied["weight_bytes"] == 128
+    try:
+        estimate_model_memory(32, TensorDtype.INT4, quantization="sideband")
+        raise AssertionError("an unknown quantization method was accepted")
+    except ValueError as exc:
+        assert "sideband" in str(exc)
+    try:
+        estimate_model_memory(32, TensorDtype.INT4, quantization="awq", group_size=-1)
+        raise AssertionError("per-channel group size was accepted")
+    except ValueError as exc:
+        assert "group_size" in str(exc)
+    try:
+        estimate_model_memory(32, TensorDtype.INT4, quantization="gptq", group_size=0)
+        raise AssertionError("a zero group size was accepted")
+    except ValueError as exc:
+        assert "group_size" in str(exc)
+    print("  quantized memory: int4 packing, awq and gptq groups, matmul nbits blocks")
     print("hf integration: OK\n")
     return True
 
