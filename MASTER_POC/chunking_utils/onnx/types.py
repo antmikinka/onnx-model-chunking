@@ -103,9 +103,12 @@ class OnnxMergeResult:
         num_nodes: Total number of nodes in the merged model.
         num_initializers: Total number of initializers in the merged model.
         error: Error message if merge failed.
+        psnr: Peak signal-to-noise ratio in decibels when numerical
+            verification ran. An exact match is infinity.
     """
     success: bool
     output_path: Optional[str] = None
     num_nodes: int = 0
     num_initializers: int = 0
     error: Optional[str] = None
+    psnr: Optional[float] = None

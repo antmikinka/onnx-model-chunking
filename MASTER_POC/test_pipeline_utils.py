@@ -13974,6 +13974,440 @@ def test_quantization_coherence():
     return True
 
 
+def test_merge_psnr():
+    """Merged outputs match the original model within the documented PSNR."""
+    print("=" * 50)
+    print("Testing merge PSNR...")
+    print("=" * 50)
+
+    import inspect
+    import json
+    import math
+    import os
+    import sys
+    import tempfile
+    import types
+    import warnings
+
+    import numpy as np
+
+    try:
+        import chunking_utils.onnx.merger as merger
+    except ModuleNotFoundError:
+        for name in list(sys.modules):
+            if name == "chunking_utils.onnx" or name.startswith("chunking_utils.onnx."):
+                del sys.modules[name]
+        onnx_stub = types.ModuleType("onnx")
+        onnx_stub.ModelProto = type("ModelProto", (), {})
+        onnx_stub.numpy_helper = types.SimpleNamespace()
+        onnx_stub.helper = types.SimpleNamespace()
+        onnx_stub.TensorProto = types.SimpleNamespace()
+        onnx_stub.shape_inference = types.SimpleNamespace()
+        sys.modules["onnx"] = onnx_stub
+        import chunking_utils.onnx.merger as merger
+
+    import chunking_utils.onnx as onnx_pkg
+    from chunking_utils.onnx.types import OnnxMergeResult
+
+    assert list(inspect.signature(merger.merge_onnx).parameters) == [
+        "output_dir",
+        "save_path",
+        "execution_plan",
+    ]
+    assert list(inspect.signature(merger.merge_and_verify).parameters) == [
+        "output_dir",
+        "sample_inputs",
+        "save_path",
+        "min_psnr",
+    ]
+    assert "merge_and_verify" not in onnx_pkg.__all__
+    assert OnnxMergeResult(success=True).psnr is None
+
+    def expect_value_error(callable_check, text):
+        try:
+            callable_check()
+            raise AssertionError(text)
+        except ValueError:
+            return
+
+    expect_value_error(
+        lambda: merger.merge_and_verify("unused", "x"),
+        "a string sample_inputs was accepted",
+    )
+    expect_value_error(
+        lambda: merger.merge_and_verify("unused", {}),
+        "an empty sample_inputs was accepted",
+    )
+    expect_value_error(
+        lambda: merger.merge_and_verify("unused", {"  ": [1.0]}),
+        "a blank sample input name was accepted",
+    )
+    expect_value_error(
+        lambda: merger.merge_and_verify("unused", {"x": "text"}),
+        "a non-numeric sample input was accepted",
+    )
+    expect_value_error(
+        lambda: merger.merge_and_verify("unused", {"x": np.array([True, False])}),
+        "a bool sample input was accepted",
+    )
+    expect_value_error(
+        lambda: merger.merge_and_verify("unused", {"x": [1.0], " x": [1.0]}),
+        "a duplicated sample input name was accepted",
+    )
+    expect_value_error(
+        lambda: merger.merge_and_verify("unused", {"x": [1.0]}, min_psnr=True),
+        "a bool min_psnr was accepted",
+    )
+
+    import onnxruntime as ort
+
+    class RecordingSession:
+        created = []
+        next_outputs = [types.SimpleNamespace(name="y")]
+        next_values = [np.array([1.0, 2.0], dtype=np.float32)]
+
+        def __init__(self, model, providers=None):
+            self.model = model
+            self.providers = providers
+            self.outputs = RecordingSession.next_outputs
+            self.values = RecordingSession.next_values
+            RecordingSession.created.append(self)
+
+        def get_outputs(self):
+            return self.outputs
+
+        def run(self, names, feeds):
+            self.names = names
+            self.feeds = feeds
+            return self.values
+
+    original_session = ort.InferenceSession
+    ort.InferenceSession = RecordingSession
+    try:
+        feeds = {"x": np.array([1.0, 2.0], dtype=np.float32)}
+
+        class MemoryModel:
+            def SerializeToString(self):
+                return b"onnx-bytes"
+
+        ran = merger._run_onnx_outputs(MemoryModel(), feeds)
+        assert np.array_equal(ran["y"], feeds["x"])
+        assert RecordingSession.created[-1].names == ["y"]
+        assert RecordingSession.created[-1].feeds is feeds
+        assert RecordingSession.created[-1].providers == ["CPUExecutionProvider"]
+        assert RecordingSession.created[-1].model == b"onnx-bytes"
+
+        merger._run_onnx_outputs("original.onnx", feeds)
+        assert RecordingSession.created[-1].model == "original.onnx"
+
+        class TextModel:
+            def SerializeToString(self):
+                return "not-bytes"
+
+        expect_value_error(
+            lambda: merger._run_onnx_outputs(TextModel(), feeds),
+            "a text serialization was accepted",
+        )
+        expect_value_error(
+            lambda: merger._run_onnx_outputs(object(), feeds),
+            "a model without serialization was accepted",
+        )
+
+        RecordingSession.next_outputs = [types.SimpleNamespace(name="  ")]
+        expect_value_error(
+            lambda: merger._run_onnx_outputs(MemoryModel(), feeds),
+            "a blank output name was accepted",
+        )
+        RecordingSession.next_outputs = [
+            types.SimpleNamespace(name="y"),
+            types.SimpleNamespace(name=" y"),
+        ]
+        expect_value_error(
+            lambda: merger._run_onnx_outputs(MemoryModel(), feeds),
+            "a duplicated output name was accepted",
+        )
+        RecordingSession.next_outputs = []
+        expect_value_error(
+            lambda: merger._run_onnx_outputs(MemoryModel(), feeds),
+            "an empty output list was accepted",
+        )
+        RecordingSession.next_outputs = [types.SimpleNamespace(name="y")]
+        RecordingSession.next_values = []
+        expect_value_error(
+            lambda: merger._run_onnx_outputs(MemoryModel(), feeds),
+            "a short runtime result was accepted",
+        )
+    finally:
+        ort.InferenceSession = original_session
+
+    import builtins
+
+    real_import = builtins.__import__
+
+    def blocked_import(name, *args, **kwargs):
+        if name == "onnxruntime":
+            raise ImportError("blocked")
+        return real_import(name, *args, **kwargs)
+
+    removed_runtime = sys.modules.pop("onnxruntime", None)
+    builtins.__import__ = blocked_import
+    try:
+        try:
+            merger._run_onnx_outputs("original.onnx", {"x": [1.0]})
+            raise AssertionError("a missing onnxruntime was accepted")
+        except ValueError as exc:
+            assert "onnxruntime is required" in str(exc)
+    finally:
+        builtins.__import__ = real_import
+        if removed_runtime is not None:
+            sys.modules["onnxruntime"] = removed_runtime
+
+    def component():
+        return types.SimpleNamespace(
+            graph=types.SimpleNamespace(
+                name="embed_graph",
+                node=[types.SimpleNamespace(op_type="Identity", input=["x"], output=["y"])],
+                initializer=[],
+                input=[],
+                output=[],
+                value_info=[],
+            ),
+            opset_import=[],
+            ir_version=8,
+        )
+
+    calls = []
+    script = []
+    saved = {}
+
+    def fake_run(model, feeds):
+        calls.append((model, feeds))
+        if not script:
+            raise AssertionError("unexpected runtime call")
+        return script.pop(0)
+
+    def fake_load(filepath, load_external_data=True):
+        return component()
+
+    def make_graph(nodes, name, inputs, outputs, initializer):
+        return types.SimpleNamespace(
+            node=list(nodes),
+            name=name,
+            input=list(inputs),
+            output=list(outputs),
+            initializer=list(initializer),
+            value_info=[],
+        )
+
+    def make_model(graph, producer_name, opset_imports):
+        return types.SimpleNamespace(graph=graph, producer_name=producer_name, ir_version=None)
+
+    def fake_save(model, path):
+        saved["path"] = path
+        saved["model"] = model
+
+    if not hasattr(merger.onnx, "load"):
+        merger.onnx.load = None
+    if not hasattr(merger.onnx, "save"):
+        merger.onnx.save = None
+    original_load = merger.onnx.load
+    original_save = merger.onnx.save
+    original_helper = merger.helper
+    original_run = merger._run_onnx_outputs
+    original_psnr = merger.compute_psnr
+    merger.onnx.load = fake_load
+    merger.onnx.save = fake_save
+    merger.helper = types.SimpleNamespace(make_graph=make_graph, make_model=make_model)
+    merger._run_onnx_outputs = fake_run
+    try:
+        with tempfile.TemporaryDirectory() as root:
+            chunks = os.path.join(root, "chunks")
+            os.makedirs(chunks)
+            source = os.path.join(root, "source.onnx")
+            with open(source, "w", encoding="utf-8") as handle:
+                handle.write("original")
+            with open(os.path.join(chunks, "embedding.onnx"), "w", encoding="utf-8") as handle:
+                handle.write("onnx")
+            info_path = os.path.join(chunks, "model_info.json")
+
+            def write_info(original_model="source.onnx"):
+                payload = {
+                    "num_layers": 0,
+                    "components": {"embedding": {"file": "embedding.onnx"}},
+                }
+                if original_model is not None:
+                    payload["original_model"] = original_model
+                with open(info_path, "w", encoding="utf-8") as handle:
+                    json.dump(payload, handle)
+
+            reference = [1.0, 1.0]
+            ids = np.array([1, 2], dtype=np.int64)
+            feeds = {"ids": ids, "x": reference}
+
+            def verify(responses, **kwargs):
+                calls.clear()
+                script.clear()
+                script.extend(responses)
+                return merger.merge_and_verify(chunks, feeds, **kwargs)
+
+            write_info()
+            exact = verify([{"y": reference}, {"y": list(reference)}])
+            assert exact.success is True
+            assert math.isinf(exact.psnr)
+            assert exact.error is None
+            assert exact.output_path is None
+            assert exact.num_nodes == 1
+            assert exact.num_initializers == 0
+            assert calls[0][0] == source
+            assert calls[1][0].producer_name == "chunking_utils_merged"
+            assert calls[0][1]["ids"] is ids
+
+            close = verify([
+                {"y": reference},
+                {"y": [1.01, 1.01]},
+            ])
+            assert close.success is True
+            assert math.isclose(close.psnr, 40.0, abs_tol=1e-6)
+            assert close.error is None
+
+            production = verify(
+                [{"y": reference}, {"y": [1.005, 1.005]}],
+                min_psnr=40.0,
+            )
+            assert production.success is True
+            assert production.psnr > 40.0
+
+            delta = 10 ** -1.75
+            threshold = verify([
+                {"y": reference},
+                {"y": [1.0 + delta, 1.0 + delta]},
+            ])
+            assert threshold.success is True
+            assert threshold.psnr >= 35.0
+
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                failed = verify([
+                    {"y": reference},
+                    {"y": [1.1, 1.1]},
+                ])
+            assert failed.success is False
+            assert math.isclose(failed.psnr, 20.0, abs_tol=1e-6)
+            assert failed.num_nodes == 1
+            assert failed.error is not None
+            assert "PSNR" in failed.error
+            assert "below" in failed.error
+            assert "35" in failed.error
+            assert any("PSNR verification failed" in str(item.message) for item in caught)
+
+            under = verify(
+                [{"y": reference}, {"y": [1.01, 1.01]}],
+                min_psnr=41.0,
+            )
+            assert under.success is False
+            assert "41" in under.error
+
+            merger.compute_psnr = lambda reference, candidate, data_range=None: 35.0
+            try:
+                boundary = verify([{"y": reference}, {"y": reference}])
+            finally:
+                merger.compute_psnr = original_psnr
+            assert boundary.success is True
+            assert boundary.psnr == 35.0
+
+            worst = verify([
+                {"y": reference, "z": reference},
+                {"y": list(reference), "z": [1.1, 1.1]},
+            ])
+            assert worst.success is False
+            assert math.isclose(worst.psnr, 20.0, abs_tol=1e-6)
+
+            try:
+                verify([{"y": reference}, {"z": reference}])
+                raise AssertionError("disagreeing output names were accepted")
+            except ValueError as exc:
+                assert "output names disagree" in str(exc)
+
+            try:
+                verify([{}, {}])
+                raise AssertionError("empty outputs were accepted")
+            except ValueError as exc:
+                assert "at least one" in str(exc)
+
+            saved.clear()
+            destination = os.path.join(root, "merged.onnx")
+            stored = verify(
+                [{"y": reference}, {"y": list(reference)}],
+                save_path=destination,
+            )
+            assert stored.success is True
+            assert stored.output_path == destination
+            assert saved["path"] == destination
+
+            unsaved = verify(
+                [{"y": reference}, {"y": list(reference)}],
+                save_path="",
+            )
+            assert unsaved.output_path is None
+
+            write_info(original_model=None)
+            try:
+                verify([{"y": reference}, {"y": reference}])
+                raise AssertionError("a missing original model was accepted")
+            except ValueError as exc:
+                assert "original_model" in str(exc)
+
+            model_dir = os.path.join(chunks, "original.onnx")
+            os.makedirs(model_dir)
+            write_info("original.onnx")
+            try:
+                verify([{"y": reference}, {"y": reference}])
+                raise AssertionError("a directory original model was accepted")
+            except ValueError as exc:
+                assert "directory" in str(exc)
+            os.rmdir(model_dir)
+
+            write_info("missing.onnx")
+            try:
+                verify([{"y": reference}, {"y": reference}])
+                raise AssertionError("a missing original file was accepted")
+            except FileNotFoundError as exc:
+                assert "original model not found" in str(exc)
+
+            local = os.path.join(chunks, "local.onnx")
+            with open(local, "w", encoding="utf-8") as handle:
+                handle.write("local")
+            write_info("local.onnx")
+            local_result = verify([{"y": reference}, {"y": list(reference)}])
+            assert local_result.success is True
+            assert calls[0][0] == local
+
+            write_info(os.path.abspath(source))
+            absolute = verify([{"y": reference}, {"y": list(reference)}])
+            assert absolute.success is True
+            assert calls[0][0] == os.path.abspath(source)
+
+            empty = tempfile.TemporaryDirectory()
+            try:
+                try:
+                    merger.merge_and_verify(empty.name, {"x": [1.0, 1.0]})
+                    raise AssertionError("a missing model_info was accepted")
+                except FileNotFoundError as exc:
+                    assert "model_info.json" in str(exc)
+            finally:
+                empty.cleanup()
+    finally:
+        merger.onnx.load = original_load
+        merger.onnx.save = original_save
+        merger.helper = original_helper
+        merger._run_onnx_outputs = original_run
+        merger.compute_psnr = original_psnr
+
+    print("merge PSNR: OK")
+    print("  identical outputs succeed, a small error stays above 35 dB, a large error fails, and a missing original model raises")
+    return True
+
+
 def test_path_manager():
     """ONNX discovery, external data, split directories, and NPU cache paths."""
     print("=" * 50)
@@ -14374,6 +14808,12 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"quantization_coherence: FAILED - {e}")
         results.append(("quantization_coherence", False))
+
+    try:
+        results.append(("merge_psnr", test_merge_psnr()))
+    except Exception as e:
+        print(f"merge_psnr: FAILED - {e}")
+        results.append(("merge_psnr", False))
 
     try:
         results.append(("path_manager", test_path_manager()))

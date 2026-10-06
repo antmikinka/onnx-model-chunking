@@ -6,6 +6,7 @@ back into a single unified ONNX model.
 """
 
 import json
+import math
 import os
 from typing import Any, Dict, List, Optional
 
@@ -29,6 +30,7 @@ from .quantization import (
     _recorded_quant_dtype,
 )
 from .types import OnnxMergeResult
+from .validator import _as_signal, _real_number, _warn_psnr_failed, compute_psnr
 
 
 def _require_merge_dir(output_dir: str) -> None:
@@ -1177,6 +1179,162 @@ def merge_onnx_with_result(
             success=False,
             error=str(e),
         )
+
+
+def _require_sample_inputs(sample_inputs) -> Dict[str, Any]:
+    """Named numeric feeds. A string, a blank name, or an empty map raises."""
+    if isinstance(sample_inputs, (str, bytes)) or not isinstance(sample_inputs, dict):
+        raise ValueError(f"sample_inputs must be a dict, got {sample_inputs!r}")
+    if not sample_inputs:
+        raise ValueError("sample_inputs must contain at least one input")
+    feeds: Dict[str, Any] = {}
+    for name, value in sample_inputs.items():
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"sample input name must be a non-empty string, got {name!r}")
+        text = name.strip()
+        if text in feeds:
+            raise ValueError(f"sample input {text!r} is duplicated")
+        _as_signal(value, text)
+        feeds[text] = value
+    return feeds
+
+
+def _original_model_file(output_dir: str, model_info: dict) -> str:
+    """Resolve model_info original_model to a file. A directory raises."""
+    raw = model_info.get("original_model")
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError(
+            f"model_info original_model must be a non-empty string, got {raw!r}"
+        )
+    raw = raw.strip()
+    if os.path.isabs(raw):
+        candidates = [raw]
+    else:
+        parent = os.path.dirname(os.path.abspath(output_dir))
+        candidates = [os.path.join(output_dir, raw), os.path.join(parent, raw), raw]
+    for path in candidates:
+        if os.path.isdir(path):
+            raise ValueError(f"original model must be a file, got a directory {path}")
+        if os.path.isfile(path):
+            return path
+    raise FileNotFoundError(f"original model not found: {raw}")
+
+
+def _ort_session(model):
+    """CPU session for a model path or an in-memory ONNX model."""
+    try:
+        import onnxruntime as ort
+    except ImportError as exc:
+        raise ValueError("onnxruntime is required to verify merge PSNR") from exc
+    chosen = None
+    available = getattr(ort, "get_available_providers", lambda: [])()
+    if "CPUExecutionProvider" in available:
+        chosen = ["CPUExecutionProvider"]
+    if isinstance(model, str):
+        if chosen:
+            return ort.InferenceSession(model, providers=chosen)
+        return ort.InferenceSession(model)
+    serialize = getattr(model, "SerializeToString", None)
+    if not callable(serialize):
+        raise ValueError("merged model must be an ONNX model")
+    payload = serialize()
+    if not isinstance(payload, (bytes, bytearray)):
+        raise ValueError("merged model must serialize to bytes")
+    if chosen:
+        return ort.InferenceSession(payload, providers=chosen)
+    return ort.InferenceSession(payload)
+
+
+def _run_onnx_outputs(model, feeds: Dict[str, Any]) -> Dict[str, Any]:
+    """Run one model and return output name to array."""
+    session = _ort_session(model)
+    names: List[str] = []
+    for item in session.get_outputs():
+        name = getattr(item, "name", None)
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"model output name must be a non-empty string, got {name!r}")
+        text = name.strip()
+        if text in names:
+            raise ValueError(f"model output {text!r} is duplicated")
+        names.append(text)
+    if not names:
+        raise ValueError("model outputs must contain at least one value")
+    values = session.run(names, feeds)
+    if not isinstance(values, (list, tuple)) or len(values) != len(names):
+        raise ValueError("onnxruntime returned a different number of outputs")
+    return {name: value for name, value in zip(names, values)}
+
+
+def _worst_psnr(reference: Dict[str, Any], candidate: Dict[str, Any]) -> float:
+    """Lowest PSNR across named outputs. Disagreeing names raise."""
+    if set(reference) != set(candidate):
+        raise ValueError(
+            f"output names disagree: {sorted(reference)} and {sorted(candidate)}"
+        )
+    if not reference:
+        raise ValueError("model outputs must contain at least one value")
+    worst = None
+    for name in sorted(reference):
+        score = compute_psnr(reference[name], candidate[name])
+        if worst is None or score < worst:
+            worst = score
+    if worst is None:
+        raise ValueError("model outputs must contain at least one value")
+    return worst
+
+
+def merge_and_verify(
+    output_dir: str,
+    sample_inputs: Dict[str, Any],
+    save_path: Optional[str] = None,
+    min_psnr: float = 35.0,
+) -> OnnxMergeResult:
+    """
+    Merge components and verify numerical correctness.
+
+    The original model recorded in model_info and the merged graph both run
+    on ``sample_inputs``. ``compute_psnr`` compares each output. The lowest
+    score is kept. A result of at least ``min_psnr`` (35 dB) succeeds. A
+    result above 40 dB is production accuracy. An exact match is infinite.
+
+    Args:
+        output_dir: Directory containing component ONNX files.
+        sample_inputs: Named numeric arrays fed to both models.
+        save_path: Optional path to save the merged model.
+        min_psnr: Minimum PSNR in decibels. The default is 35.
+
+    Returns:
+        OnnxMergeResult with the PSNR. ``success`` is true when the score
+        meets ``min_psnr``.
+
+    Raises:
+        ValueError: If the feeds, the threshold, the original model path,
+            or the output names are unusable.
+        FileNotFoundError: If model_info.json or the original model is missing.
+    """
+    feeds = _require_sample_inputs(sample_inputs)
+    minimum = _real_number(min_psnr, "min_psnr")
+    merged_model = merge_onnx(output_dir, save_path)
+    model_info = _load_model_info(output_dir)
+    original_path = _original_model_file(output_dir, model_info)
+    original_outputs = _run_onnx_outputs(original_path, feeds)
+    merged_outputs = _run_onnx_outputs(merged_model, feeds)
+    psnr = _worst_psnr(original_outputs, merged_outputs)
+    passed = psnr >= minimum
+    error = None
+    if not passed:
+        _warn_psnr_failed(psnr, minimum)
+        shown = "infinite" if math.isinf(psnr) else f"{psnr:.6g}"
+        error = f"PSNR {shown} dB is below {minimum:g} dB"
+    saved = save_path if isinstance(save_path, str) and save_path.strip() else None
+    return OnnxMergeResult(
+        success=passed,
+        output_path=saved,
+        num_nodes=len(merged_model.graph.node),
+        num_initializers=len(merged_model.graph.initializer),
+        error=error,
+        psnr=psnr,
+    )
 
 
 def get_merge_info(output_dir: str) -> dict:
