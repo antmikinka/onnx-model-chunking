@@ -18,6 +18,16 @@ from chunking_utils.common.types import (
     _coerce_execution_plan,
 )
 
+from .graph_analysis import _boundary_graph, _value_info_map
+from .quantization import (
+    _attribute_map,
+    _node_input_names,
+    _optional_int_attr,
+    _packing_for_storage,
+    _quant_kind,
+    _quant_node_label,
+    _recorded_quant_dtype,
+)
 from .types import OnnxMergeResult
 
 
@@ -718,6 +728,236 @@ def validate_boundary_reconnection(components, model_info) -> Dict[str, Any]:
     return {"valid": len(unique) == 0, "errors": unique}
 
 
+_QUANT_METHODS = ("MatMulNBits", "AWQ", "GPTQ", "QLinearMatMul")
+_QUANT_COUNT_KEYS = _QUANT_METHODS + (
+    "DequantizeLinear",
+    "QuantizeLinear",
+    "DynamicQuantizeLinear",
+)
+
+
+def _quant_initializer_map(graph) -> Dict[str, Any]:
+    """Initializer name to tensor. A blank or repeated name raises."""
+    raw = getattr(graph, "initializer", None)
+    if raw is None:
+        return {}
+    if isinstance(raw, (str, bytes)):
+        raise ValueError(f"graph initializers must be a list, got {raw!r}")
+    try:
+        items = list(raw)
+    except TypeError as exc:
+        raise ValueError(f"graph initializers must be a list, got {raw!r}") from exc
+    found: Dict[str, Any] = {}
+    for initializer in items:
+        name = getattr(initializer, "name", None)
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(
+                f"initializer name must be a non-empty string, got {name!r}"
+            )
+        name = name.strip()
+        if name in found:
+            raise ValueError(f"initializer {name!r} is duplicated")
+        found[name] = initializer
+    return found
+
+
+def _remember_quant_tensor(name: str, names: List[str], present: List[str], initializers: Dict[str, Any]) -> None:
+    """Record a scale or zero-point input and whether its initializer survived."""
+    if not name:
+        return
+    names.append(name)
+    if name in initializers:
+        present.append(name)
+
+
+def count_quant_ops(model) -> Dict[str, Any]:
+    """
+    Count quantization ops and the tensors that keep them quantized.
+
+    MatMulNBits, AWQ, GPTQ, and QLinearMatMul contribute a scale, an optional
+    zero point, a packing format, bits, and a group size. DequantizeLinear is
+    counted so a float MatMul that replaced a packed weight is visible. Packing
+    comes from the weight initializer. A missing dtype stays unset.
+    """
+    graph, nodes = _boundary_graph(model)
+    info = _value_info_map(graph)
+    initializers = _quant_initializer_map(graph)
+    ops = {key: 0 for key in _QUANT_COUNT_KEYS}
+    scales: List[str] = []
+    zeros: List[str] = []
+    scale_initializers: List[str] = []
+    zero_initializers: List[str] = []
+    packings: List[str] = []
+    bit_values: List[int] = []
+    unset_bits = 0
+    group_values: List[int] = []
+    unset_groups = 0
+    for node in nodes:
+        op_type = getattr(node, "op_type", "")
+        if op_type is None:
+            op_type = ""
+        if not isinstance(op_type, str):
+            raise ValueError(f"node op_type must be a string, got {op_type!r}")
+        op_type = op_type.strip()
+        if op_type in ("DequantizeLinear", "QuantizeLinear", "DynamicQuantizeLinear"):
+            ops[op_type] += 1
+            if op_type == "DynamicQuantizeLinear":
+                continue
+            inputs = _node_input_names(node)
+            _remember_quant_tensor(_input_at_quant(inputs, 1), scales, scale_initializers, initializers)
+            _remember_quant_tensor(_input_at_quant(inputs, 2), zeros, zero_initializers, initializers)
+            continue
+        kind = _quant_kind(node)
+        if kind is None:
+            continue
+        label = _quant_node_label(node)
+        attrs = _attribute_map(node, label)
+        inputs = _node_input_names(node)
+        if kind == "QLinearMatMul":
+            weight = _input_at_quant(inputs, 3)
+            scale = _input_at_quant(inputs, 4)
+            zero = _input_at_quant(inputs, 5) or _input_at_quant(inputs, 2)
+        else:
+            weight = _input_at_quant(inputs, 1)
+            scale = _input_at_quant(inputs, 2)
+            zero = _input_at_quant(inputs, 3)
+            if _input_at_quant(inputs, 4) and kind != "AWQ":
+                kind = "GPTQ"
+        if kind not in ops:
+            raise ValueError(f"quantization op {kind} is unknown")
+        ops[kind] += 1
+        _remember_quant_tensor(scale, scales, scale_initializers, initializers)
+        _remember_quant_tensor(zero, zeros, zero_initializers, initializers)
+        bits = _optional_int_attr(attrs, label, "bits")
+        group_size = _optional_int_attr(attrs, label, "block_size", "group_size")
+        storage = _recorded_quant_dtype(weight, info, initializers) if weight else None
+        packing = _packing_for_storage(kind, bits, storage)
+        packings.append(packing if packing is not None else "unset")
+        if bits is None:
+            unset_bits += 1
+        else:
+            bit_values.append(bits)
+        if group_size is None:
+            unset_groups += 1
+        else:
+            group_values.append(group_size)
+    return {
+        "ops": ops,
+        "scale_tensors": sorted(scales),
+        "zero_point_tensors": sorted(zeros),
+        "scale_initializers": sorted(scale_initializers),
+        "zero_point_initializers": sorted(zero_initializers),
+        "packing_formats": sorted(packings),
+        "bits": sorted(bit_values),
+        "unset_bits": unset_bits,
+        "group_sizes": sorted(group_values),
+        "unset_groups": unset_groups,
+    }
+
+
+def _input_at_quant(names: List[str], index: int) -> str:
+    if index < 0 or index >= len(names):
+        return ""
+    return names[index]
+
+
+def verify_quantization_coherence(original_model, merged_model) -> Dict[str, Any]:
+    """
+    Verify quantization ops survived split/merge.
+
+    Scale tensors, zero-point tensors, and packing formats are part of the
+    count. A DequantizeLinear that was not in the original model means the
+    packed weights were expanded. ``coherent`` is true when both counts match.
+
+    Returns:
+        The original count, the merged count, and whether they match.
+
+    Raises:
+        ValueError: If either graph, a quant attribute, or an initializer is unusable.
+    """
+    original_quant_ops = count_quant_ops(original_model)
+    merged_quant_ops = count_quant_ops(merged_model)
+    return {
+        "original": original_quant_ops,
+        "merged": merged_quant_ops,
+        "coherent": original_quant_ops == merged_quant_ops,
+    }
+
+
+def _check_saved_quantization(merged_model, quantization_info) -> None:
+    """Raise when the merged graph drops the quantization contract saved at split."""
+    if quantization_info is None:
+        return
+    if not isinstance(quantization_info, dict):
+        raise ValueError(
+            f"quantization_info must be a dict, got {quantization_info!r}"
+        )
+    counted = count_quant_ops(merged_model)
+    method = quantization_info.get("method")
+    if method is None:
+        for name in _QUANT_METHODS:
+            if counted["ops"][name]:
+                raise ValueError(
+                    f"quantization coherence failed: merged graph has {name}"
+                )
+        if counted["ops"]["DequantizeLinear"]:
+            raise ValueError(
+                "quantization coherence failed: merged graph has DequantizeLinear"
+            )
+        return
+    if not isinstance(method, str) or method not in _QUANT_METHODS:
+        raise ValueError(
+            f"quantization_info method must be a quantization op, got {method!r}"
+        )
+    if counted["ops"][method] == 0:
+        raise ValueError(
+            f"quantization coherence failed: quantization_info records {method} "
+            "but the merged graph has none"
+        )
+    if method != "QLinearMatMul" and counted["ops"]["DequantizeLinear"]:
+        raise ValueError(
+            "quantization coherence failed: merged graph has DequantizeLinear"
+        )
+    if not counted["scale_tensors"] or not counted["scale_initializers"]:
+        raise ValueError("quantization coherence failed: scale tensors are missing")
+    has_zero_point = quantization_info.get("has_zero_point")
+    if has_zero_point is not None and not isinstance(has_zero_point, bool):
+        raise ValueError(
+            f"quantization_info has_zero_point must be a bool, got {has_zero_point!r}"
+        )
+    if has_zero_point is True and not counted["zero_point_initializers"]:
+        raise ValueError("quantization coherence failed: zero-point tensors are missing")
+    if has_zero_point is False and counted["zero_point_tensors"]:
+        raise ValueError("quantization coherence failed: unexpected zero-point tensors")
+    packing = quantization_info.get("packing_format")
+    if isinstance(packing, str) and packing.strip():
+        packing = packing.strip()
+        if any(item != packing for item in counted["packing_formats"]):
+            raise ValueError(
+                "quantization coherence failed: packing "
+                f"{counted['packing_formats']} does not match {packing}"
+            )
+    bits = quantization_info.get("bits")
+    if bits is not None:
+        if isinstance(bits, bool) or not isinstance(bits, int):
+            raise ValueError(f"quantization_info bits must be an integer, got {bits!r}")
+        if counted["unset_bits"] or any(item != bits for item in counted["bits"]):
+            raise ValueError(
+                f"quantization coherence failed: bits {counted['bits']} do not match {bits}"
+            )
+    group_size = quantization_info.get("group_size")
+    if group_size is not None:
+        if isinstance(group_size, bool) or not isinstance(group_size, int):
+            raise ValueError(
+                f"quantization_info group_size must be an integer, got {group_size!r}"
+            )
+        if counted["unset_groups"] or any(item != group_size for item in counted["group_sizes"]):
+            raise ValueError(
+                "quantization coherence failed: group size "
+                f"{counted['group_sizes']} does not match {group_size}"
+            )
+
+
 def _plan_from_value(execution_plan) -> ExecutionPlan:
     """Copy an ExecutionPlan, or build one from a dict. Other types raise."""
     if isinstance(execution_plan, ExecutionPlan):
@@ -773,7 +1013,9 @@ def merge_onnx(
             and lm_head. other is inserted where its inputs are produced.
             Loaded components are checked with validate_boundary_reconnection
             before the graph is built. A renamed boundary, a dtype mismatch,
-            or a shape mismatch raises.
+            or a shape mismatch raises. When model_info records
+            quantization_info, the merged graph must still contain that
+            op, its scale and zero-point tensors, and its packing format.
 
     Returns:
         Merged ONNX ModelProto.
@@ -893,6 +1135,8 @@ def merge_onnx(
 
     if ir_version:
         merged_model.ir_version = ir_version
+
+    _check_saved_quantization(merged_model, model_info.get("quantization_info"))
 
     print(f"  Merged model: {len(all_nodes)} nodes, {len(all_initializers)} initializers")
 

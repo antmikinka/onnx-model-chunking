@@ -13632,6 +13632,348 @@ def test_boundary_reconnection():
     return True
 
 
+def test_quantization_coherence():
+    """Scale, zero-point, and packing metadata stay intact across split and merge."""
+    print("=" * 50)
+    print("Testing quantization coherence...")
+    print("=" * 50)
+
+    import inspect
+    import json
+    import os
+    import sys
+    import tempfile
+    import types
+
+    try:
+        import chunking_utils.onnx.merger as merger
+    except ModuleNotFoundError:
+        for name in list(sys.modules):
+            if name == "chunking_utils.onnx" or name.startswith("chunking_utils.onnx."):
+                del sys.modules[name]
+        onnx_stub = types.ModuleType("onnx")
+        onnx_stub.ModelProto = type("ModelProto", (), {})
+        onnx_stub.numpy_helper = types.SimpleNamespace()
+        onnx_stub.helper = types.SimpleNamespace()
+        onnx_stub.TensorProto = types.SimpleNamespace()
+        onnx_stub.shape_inference = types.SimpleNamespace()
+        sys.modules["onnx"] = onnx_stub
+        import chunking_utils.onnx.merger as merger
+
+    assert list(inspect.signature(merger.merge_onnx).parameters) == [
+        "output_dir",
+        "save_path",
+        "execution_plan",
+    ]
+
+    def attr(name, value):
+        return types.SimpleNamespace(name=name, type=2, i=value)
+
+    def init(name, dtype):
+        return types.SimpleNamespace(name=name, data_type=dtype)
+
+    def quant_node(op_type, inputs, attributes=None):
+        return types.SimpleNamespace(
+            op_type=op_type,
+            name=op_type if isinstance(op_type, str) else "quant",
+            input=list(inputs),
+            attribute=[] if attributes is None else list(attributes),
+        )
+
+    def quant_model(op_type="MatMulNBits", inputs=None, attributes=None, initializers=None):
+        if inputs is None:
+            inputs = ["a", "w", "s", "z"]
+        if attributes is None:
+            attributes = [attr("bits", 4), attr("block_size", 32)]
+        if initializers is None:
+            initializers = [init("w", 2), init("s", 10), init("z", 2)]
+        return types.SimpleNamespace(
+            graph=types.SimpleNamespace(
+                name="quant_graph",
+                node=[quant_node(op_type, inputs, attributes)],
+                initializer=list(initializers),
+                input=[],
+                output=[],
+                value_info=[],
+            ),
+            opset_import=[],
+            ir_version=8,
+        )
+
+    original = quant_model()
+    report = merger.verify_quantization_coherence(original, quant_model())
+    assert report["coherent"] is True
+    assert report["original"] == report["merged"]
+    assert report["original"]["ops"]["MatMulNBits"] == 1
+    assert report["original"]["ops"]["DequantizeLinear"] == 0
+    assert report["original"]["scale_tensors"] == ["s"]
+    assert report["original"]["zero_point_tensors"] == ["z"]
+    assert report["original"]["scale_initializers"] == ["s"]
+    assert report["original"]["zero_point_initializers"] == ["z"]
+    assert report["original"]["packing_formats"] == ["packed_uint8"]
+    assert report["original"]["bits"] == [4]
+    assert report["original"]["group_sizes"] == [32]
+    assert report["original"]["unset_bits"] == 0
+
+    dropped_scale = quant_model(inputs=["a", "w", "", "z"])
+    dropped = merger.verify_quantization_coherence(original, dropped_scale)
+    assert dropped["coherent"] is False
+    assert dropped["merged"]["scale_tensors"] == []
+
+    missing_scale = quant_model(initializers=[init("w", 2), init("z", 2)])
+    missing = merger.verify_quantization_coherence(original, missing_scale)
+    assert missing["coherent"] is False
+    assert missing["merged"]["scale_tensors"] == ["s"]
+    assert missing["merged"]["scale_initializers"] == []
+
+    dropped_zero = quant_model(inputs=["a", "w", "s"])
+    no_zero = merger.verify_quantization_coherence(original, dropped_zero)
+    assert no_zero["coherent"] is False
+    assert no_zero["merged"]["zero_point_tensors"] == []
+
+    packed_int = quant_model(initializers=[init("w", 6), init("s", 10), init("z", 2)])
+    repacked = merger.verify_quantization_coherence(original, packed_int)
+    assert repacked["coherent"] is False
+    assert repacked["merged"]["packing_formats"] == ["packed_int32"]
+
+    wider = quant_model(attributes=[attr("bits", 8), attr("block_size", 32)])
+    wider_report = merger.verify_quantization_coherence(original, wider)
+    assert wider_report["coherent"] is False
+    assert wider_report["merged"]["bits"] == [8]
+    assert wider_report["merged"]["packing_formats"] == ["dense"]
+
+    dequantized = types.SimpleNamespace(
+        graph=types.SimpleNamespace(
+            name="dequant_graph",
+            node=[
+                quant_node("DequantizeLinear", ["w", "s", "z"]),
+                quant_node("MatMul", ["a", "w_f"]),
+            ],
+            initializer=[init("w", 2), init("s", 10), init("z", 2)],
+            input=[],
+            output=[],
+            value_info=[],
+        )
+    )
+    expanded = merger.verify_quantization_coherence(original, dequantized)
+    assert expanded["coherent"] is False
+    assert expanded["merged"]["ops"]["MatMulNBits"] == 0
+    assert expanded["merged"]["ops"]["DequantizeLinear"] == 1
+    assert expanded["original"]["ops"]["DequantizeLinear"] == 0
+
+    dense = types.SimpleNamespace(
+        graph=types.SimpleNamespace(
+            name="dense_graph",
+            node=[quant_node("MatMul", ["a", "b"])],
+            initializer=[],
+            input=[],
+            output=[],
+        )
+    )
+    dense_report = merger.verify_quantization_coherence(dense, dense)
+    assert dense_report["coherent"] is True
+    assert dense_report["original"]["ops"]["MatMulNBits"] == 0
+    assert dense_report["original"]["scale_tensors"] == []
+    assert dense_report["original"]["packing_formats"] == []
+
+    qlinear = quant_model(
+        op_type="QLinearMatMul",
+        inputs=["a", "a_s", "a_z", "w", "s", "z"],
+        attributes=[attr("bits", 8)],
+    )
+    qdq = merger.verify_quantization_coherence(qlinear, quant_model(
+        op_type="QLinearMatMul",
+        inputs=["a", "a_s", "a_z", "w", "s", "z"],
+        attributes=[attr("bits", 8)],
+    ))
+    assert qdq["coherent"] is True
+    assert qdq["original"]["ops"]["QLinearMatMul"] == 1
+    assert qdq["original"]["packing_formats"] == ["qdq"]
+
+    try:
+        merger.verify_quantization_coherence("original", original)
+        raise AssertionError("a string model was counted")
+    except ValueError as exc:
+        assert "graph" in str(exc)
+
+    duplicated = quant_model(initializers=[init("w", 2), init("s", 10), init("s", 10)])
+    try:
+        merger.count_quant_ops(duplicated)
+        raise AssertionError("a duplicated initializer was accepted")
+    except ValueError as exc:
+        assert "duplicated" in str(exc)
+
+    blank_name = quant_model(initializers=[init("  ", 2)])
+    try:
+        merger.count_quant_ops(blank_name)
+        raise AssertionError("a blank initializer name was accepted")
+    except ValueError as exc:
+        assert "initializer name" in str(exc)
+
+    bad_op = quant_model()
+    bad_op.graph.node[0].op_type = 4
+    try:
+        merger.count_quant_ops(bad_op)
+        raise AssertionError("a non-string op_type was accepted")
+    except ValueError as exc:
+        assert "op_type" in str(exc)
+
+    captured = {}
+    state = {"model": quant_model()}
+
+    def fake_load(filepath, load_external_data=True):
+        return state["model"]
+
+    def make_graph(nodes, name, inputs, outputs, initializer):
+        captured["built"] = True
+        return types.SimpleNamespace(
+            node=list(nodes),
+            name=name,
+            input=list(inputs),
+            output=list(outputs),
+            initializer=list(initializer),
+            value_info=[],
+        )
+
+    def make_model(graph, producer_name, opset_imports):
+        return types.SimpleNamespace(graph=graph, producer_name=producer_name, ir_version=None)
+
+    if not hasattr(merger.onnx, "load"):
+        merger.onnx.load = None
+    if not hasattr(merger.onnx, "save"):
+        merger.onnx.save = None
+    original_load = merger.onnx.load
+    original_helper = merger.helper
+    merger.onnx.load = fake_load
+    merger.helper = types.SimpleNamespace(make_graph=make_graph, make_model=make_model)
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            payload = {
+                "num_layers": 0,
+                "components": {"embedding": {"file": "embedding.onnx"}},
+                "quantization_info": {
+                    "method": "MatMulNBits",
+                    "has_zero_point": True,
+                    "packing_format": "packed_uint8",
+                    "bits": 4,
+                    "group_size": 32,
+                },
+            }
+            info_path = os.path.join(directory, "model_info.json")
+            with open(info_path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle)
+            with open(os.path.join(directory, "embedding.onnx"), "w", encoding="utf-8") as handle:
+                handle.write("onnx")
+
+            state["model"] = types.SimpleNamespace(
+                graph=types.SimpleNamespace(
+                    name="empty_graph",
+                    node=[],
+                    initializer=[],
+                    input=[],
+                    output=[],
+                ),
+                opset_import=[],
+                ir_version=8,
+            )
+            try:
+                merger.merge_onnx(directory)
+                raise AssertionError("a merge without MatMulNBits was accepted")
+            except ValueError as exc:
+                assert "quantization coherence failed" in str(exc)
+                assert "has none" in str(exc)
+            assert captured.get("built") is True
+
+            result = merger.merge_onnx_with_result(directory)
+            assert result.success is False
+            assert "quantization" in result.error
+
+            payload["quantization_info"] = "MatMulNBits"
+            with open(info_path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle)
+            try:
+                merger.merge_onnx(directory)
+                raise AssertionError("a string quantization_info was accepted")
+            except ValueError as exc:
+                assert "quantization_info must be a dict" in str(exc)
+
+            state["model"] = quant_model()
+            payload["quantization_info"] = {
+                "method": "MatMulNBits",
+                "has_zero_point": True,
+                "packing_format": "packed_uint8",
+                "bits": 4,
+                "group_size": 32,
+            }
+            with open(info_path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle)
+            captured.clear()
+            merged = merger.merge_onnx(directory)
+            assert captured.get("built") is True
+            assert merged.producer_name == "chunking_utils_merged"
+            checked = merger.verify_quantization_coherence(state["model"], merged)
+            assert checked["coherent"] is True
+
+            payload["quantization_info"] = {"method": None}
+            with open(info_path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle)
+            try:
+                merger.merge_onnx(directory)
+                raise AssertionError("MatMulNBits survived a dense contract")
+            except ValueError as exc:
+                assert "quantization coherence failed" in str(exc)
+                assert "MatMulNBits" in str(exc)
+
+            payload["quantization_info"] = {
+                "method": "MatMulNBits",
+                "packing_format": "packed_int32",
+                "bits": 4,
+                "group_size": 32,
+                "has_zero_point": True,
+            }
+            with open(info_path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle)
+            try:
+                merger.merge_onnx(directory)
+                raise AssertionError("a packing change was accepted")
+            except ValueError as exc:
+                assert "quantization coherence failed" in str(exc)
+                assert "packing" in str(exc)
+
+            both = quant_model()
+            both.graph.node.append(quant_node("DequantizeLinear", ["w", "s", "z"]))
+            state["model"] = both
+            payload["quantization_info"] = {
+                "method": "MatMulNBits",
+                "has_zero_point": True,
+                "packing_format": "packed_uint8",
+                "bits": 4,
+                "group_size": 32,
+            }
+            with open(info_path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle)
+            try:
+                merger.merge_onnx(directory)
+                raise AssertionError("a dequantized MatMul was accepted")
+            except ValueError as exc:
+                assert "quantization coherence failed" in str(exc)
+                assert "DequantizeLinear" in str(exc)
+
+            del payload["quantization_info"]
+            with open(info_path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle)
+            state["model"] = quant_model()
+            skipped = merger.merge_onnx(directory)
+            assert skipped.producer_name == "chunking_utils_merged"
+    finally:
+        merger.onnx.load = original_load
+        merger.helper = original_helper
+
+    print("quantization coherence: OK")
+    print("  a dropped scale, a dropped zero point, a packing change, and a dequantized MatMul are not coherent")
+    return True
+
+
 def test_path_manager():
     """ONNX discovery, external data, split directories, and NPU cache paths."""
     print("=" * 50)
@@ -14026,6 +14368,12 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"boundary_reconnection: FAILED - {e}")
         results.append(("boundary_reconnection", False))
+
+    try:
+        results.append(("quantization_coherence", test_quantization_coherence()))
+    except Exception as e:
+        print(f"quantization_coherence: FAILED - {e}")
+        results.append(("quantization_coherence", False))
 
     try:
         results.append(("path_manager", test_path_manager()))
