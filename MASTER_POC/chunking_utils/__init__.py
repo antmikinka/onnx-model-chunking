@@ -136,6 +136,7 @@ _LAZY_EXPORTS = {
     "create_component_onnx": (".onnx", "create_component_onnx"),
     "collect_boundary_tensors": (".onnx", "collect_boundary_tensors"),
     "resolve_tensor_type": (".onnx", "resolve_tensor_type"),
+    "extract_quantization_info": (".onnx", "extract_quantization_info"),
     "detect_architecture_from_onnx": (".onnx", "detect_architecture_from_onnx"),
     "ComponentInfo": (".onnx", "ComponentInfo"),
     "OnnxSplitResult": (".onnx", "OnnxSplitResult"),
@@ -302,6 +303,7 @@ __all__ = [
     "create_component_onnx",
     "collect_boundary_tensors",
     "resolve_tensor_type",
+    "extract_quantization_info",
     "detect_architecture_from_onnx",
     "infer_onnx",
     

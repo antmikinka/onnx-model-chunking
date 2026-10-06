@@ -10474,6 +10474,385 @@ def test_dtype_resolution():
     return True
 
 
+def test_quantization_metadata():
+    """Quantization metadata is read from the graph and saved in model_info."""
+    print("=" * 50)
+    print("Testing quantization metadata...")
+    print("=" * 50)
+
+    import json
+    import os
+    import sys
+    import tempfile
+    import types
+    import warnings
+    import chunking_utils
+
+    try:
+        from chunking_utils.onnx.splitter import extract_quantization_info
+        import chunking_utils.onnx.splitter as splitter
+    except ModuleNotFoundError:
+        for name in list(sys.modules):
+            if name == "chunking_utils.onnx" or name.startswith("chunking_utils.onnx."):
+                del sys.modules[name]
+        onnx_stub = types.ModuleType("onnx")
+        onnx_stub.ModelProto = type("ModelProto", (), {})
+        onnx_stub.numpy_helper = types.SimpleNamespace()
+        onnx_stub.helper = types.SimpleNamespace()
+        onnx_stub.TensorProto = types.SimpleNamespace()
+        onnx_stub.shape_inference = types.SimpleNamespace()
+        sys.modules["onnx"] = onnx_stub
+        from chunking_utils.onnx.splitter import extract_quantization_info
+        import chunking_utils.onnx.splitter as splitter
+
+    from chunking_utils.onnx.types import ComponentInfo
+
+    assert chunking_utils.extract_quantization_info is extract_quantization_info
+
+    class _Attr:
+        def __init__(self, name, value, type_code=2):
+            self.name = name
+            self.type = type_code
+            self.i = value
+
+    class _Dim:
+        def __init__(self, value):
+            self.dim_value = value
+            self.dim_param = ""
+
+    class _Value:
+        def __init__(self, name, elem, dims):
+            shape = None if dims is None else types.SimpleNamespace(
+                dim=[_Dim(dim) for dim in dims]
+            )
+            self.name = name
+            self.type = types.SimpleNamespace(
+                tensor_type=types.SimpleNamespace(elem_type=elem, shape=shape)
+            )
+
+    class _Init:
+        def __init__(self, name, data_type, dims):
+            self.name = name
+            self.data_type = data_type
+            self.dims = dims
+
+    class _Node:
+        def __init__(self, name, op_type, inputs, attributes=()):
+            self.name = name
+            self.op_type = op_type
+            self.domain = "com.microsoft"
+            self.input = list(inputs)
+            self.attribute = list(attributes)
+
+    class _Graph:
+        def __init__(self, nodes, inputs=(), initializers=(), value_info=()):
+            self.node = list(nodes)
+            self.input = list(inputs)
+            self.initializer = list(initializers)
+            self.output = []
+            self.value_info = list(value_info)
+
+    def _nbits(name="q_proj", bits=4, block=32, inputs=None, op="MatMulNBits"):
+        if inputs is None:
+            inputs = ["hidden", "q_weight", "q_scale", "q_zp"]
+        attributes = []
+        if bits is not None:
+            attributes.append(_Attr("bits", bits))
+        if block is not None:
+            attributes.append(_Attr("block_size", block))
+        return _Node(name, op, inputs, attributes)
+
+    def _quiet(graph):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            info = extract_quantization_info(graph)
+        return info, caught
+
+    values = [
+        _Value("hidden", 10, [1, 8]),
+        _Value("q_weight", 2, [8, 4, 16]),
+        _Value("q_scale", 10, [8, 4]),
+        _Value("q_zp", 2, [8, 4]),
+    ]
+    second = _nbits("k_proj", block=None)
+    second.attribute.append(_Attr("group_size", 32))
+    info, caught = _quiet(_Graph([_nbits(), second], value_info=values))
+    assert caught == []
+    assert info == {
+        "method": "MatMulNBits",
+        "weight_dtype": "int4",
+        "activation_dtype": "float16",
+        "group_size": 32,
+        "has_zero_point": True,
+        "packing_format": "packed_uint8",
+        "bits": 4,
+        "scale_dtype": "float16",
+        "zero_point_dtype": "uint8",
+    }
+    info["group_size"] = 1
+    again, _ = _quiet(_Graph([_nbits()], value_info=values))
+    assert again["group_size"] == 32
+    assert again is not info
+    json.dumps(again)
+
+    dense, caught = _quiet(_Graph([_Node("proj", "MatMul", ["hidden"])]))
+    assert dense["method"] is None
+    assert dense["weight_dtype"] is None
+    assert dense["activation_dtype"] is None
+    assert dense["group_size"] is None
+    assert dense["has_zero_point"] is False
+    assert dense["packing_format"] is None
+    assert dense["bits"] is None
+    assert dense["scale_dtype"] is None
+    assert dense["zero_point_dtype"] is None
+    assert caught == []
+    other_dense, _ = _quiet(types.SimpleNamespace(node=[_Node("proj", "MatMul", ["hidden"])]))
+    assert other_dense is not dense
+    dense["method"] = "MatMulNBits"
+    assert other_dense["method"] is None
+
+    gptq, caught = _quiet(_Graph([
+        _nbits("q_proj", inputs=["hidden", "q_weight", "q_scale", "", "g_idx"]),
+    ], value_info=values))
+    assert caught == []
+    assert gptq["method"] == "GPTQ"
+    assert gptq["has_zero_point"] is False
+    assert gptq["zero_point_dtype"] is None
+    assert gptq["packing_format"] == "packed_uint8"
+    assert gptq["group_size"] == 32
+
+    awq, caught = _quiet(_Graph([
+        _nbits("gate_awq", op="AWQMatMul"),
+    ], value_info=values))
+    assert caught == []
+    assert awq["method"] == "AWQ"
+    assert awq["weight_dtype"] == "int4"
+    assert awq["packing_format"] == "packed_uint8"
+    named, _ = _quiet(_Graph([_nbits("layers.0.awq.q_proj")], value_info=values))
+    assert named["method"] == "AWQ"
+
+    qvalues = [
+        _Value("hidden", 2, [1, 8]),
+        _Value("b_weight", 3, [8, 8]),
+        _Value("b_scale", 1, [1]),
+        _Value("b_zp", 3, [1]),
+    ]
+    qlinear, caught = _quiet(_Graph([
+        _Node(
+            "down",
+            "QLinearMatMul",
+            ["hidden", "a_scale", "a_zp", "b_weight", "b_scale", "b_zp"],
+            [_Attr("bits", 8)],
+        ),
+    ], value_info=qvalues))
+    assert caught == []
+    assert qlinear["method"] == "QLinearMatMul"
+    assert qlinear["bits"] == 8
+    assert qlinear["weight_dtype"] == "int8"
+    assert qlinear["activation_dtype"] == "uint8"
+    assert qlinear["group_size"] is None
+    assert qlinear["has_zero_point"] is True
+    assert qlinear["packing_format"] == "qdq"
+    assert qlinear["scale_dtype"] == "float32"
+    assert qlinear["zero_point_dtype"] == "int8"
+
+    bare, caught = _quiet(_Graph([
+        _Node("q_proj", "MatMulNBits", ["attention_mask", "", "", ""]),
+    ]))
+    assert bare["method"] == "MatMulNBits"
+    assert bare["bits"] == 4
+    assert bare["weight_dtype"] == "int4"
+    assert bare["activation_dtype"] == "float16"
+    assert bare["group_size"] == 128
+    assert bare["packing_format"] == "packed_uint8"
+    assert bare["has_zero_point"] is False
+    messages = [str(item.message) for item in caught]
+    assert all(issubclass(item.category, UserWarning) for item in caught)
+    assert any("default bits 4" in message for message in messages)
+    assert any("default group_size 128" in message for message in messages)
+    assert any("default activation_dtype float16" in message for message in messages)
+    assert any("default packing_format packed_uint8" in message for message in messages)
+    assert all("heuristic" not in message for message in messages)
+    assert bare["activation_dtype"] != "int64"
+
+    shaped = _nbits(block=None)
+    inferred, caught = _quiet(_Graph([shaped], value_info=values))
+    assert inferred["group_size"] == 32
+    assert all("group_size" not in str(item.message) for item in caught)
+
+    from_k = _nbits(block=None)
+    from_k.attribute.append(_Attr("K", 128))
+    k_values = [
+        _Value("hidden", 10, [1, 8]),
+        _Value("q_weight", 2, [8, 16]),
+        _Value("q_scale", 10, [8, 4]),
+        _Value("q_zp", 2, [8, 4]),
+    ]
+    k_info, caught = _quiet(_Graph([from_k], value_info=k_values))
+    assert k_info["group_size"] == 32
+    assert caught == []
+
+    init_values = [
+        _Value("hidden", 1, [1, 4]),
+        _Value("q_weight", 6, [8, 4, 16]),
+        _Value("q_zp", 2, [8, 4]),
+    ]
+    stored, caught = _quiet(_Graph(
+        [_nbits()],
+        value_info=init_values,
+        initializers=[
+            _Init("hidden", 10, [1, 4]),
+            _Init("q_scale", 10, [8, 4]),
+        ],
+    ))
+    assert caught == []
+    assert stored["activation_dtype"] == "float32"
+    assert stored["scale_dtype"] == "float16"
+    assert stored["packing_format"] == "packed_int32"
+    assert stored["weight_dtype"] == "int4"
+
+    try:
+        extract_quantization_info(_Graph([
+            _nbits(block=32),
+            _nbits("other", block=128),
+        ], value_info=values))
+        raise AssertionError("disagreeing group sizes were accepted")
+    except ValueError as exc:
+        assert "group_size" in str(exc)
+        assert "32" in str(exc) and "128" in str(exc)
+    try:
+        extract_quantization_info(None)
+        raise AssertionError("a missing graph was accepted")
+    except ValueError as exc:
+        assert "graph" in str(exc)
+    try:
+        bad_bits = _nbits()
+        bad_bits.attribute = [_Attr("bits", True)]
+        extract_quantization_info(_Graph([bad_bits], value_info=values))
+        raise AssertionError("a bool bits attribute was accepted")
+    except ValueError as exc:
+        assert "bits" in str(exc)
+    try:
+        extract_quantization_info(_Graph([_nbits(bits=7)], value_info=values))
+        raise AssertionError("a 7-bit weight was accepted")
+    except ValueError as exc:
+        assert "bits" in str(exc)
+    try:
+        extract_quantization_info(_Graph([_nbits(block=0)], value_info=values))
+        raise AssertionError("a zero group size was accepted")
+    except ValueError as exc:
+        assert "group_size" in str(exc)
+    try:
+        extract_quantization_info(_Graph([_nbits(block=3)], value_info=values))
+        raise AssertionError("a group that does not fill a byte was accepted")
+    except ValueError as exc:
+        assert "bytes" in str(exc)
+    try:
+        broken = _nbits()
+        broken.attribute = "bits"
+        extract_quantization_info(_Graph([broken]))
+        raise AssertionError("a string attribute list was accepted")
+    except ValueError as exc:
+        assert "list" in str(exc)
+
+    class _SplitModel:
+        def __init__(self, graph):
+            self.graph = graph
+            self.ir_version = 8
+            self.producer_name = "test"
+
+    split_graph = _Graph(
+        [_nbits("/model/layers.0/self_attn/q_proj/MatMulNBits")],
+        value_info=values,
+    )
+    original_load = splitter.load_onnx_model
+    original_extract = splitter.extract_components
+    original_create = splitter.create_component_onnx
+    original_boundaries = splitter.collect_boundary_tensors
+    original_save = getattr(splitter.onnx, "save", None)
+    original_infer = getattr(splitter.shape_inference, "infer_shapes", None)
+
+    def fake_load(path):
+        return _SplitModel(split_graph)
+
+    def fake_infer(model):
+        return model
+
+    def fake_extract(model, **kwargs):
+        return {
+            "layer_0": ComponentInfo(
+                component_type="layer",
+                layer_id=0,
+                node_indices=[0],
+            )
+        }
+
+    def fake_create(model, component, name):
+        return types.SimpleNamespace(
+            graph=types.SimpleNamespace(
+                input=[types.SimpleNamespace(name="hidden")],
+                output=[types.SimpleNamespace(name="hidden_out")],
+            )
+        )
+
+    def fake_boundaries(model, components):
+        return []
+
+    def fake_save(*args, **kwargs):
+        return None
+
+    splitter.load_onnx_model = fake_load
+    splitter.extract_components = fake_extract
+    splitter.create_component_onnx = fake_create
+    splitter.collect_boundary_tensors = fake_boundaries
+    splitter.onnx.save = fake_save
+    splitter.shape_inference.infer_shapes = fake_infer
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            model_path = os.path.join(directory, "model.onnx")
+            output_path = os.path.join(directory, "out")
+            os.makedirs(output_path)
+            with open(model_path, "w", encoding="utf-8") as handle:
+                handle.write("onnx")
+            result = splitter.split_onnx(
+                model=model_path,
+                output=output_path,
+                split_only=True,
+            )
+            info_path = os.path.join(result.output_dir, "model_info.json")
+            saved = json.load(open(info_path, encoding="utf-8"))
+            assert saved["quantization_info"]["method"] == "MatMulNBits"
+            assert saved["quantization_info"]["weight_dtype"] == "int4"
+            assert saved["quantization_info"]["activation_dtype"] == "float16"
+            assert saved["quantization_info"]["group_size"] == 32
+            assert saved["quantization_info"]["has_zero_point"] is True
+            assert saved["quantization_info"]["packing_format"] == "packed_uint8"
+            assert saved["quantization_info"]["bits"] == 4
+            assert saved["quantization_info"]["scale_dtype"] == "float16"
+            assert saved["quantization_info"]["zero_point_dtype"] == "uint8"
+            assert result.model_info["quantization_info"] == saved["quantization_info"]
+    finally:
+        splitter.load_onnx_model = original_load
+        splitter.extract_components = original_extract
+        splitter.create_component_onnx = original_create
+        splitter.collect_boundary_tensors = original_boundaries
+        if original_save is None:
+            del splitter.onnx.save
+        else:
+            splitter.onnx.save = original_save
+        if original_infer is None:
+            if hasattr(splitter.shape_inference, "infer_shapes"):
+                del splitter.shape_inference.infer_shapes
+        else:
+            splitter.shape_inference.infer_shapes = original_infer
+
+    print("quantization metadata: OK")
+    print("  matmul nbits: int4 group 32 packed uint8")
+    print("  formats: AWQ, GPTQ, scale and zero point")
+    print("  model_info: quantization_info saved")
+    return True
+
+
 def test_path_manager():
     """ONNX discovery, external data, split directories, and NPU cache paths."""
     print("=" * 50)
@@ -10814,6 +11193,12 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"dtype_resolution: FAILED - {e}")
         results.append(("dtype_resolution", False))
+
+    try:
+        results.append(("quantization_metadata", test_quantization_metadata()))
+    except Exception as e:
+        print(f"quantization_metadata: FAILED - {e}")
+        results.append(("quantization_metadata", False))
 
     try:
         results.append(("path_manager", test_path_manager()))
