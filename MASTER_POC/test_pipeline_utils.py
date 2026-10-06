@@ -1971,7 +1971,253 @@ def test_config_loader():
     # Test to_dict
     d = config.to_dict()
     print(f"  to_dict keys: {list(d.keys())}")
-    
+
+    import json
+    import os
+    import tempfile
+    import warnings
+
+    from pipeline_utils import load_model_config as exported_loader
+    assert exported_loader is load_model_config
+
+    def _write_json(directory, name, payload):
+        path = os.path.join(directory, name)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+        return path
+
+    def _encode_varint(number):
+        out = bytearray()
+        value = int(number)
+        while True:
+            byte = value & 0x7F
+            value >>= 7
+            if value:
+                out.append(byte | 0x80)
+            else:
+                out.append(byte)
+                return bytes(out)
+
+    def _proto_key(field, wire):
+        return _encode_varint((field << 3) | wire)
+
+    def _proto_int(field, number):
+        return _proto_key(field, 0) + _encode_varint(number)
+
+    def _proto_bytes(field, payload):
+        data = payload.encode() if isinstance(payload, str) else payload
+        return _proto_key(field, 2) + _encode_varint(len(data)) + data
+
+    def _write_past_key_onnx(path, shapes):
+        def dim(item):
+            if isinstance(item, int):
+                return _proto_bytes(1, _proto_int(1, item))
+            return _proto_bytes(1, _proto_bytes(2, item))
+
+        def value_info(name, dims):
+            shape = b"".join(dim(item) for item in dims)
+            tensor = _proto_int(1, 1) + _proto_bytes(2, shape)
+            return _proto_bytes(1, name) + _proto_bytes(2, _proto_bytes(1, tensor))
+
+        def node(op_type, inputs, outputs):
+            body = b"".join(_proto_bytes(1, item) for item in inputs)
+            body += b"".join(_proto_bytes(2, item) for item in outputs)
+            body += _proto_bytes(4, op_type)
+            return body
+
+        graph = _proto_bytes(2, "g")
+        for name, dims in shapes:
+            present = "present_" + name.replace(".", "_")
+            graph += _proto_bytes(1, node("Identity", [name], [present]))
+            graph += _proto_bytes(11, value_info(name, dims))
+            graph += _proto_bytes(12, value_info(present, dims))
+        model = _proto_int(1, 8) + _proto_bytes(7, graph) + _proto_bytes(8, _proto_int(2, 13))
+        with open(path, "wb") as handle:
+            handle.write(model)
+
+    with tempfile.TemporaryDirectory() as directory:
+        _write_json(directory, "genai_config.json", {
+            "model": {
+                "type": "llama",
+                "vocab_size": 10,
+                "decoder": {
+                    "num_hidden_layers": 3,
+                    "num_key_value_heads": 4,
+                    "head_size": 96,
+                    "hidden_size": 384,
+                    "num_attention_heads": 4,
+                },
+            },
+        })
+        genai = load_model_config(directory, require_all_fields=True)
+        assert genai.num_layers == 3
+        assert genai.num_kv_heads == 4
+        assert genai.head_dim == 96
+
+    with tempfile.TemporaryDirectory() as directory:
+        _write_json(directory, "config.json", {
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "hidden_size": 384,
+            "model_type": "llama",
+        })
+        hf = load_model_config(directory)
+        assert hf.num_kv_heads == 2
+        assert hf.head_dim == 96
+
+    with tempfile.TemporaryDirectory() as directory:
+        _write_json(directory, "model_info.json", {
+            "num_layers": 24,
+            "architecture": {"num_kv_heads": 4, "head_dim": 96, "hidden_size": 384},
+        })
+        with open(os.path.join(directory, "model.onnx"), "wb") as handle:
+            handle.write(b"not an onnx model")
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            explicit = load_model_config(directory, require_all_fields=True)
+        assert explicit.num_kv_heads == 4
+        assert explicit.head_dim == 96
+        assert not any("Could not read ONNX" in str(item.message) for item in caught)
+        assert not any("missing" in str(item.message) for item in caught)
+
+    with tempfile.TemporaryDirectory() as directory:
+        _write_json(directory, "model_info.json", {
+            "num_layers": 24,
+            "architecture": "llama",
+            "num_key_value_heads": 4,
+            "head_dim": 96,
+        })
+        named = load_model_config(directory, require_all_fields=True)
+        assert named.num_kv_heads == 4
+        assert named.head_dim == 96
+
+    with tempfile.TemporaryDirectory() as directory:
+        _write_json(directory, "model_info.json", {
+            "num_layers": 24,
+            "architecture": "llama",
+            "num_kv_heads": 4,
+            "hidden_size": 384,
+            "num_attention_heads": 4,
+        })
+        ratio = load_model_config(directory, require_all_fields=True)
+        assert ratio.num_kv_heads == 4
+        assert ratio.head_dim == 96
+
+    with tempfile.TemporaryDirectory() as directory:
+        _write_json(directory, "model_info.json", {
+            "num_layers": 24,
+            "architecture": "llama",
+        })
+        try:
+            load_model_config(directory, require_all_fields=True)
+            raise AssertionError("incomplete model_info should fail loudly")
+        except ValueError as exc:
+            message = str(exc)
+            assert "missing num_kv_heads, head_dim" in message
+            assert "Refusing defaults" in message
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            fallback = load_model_config(directory, require_all_fields=False)
+        assert fallback.num_kv_heads == 8
+        assert fallback.head_dim == 128
+        assert any("missing num_kv_heads, head_dim" in str(item.message) for item in caught)
+        assert any("require_all_fields=True" in str(item.message) for item in caught)
+
+    with tempfile.TemporaryDirectory() as directory:
+        _write_json(directory, "model_info.json", {
+            "num_layers": 24,
+            "architecture": {"num_kv_heads": 4, "head_dim": 96},
+        })
+        # head_dim is present; only a missing field may use the explicit default.
+        info = json.load(open(os.path.join(directory, "model_info.json"), encoding="utf-8"))
+        info["architecture"].pop("num_kv_heads")
+        _write_json(directory, "model_info.json", info)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            partial = load_model_config(directory)
+        assert partial.num_kv_heads == 8
+        assert partial.head_dim == 96
+        assert any("missing num_kv_heads" in str(item.message) for item in caught)
+        assert not any("missing num_kv_heads, head_dim" in str(item.message) for item in caught)
+        try:
+            load_model_config(directory, require_all_fields=True)
+            raise AssertionError("missing num_kv_heads should raise")
+        except ValueError as exc:
+            assert "missing num_kv_heads" in str(exc)
+            assert "missing num_kv_heads, head_dim" not in str(exc)
+
+    with tempfile.TemporaryDirectory() as directory:
+        _write_json(directory, "model_info.json", {
+            "num_layers": 2,
+            "architecture": {"num_kv_heads": 0, "head_dim": 96},
+        })
+        try:
+            load_model_config(directory)
+            raise AssertionError("explicit zero heads must not become 8")
+        except ValueError as exc:
+            assert "num_kv_heads must be positive" in str(exc)
+
+    with tempfile.TemporaryDirectory() as directory:
+        onnx_path = os.path.join(directory, "layer_0.onnx")
+        _write_past_key_onnx(onnx_path, [
+            ("past_key_values.0.key", [1, 4, "seq", 96]),
+            ("past_key_values.0.value", [1, 8, "seq", 32]),
+        ])
+        _write_json(directory, "model_info.json", {
+            "num_layers": 24,
+            "architecture": "llama",
+            "components": {"layer_0": {"file": "layer_0.onnx"}},
+        })
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            inferred = load_model_config(directory, require_all_fields=True)
+        assert inferred.num_kv_heads == 4
+        assert inferred.head_dim == 96
+        assert not any("Using explicit defaults" in str(item.message) for item in caught)
+
+        dynamic_path = os.path.join(directory, "layer_0.onnx")
+        _write_past_key_onnx(dynamic_path, [
+            ("past_key_values.0.key", [1, 4, "seq", "head_dim"]),
+        ])
+        try:
+            load_model_config(directory, require_all_fields=True)
+            raise AssertionError("a symbolic head_dim must not be invented")
+        except ValueError as exc:
+            assert "missing head_dim" in str(exc)
+            assert "missing num_kv_heads" not in str(exc)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            dynamic = load_model_config(directory)
+        assert dynamic.num_kv_heads == 4
+        assert dynamic.head_dim == 128
+
+        _write_past_key_onnx(onnx_path, [
+            ("past_key_values.0.key", [1, 4, "seq", 96]),
+            ("past_key_values.1.key", [1, 2, "seq", 96]),
+        ])
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            disagreed = load_model_config(directory, require_all_fields=True)
+        assert disagreed.num_kv_heads == 4
+        assert disagreed.head_dim == 96
+        assert any("disagrees" in str(item.message) for item in caught)
+
+    with tempfile.TemporaryDirectory() as directory:
+        _write_json(directory, "model_info.json", {
+            "num_layers": 2,
+            "architecture": "llama",
+            "components": {"layer_0": {"file": "layer_0.onnx"}},
+        })
+        with open(os.path.join(directory, "layer_0.onnx"), "wb") as handle:
+            handle.write(b"not onnx")
+        try:
+            load_model_config(directory, require_all_fields=True)
+            raise AssertionError("an unreadable graph must still fail loudly")
+        except ValueError as exc:
+            assert "missing num_kv_heads, head_dim" in str(exc)
+
+    print("  kv shape: refuse silent 8/128, infer 4 x 96 from ONNX")
     print("config_loader module: OK\n")
     return True
 
