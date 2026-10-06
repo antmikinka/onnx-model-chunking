@@ -54,25 +54,62 @@ from pipeline_utils import (
 class SequentialModelPipeline:
     """
     Inference pipeline that loads and unloads ONNX components sequentially.
-    
+
     Uses proper prefill/decode separation for efficient KV-cached inference.
     Supports both sequential (RAM-efficient) and persistent (NPU-optimized) modes.
+
+    Features:
+    - Per-component provider routing (hybrid dispatch)
+    - Phase-based provider selection (prefill vs decode)
+    - Session persistence for NPU optimization
+
+    Example usage with per-component routing:
+    ```python
+    pipeline = SequentialModelPipeline(
+        model_path="split_output",
+        component_providers={
+            "embedding": ["DmlExecutionProvider"],      # iGPU
+            "layer_*":   ["VitisAIExecutionProvider"],  # NPU
+            "norm":      ["CPUExecutionProvider"],      # CPU
+            "lm_head":   ["DmlExecutionProvider"],      # iGPU
+        }
+    )
+    ```
+
+    Example usage with phase-based routing:
+    ```python
+    pipeline = SequentialModelPipeline(
+        model_path="split_output",
+        phase_providers={
+            "prefill": ["VitisAIExecutionProvider"],  # NPU for compute-intensive
+            "decode": ["DmlExecutionProvider"],       # iGPU for memory-bandwidth
+        }
+    )
+    ```
     """
-    
+
     def __init__(
-        self, 
-        model_path: str,         tokenizer_path: Optional[str] = None, 
+        self,
+        model_path: str,
+        tokenizer_path: Optional[str] = None,
         providers: Optional[List[str]] = None,
+        component_providers: Optional[Dict[str, List[str]]] = None,
+        phase_providers: Optional[Dict[str, List[str]]] = None,
         verbose: bool = True,
         persist_sessions: bool = False
     ):
         """
         Initialize the pipeline.
-        
+
         Args:
             model_path: Directory containing split components OR path to monolithic .onnx file
             tokenizer_path: Optional path to the tokenizer
-            providers: List of execution providers
+            providers: List of execution providers (default for all components/phases)
+            component_providers: Optional dict mapping component patterns to providers.
+                Keys can be exact names ("embedding") or patterns ("layer_*").
+                Pattern matching: "layer_*" matches "layer_0", "layer_1", etc.
+            phase_providers: Optional dict mapping phase names to providers.
+                Keys: "prefill" (process full prompt) or "decode" (generate tokens)
             verbose: Enable verbose output
             persist_sessions: If True, keep sessions loaded (implied for Monolith)
         """
@@ -81,8 +118,14 @@ class SequentialModelPipeline:
         self.model_dir = os.path.dirname(model_path) if self.is_monolith else model_path
 
         self.providers = providers or ['CPUExecutionProvider']
+        self.component_providers = component_providers or {}
+        self.phase_providers = phase_providers or {}
         self.verbose = verbose
         self.persist_sessions = persist_sessions
+
+        # Phase tracking for phase-based dispatch
+        # "prefill" = processing full prompt, "decode" = generating tokens one at a time
+        self.phase: str = "prefill"
         # Load model info
         self.info_path = os.path.join(self.model_dir, "model_info.json")
         if self.is_monolith:
@@ -182,15 +225,99 @@ class SequentialModelPipeline:
         """Log message if verbose mode is enabled."""
         if self.verbose:
             print(msg)
+
+    def _get_component_providers(self, component_name: str) -> List[str]:
+        """
+        Get execution providers for a specific component.
+
+        Uses pattern matching to find the best provider configuration:
+        1. Exact match: "embedding" matches "embedding"
+        2. Wildcard match: "layer_*" matches "layer_0", "layer_1", etc.
+        3. Fallback: Returns self.providers if no pattern matches
+
+        Args:
+            component_name: Name of the component (e.g., "embedding", "layer_0")
+
+        Returns:
+            List of provider names for the component
+
+        Example:
+            >>> pipeline.component_providers = {
+            ...     "embedding": ["DmlExecutionProvider"],
+            ...     "layer_*": ["VitisAIExecutionProvider"]
+            ... }
+            >>> pipeline._get_component_providers("embedding")
+            ["DmlExecutionProvider"]
+            >>> pipeline._get_component_providers("layer_5")
+            ["VitisAIExecutionProvider"]
+            >>> pipeline._get_component_providers("norm")
+            ["CPUExecutionProvider"]  # fallback
+        """
+        # First try exact match
+        if component_name in self.component_providers:
+            return self.component_providers[component_name]
+
+        # Then try wildcard patterns
+        for pattern, providers in self.component_providers.items():
+            if pattern.endswith('*'):
+                prefix = pattern[:-1]
+                if component_name.startswith(prefix):
+                    return providers
+
+        # Fallback to default providers
+        return self.providers
+
+    def _get_current_providers(self) -> List[str]:
+        """
+        Get execution providers for the current phase.
+
+        Phase-based dispatch allows different providers for prefill vs decode:
+        - "prefill": Compute-intensive, benefits from NPU
+        - "decode": Memory-bandwidth-intensive, may benefit from iGPU
+
+        Returns:
+            List of provider names for current phase
+
+        Example:
+            >>> pipeline.phase_providers = {
+            ...     "prefill": ["VitisAIExecutionProvider"],
+            ...     "decode": ["DmlExecutionProvider"]
+            ... }
+            >>> pipeline.phase = "prefill"
+            >>> pipeline._get_current_providers()
+            ["VitisAIExecutionProvider"]
+        """
+        return self.phase_providers.get(self.phase, self.providers)
+
+    def _set_phase(self, phase: str) -> None:
+        """
+        Set the current inference phase.
+
+        Args:
+            phase: Either "prefill" (processing full prompt) or "decode" (generating tokens)
+
+        Raises:
+            ValueError: If phase is not "prefill" or "decode"
+        """
+        if phase not in ("prefill", "decode"):
+            raise ValueError(f"Invalid phase: {phase}. Must be 'prefill' or 'decode'")
+        self.phase = phase
+        self._log(f"  [Phase] Switched to '{phase}' mode")
         
     def load_component_session(self, component_name: str) -> Optional[ort.InferenceSession]:
         """
         Load the ONNX session for a specific component.
-        
+
         In persistent mode, returns pre-loaded session.
-        In sequential mode, loads from disk.
-        
+        In sequential mode, loads from disk with component-specific providers.
+
         Returns None if component/file missing.
+
+        Args:
+            component_name: Name of the component to load (e.g., "embedding", "layer_0")
+
+        Returns:
+            Loaded InferenceSession or None if failed
         """
         # Persistent mode: use SessionManager
         if self.session_manager is not None:
@@ -198,10 +325,10 @@ class SequentialModelPipeline:
             if session:
                 self._log(f"  [Pipeline] Using cached {component_name}")
             return session
-        
-        # Sequential mode: load from disk
+
+        # Sequential mode: load from disk with component-specific providers
         if self.is_monolith and component_name == "monolith":
-            filepath = self.model_path 
+            filepath = self.model_path
             filename = os.path.basename(filepath)
         else:
             comp_info = self.model_info["components"].get(component_name)
@@ -210,23 +337,43 @@ class SequentialModelPipeline:
                 return None
             filename = comp_info["file"]
             filepath = os.path.join(self.model_dir, filename)
-        
+
         if not os.path.exists(filepath):
             self._log(f"  Warning: Component file {filename} not found, skipping.")
             return None
 
         self._log(f"  [Pipeline] Loading {component_name} ({filename})...")
-        
+
+        # Get component-specific providers (P1.1: Per-component Provider Routing)
+        component_prov = self._get_component_providers(component_name)
+        self._log(f"  [Pipeline] Using providers: {component_prov}")
+
         # Create session options to handle dynamic shapes
         sess_options = ort.SessionOptions()
         sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
         sess_options.add_session_config_entry("session.disable_node_shape_check", "1")
-        
+
         try:
-            session = ort.InferenceSession(filepath, sess_options=sess_options, providers=self.providers)
+            session = ort.InferenceSession(
+                filepath,
+                sess_options=sess_options,
+                providers=component_prov  # Use component-specific providers
+            )
             return session
         except Exception as e:
-            self._log(f"  [Error] Failed to load session {filename} with providers {self.providers}: {e}")
+            self._log(f"  [Error] Failed to load session {filename} with providers {component_prov}: {e}")
+            # Try fallback to default providers
+            if component_prov != self.providers:
+                self._log(f"  [Fallback] Trying with default providers: {self.providers}")
+                try:
+                    session = ort.InferenceSession(
+                        filepath,
+                        sess_options=sess_options,
+                        providers=self.providers
+                    )
+                    return session
+                except Exception as e2:
+                    self._log(f"  [Error] Fallback also failed: {e2}")
             return None
 
     def _detect_kv_format(self) -> Tuple[str, str]:
@@ -442,27 +589,33 @@ class SequentialModelPipeline:
         # Generation loop
         for token_idx in range(max_new_tokens):
             self._log(f"\n--- Token {token_idx+1}/{max_new_tokens} ---")
-            
+
             # ================================================================
             # PREFILL (first iteration) - Process full prompt
             # ================================================================
             if token_idx == 0:
+                # P1.3: Set phase to prefill for compute-intensive processing
+                self._set_phase("prefill")
+
                 current_input_ids = prompt_ids
                 current_position_ids = np.arange(prompt_len, dtype=np.int64).reshape(1, -1)
                 current_attention_mask = np.ones((1, prompt_len), dtype=np.int64)
                 self._log(f"  [Prefill] Processing full prompt ({prompt_len} tokens)")
-            
+
             # ================================================================
             # DECODE (subsequent iterations) - Process only new token
             # ================================================================
             else:
+                # P1.3: Set phase to decode for memory-bandwidth-intensive processing
+                self._set_phase("decode")
+
                 # Only pass the NEW token, not the full sequence
                 current_input_ids = np.array([[last_token_id]], dtype=np.int64)
-                
+
                 # Position is the current sequence position (past tokens + 1)
                 past_len = self.kv_cache.get_sequence_length()
                 current_position_ids = np.array([[past_len]], dtype=np.int64)
-                
+
                 # Attention mask covers all tokens (past + current)
                 current_attention_mask = np.ones((1, past_len + 1), dtype=np.int64)
                 self._log(f"  [Decode] New token, position {past_len}, total seq {past_len + 1}")

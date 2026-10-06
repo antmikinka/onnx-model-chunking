@@ -8,12 +8,14 @@ This package provides reusable components for ONNX model inference:
 - config_loader: Model configuration loading and validation
 - session_manager: ONNX session lifecycle and persistence
 - io_binding: Zero-copy inference with device-resident buffers
+- npu_config: NPU configuration and management (AMD XDNA/Ryzen AI)
 
 Usage:
     from pipeline_utils import KVCacheManager, safe_cast, load_model_config
     from pipeline_utils import SessionManager, SessionConfig
     from pipeline_utils import IOBindingManager, MemoryMode
     from pipeline_utils.dtypes import ONNX_DTYPE_MAP, get_numpy_dtype
+    from pipeline_utils.npu_config import NPUConfig, NPUOffloadConfig, is_npu_available
 """
 
 from .dtypes import (
@@ -70,13 +72,26 @@ from .backend import (
 
 from .dtypes import GGUF_DTYPE_MAP, AWQ_DTYPE_MAP
 
+# NPU configuration module (P1.4)
+from .npu_config import (
+    NPUConfig,
+    NPUOffloadConfig,
+    NPUCapabilities,
+    NPUCompilationMode,
+    NPUOffloadStrategy,
+    is_npu_available,
+    get_npu_capabilities,
+    validate_npu_config,
+    get_recommended_npu_config,
+)
+
 
 __version__ = "2.2.0"
 
 __all__ = [
     # dtypes exports
     "ONNX_DTYPE_MAP",
-    "SHORT_DTYPE_MAP", 
+    "SHORT_DTYPE_MAP",
     "SPECIAL_TYPES",
     "GGUF_DTYPE_MAP",
     "AWQ_DTYPE_MAP",
@@ -118,4 +133,14 @@ __all__ = [
     "get_backend",
     "detect_model_format",
     "get_backend_for_model",
+    # npu_config exports (P1.4)
+    "NPUConfig",
+    "NPUOffloadConfig",
+    "NPUCapabilities",
+    "NPUCompilationMode",
+    "NPUOffloadStrategy",
+    "is_npu_available",
+    "get_npu_capabilities",
+    "validate_npu_config",
+    "get_recommended_npu_config",
 ]

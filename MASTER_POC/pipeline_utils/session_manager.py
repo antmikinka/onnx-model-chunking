@@ -61,7 +61,7 @@ PROVIDER_CATEGORIES = {
 class SessionConfig:
     """
     Configuration for ONNX Runtime session creation.
-    
+
     Attributes:
         providers: Execution providers in priority order
         optimization_level: Graph optimization level (DISABLE/BASIC/EXTENDED/ALL)
@@ -71,6 +71,19 @@ class SessionConfig:
         enable_profiling: Enable ONNX Runtime profiling
         graph_optimization_level: Enum for optimization level
         disable_shape_check: Disable node shape checking for dynamic shapes
+
+    NPU-Specific Options (for VitisAIExecutionProvider):
+        npu_graph_capture: Enable NPU graph capture for faster inference (default: True)
+            When enabled, the NPU graph is captured and cached for reuse,
+            reducing compilation overhead on subsequent runs.
+        npu_weight_preload: Preload weights to NPU tile SRAM (default: True)
+            When enabled, model weights are preloaded into the NPU's on-chip
+            SRAM for faster access during inference.
+        npu_compilation_mode: NPU compilation strategy (default: "default")
+            Options:
+            - "default": Balanced compilation for general workloads
+            - "fast": Faster compilation, potentially lower optimization
+            - "optimized": Slower compilation, maximum optimization
     """
     providers: List[str] = field(default_factory=lambda: ['CPUExecutionProvider'])
     optimization_level: str = "DISABLE"  # DISABLE, BASIC, EXTENDED, ALL
@@ -79,6 +92,11 @@ class SessionConfig:
     memory_limit_mb: Optional[int] = None
     enable_profiling: bool = False
     disable_shape_check: bool = True  # For dynamic shapes in LLMs
+
+    # NPU-specific options (P1.2: NPU Session Options)
+    npu_graph_capture: bool = True
+    npu_weight_preload: bool = True
+    npu_compilation_mode: str = "default"  # "default", "fast", "optimized"
     
     def get_optimization_level_enum(self) -> ort.GraphOptimizationLevel:
         """Convert string to ONNX Runtime enum."""
@@ -92,22 +110,82 @@ class SessionConfig:
                           ort.GraphOptimizationLevel.ORT_DISABLE_ALL)
     
     def create_session_options(self) -> ort.SessionOptions:
-        """Create configured SessionOptions object."""
+        """
+        Create configured SessionOptions object.
+
+        Includes NPU-specific configuration when VitisAIExecutionProvider is used.
+
+        Returns:
+            Configured ort.SessionOptions object
+
+        Example:
+            >>> config = SessionConfig(
+            ...     providers=["VitisAIExecutionProvider", "CPUExecutionProvider"],
+            ...     npu_graph_capture=True,
+            ...     npu_weight_preload=True
+            ... )
+            >>> opts = config.create_session_options()
+            # opts now contains vitisai.* session config entries
+        """
         opts = ort.SessionOptions()
         opts.graph_optimization_level = self.get_optimization_level_enum()
-        
+
         if self.inter_op_threads > 0:
             opts.inter_op_num_threads = self.inter_op_threads
         if self.intra_op_threads > 0:
             opts.intra_op_num_threads = self.intra_op_threads
-            
+
         if self.enable_profiling:
             opts.enable_profiling = True
-            
+
         if self.disable_shape_check:
             opts.add_session_config_entry("session.disable_node_shape_check", "1")
-            
+
+        # P1.2: Add NPU-specific session configuration
+        if "VitisAIExecutionProvider" in self.providers:
+            self._add_npu_session_config(opts)
+
         return opts
+
+    def _add_npu_session_config(self, opts: ort.SessionOptions) -> None:
+        """
+        Add NPU-specific session configuration entries.
+
+        These options optimize VitisAI Execution Provider performance:
+
+        1. vitisai.graph_capture: Enable graph capture for reuse
+           - Reduces compilation overhead on subsequent runs
+           - Recommended for inference workloads
+
+        2. vitisai.weight_preload: Preload weights to tile SRAM
+           - Keeps weights in on-chip memory for faster access
+           - Critical for NPU performance
+
+        3. vitisai.compilation_mode: Compilation strategy
+           - "default": Balanced approach
+           - "fast": Prioritize compilation speed
+           - "optimized": Prioritize runtime performance
+
+        Args:
+            opts: SessionOptions object to configure
+        """
+        # Graph capture for faster inference
+        opts.add_session_config_entry(
+            "vitisai.graph_capture",
+            "1" if self.npu_graph_capture else "0"
+        )
+
+        # Weight preloading to tile SRAM
+        opts.add_session_config_entry(
+            "vitisai.weight_preload",
+            "1" if self.npu_weight_preload else "0"
+        )
+
+        # Compilation mode
+        opts.add_session_config_entry(
+            "vitisai.compilation_mode",
+            self.npu_compilation_mode
+        )
 
 
 @dataclass
