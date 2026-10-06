@@ -22,6 +22,7 @@ from .splitter import (
     resolve_tensor_type,
     extract_quantization_info,
     extract_kv_cache_info,
+    extract_execution_policy,
     detect_architecture_from_onnx,
 )
 from .merger import merge_onnx
@@ -43,6 +44,7 @@ __all__ = [
     "resolve_tensor_type",
     "extract_quantization_info",
     "extract_kv_cache_info",
+    "extract_execution_policy",
     # Architecture detection
     "detect_architecture_from_onnx",
     # Types

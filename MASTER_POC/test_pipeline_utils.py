@@ -11281,6 +11281,379 @@ def test_kv_cache_metadata():
     return True
 
 
+def test_execution_policy():
+    """AMD execution policy is read from the split and saved."""
+    print("=" * 50)
+    print("Testing execution policy...")
+    print("=" * 50)
+
+    import json
+    import os
+    import sys
+    import tempfile
+    import types
+    import warnings
+    import chunking_utils
+
+    try:
+        from chunking_utils.onnx.splitter import extract_execution_policy
+        import chunking_utils.onnx.splitter as splitter
+    except ModuleNotFoundError:
+        for name in list(sys.modules):
+            if name == "chunking_utils.onnx" or name.startswith("chunking_utils.onnx."):
+                del sys.modules[name]
+        onnx_stub = types.ModuleType("onnx")
+        onnx_stub.ModelProto = type("ModelProto", (), {})
+        onnx_stub.numpy_helper = types.SimpleNamespace()
+        onnx_stub.helper = types.SimpleNamespace()
+        onnx_stub.TensorProto = types.SimpleNamespace()
+        onnx_stub.shape_inference = types.SimpleNamespace()
+        sys.modules["onnx"] = onnx_stub
+        from chunking_utils.onnx.splitter import extract_execution_policy
+        import chunking_utils.onnx.splitter as splitter
+
+    from chunking_utils.onnx.types import ComponentInfo
+
+    assert chunking_utils.extract_execution_policy is extract_execution_policy
+
+    class _Init:
+        def __init__(self, name, data_type):
+            self.name = name
+            self.data_type = data_type
+
+    class _Node:
+        def __init__(self, name, op_type="MatMul"):
+            self.name = name
+            self.op_type = op_type
+            self.input = ["hidden"]
+            self.output = ["hidden_out"]
+
+    class _Graph:
+        def __init__(self, nodes=None, initializers=()):
+            self.node = list(nodes or [_Node("/model/layers.0/MatMul")])
+            self.initializer = list(initializers)
+            self.input = []
+            self.output = []
+            self.value_info = []
+
+    def _parts(*kinds):
+        parts = {}
+        for index, kind in enumerate(kinds):
+            parts[f"{kind}_{index}"] = ComponentInfo(
+                component_type=kind,
+                layer_id=0 if kind == "layer" else None,
+                node_indices=[index],
+            )
+        return parts
+
+    def _read(graph=None, components=None, quantization_info=None):
+        if graph is None:
+            graph = _Graph()
+        if components is None:
+            components = _parts("embedding", "layer", "norm", "lm_head")
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            info = extract_execution_policy(
+                graph,
+                components,
+                quantization_info=quantization_info,
+            )
+        return info, caught
+
+    example = {
+        "npu_safe": False,
+        "recommended_mode": "hybrid_phase_split",
+        "prefill_device": "npu",
+        "decode_device": "igpu",
+        "resident_components": ["embedding", "norm", "lm_head"],
+        "streamed_components": ["layer_*"],
+        "graph_form": "split",
+        "layer_schedule": "persistent",
+        "moe_routing": None,
+    }
+    info, caught = _read()
+    assert info == example
+    messages = [str(item.message) for item in caught]
+    assert any("default npu_safe False" in message for message in messages)
+    assert all("heuristic" not in message for message in messages)
+    assert all(issubclass(item.category, UserWarning) for item in caught)
+    info["resident_components"].append("other")
+    info["streamed_components"].append("other_*")
+    info["npu_safe"] = True
+    again, _ = _read(components=_parts("lm_head", "embedding", "layer", "norm"))
+    assert again == example
+    assert again is not info
+    assert again["resident_components"] is not info["resident_components"]
+    assert again["streamed_components"] is not info["streamed_components"]
+    json.dumps(again)
+
+    masked, caught = _read(_Graph(initializers=[_Init("attention_mask", 0)]))
+    assert masked == example
+    masked_messages = [str(item.message) for item in caught]
+    assert any("default npu_safe False" in message for message in masked_messages)
+    assert all("heuristic" not in message for message in masked_messages)
+    assert all("int64" not in message for message in masked_messages)
+
+    for method in ("MatMulNBits", "AWQ", "GPTQ", "QLinearMatMul"):
+        legal, caught = _read(quantization_info={"method": method})
+        assert legal["npu_safe"] is True
+        assert legal["recommended_mode"] == "hybrid_phase_split"
+        assert legal["prefill_device"] == "npu"
+        assert legal["decode_device"] == "igpu"
+        assert legal["graph_form"] == "split"
+        assert legal["layer_schedule"] == "persistent"
+        assert all("default npu_safe" not in str(item.message) for item in caught)
+
+    float16, caught = _read(_Graph(initializers=[_Init("weight", 10)]))
+    assert float16["npu_safe"] is True
+    assert float16["recommended_mode"] == "hybrid_phase_split"
+    assert caught == []
+    int4, caught = _read(_Graph(initializers=[_Init("weight", 21)]))
+    assert int4["npu_safe"] is True
+    assert caught == []
+
+    float32, caught = _read(_Graph(initializers=[_Init("weight", 1)]))
+    assert float32["npu_safe"] is False
+    assert float32["recommended_mode"] == "sequential"
+    assert float32["prefill_device"] == "igpu"
+    assert float32["decode_device"] == "igpu"
+    assert float32["layer_schedule"] == "sequential"
+    assert float32["graph_form"] == "split"
+    assert float32["resident_components"] == ["embedding", "norm", "lm_head"]
+    assert float32["streamed_components"] == ["layer_*"]
+    assert all("default npu_safe" not in str(item.message) for item in caught)
+    float64, _ = _read(_Graph(initializers=[_Init("weight", 11)]))
+    assert float64["recommended_mode"] == "sequential"
+    assert float64["prefill_device"] == "igpu"
+
+    mixed_safe, caught = _read(_Graph(initializers=[
+        _Init("weight", 1),
+        _Init("packed", 10),
+    ]))
+    assert mixed_safe["npu_safe"] is True
+    assert mixed_safe["recommended_mode"] == "hybrid_phase_split"
+    assert any("majority" in str(item.message) and "True" in str(item.message) for item in caught)
+    mixed_unsafe, caught = _read(_Graph(initializers=[
+        _Init("a", 1),
+        _Init("b", 1),
+        _Init("packed", 10),
+    ]))
+    assert mixed_unsafe["npu_safe"] is False
+    assert mixed_unsafe["recommended_mode"] == "hybrid_phase_split"
+    assert any("majority" in str(item.message) and "False" in str(item.message) for item in caught)
+
+    alone, caught = _read(components=_parts("layer"))
+    assert alone == {
+        "npu_safe": False,
+        "recommended_mode": "monolithic",
+        "prefill_device": "igpu",
+        "decode_device": "igpu",
+        "resident_components": ["layer"],
+        "streamed_components": [],
+        "graph_form": "monolithic",
+        "layer_schedule": "persistent",
+        "moe_routing": None,
+    }
+    assert any("default npu_safe False" in str(item.message) for item in caught)
+    alone_npu, caught = _read(
+        _Graph(initializers=[_Init("weight", 10)]),
+        components=_parts("lm_head"),
+    )
+    assert alone_npu["npu_safe"] is True
+    assert alone_npu["recommended_mode"] == "monolithic"
+    assert alone_npu["prefill_device"] == "npu"
+    assert alone_npu["decode_device"] == "npu"
+    assert alone_npu["resident_components"] == ["lm_head"]
+    assert alone_npu["streamed_components"] == []
+    assert caught == []
+
+    two_embed, _ = _read(components=_parts("embedding", "embedding"))
+    assert two_embed["graph_form"] == "split"
+    assert two_embed["resident_components"] == ["embedding"]
+    assert two_embed["streamed_components"] == []
+    assert two_embed["recommended_mode"] == "hybrid_phase_split"
+
+    moe, _ = _read(components=_parts(
+        "moe_expert",
+        "lm_head",
+        "gated_deltanet",
+        "embedding",
+        "sparse_attention",
+        "moe_router",
+        "other",
+        "mtp_head",
+        "layer",
+        "ngram_embedding",
+        "norm",
+    ))
+    assert moe["resident_components"] == [
+        "embedding", "norm", "lm_head", "moe_router", "mtp_head", "ngram_embedding",
+    ]
+    assert moe["streamed_components"] == [
+        "layer_*",
+        "moe_expert_*",
+        "gated_deltanet_*",
+        "sparse_attention_*",
+        "other",
+    ]
+    assert moe["moe_routing"] == "moe_routing"
+    assert moe["recommended_mode"] == "hybrid_phase_split"
+    expert_only, _ = _read(components=_parts("moe_expert", "layer"))
+    assert expert_only["moe_routing"] == "moe_routing"
+    assert expert_only["streamed_components"] == ["layer_*", "moe_expert_*"]
+    assert expert_only["resident_components"] == []
+
+    hyphen, _ = _read(components={
+        "head": {"component_type": "lm-head"},
+        "block": {"component_type": "Gated DeltaNet"},
+    })
+    assert hyphen["resident_components"] == ["lm_head"]
+    assert hyphen["streamed_components"] == ["gated_deltanet_*"]
+
+    try:
+        extract_execution_policy(None, _parts("layer"))
+        raise AssertionError("a missing graph was accepted")
+    except ValueError as exc:
+        assert "graph" in str(exc)
+    try:
+        extract_execution_policy(_Graph(), ["layer"])
+        raise AssertionError("a component list was accepted")
+    except ValueError as exc:
+        assert "dict" in str(exc)
+    try:
+        extract_execution_policy(_Graph(), {})
+        raise AssertionError("an empty component map was accepted")
+    except ValueError as exc:
+        assert "at least one" in str(exc)
+    try:
+        extract_execution_policy(_Graph(), {" ": ComponentInfo(component_type="layer")})
+        raise AssertionError("a blank component name was accepted")
+    except ValueError as exc:
+        assert "name" in str(exc)
+    try:
+        extract_execution_policy(_Graph(), {"layer_0": ComponentInfo(component_type="  ")})
+        raise AssertionError("a blank component type was accepted")
+    except ValueError as exc:
+        assert "type" in str(exc)
+    try:
+        extract_execution_policy(_Graph(), {"layer_0": {"component_type": "banana"}})
+        raise AssertionError("an unknown component type was accepted")
+    except ValueError as exc:
+        assert "Unknown component type" in str(exc)
+        assert "banana" in str(exc)
+    try:
+        extract_execution_policy(_Graph(initializers=[_Init("weight", True)]), _parts("layer"))
+        raise AssertionError("a bool data_type was accepted")
+    except ValueError as exc:
+        assert "data_type" in str(exc)
+    try:
+        extract_execution_policy(_Graph(), _parts("layer"), quantization_info=["MatMulNBits"])
+        raise AssertionError("a quantization list was accepted")
+    except ValueError as exc:
+        assert "dict" in str(exc)
+    try:
+        extract_execution_policy(_Graph(), _parts("layer"), quantization_info={"method": True})
+        raise AssertionError("a bool quantization method was accepted")
+    except ValueError as exc:
+        assert "method" in str(exc)
+
+    class _SplitModel:
+        def __init__(self, graph):
+            self.graph = graph
+            self.ir_version = 8
+            self.producer_name = "test"
+
+    split_graph = _Graph([_Node("/model/layers.0/self_attn/MatMul")])
+    original_load = splitter.load_onnx_model
+    original_extract = splitter.extract_components
+    original_create = splitter.create_component_onnx
+    original_boundaries = splitter.collect_boundary_tensors
+    original_save = getattr(splitter.onnx, "save", None)
+    original_infer = getattr(splitter.shape_inference, "infer_shapes", None)
+
+    def fake_load(path):
+        return _SplitModel(split_graph)
+
+    def fake_infer(model):
+        return model
+
+    def fake_extract(model, **kwargs):
+        return _parts("embedding", "layer", "norm", "lm_head")
+
+    def fake_create(model, component, name):
+        return types.SimpleNamespace(
+            graph=types.SimpleNamespace(
+                input=[types.SimpleNamespace(name="hidden")],
+                output=[types.SimpleNamespace(name="hidden_out")],
+            )
+        )
+
+    def fake_boundaries(model, components):
+        return []
+
+    def fake_save(*args, **kwargs):
+        return None
+
+    splitter.load_onnx_model = fake_load
+    splitter.extract_components = fake_extract
+    splitter.create_component_onnx = fake_create
+    splitter.collect_boundary_tensors = fake_boundaries
+    splitter.onnx.save = fake_save
+    splitter.shape_inference.infer_shapes = fake_infer
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            model_path = os.path.join(directory, "model.onnx")
+            output_path = os.path.join(directory, "out")
+            os.makedirs(output_path)
+            with open(model_path, "w", encoding="utf-8") as handle:
+                handle.write("onnx")
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                result = splitter.split_onnx(
+                    model=model_path,
+                    output=output_path,
+                    split_only=True,
+                )
+            info_path = os.path.join(result.output_dir, "model_info.json")
+            saved = json.load(open(info_path, encoding="utf-8"))
+            assert saved["execution_policy"] == example
+            assert result.model_info["execution_policy"] == saved["execution_policy"]
+            assert any("default npu_safe False" in str(item.message) for item in caught)
+
+            def fake_extract_bad(model, **kwargs):
+                return {"bad": ComponentInfo(component_type="not_a_type", node_indices=[0])}
+
+            splitter.extract_components = fake_extract_bad
+            bad_output = os.path.join(directory, "bad")
+            os.makedirs(bad_output)
+            try:
+                splitter.split_onnx(model=model_path, output=bad_output, split_only=True)
+                raise AssertionError("an unknown component was written")
+            except ValueError as exc:
+                assert "Unknown component type" in str(exc)
+            assert not os.path.exists(os.path.join(bad_output, "model.onnx"))
+    finally:
+        splitter.load_onnx_model = original_load
+        splitter.extract_components = original_extract
+        splitter.create_component_onnx = original_create
+        splitter.collect_boundary_tensors = original_boundaries
+        if original_save is None:
+            del splitter.onnx.save
+        else:
+            splitter.onnx.save = original_save
+        if original_infer is None:
+            if hasattr(splitter.shape_inference, "infer_shapes"):
+                del splitter.shape_inference.infer_shapes
+        else:
+            splitter.shape_inference.infer_shapes = original_infer
+
+    print("execution policy: OK")
+    print("  hybrid phase split: npu prefill, igpu decode")
+    print("  resident embedding, norm, lm_head; streamed layer")
+    print("  model_info: execution_policy saved")
+    return True
+
+
 def test_path_manager():
     """ONNX discovery, external data, split directories, and NPU cache paths."""
     print("=" * 50)
@@ -11633,6 +12006,12 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"kv_cache_metadata: FAILED - {e}")
         results.append(("kv_cache_metadata", False))
+
+    try:
+        results.append(("execution_policy", test_execution_policy()))
+    except Exception as e:
+        print(f"execution_policy: FAILED - {e}")
+        results.append(("execution_policy", False))
 
     try:
         results.append(("path_manager", test_path_manager()))
