@@ -30,6 +30,13 @@ Heterogeneous prefill/decode:
   and the iGPU decode input. Private weights stay on the prefill and
   decode managers.
 
+NPU static KV cache:
+- MemoryMode.NPU_STATIC disables OrtValue reallocation. XDNA XCLBIN
+  graphs are compiled for one shape.
+- allocate_static_kv_cache() allocates keys and values at max_seq_len
+  (default 4096). attention_mask(valid_tokens) rewrites a fixed
+  (batch, max_seq_len) mask: 1 for the written prefix, 0 for padding.
+
 IMPORTANT MEMORY TRADEOFF CLARIFICATION:
 - I/O Binding does NOT reduce RAM usage
 - It reduces DATA COPY latency between CPU and device
@@ -91,10 +98,17 @@ class MemoryMode(Enum):
         - Device Memory: Activations stay on device
         - Speed: FASTEST (no CPU-device copies)
         - Best for: NPU/GPU with device memory available
+
+    NPU_STATIC:
+        - KV cache is allocated once at max sequence length
+        - Sequence growth updates an attention mask, not the OrtValue shape
+        - Required for XDNA XCLBIN graphs, which are compiled ahead of time
+        - Best for: VitisAI / Ryzen AI prefill and decode
     """
     MINIMAL = "minimal"
     PERSISTENT = "persistent"
     IO_BOUND = "io_bound"
+    NPU_STATIC = "npu_static"
     
     @classmethod
     def get_description(cls, mode: 'MemoryMode') -> str:
@@ -103,8 +117,84 @@ class MemoryMode(Enum):
             cls.MINIMAL: "RAM-efficient: Load/unload per component (slow)",
             cls.PERSISTENT: "Balanced: All sessions resident (medium RAM, fast)",
             cls.IO_BOUND: "Throughput-optimized: Persistent + zero-copy (fast)",
+            cls.NPU_STATIC: "NPU AOT: KV pool at max sequence length, attention mask hides padding",
         }
         return descriptions.get(mode, "Unknown mode")
+
+
+# Default context compiled into an XDNA KV pool when the caller does not
+# pass a maximum. 4096 matches a typical Ryzen AI generation window.
+DEFAULT_NPU_MAX_SEQ_LEN = 4096
+
+
+class StaticShapeError(ValueError):
+    """Resizing this OrtValue would reload or crash an AOT NPU graph."""
+
+
+def kv_cache_shape(
+    batch_size: int,
+    num_kv_heads: int,
+    seq_len: int,
+    head_dim: int,
+    seq_axis: int = 2,
+) -> Tuple[int, ...]:
+    """Build a 4D KV shape with ``seq_len`` placed on ``seq_axis``."""
+    if seq_axis < 0 or seq_axis > 3:
+        raise ValueError(f"seq_axis must be in 0..3, got {seq_axis}")
+    remaining = [batch_size, num_kv_heads, head_dim]
+    shape: List[int] = []
+    cursor = 0
+    for axis in range(4):
+        if axis == seq_axis:
+            shape.append(seq_len)
+        else:
+            shape.append(remaining[cursor])
+            cursor += 1
+    return tuple(shape)
+
+
+@dataclass
+class StaticKVPool:
+    """KV cache preallocated at the maximum sequence length an XCLBIN can run."""
+
+    name: str
+    max_seq_len: int
+    batch_size: int
+    num_layers: int
+    num_kv_heads: int
+    head_dim: int
+    dtype: np.dtype
+    seq_axis: int
+    valid_seq_len: int
+    key_names: List[str]
+    value_names: List[str]
+    mask_name: str
+
+    def __post_init__(self) -> None:
+        if isinstance(self.dtype, str):
+            self.dtype = np.dtype(self.dtype)
+
+    @property
+    def kv_shape(self) -> Tuple[int, ...]:
+        return kv_cache_shape(
+            self.batch_size,
+            self.num_kv_heads,
+            self.max_seq_len,
+            self.head_dim,
+            self.seq_axis,
+        )
+
+    def padding_mask(self) -> np.ndarray:
+        """
+        Attention mask of shape ``(batch, max_seq_len)``.
+
+        1 marks tokens the NPU may attend to. 0 marks padded or unwritten
+        positions in the preallocated KV cache.
+        """
+        mask = np.zeros((self.batch_size, self.max_seq_len), dtype=np.int64)
+        if self.valid_seq_len > 0:
+            mask[:, : self.valid_seq_len] = 1
+        return mask
 
 
 class MemoryPlacement(Enum):
@@ -399,6 +489,8 @@ class DeviceBuffer:
     ortvalue_device: str = "cpu"
     memory_placement: MemoryPlacement = MemoryPlacement.CPU
     vendor_id: Optional[int] = None
+    static_seq_axis: Optional[int] = None
+    static_max_seq: Optional[int] = None
     
     def __post_init__(self):
         """Convert dtype to numpy dtype if string."""
@@ -428,6 +520,26 @@ class DeviceBuffer:
     def matches_shape(self, shape: Tuple[int, ...]) -> bool:
         """Check if buffer shape matches requested shape."""
         return self.shape == tuple(shape)
+
+    def fits_static_request(self, shape: Tuple[int, ...]) -> bool:
+        """
+        True when ``shape`` is this buffer with a shorter sequence axis.
+
+        The allocated OrtValue stays at ``static_max_seq``. A shorter request
+        is the valid prefix, not a new allocation.
+        """
+        if self.static_seq_axis is None or self.static_max_seq is None:
+            return False
+        requested = tuple(shape)
+        if len(requested) != len(self.shape):
+            return False
+        for index, (allocated, want) in enumerate(zip(self.shape, requested)):
+            if index == self.static_seq_axis:
+                if want <= 0 or want > allocated:
+                    return False
+            elif allocated != want:
+                return False
+        return True
     
     def to_numpy(self) -> np.ndarray:
         """
@@ -461,6 +573,8 @@ class DeviceBuffer:
                 else self.memory_placement
             ),
             "vendor_id": self.vendor_id,
+            "static_seq_axis": self.static_seq_axis,
+            "static_max_seq": self.static_max_seq,
         }
 
 
@@ -502,7 +616,9 @@ class IOBindingManager:
         self,
         device_type: str = "cpu",
         device_id: int = 0,
-        auto_reallocate: bool = True
+        auto_reallocate: bool = True,
+        memory_mode: Union[MemoryMode, str] = MemoryMode.IO_BOUND,
+        max_seq_len: int = DEFAULT_NPU_MAX_SEQ_LEN,
     ):
         """
         Initialize the I/O binding manager.
@@ -512,11 +628,27 @@ class IOBindingManager:
                 "vitisai", and "ryzenai". Also accepts "cpu", "cuda",
                 "cuda_pinned", "hip_pinned", and "rocm_pinned".
             device_id: Device ID for multi-GPU/NPU systems
-            auto_reallocate: If True, automatically reallocate buffers on shape mismatch
+            auto_reallocate: If True, automatically reallocate buffers on shape mismatch.
+                Ignored for MemoryMode.NPU_STATIC.
+            memory_mode: IO_BOUND allows dynamic shapes. NPU_STATIC keeps KV
+                OrtValues at max_seq_len for an AOT XCLBIN.
+            max_seq_len: Maximum sequence length used by allocate_static_kv_cache.
         """
         self.device_type = (device_type or "cpu").lower()
         self.device_id = device_id
-        self.auto_reallocate = auto_reallocate
+        if isinstance(memory_mode, str):
+            memory_mode = MemoryMode(memory_mode)
+        self.memory_mode = memory_mode
+        self.max_seq_len = int(max_seq_len)
+        if self.max_seq_len <= 0:
+            raise ValueError(f"max_seq_len must be positive, got {max_seq_len}")
+        # XDNA graphs are compiled for one shape. A later OrtValue resize
+        # reloads that graph or faults the execution provider.
+        self.auto_reallocate = (
+            False if memory_mode == MemoryMode.NPU_STATIC else auto_reallocate
+        )
+        self._kv_pools: Dict[str, StaticKVPool] = {}
+        self._buffer_pool: Dict[str, str] = {}
 
         # Preferred memory info is the caller's device. AMD names in
         # VALID_ORTVALUE_DEVICES are kept. The resolved placement is filled
@@ -865,7 +997,11 @@ class IOBindingManager:
         Get existing buffer or allocate if needed.
         
         If buffer exists with matching shape, returns it.
+        A static KV buffer also matches a shorter sequence length: the
+        OrtValue stays at max_seq_len and the attention mask marks the
+        valid prefix.
         If shape differs and auto_reallocate is True, reallocates.
+        MemoryMode.NPU_STATIC never reallocates.
         
         Args:
             name: Buffer name
@@ -879,22 +1015,20 @@ class IOBindingManager:
         with self._lock:
             if name in self._buffers:
                 existing = self._buffers[name]
-                if existing.matches_shape(shape):
-                    # Update data if provided
-                    if data is not None:
-                        existing.ort_value = self._create_ort_value(data)
+                if existing.matches_shape(shape) or existing.fits_static_request(shape):
+                    self._accept_static_shape(existing, shape, data)
                     return existing
-                elif self.auto_reallocate:
-                    # Shape mismatch, reallocate
-                    pass  # Fall through to allocation
-                else:
-                    raise ValueError(
-                        f"Buffer '{name}' shape mismatch: "
-                        f"existing {existing.shape} vs requested {shape}"
-                    )
+                self._reject_or_reallocate(existing, shape)
             
-            # Allocate new buffer
-            return self.allocate_buffer(name, shape, dtype, data, is_dynamic=True)
+            # Allocate new buffer. NPU_STATIC marks it fixed so the next
+            # token cannot resize it.
+            return self.allocate_buffer(
+                name,
+                shape,
+                dtype,
+                data,
+                is_dynamic=self.auto_reallocate,
+            )
     
     def get_buffer(self, name: str) -> Optional[DeviceBuffer]:
         """Get buffer by name."""
@@ -917,20 +1051,211 @@ class IOBindingManager:
         """
         with self._lock:
             if name not in self._buffers:
-                # Create new buffer
-                return self.allocate_buffer(name, data.shape, data.dtype, data)
+                return self.allocate_buffer(
+                    name,
+                    data.shape,
+                    data.dtype,
+                    data,
+                    is_dynamic=self.auto_reallocate,
+                )
             
             buffer = self._buffers[name]
-            
-            if not buffer.matches_shape(data.shape):
-                if self.auto_reallocate:
-                    return self.allocate_buffer(name, data.shape, data.dtype, data)
-                else:
-                    raise ValueError(f"Shape mismatch for buffer '{name}'")
-            
-            # Update OrtValue
-            buffer.ort_value = self._create_ort_value(data)
-            return buffer
+            if buffer.matches_shape(data.shape) or buffer.fits_static_request(data.shape):
+                self._accept_static_shape(buffer, tuple(data.shape), data)
+                return buffer
+            self._reject_or_reallocate(buffer, tuple(data.shape))
+            return self.allocate_buffer(name, data.shape, data.dtype, data)
+
+    def _reject_or_reallocate(self, existing: DeviceBuffer, shape: Tuple[int, ...]) -> None:
+        """Raise for NPU static buffers. Dynamic modes fall through and reallocate."""
+        if existing.static_max_seq is not None or self.memory_mode == MemoryMode.NPU_STATIC or not self.auto_reallocate:
+            raise StaticShapeError(
+                f"Refusing to reallocate '{existing.name}' from {existing.shape} "
+                f"to {tuple(shape)}. MemoryMode.{self.memory_mode.name} keeps the "
+                f"OrtValue shape fixed for an AOT NPU graph. Grow the valid token "
+                f"count with attention_mask() inside max_seq_len="
+                f"{existing.static_max_seq or self.max_seq_len}."
+            )
+
+    def _accept_static_shape(
+        self,
+        existing: DeviceBuffer,
+        shape: Tuple[int, ...],
+        data: Optional[np.ndarray],
+    ) -> None:
+        """Write into the existing OrtValue. Do not allocate a replacement."""
+        if data is not None:
+            if existing.static_seq_axis is not None and not existing.matches_shape(shape):
+                self._write_prefix(existing, data)
+            elif self.memory_mode == MemoryMode.NPU_STATIC or existing.static_max_seq is not None:
+                self._write_into_existing(existing, data)
+            else:
+                existing.ort_value = self._create_ort_value(data)
+        if existing.static_seq_axis is not None:
+            self._sync_valid_length(existing, int(shape[existing.static_seq_axis]))
+
+    def _write_into_existing(self, buffer: DeviceBuffer, data: np.ndarray) -> None:
+        if buffer.ort_value is None:
+            raise RuntimeError(f"Buffer '{buffer.name}' is not allocated")
+        host = buffer.ort_value.numpy()
+        incoming = np.ascontiguousarray(data, dtype=host.dtype)
+        if incoming.shape != host.shape:
+            raise StaticShapeError(
+                f"Cannot write shape {incoming.shape} into '{buffer.name}' "
+                f"allocated as {host.shape}"
+            )
+        np.copyto(host, incoming)
+        if int(host.ctypes.data) != int(buffer.ort_value.data_ptr()):
+            buffer.ort_value.update_inplace(np.ascontiguousarray(host))
+
+    def _write_prefix(self, buffer: DeviceBuffer, data: np.ndarray) -> None:
+        """Copy a shorter sequence into the prefix of a max-length KV buffer."""
+        if buffer.ort_value is None or buffer.static_seq_axis is None:
+            raise RuntimeError(f"Buffer '{buffer.name}' is not a static KV buffer")
+        host = buffer.ort_value.numpy()
+        incoming = np.ascontiguousarray(data, dtype=host.dtype)
+        axis = buffer.static_seq_axis
+        if incoming.ndim != host.ndim:
+            raise StaticShapeError(
+                f"Rank mismatch for '{buffer.name}': allocated {host.shape}, "
+                f"got {incoming.shape}"
+            )
+        for index, (allocated, requested) in enumerate(zip(host.shape, incoming.shape)):
+            if index == axis:
+                if requested <= 0 or requested > allocated:
+                    raise StaticShapeError(
+                        f"Sequence {requested} does not fit '{buffer.name}' "
+                        f"capacity {allocated}"
+                    )
+            elif allocated != requested:
+                raise StaticShapeError(
+                    f"Axis {index} of '{buffer.name}' is fixed at {allocated}, got {requested}"
+                )
+        slices: List[slice] = [slice(None)] * host.ndim
+        slices[axis] = slice(0, incoming.shape[axis])
+        host[tuple(slices)] = incoming
+        if int(host.ctypes.data) != int(buffer.ort_value.data_ptr()):
+            buffer.ort_value.update_inplace(np.ascontiguousarray(host))
+
+    def _sync_valid_length(self, buffer: DeviceBuffer, valid_seq_len: int) -> None:
+        pool_name = self._buffer_pool.get(buffer.name)
+        if pool_name is None:
+            return
+        pool = self._kv_pools[pool_name]
+        if buffer.name == pool.mask_name:
+            return
+        self.set_valid_sequence_length(valid_seq_len, pool_name)
+
+    def allocate_static_kv_cache(
+        self,
+        name: str = "kv",
+        num_layers: int = 1,
+        num_kv_heads: int = 1,
+        head_dim: int = 1,
+        dtype: np.dtype = np.float16,
+        batch_size: int = 1,
+        max_seq_len: Optional[int] = None,
+        seq_axis: int = 2,
+    ) -> StaticKVPool:
+        """
+        Allocate key and value OrtValues at the maximum sequence length.
+
+        The sequence axis does not change during generation. Call
+        ``attention_mask(valid_tokens)`` so the NPU ignores padded positions.
+        """
+        with self._lock:
+            if name in self._kv_pools:
+                raise ValueError(f"Static KV pool '{name}' already exists")
+            if min(num_layers, num_kv_heads, head_dim, batch_size) <= 0:
+                raise ValueError("KV pool dimensions must be positive")
+            limit = self.max_seq_len if max_seq_len is None else int(max_seq_len)
+            if limit <= 0:
+                raise ValueError(f"max_seq_len must be positive, got {limit}")
+            if isinstance(dtype, str):
+                dtype = np.dtype(dtype)
+
+            pool = StaticKVPool(
+                name=name,
+                max_seq_len=limit,
+                batch_size=batch_size,
+                num_layers=num_layers,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                dtype=dtype,
+                seq_axis=seq_axis,
+                valid_seq_len=0,
+                key_names=[],
+                value_names=[],
+                mask_name=f"{name}.attention_mask",
+            )
+            kv_shape = pool.kv_shape
+            for layer in range(num_layers):
+                key_name = f"{name}.layer{layer}.key"
+                value_name = f"{name}.layer{layer}.value"
+                for tensor_name in (key_name, value_name):
+                    buffer = self.allocate_buffer(
+                        tensor_name,
+                        kv_shape,
+                        dtype,
+                        is_dynamic=False,
+                    )
+                    buffer.static_seq_axis = seq_axis
+                    buffer.static_max_seq = limit
+                    self._buffer_pool[tensor_name] = name
+                pool.key_names.append(key_name)
+                pool.value_names.append(value_name)
+
+            mask = pool.padding_mask()
+            mask_buffer = self.allocate_buffer(
+                pool.mask_name,
+                mask.shape,
+                mask.dtype,
+                data=mask,
+                is_dynamic=False,
+            )
+            mask_buffer.static_seq_axis = 1
+            mask_buffer.static_max_seq = limit
+            self._buffer_pool[pool.mask_name] = name
+            self._kv_pools[name] = pool
+            return pool
+
+    def set_valid_sequence_length(self, valid_seq_len: int, pool: str = "kv") -> np.ndarray:
+        """
+        Mark how many KV positions contain real tokens.
+
+        Rewrites the preallocated attention mask in place. The KV OrtValues
+        keep their maximum shape.
+        """
+        with self._lock:
+            if pool not in self._kv_pools:
+                raise KeyError(f"Static KV pool '{pool}' is not allocated")
+            spec = self._kv_pools[pool]
+            if valid_seq_len < 0 or valid_seq_len > spec.max_seq_len:
+                raise StaticShapeError(
+                    f"valid sequence length {valid_seq_len} is outside the "
+                    f"preallocated KV pool '{pool}' of {spec.max_seq_len}. "
+                    f"Refusing to reallocate the XCLBIN tensors."
+                )
+            spec.valid_seq_len = int(valid_seq_len)
+            mask = spec.padding_mask()
+            mask_buffer = self._buffers[spec.mask_name]
+            self._write_into_existing(mask_buffer, mask)
+            return mask
+
+    def attention_mask(self, valid_seq_len: int, pool: str = "kv") -> np.ndarray:
+        """
+        Return the static attention mask for ``valid_seq_len`` tokens.
+
+        Shape is ``(batch, max_seq_len)``. Ones cover the written prefix.
+        Zeros tell the NPU to ignore the rest of the preallocated KV cache.
+        """
+        return self.set_valid_sequence_length(valid_seq_len, pool)
+
+    def get_static_kv_pool(self, name: str = "kv") -> StaticKVPool:
+        """Return a previously allocated static KV pool."""
+        if name not in self._kv_pools:
+            raise KeyError(f"Static KV pool '{name}' is not allocated")
+        return self._kv_pools[name]
     
     def create_binding(self, session: ort.InferenceSession) -> ort.IOBinding:
         """
@@ -1095,6 +1420,7 @@ class IOBindingManager:
         with self._lock:
             if name in self._buffers:
                 del self._buffers[name]
+                self._buffer_pool.pop(name, None)
                 return True
             return False
     
@@ -1108,6 +1434,8 @@ class IOBindingManager:
         with self._lock:
             count = len(self._buffers)
             self._buffers.clear()
+            self._kv_pools.clear()
+            self._buffer_pool.clear()
             return count
     
     def get_memory_usage(self) -> Dict[str, Any]:
@@ -1141,6 +1469,9 @@ class IOBindingManager:
                 "memory_placement": self._memory_placement.value,
                 "vendor_id": self._ortvalue_vendor_id,
                 "memory_resolved": self._memory_target is not None,
+                "memory_mode": self.memory_mode.value,
+                "max_seq_len": self.max_seq_len,
+                "auto_reallocate": self.auto_reallocate,
                 "per_buffer": per_buffer,
             }
     
@@ -1159,6 +1490,7 @@ class IOBindingManager:
     def __repr__(self) -> str:
         mem = self.get_memory_usage()
         return (f"IOBindingManager(device={self.device_type}:{self.device_id}, "
+                f"mode={self.memory_mode.value}, "
                 f"ortvalue={self._ortvalue_device}/{self._memory_placement.value}, "
                 f"buffers={len(self)}, memory={mem['total_mb']}MB)")
 
@@ -1410,12 +1742,22 @@ class HeterogeneousIOBindingManager:
         npu_device_id: int = 0,
         igpu_device_type: str = "rocm",
         igpu_device_id: int = 0,
+        max_seq_len: int = DEFAULT_NPU_MAX_SEQ_LEN,
+        prefill_memory_mode: Union[MemoryMode, str] = MemoryMode.NPU_STATIC,
     ):
         self.npu_device_type = (npu_device_type or "vitisai").lower()
         self.npu_device_id = npu_device_id
         self.igpu_device_type = (igpu_device_type or "rocm").lower()
         self.igpu_device_id = igpu_device_id
-        self.prefill = IOBindingManager(self.npu_device_type, npu_device_id)
+        self.max_seq_len = int(max_seq_len)
+        # Prefill runs on the NPU, whose XCLBIN cannot be reallocated per token.
+        # Decode on the iGPU keeps dynamic shapes.
+        self.prefill = IOBindingManager(
+            self.npu_device_type,
+            npu_device_id,
+            memory_mode=prefill_memory_mode,
+            max_seq_len=self.max_seq_len,
+        )
         self.decode = IOBindingManager(self.igpu_device_type, igpu_device_id)
         self._shared: Dict[str, SharedBuffer] = {}
         self._lock = threading.RLock()
@@ -1790,6 +2132,8 @@ __all__ = [
     "MemoryMode",
     "MemoryPlacement",
     "SharedAllocationKind",
+    "StaticKVPool",
+    "StaticShapeError",
     "OrtMemoryTarget",
     "OsSharedAllocation",
     # Functions
@@ -1803,4 +2147,5 @@ __all__ = [
     "ONNX_ELEMENT_TYPE_NAMES",
     "VALID_ORTVALUE_DEVICES",
     "AMD_PCI_VENDOR_ID",
+    "DEFAULT_NPU_MAX_SEQ_LEN",
 ]

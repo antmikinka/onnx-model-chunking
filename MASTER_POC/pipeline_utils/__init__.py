@@ -55,6 +55,8 @@ from .io_binding import (
     MemoryMode,
     MemoryPlacement,
     SharedAllocationKind,
+    StaticKVPool,
+    StaticShapeError,
     get_supported_devices,
     get_onnx_element_type,
     create_ortvalue_from_numpy,
@@ -62,6 +64,7 @@ from .io_binding import (
     allocate_os_shared_memory,
     NUMPY_TO_ONNX_ELEMENT_TYPE,
     VALID_ORTVALUE_DEVICES,
+    DEFAULT_NPU_MAX_SEQ_LEN,
 )
 
 from .backend import (
@@ -129,6 +132,8 @@ __all__ = [
     "MemoryMode",
     "MemoryPlacement",
     "SharedAllocationKind",
+    "StaticKVPool",
+    "StaticShapeError",
     "get_supported_devices",
     "get_onnx_element_type",
     "create_ortvalue_from_numpy",
@@ -136,6 +141,7 @@ __all__ = [
     "allocate_os_shared_memory",
     "NUMPY_TO_ONNX_ELEMENT_TYPE",
     "VALID_ORTVALUE_DEVICES",
+    "DEFAULT_NPU_MAX_SEQ_LEN",
     # backend exports
     "BackendType",
     "DeviceType",

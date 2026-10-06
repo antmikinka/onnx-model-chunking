@@ -230,6 +230,7 @@ def test_io_binding():
     print(f"  MemoryMode.PERSISTENT: {MemoryMode.PERSISTENT.value}")
     print(f"  MemoryMode.IO_BOUND: {MemoryMode.IO_BOUND.value}")
     print(f"  Description: {MemoryMode.get_description(MemoryMode.MINIMAL)}")
+    print(f"  NPU_STATIC: {MemoryMode.get_description(MemoryMode.NPU_STATIC)}")
     
     # Test supported devices
     devices = get_supported_devices()
@@ -455,6 +456,67 @@ def test_io_binding():
         assert unified.ort_value is None
     finally:
         io_binding_module.allocate_os_shared_memory = original_os_alloc
+
+    from pipeline_utils.io_binding import (
+        StaticShapeError,
+        DEFAULT_NPU_MAX_SEQ_LEN,
+    )
+
+    assert bridge.prefill.memory_mode == MemoryMode.NPU_STATIC
+    assert bridge.prefill.auto_reallocate is False
+    assert bridge.prefill.max_seq_len == DEFAULT_NPU_MAX_SEQ_LEN
+    assert bridge.decode.auto_reallocate is True
+
+    npu = IOBindingManager(
+        device_type="cpu",
+        memory_mode=MemoryMode.NPU_STATIC,
+        max_seq_len=32,
+        auto_reallocate=True,
+    )
+    assert npu.auto_reallocate is False
+    pool = npu.allocate_static_kv_cache(
+        "kv",
+        num_layers=2,
+        num_kv_heads=4,
+        head_dim=8,
+        dtype=np.float32,
+        batch_size=1,
+        max_seq_len=32,
+    )
+    key = npu.get_buffer("kv.layer0.key")
+    assert key is not None
+    assert key.shape == (1, 4, 32, 8)
+    assert pool.kv_shape == (1, 4, 32, 8)
+    original_ptr = int(key.ort_value.data_ptr())
+    prefix = np.arange(1 * 4 * 5 * 8, dtype=np.float32).reshape(1, 4, 5, 8)
+    reused = npu.get_or_allocate("kv.layer0.key", prefix.shape, prefix.dtype, prefix)
+    assert reused is key
+    assert int(key.ort_value.data_ptr()) == original_ptr
+    assert key.shape == (1, 4, 32, 8)
+    assert np.array_equal(key.to_numpy()[:, :, :5, :], prefix)
+    mask = npu.get_buffer("kv.attention_mask")
+    assert mask is not None and mask.shape == (1, 32)
+    mask_ptr = int(mask.ort_value.data_ptr())
+    visible = npu.attention_mask(5, pool="kv")
+    assert visible.shape == (1, 32)
+    assert visible[0, :5].tolist() == [1, 1, 1, 1, 1]
+    assert visible[0, 5:].tolist() == [0] * 27
+    assert np.array_equal(mask.to_numpy(), visible)
+    assert int(mask.ort_value.data_ptr()) == mask_ptr
+    assert int(key.ort_value.data_ptr()) == original_ptr
+    try:
+        npu.get_or_allocate("kv.layer0.key", (1, 4, 64, 8), np.float32)
+        raise AssertionError("sequence past the KV pool was reallocated")
+    except StaticShapeError:
+        pass
+    assert int(npu.get_buffer("kv.layer0.key").ort_value.data_ptr()) == original_ptr
+    npu.allocate_buffer("logits", (1, 10), np.float32)
+    try:
+        npu.update_buffer("logits", np.zeros((1, 11), dtype=np.float32))
+        raise AssertionError("NPU_STATIC reallocated a non-KV buffer")
+    except StaticShapeError:
+        pass
+    print(f"  NPU_STATIC pool kept ptr={original_ptr:#x} at seq 5/{pool.max_seq_len}")
 
     assert allocate_os_shared_memory(0) is None
     assert bridge.deallocate_shared() >= 1
