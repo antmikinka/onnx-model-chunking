@@ -6,13 +6,13 @@ weight/node name prefixes for both SafeTensors and ONNX formats.
 
 To add support for a new architecture:
 1. Add it to ArchitectureType enum
-2. Add it to LLAMA_STYLE_ARCHITECTURES when it uses the shared LLaMA prefixes
+2. Add it to LLAMA_STYLE_ARCHITECTURES when it uses the shared dense LLaMA prefixes
 3. Otherwise add its own record to SAFETENSORS_PREFIXES and ONNX_PREFIXES
 """
 
 from enum import Enum
 from typing import Dict, Iterable, Optional, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 
 class ArchitectureType(str, Enum):
@@ -34,7 +34,8 @@ class ArchitectureType(str, Enum):
     UNKNOWN = "unknown"
 
 
-# Architectures that follow LLaMA-style naming conventions
+# Dense architectures that share one LLaMA prefix record.
+# Qwen3 MoE and Qwen3.8 keep the same four strings on their own records.
 LLAMA_STYLE_ARCHITECTURES = {
     ArchitectureType.LLAMA,
     ArchitectureType.MISTRAL,
@@ -43,8 +44,6 @@ LLAMA_STYLE_ARCHITECTURES = {
     ArchitectureType.QWEN,
     ArchitectureType.QWEN2,
     ArchitectureType.QWEN3,
-    ArchitectureType.QWEN3_MOE,
-    ArchitectureType.QWEN3_HYBRID,
 }
 
 
@@ -52,23 +51,57 @@ LLAMA_STYLE_ARCHITECTURES = {
 class ArchitecturePrefixes:
     """
     Weight/node name prefixes for a model architecture.
-    
-    These prefixes are used to identify and categorize model components
-    (embeddings, layers, norm, lm_head) during the splitting process.
-    
+
+    Dense models use the four core prefixes. Router, expert, multi-token
+    prediction, vision, cross-attention, and draft prefixes stay unset until
+    an architecture names that component.
+
     Attributes:
         embed_prefix: Prefix for embedding layer weights/nodes
         layer_prefix: Prefix for transformer layer weights/nodes (followed by layer index)
         norm_prefix: Prefix for final normalization layer weights/nodes
         lm_head_prefix: Prefix for language model head weights/nodes
+        router_prefix: Prefix for an MoE router, when the model has one
+        expert_prefix: Prefix for MoE expert weights, when the model has them
+        mtp_head_prefix: Prefix for a multi-token prediction head
+        vision_prefix: Prefix for a multimodal vision tower
+        cross_attn_prefix: Prefix for encoder-decoder cross-attention
+        speculative_prefix: Prefix for a draft model
     """
     embed_prefix: str
     layer_prefix: str
     norm_prefix: str
     lm_head_prefix: str
+    router_prefix: Optional[str] = None
+    expert_prefix: Optional[str] = None
+    mtp_head_prefix: Optional[str] = None
+    vision_prefix: Optional[str] = None
+    cross_attn_prefix: Optional[str] = None
+    speculative_prefix: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        for name in ("embed_prefix", "layer_prefix", "norm_prefix", "lm_head_prefix"):
+            _require_prefix(getattr(self, name), name)
+        for name in (
+            "router_prefix",
+            "expert_prefix",
+            "mtp_head_prefix",
+            "vision_prefix",
+            "cross_attn_prefix",
+            "speculative_prefix",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                _require_prefix(value, name)
 
 
-# One SafeTensors record for every LLaMA-style architecture.
+def _require_prefix(value: object, name: str) -> None:
+    """Reject a missing or blank prefix string."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-empty string")
+
+
+# One SafeTensors record for every dense LLaMA-style architecture.
 _LLAMA_STYLE = ArchitecturePrefixes(
     embed_prefix="model.embed_tokens.",
     layer_prefix="model.layers.",
@@ -76,12 +109,38 @@ _LLAMA_STYLE = ArchitecturePrefixes(
     lm_head_prefix="lm_head.",
 )
 
-# One ONNX record for every LLaMA-style architecture.
+# One ONNX record for every dense LLaMA-style architecture.
 _LLAMA_STYLE_ONNX = ArchitecturePrefixes(
     embed_prefix="/model/embed",
     layer_prefix="/model/layers.",
     norm_prefix="/model/norm",
     lm_head_prefix="/lm_head",
+)
+
+# Qwen3 MoE keeps the dense prefixes and names the router and experts.
+_QWEN3_MOE_STYLE = replace(
+    _LLAMA_STYLE,
+    router_prefix="mlp.gate.",
+    expert_prefix="mlp.experts.",
+)
+_QWEN3_MOE_ONNX = replace(
+    _LLAMA_STYLE_ONNX,
+    router_prefix="/mlp/gate",
+    expert_prefix="/mlp/experts",
+)
+
+# Qwen3.8 adds the multi-token prediction head beside the MoE prefixes.
+_QWEN3_HYBRID_STYLE = replace(
+    _LLAMA_STYLE,
+    router_prefix="mlp.gate.",
+    expert_prefix="mlp.experts.",
+    mtp_head_prefix="model.mtp_head.",
+)
+_QWEN3_HYBRID_ONNX = replace(
+    _LLAMA_STYLE_ONNX,
+    router_prefix="/mlp/gate",
+    expert_prefix="/mlp/experts",
+    mtp_head_prefix="/mtp_head",
 )
 
 
@@ -91,6 +150,8 @@ _LLAMA_STYLE_ONNX = ArchitecturePrefixes(
 
 SAFETENSORS_PREFIXES: Dict[ArchitectureType, ArchitecturePrefixes] = {
     **{arch: _LLAMA_STYLE for arch in LLAMA_STYLE_ARCHITECTURES},
+    ArchitectureType.QWEN3_MOE: _QWEN3_MOE_STYLE,
+    ArchitectureType.QWEN3_HYBRID: _QWEN3_HYBRID_STYLE,
     ArchitectureType.GPT2: ArchitecturePrefixes(
         embed_prefix="transformer.wte.",
         layer_prefix="transformer.h.",
@@ -107,6 +168,8 @@ SAFETENSORS_PREFIXES: Dict[ArchitectureType, ArchitecturePrefixes] = {
 
 ONNX_PREFIXES: Dict[ArchitectureType, ArchitecturePrefixes] = {
     **{arch: _LLAMA_STYLE_ONNX for arch in LLAMA_STYLE_ARCHITECTURES},
+    ArchitectureType.QWEN3_MOE: _QWEN3_MOE_ONNX,
+    ArchitectureType.QWEN3_HYBRID: _QWEN3_HYBRID_ONNX,
     ArchitectureType.GPT2: ArchitecturePrefixes(
         embed_prefix="/transformer/wte",
         layer_prefix="/transformer/h.",
@@ -165,6 +228,9 @@ def get_prefixes_tuple(
     
     Returns:
         Tuple of (embed_prefix, layer_prefix, norm_prefix, lm_head_prefix).
+
+        Optional router, expert, multi-token, vision, cross-attention, and
+        draft prefixes stay on the ArchitecturePrefixes record.
     """
     p = get_prefixes(arch, format)
     return (p.embed_prefix, p.layer_prefix, p.norm_prefix, p.lm_head_prefix)

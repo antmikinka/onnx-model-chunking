@@ -8755,9 +8755,10 @@ def test_architecture():
     assert set(ONNX_PREFIXES) == set(ArchitectureType)
     assert ArchitectureType.GPT2 not in LLAMA_STYLE_ARCHITECTURES
     assert ArchitectureType.UNKNOWN not in LLAMA_STYLE_ARCHITECTURES
-    assert len(LLAMA_STYLE_ARCHITECTURES) == 9
-    assert ArchitectureType.QWEN3_MOE in LLAMA_STYLE_ARCHITECTURES
-    assert ArchitectureType.QWEN3_HYBRID in LLAMA_STYLE_ARCHITECTURES
+    assert ArchitectureType.QWEN3_MOE not in LLAMA_STYLE_ARCHITECTURES
+    assert ArchitectureType.QWEN3_HYBRID not in LLAMA_STYLE_ARCHITECTURES
+    assert len(LLAMA_STYLE_ARCHITECTURES) == 7
+    assert ArchitectureType.QWEN3 in LLAMA_STYLE_ARCHITECTURES
     assert _LLAMA_STYLE is not _LLAMA_STYLE_ONNX
     assert isinstance(_LLAMA_STYLE, ArchitecturePrefixes)
 
@@ -8841,15 +8842,83 @@ def test_architecture():
         "model.norm.",
         "lm_head.",
     )
-    assert SAFETENSORS_PREFIXES[ArchitectureType.QWEN3_HYBRID] is _LLAMA_STYLE
-    assert SAFETENSORS_PREFIXES[ArchitectureType.QWEN3_MOE] is _LLAMA_STYLE
-    assert ONNX_PREFIXES[ArchitectureType.QWEN3_HYBRID] is _LLAMA_STYLE_ONNX
+    assert SAFETENSORS_PREFIXES[ArchitectureType.QWEN3_HYBRID] is not _LLAMA_STYLE
+    assert SAFETENSORS_PREFIXES[ArchitectureType.QWEN3_MOE] is not _LLAMA_STYLE
+    assert ONNX_PREFIXES[ArchitectureType.QWEN3_HYBRID] is not _LLAMA_STYLE_ONNX
     assert get_prefixes_tuple(ArchitectureType.QWEN3_MOE, "onnx") == (
         "/model/embed",
         "/model/layers.",
         "/model/norm",
         "/lm_head",
     )
+
+    optional_names = (
+        "router_prefix",
+        "expert_prefix",
+        "mtp_head_prefix",
+        "vision_prefix",
+        "cross_attn_prefix",
+        "speculative_prefix",
+    )
+    for arch in (*LLAMA_STYLE_ARCHITECTURES, ArchitectureType.GPT2, ArchitectureType.UNKNOWN):
+        for record in (get_prefixes(arch, "safetensors"), get_prefixes(arch, "onnx")):
+            for name in optional_names:
+                assert getattr(record, name) is None, (arch, name)
+
+    dense = ArchitecturePrefixes("model.embed_tokens.", "model.layers.", "model.norm.", "lm_head.")
+    assert dense.router_prefix is None
+    assert dense.vision_prefix is None
+    assert dense.speculative_prefix is None
+
+    moe = SAFETENSORS_PREFIXES[ArchitectureType.QWEN3_MOE]
+    moe_onnx = ONNX_PREFIXES[ArchitectureType.QWEN3_MOE]
+    hybrid = SAFETENSORS_PREFIXES[ArchitectureType.QWEN3_HYBRID]
+    hybrid_onnx = ONNX_PREFIXES[ArchitectureType.QWEN3_HYBRID]
+    assert moe is not hybrid
+    assert moe_onnx is not hybrid_onnx
+    assert get_prefixes(ArchitectureType.QWEN3_MOE, "safetensors") is moe
+    assert get_prefixes(ArchitectureType.QWEN3_HYBRID, "onnx") is hybrid_onnx
+    assert moe.router_prefix == "mlp.gate."
+    assert moe.expert_prefix == "mlp.experts."
+    assert moe.mtp_head_prefix is None
+    assert moe.vision_prefix is None
+    assert moe.cross_attn_prefix is None
+    assert moe.speculative_prefix is None
+    assert "model.layers.0.mlp.gate.weight".find(moe.router_prefix) >= 0
+    assert "model.layers.0.mlp.experts.0.gate_proj.weight".find(moe.expert_prefix) >= 0
+    assert "mlp.gate_proj.weight".find(moe.router_prefix) < 0
+    assert hybrid.router_prefix == moe.router_prefix
+    assert hybrid.expert_prefix == moe.expert_prefix
+    assert hybrid.mtp_head_prefix == "model.mtp_head."
+    assert "model.mtp_head.weight".startswith(hybrid.mtp_head_prefix)
+    assert hybrid.vision_prefix is None
+    assert hybrid.cross_attn_prefix is None
+    assert hybrid.speculative_prefix is None
+    assert moe_onnx.router_prefix == "/mlp/gate"
+    assert moe_onnx.expert_prefix == "/mlp/experts"
+    assert moe_onnx.mtp_head_prefix is None
+    assert hybrid_onnx.mtp_head_prefix == "/mtp_head"
+    assert "/model/layers.0/mlp/experts/0/gate_proj".find(hybrid_onnx.expert_prefix) >= 0
+    assert hybrid_onnx.vision_prefix is None
+    assert hybrid_onnx.cross_attn_prefix is None
+    assert hybrid_onnx.speculative_prefix is None
+
+    try:
+        ArchitecturePrefixes(
+            embed_prefix="model.embed_tokens.",
+            layer_prefix="model.layers.",
+            norm_prefix="model.norm.",
+            lm_head_prefix="lm_head.",
+            router_prefix=" ",
+        )
+        raise AssertionError("a blank router prefix was accepted")
+    except ValueError as exc:
+        assert "router_prefix" in str(exc)
+    try:
+        ArchitecturePrefixes("", "model.layers.", "model.norm.", "lm_head.")
+        raise AssertionError("a blank embed prefix was accepted")
+    except ValueError as exc:
+        assert "embed_prefix" in str(exc)
 
     assert classify_qwen_family(["model.layers.0.self_attn.q_norm.weight"]) is ArchitectureType.QWEN3
     assert classify_qwen_family([
@@ -8896,7 +8965,7 @@ def test_architecture():
     except ValueError as exc:
         assert "layer id" in str(exc)
 
-    print("  architecture prefixes: one llama style record, qwen3 hybrid, gpt2 stays separate")
+    print("  architecture prefixes: dense llama record, moe router and expert, hybrid mtp head")
     print("architecture prefixes: OK\n")
     return True
 
