@@ -94,6 +94,11 @@ from .common.architecture import (
 )
 
 from .common.architecture_detector import detect_architecture
+from .common.graph_topology import (
+    GraphTopology,
+    NodeGroup,
+    analyze_graph_topology,
+)
 
 from .common.path_utils import (
     is_local_path,
@@ -257,6 +262,9 @@ __all__ = [
     "QUANTIZED_OP_PATTERNS",
     "quantized_op_scheme",
     "detect_architecture",
+    "GraphTopology",
+    "NodeGroup",
+    "analyze_graph_topology",
     "SAFETENSORS_PREFIXES",
     "ONNX_PREFIXES",
     "LLAMA_STYLE_ARCHITECTURES",

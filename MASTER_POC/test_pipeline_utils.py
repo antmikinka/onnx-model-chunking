@@ -9335,6 +9335,315 @@ def test_architecture():
     return True
 
 
+def test_graph_topology():
+    """Topology maps, dependency closures, and config-aware component grouping."""
+    print("=" * 50)
+    print("Testing graph topology...")
+    print("=" * 50)
+
+    import sys
+    import types
+    import chunking_utils
+    import chunking_utils.common as common
+    from chunking_utils.common.graph_topology import (
+        analyze_graph_topology,
+        GraphTopology,
+        NodeGroup,
+    )
+
+    assert common.analyze_graph_topology is analyze_graph_topology
+    assert chunking_utils.analyze_graph_topology is analyze_graph_topology
+    assert common.GraphTopology is GraphTopology
+    assert common.NodeGroup is NodeGroup
+
+    try:
+        from chunking_utils.onnx.splitter import extract_components
+    except ModuleNotFoundError:
+        for name in list(sys.modules):
+            if name == "chunking_utils.onnx" or name.startswith("chunking_utils.onnx."):
+                del sys.modules[name]
+        onnx_stub = types.ModuleType("onnx")
+        onnx_stub.ModelProto = type("ModelProto", (), {})
+        onnx_stub.numpy_helper = types.SimpleNamespace()
+        onnx_stub.helper = types.SimpleNamespace()
+        onnx_stub.TensorProto = types.SimpleNamespace()
+        onnx_stub.shape_inference = types.SimpleNamespace()
+        sys.modules["onnx"] = onnx_stub
+        from chunking_utils.onnx.splitter import extract_components
+
+    class _Node:
+        def __init__(self, name, inputs, outputs, op_type="MatMul"):
+            self.name = name
+            self.input = list(inputs)
+            self.output = list(outputs)
+            self.op_type = op_type
+
+    class _Init:
+        def __init__(self, name):
+            self.name = name
+
+    class _Out:
+        def __init__(self, name):
+            self.name = name
+
+    class _Graph:
+        def __init__(self, nodes, inits=(), outputs=()):
+            self.node = list(nodes)
+            self.initializer = list(inits)
+            self.output = list(outputs)
+
+    class _Model:
+        def __init__(self, graph):
+            self.graph = graph
+
+    def names_of(topology, nodes, group_name):
+        group = next(item for item in topology.groups if item.name == group_name)
+        return [nodes[index].name for index in group.node_indices]
+
+    embed = _Node("/model/embed_tokens/Gather", ["input_ids", "embed_weight"], ["hidden"])
+    layer0 = _Node("/model/layers.0/self_attn/MatMul", ["hidden", "w0"], ["h0"])
+    layer1 = _Node("/model/layers.1/mlp/MatMul", ["h0", "w1"], ["h1"])
+    norm = _Node("/model/norm/Mul", ["h1", "norm_weight"], ["hn"])
+    lm_head = _Node("/lm_head/MatMul", ["hn", "embed_weight"], ["logits"])
+    topology_nodes = [embed, layer0, layer1, norm, lm_head]
+    clean = _Graph(
+        topology_nodes,
+        [_Init("embed_weight"), _Init("w0"), _Init("w1"), _Init("norm_weight"), _Init("unused_weight")],
+        [_Out("logits")],
+    )
+    clean_topology = analyze_graph_topology(clean)
+    assert clean_topology.producer_map["hidden"] == 0
+    assert clean_topology.producer_map["h0"] == 1
+    assert clean_topology.consumer_map["hidden"] == [1]
+    assert clean_topology.consumer_map["h0"] == [2]
+    assert clean_topology.initializer_ownership["w0"] == [1]
+    assert clean_topology.initializer_ownership["embed_weight"] == [0, 4]
+    assert clean_topology.initializer_ownership["unused_weight"] == []
+    assert clean_topology.topological_order == [0, 1, 2, 3, 4]
+    assert [group.name for group in clean_topology.groups] == [
+        "embedding",
+        "layer_0",
+        "layer_1",
+        "norm",
+        "lm_head",
+    ]
+    assert names_of(clean_topology, topology_nodes, "layer_0") == ["/model/layers.0/self_attn/MatMul"]
+    assert names_of(clean_topology, topology_nodes, "lm_head") == ["/lm_head/MatMul"]
+
+    reversed_nodes = [lm_head, norm, layer1, layer0, embed]
+    reversed_graph = _Graph(
+        reversed_nodes,
+        [_Init("embed_weight"), _Init("w0"), _Init("w1"), _Init("norm_weight")],
+        [_Out("logits")],
+    )
+    reversed_topology = analyze_graph_topology(reversed_graph)
+    assert reversed_topology.topological_order == [4, 3, 2, 1, 0]
+    assert [reversed_nodes[index].name for index in reversed_topology.topological_order] == [
+        "/model/embed_tokens/Gather",
+        "/model/layers.0/self_attn/MatMul",
+        "/model/layers.1/mlp/MatMul",
+        "/model/norm/Mul",
+        "/lm_head/MatMul",
+    ]
+
+    prologue = _Node("pos_add", ["input_ids"], ["positions"])
+    fused = _Node("fused_attn_kernel", ["a0"], ["a1"])
+    start = _Node("/model/layers.0/self_attn/q_proj", ["hidden"], ["a0"])
+    end = _Node("/model/layers.0/mlp/down_proj", ["a1"], ["h0"])
+    tail = _Node("tail_matmul", ["h0"], ["logits"])
+    mtp = _Node("/mtp_head", ["logits"], ["mtp_out"])
+    ngram = _Node("/model/ngram_embedding", ["input_ids"], ["ng"])
+    fused_graph = _Graph(
+        [
+            prologue,
+            _Node("/model/embed_tokens/Gather", ["positions", "embed_weight"], ["hidden"]),
+            start,
+            fused,
+            end,
+            _Node("/model/norm/Mul", ["h0"], ["hn"]),
+            _Node("/lm_head/MatMul", ["hn"], ["logits"]),
+            tail,
+            mtp,
+            ngram,
+        ],
+        [_Init("embed_weight")],
+        [_Out("logits"), _Out("mtp_out")],
+    )
+    fused_topology = analyze_graph_topology(fused_graph)
+    assert names_of(fused_topology, fused_graph.node, "embedding") == [
+        "pos_add",
+        "/model/embed_tokens/Gather",
+    ]
+    assert names_of(fused_topology, fused_graph.node, "layer_0") == [
+        "/model/layers.0/self_attn/q_proj",
+        "fused_attn_kernel",
+        "/model/layers.0/mlp/down_proj",
+    ]
+    assert names_of(fused_topology, fused_graph.node, "other") == [
+        "/model/ngram_embedding",
+        "tail_matmul",
+        "/mtp_head",
+    ]
+
+    sparse_side = _Node("Gather", ["q"], ["idx"])
+    sparse = _Graph([
+        _Node("/model/layers.1/sparse_attn/q_proj", ["hidden"], ["q"]),
+        sparse_side,
+        _Node("/model/layers.1/sparse_attn/out_proj", ["q"], ["h1"]),
+    ])
+    sparse_topology = analyze_graph_topology(sparse)
+    assert names_of(sparse_topology, sparse.node, "layer_1") == [
+        "/model/layers.1/sparse_attn/q_proj",
+        "Gather",
+        "/model/layers.1/sparse_attn/out_proj",
+    ]
+    assert sparse_topology.consumer_map["q"] == [1, 2]
+
+    expert = _Graph([
+        _Node("/model/layers.0/mlp/experts/0/up_proj", ["hidden"], ["e0"]),
+        _Node("fused_expert_gemm", ["e0"], ["e1"]),
+        _Node("/model/layers.0/mlp/experts/0/down_proj", ["e1"], ["h0"]),
+        _Node("/model/layers.0/mlp/gate/MatMul", ["hidden"], ["gate"]),
+    ])
+    expert_topology = analyze_graph_topology(expert)
+    assert names_of(expert_topology, expert.node, "layer_0") == [
+        "/model/layers.0/mlp/experts/0/up_proj",
+        "/model/layers.0/mlp/gate/MatMul",
+        "fused_expert_gemm",
+        "/model/layers.0/mlp/experts/0/down_proj",
+    ]
+
+    quant = _Graph(
+        [_Node("MatMulNBits", ["model.layers.2.mlp.experts.0.up_proj.weight", "hidden"], ["y"], "MatMulNBits")],
+        [_Init("model.layers.2.mlp.experts.0.up_proj.weight")],
+    )
+    quant_topology = analyze_graph_topology(quant)
+    assert quant_topology.groups[0].name == "layer_2"
+    assert quant_topology.groups[0].component_type == "layer"
+    assert quant_topology.groups[0].layer_id == 2
+    assert quant_topology.initializer_ownership["model.layers.2.mlp.experts.0.up_proj.weight"] == [0]
+
+    mixed = _Graph(
+        [_Node("fused", ["model.layers.0.w", "model.layers.1.w"], ["y"])],
+        [_Init("model.layers.0.w"), _Init("model.layers.1.w")],
+    )
+    mixed_topology = analyze_graph_topology(mixed)
+    assert mixed_topology.groups[0].name == "other"
+
+    ryzen = _Graph([
+        _Node("gqo_8_1_0", ["h"], ["a"]),
+        _Node("com.amd.qsa", ["a"], ["b"], "com.amd.SparseAttention"),
+        _Node("ssmlp_3_0_0", ["b"], ["c"]),
+        _Node("MatMulNBits_k_6_1", ["c"], ["d"], "MatMulNBits"),
+    ])
+    ryzen_topology = analyze_graph_topology(ryzen)
+    assert names_of(ryzen_topology, ryzen.node, "layer_0") == [
+        "gqo_8_1_0",
+        "com.amd.qsa",
+        "ssmlp_3_0_0",
+    ]
+    assert names_of(ryzen_topology, ryzen.node, "layer_1") == ["MatMulNBits_k_6_1"]
+
+    def anonymous(count, side=False):
+        nodes = [_Node("/model/embed_tokens/Gather", ["input_ids"], ["h"])]
+        previous = "h"
+        for index in range(count):
+            output = f"f{index}"
+            nodes.append(_Node(f"fused_{index}", [previous, f"w{index}"], [output]))
+            previous = output
+        if side:
+            nodes.append(_Node("side_gather", ["f0"], ["side"]))
+        nodes.append(_Node("/model/norm/Mul", [previous], ["hn"]))
+        nodes.append(_Node("/lm_head/MatMul", ["hn"], ["logits"]))
+        return _Graph(nodes, outputs=[_Out("logits")])
+
+    configured_graph = anonymous(4, side=True)
+    configured = analyze_graph_topology(
+        configured_graph,
+        config_json={"num_hidden_layers": 4},
+        model_info='{"num_hidden_layers": 2}',
+    )
+    assert names_of(configured, configured_graph.node, "layer_0") == [
+        "fused_0",
+        "fused_1",
+        "side_gather",
+    ]
+    assert names_of(configured, configured_graph.node, "layer_1") == ["fused_2", "fused_3"]
+
+    uneven_graph = anonymous(3)
+    uneven = analyze_graph_topology(uneven_graph, config_json={"num_hidden_layers": 2})
+    assert [group.name for group in uneven.groups] == ["embedding", "norm", "lm_head", "other"]
+    assert names_of(uneven, uneven_graph.node, "other") == ["fused_0", "fused_1", "fused_2"]
+
+    typed_graph = anonymous(2)
+    by_types = analyze_graph_topology(
+        typed_graph,
+        genai_config={"model": {"decoder": {"layer_types": ["linear_attention", "sparse_attention"]}}},
+    )
+    assert names_of(by_types, typed_graph.node, "layer_0") == ["fused_0"]
+    assert names_of(by_types, typed_graph.node, "layer_1") == ["fused_1"]
+    assert by_types.groups[1].component_type == "layer"
+
+    cycle = _Graph([
+        _Node("/model/layers.0/a", ["t1"], ["t0"]),
+        _Node("/model/layers.1/b", ["t0"], ["t1"]),
+    ])
+    cycle_topology = analyze_graph_topology(cycle)
+    assert cycle_topology.topological_order == [0, 1]
+    assert [group.name for group in cycle_topology.groups] == ["layer_0", "layer_1"]
+
+    boundary_graph = _Graph([
+        _Node("/model/embed_tokens/Gather", ["input_ids"], ["hidden"]),
+        _Node("boundary_fused", ["hidden"], ["mid"]),
+        _Node("/model/norm/Mul", ["mid"], ["hn"]),
+        _Node("/lm_head/MatMul", ["hn"], ["logits"]),
+    ], outputs=[_Out("logits")])
+    boundary_topology = analyze_graph_topology(boundary_graph)
+    assert names_of(boundary_topology, boundary_graph.node, "other") == ["boundary_fused"]
+    one_layer = analyze_graph_topology(boundary_graph, config_json={"num_hidden_layers": 1})
+    assert names_of(one_layer, boundary_graph.node, "layer_0") == ["boundary_fused"]
+
+    extracted = extract_components(_Model(fused_graph))
+    assert extracted["layer_0"].component_type == "layer"
+    assert extracted["layer_0"].layer_id == 0
+    assert "fused_attn_kernel" in extracted["layer_0"].node_names
+    assert extracted["embedding"].initializer_names == {"embed_weight"}
+    assert "pos_add" in extracted["embedding"].node_names
+    assert "/mtp_head" in extracted["other"].node_names
+
+    try:
+        analyze_graph_topology(1)
+        raise AssertionError("a non-graph was accepted")
+    except ValueError as exc:
+        assert "graph" in str(exc)
+    try:
+        analyze_graph_topology(None)
+        raise AssertionError("a missing graph was accepted")
+    except ValueError as exc:
+        assert "graph" in str(exc)
+    try:
+        analyze_graph_topology(_Graph([]), config_json="{")
+        raise AssertionError("broken config json was accepted")
+    except ValueError as exc:
+        assert "config_json" in str(exc)
+    try:
+        analyze_graph_topology(_Graph([]), genai_config="  ")
+        raise AssertionError("a blank genai config was accepted")
+    except ValueError as exc:
+        assert "genai_config" in str(exc)
+    try:
+        extract_components(object())
+        raise AssertionError("a model without a graph was accepted")
+    except ValueError as exc:
+        assert "graph" in str(exc)
+
+    print("  topology maps: producers, consumers, initializer ownership, topo order")
+    print("  dependency closure: fused kernel, moe expert, sparse branch, ryzenai contrib")
+    print("  config split: renamed backbone uses num_hidden_layers, side branch stays on its layer")
+    print("graph topology: OK\n")
+    return True
+
+
 def test_path_manager():
     """ONNX discovery, external data, split directories, and NPU cache paths."""
     print("=" * 50)
@@ -9651,6 +9960,12 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"architecture: FAILED - {e}")
         results.append(("architecture", False))
+
+    try:
+        results.append(("graph_topology", test_graph_topology()))
+    except Exception as e:
+        print(f"graph_topology: FAILED - {e}")
+        results.append(("graph_topology", False))
 
     try:
         results.append(("path_manager", test_path_manager()))

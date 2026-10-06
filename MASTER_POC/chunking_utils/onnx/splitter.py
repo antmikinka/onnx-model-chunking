@@ -6,7 +6,6 @@ creating per-component ONNX files for embeddings, layers, norm, and lm_head.
 """
 
 import os
-import re
 import json
 from typing import Dict, List, Optional, Tuple, Any, Set
 
@@ -21,6 +20,7 @@ from ..common.architecture import (
     get_prefixes,
 )
 from ..common.architecture_detector import detect_architecture
+from ..common.graph_topology import analyze_graph_topology
 from ..common.types import SplitConfig, ModelFormat
 
 from .types import ComponentInfo, OnnxSplitResult
@@ -68,164 +68,80 @@ def get_onnx_prefixes(model_type: Optional[str] = None) -> Tuple[str, str, str, 
     )
 
 
-def extract_components(model: onnx.ModelProto) -> Dict[str, ComponentInfo]:
+def extract_components(
+    model: onnx.ModelProto,
+    config_json=None,
+    genai_config=None,
+    model_info=None,
+) -> Dict[str, ComponentInfo]:
     """
     Extract semantic components from the ONNX model.
-    
-    Creates one ComponentInfo for:
+
+    Classification uses node-name patterns, graph topology, initializer
+    ownership, and optional config metadata. A fused or renamed node joins
+    the layer that encloses it. Creates one ComponentInfo for:
+
     - embedding
-    - layer_0, layer_1, ..., layer_N (one per layer!)
+    - layer_0, layer_1, ..., layer_N (one per layer)
     - norm
     - lm_head
-    - other (nodes not matching any pattern)
-    
+    - other (nodes that stay outside every closure)
+
     Args:
         model: ONNX model.
-    
+        config_json: Optional Hugging Face config object or JSON string.
+        genai_config: Optional GenAI config object or JSON string.
+        model_info: Optional split model_info object or JSON string.
+
     Returns:
         Dictionary mapping component name to ComponentInfo.
     """
+    if model is None or not hasattr(model, "graph"):
+        raise ValueError("model must contain a graph")
     graph = model.graph
-    arch = detect_architecture_from_onnx(graph)
+    arch = detect_architecture(
+        graph,
+        config_json=config_json,
+        genai_config=genai_config,
+        model_info=model_info,
+    ).arch_type
     prefixes = get_prefixes(arch, "onnx")
-    embed_prefix = prefixes.embed_prefix
-    layer_prefix = prefixes.layer_prefix
-    norm_prefix = prefixes.norm_prefix
-    lm_prefix = prefixes.lm_head_prefix
-    
-    print(f"\nDetected architecture: {arch.value}")
-    print(f"  Embed prefix: {embed_prefix}")
-    print(f"  Layer prefix: {layer_prefix}")
-    print(f"  Norm prefix: {norm_prefix}")
-    print(f"  LM head prefix: {lm_prefix}")
-    
-    components: Dict[str, ComponentInfo] = {
-        "embedding": ComponentInfo(component_type="embedding"),
-        "norm": ComponentInfo(component_type="norm"),
-        "lm_head": ComponentInfo(component_type="lm_head"),
-        "other": ComponentInfo(component_type="other"),
-    }
-    
-    # Build initializer lookup
-    initializer_names = {init.name for init in graph.initializer}
-    
-    # Classify each node
-    for i, node in enumerate(graph.node):
-        node_name = node.name or ""
-        node_name_lower = node_name.lower()
-        
-        # Check for embedding
-        if embed_prefix.lower() in node_name_lower or "embed_tokens" in node_name_lower:
-            components["embedding"].node_indices.append(i)
-            components["embedding"].node_names.append(node_name)
-            for inp in node.input:
-                if inp in initializer_names:
-                    components["embedding"].initializer_names.add(inp)
-            continue
-        
-        # Check for layer pattern
-        layer_id = None
-        
-        # Try architecture-specific prefix
-        if layer_prefix.lower() in node_name_lower:
-            try:
-                suffix = node_name_lower.split(layer_prefix.lower())[-1]
-                match = re.match(r'^(\d+)', suffix)
-                if match:
-                    layer_id = int(match.group(1))
-            except Exception:
-                pass
-        
-        # Fallback to generic "layers" regex
-        if layer_id is None:
-            layer_match = re.search(r'layers[./](\d+)', node_name_lower)
-            if layer_match:
-                layer_id = int(layer_match.group(1))
-            # Fallback for GPT2 style "h.N"
-            elif "h." in node_name_lower:
-                h_match = re.search(r'h[./](\d+)', node_name_lower)
-                if h_match:
-                    layer_id = int(h_match.group(1))
-        
-        # RyzenAI/AWQ optimized operator patterns:
-        # MatMulNBits_k_6_0, MatMulNBits_q_6_1, gqo_8_1_0, ssmlp_3_0_0
-        # Pattern: <op_name>_<params>_<layer_id>
-        if layer_id is None:
-            ryzenai_patterns = [
-                r'^matmulnbits_[a-z]_\d+_(\d+)$',   # MatMulNBits_k_6_0
-                r'^gqo_\d+_\d+_(\d+)$',             # gqo_8_1_0
-                r'^ssmlp_\d+_\d+_(\d+)$',           # ssmlp_3_0_0
-                # Note: Concat_N nodes have arbitrary numbering, not layer indices
-            ]
-            for pattern in ryzenai_patterns:
-                match = re.match(pattern, node_name_lower)
-                if match:
-                    layer_id = int(match.group(1))
-                    break
-        
-        # Also check initializer names for layer association
-        if layer_id is None:
-            for inp in node.input:
-                if inp in initializer_names:
-                    init_match = re.search(r'\.layers\.(\d+)\.', inp)
-                    if init_match:
-                        layer_id = int(init_match.group(1))
-                        break
 
-        if layer_id is not None:
-            layer_key = f"layer_{layer_id}"
-            
-            if layer_key not in components:
-                components[layer_key] = ComponentInfo(
-                    component_type="layer",
-                    layer_id=layer_id
-                )
-            
-            components[layer_key].node_indices.append(i)
-            components[layer_key].node_names.append(node_name)
-            for inp in node.input:
-                if inp in initializer_names:
-                    components[layer_key].initializer_names.add(inp)
-            continue
-        
-        # Check for final norm (but NOT layer norms inside layers)
-        if (norm_prefix.lower() in node_name_lower and 
-            "layers" not in node_name_lower and
-            "layer_norm" not in node_name_lower):
-            components["norm"].node_indices.append(i)
-            components["norm"].node_names.append(node_name)
-            for inp in node.input:
-                if inp in initializer_names:
-                    components["norm"].initializer_names.add(inp)
-            continue
-        
-        # Check for lm_head
-        if lm_prefix.lower() in node_name_lower:
-            components["lm_head"].node_indices.append(i)
-            components["lm_head"].node_names.append(node_name)
-            for inp in node.input:
-                if inp in initializer_names:
-                    components["lm_head"].initializer_names.add(inp)
-            continue
-        
-        # Everything else
-        components["other"].node_indices.append(i)
-        components["other"].node_names.append(node_name)
-        for inp in node.input:
-            if inp in initializer_names:
-                components["other"].initializer_names.add(inp)
-    
-    # Remove empty components
-    components = {k: v for k, v in components.items() if v.node_indices}
-    
-    # Print summary
+    print(f"\nDetected architecture: {arch.value}")
+    print(f"  Embed prefix: {prefixes.embed_prefix}")
+    print(f"  Layer prefix: {prefixes.layer_prefix}")
+    print(f"  Norm prefix: {prefixes.norm_prefix}")
+    print(f"  LM head prefix: {prefixes.lm_head_prefix}")
+
+    topology = analyze_graph_topology(
+        graph,
+        config_json=config_json,
+        genai_config=genai_config,
+        model_info=model_info,
+    )
+    nodes = list(graph.node)
+    owned: Dict[int, Set[str]] = {}
+    for init_name, indices in topology.initializer_ownership.items():
+        for index in indices:
+            owned.setdefault(index, set()).add(init_name)
+
+    components: Dict[str, ComponentInfo] = {}
+    for group in topology.groups:
+        info = ComponentInfo(
+            component_type=group.component_type,
+            layer_id=group.layer_id,
+        )
+        for index in group.node_indices:
+            node = nodes[index]
+            info.node_indices.append(index)
+            info.node_names.append(getattr(node, "name", None) or "")
+            info.initializer_names.update(owned.get(index, ()))
+        components[group.name] = info
+
     print(f"\nExtracted {len(components)} components:")
-    layer_count = 0
     for name, info in sorted(components.items()):
-        if info.component_type == "layer":
-            layer_count += 1
         print(f"  {name}: {len(info.node_indices)} nodes, {len(info.initializer_names)} initializers")
-    
+
     return components
 
 

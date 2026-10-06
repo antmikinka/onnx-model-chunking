@@ -31,6 +31,11 @@ from .architecture import (
     quantized_op_scheme,
 )
 from .architecture_detector import detect_architecture
+from .graph_topology import (
+    GraphTopology,
+    NodeGroup,
+    analyze_graph_topology,
+)
 from .types import (
     ModelFormat,
     TensorDtype,
@@ -103,6 +108,9 @@ __all__ = [
     "QUANTIZED_OP_PATTERNS",
     "quantized_op_scheme",
     "detect_architecture",
+    "GraphTopology",
+    "NodeGroup",
+    "analyze_graph_topology",
     # Types
     "ModelFormat",
     "TensorDtype",
