@@ -1408,6 +1408,183 @@ def get_recommended_quantized_dtype(
 
 
 # =============================================================================
+# KV CACHE DTYPE POLICY
+# =============================================================================
+
+# Compute dtype for a long-context cache. ``compressed`` is the INT8 row.
+# BF16, FP8, and packed INT4/FP4 are selected through ``compression``.
+KV_CACHE_DTYPE_POLICY = {
+    "default": np.float16,
+    "npu": np.float16,
+    "rocm": np.float16,
+    "cpu": np.float32,
+    "compressed": np.int8,
+}
+
+_KV_CACHE_PROVIDER_ALIASES = {
+    "default": "default",
+    "npu": "npu",
+    "vitisai": "npu",
+    "vitisaiexecutionprovider": "npu",
+    "ryzenai": "npu",
+    "ryzenaiexecutionprovider": "npu",
+    "rocm": "rocm",
+    "rocmexecutionprovider": "rocm",
+    "hip": "rocm",
+    "igpu": "rocm",
+    "cpu": "cpu",
+    "cpuexecutionprovider": "cpu",
+}
+
+_KV_COMPRESSION_ALIASES = {
+    "compressed": "compressed",
+    "int8": "compressed",
+    "fp16": "fp16",
+    "float16": "fp16",
+    "half": "fp16",
+    "bf16": "bf16",
+    "bfloat16": "bf16",
+    "fp8": "fp8",
+    "float8": "fp8",
+    "e4m3": "fp8",
+    "e4m3fn": "fp8",
+    "int4": "int4",
+    "fp4": "fp4",
+    "float4": "fp4",
+    "fp32": "fp32",
+    "float32": "fp32",
+    "float": "fp32",
+}
+
+
+def _normalize_kv_token(value: str) -> str:
+    return str(value).strip().lower().replace("-", "").replace("_", "").replace(" ", "")
+
+
+def _kv_cache_provider_key(provider: str) -> str:
+    key = _normalize_kv_token(provider)
+    if key not in _KV_CACHE_PROVIDER_ALIASES:
+        known = ", ".join(KV_CACHE_DTYPE_POLICY)
+        raise ValueError(
+            f"Unrecognized provider for KV cache dtype: {provider}. Known policies: {known}"
+        )
+    return _KV_CACHE_PROVIDER_ALIASES[key]
+
+
+def _kv_compression_scheme(compression: Optional[str]) -> Optional[str]:
+    """Map a compression name onto a storage scheme. None keeps the provider row."""
+    if compression is None:
+        return None
+    text = str(compression).strip()
+    if text == "":
+        return None
+    if ":" in text or "=" in text:
+        raise ValueError(
+            f"Split KV precision '{compression}' needs get_kv_cache_dtypes()"
+        )
+    key = _normalize_kv_token(text)
+    if key in ("", "none"):
+        return None
+    if key not in _KV_COMPRESSION_ALIASES:
+        known = "fp16, bf16, int8, fp8, int4, fp4, fp32, compressed"
+        raise ValueError(
+            f"Unrecognized KV compression '{compression}'. Expected one of: {known}"
+        )
+    return _KV_COMPRESSION_ALIASES[key]
+
+
+def _dtype_for_kv_compression(scheme: str) -> np.dtype:
+    if scheme == "compressed":
+        return np.dtype(KV_CACHE_DTYPE_POLICY["compressed"])
+    if scheme == "fp16":
+        return np.dtype(np.float16)
+    if scheme == "fp32":
+        return np.dtype(np.float32)
+    if scheme == "bf16":
+        native = get_bfloat16_dtype()
+        if native is not None:
+            return np.dtype(native)
+        return np.dtype(np.uint16)
+    if scheme == "fp8":
+        return float8_storage_dtype("e4m3fn")
+    if scheme in ("int4", "fp4"):
+        return np.dtype(np.uint8)
+    raise ValueError(f"Unrecognized KV compression scheme: {scheme}")
+
+
+def get_kv_cache_dtype(provider: str, compression: Optional[str] = None) -> np.dtype:
+    """Storage dtype for a KV cache on ``provider``.
+
+    With no compression, the result is the policy row: float16 for default,
+    NPU, and ROCm, float32 for CPU, and int8 when ``compression`` is
+    ``compressed`` or ``int8``. ``bf16`` uses native bfloat16 or a uint16
+    container. ``fp8`` uses the E4M3 storage dtype. ``int4`` and ``fp4`` use
+    the packed uint8 container.
+    """
+    _kv_cache_provider_key(provider)
+    scheme = _kv_compression_scheme(compression)
+    if scheme is None:
+        return np.dtype(KV_CACHE_DTYPE_POLICY[_kv_cache_provider_key(provider)])
+    return _dtype_for_kv_compression(scheme)
+
+
+def _split_kv_compression(
+    compression: Optional[str],
+    key: Optional[str],
+    value: Optional[str],
+) -> Tuple[Optional[str], Optional[str]]:
+    if key is None and value is None and compression is not None:
+        text = str(compression)
+        if ":" in text or "=" in text:
+            parts: Dict[str, str] = {}
+            for piece in text.split(","):
+                if ":" in piece:
+                    name, scheme = piece.split(":", 1)
+                elif "=" in piece:
+                    name, scheme = piece.split("=", 1)
+                else:
+                    raise ValueError(
+                        f"Split KV compression '{compression}' needs key and value sides"
+                    )
+                side = _normalize_kv_token(name)
+                if side in ("k", "key"):
+                    side = "key"
+                elif side in ("v", "value"):
+                    side = "value"
+                else:
+                    raise ValueError(f"Unrecognized KV side '{name}' in '{compression}'")
+                parts[side] = scheme.strip()
+            if "key" not in parts or "value" not in parts:
+                raise ValueError(
+                    f"Split KV compression '{compression}' needs both key and value"
+                )
+            return parts["key"], parts["value"]
+    return (
+        key if key is not None else compression,
+        value if value is not None else compression,
+    )
+
+
+def get_kv_cache_dtypes(
+    provider: str,
+    compression: Optional[str] = None,
+    *,
+    key: Optional[str] = None,
+    value: Optional[str] = None,
+) -> Tuple[np.dtype, np.dtype]:
+    """Key dtype and value dtype. Both follow ``compression`` unless split.
+
+    ``key`` and ``value`` name separate schemes. A single ``compression`` of
+    ``key:bf16,value:fp8`` (or ``k=bf16,v=int8``) does the same.
+    """
+    key_scheme, value_scheme = _split_kv_compression(compression, key, value)
+    return (
+        get_kv_cache_dtype(provider, key_scheme),
+        get_kv_cache_dtype(provider, value_scheme),
+    )
+
+
+# =============================================================================
 # CONVENIENCE EXPORTS
 # =============================================================================
 
@@ -1422,6 +1599,7 @@ __all__ = [
     "AWQ_DTYPE_MAP",
     "QUANTIZED_DTYPE_MAP",
     "PROVIDER_DTYPE_POLICY",
+    "KV_CACHE_DTYPE_POLICY",
     # Quantized metadata
     "QuantizedDtype",
     "INT4_BLOCKWISE",
@@ -1459,4 +1637,6 @@ __all__ = [
     "resolve_preferred_dtype",
     "get_recommended_dtype",
     "get_recommended_quantized_dtype",
+    "get_kv_cache_dtype",
+    "get_kv_cache_dtypes",
 ]

@@ -61,6 +61,9 @@ from .dtypes import (
     resolve_preferred_dtype,
     get_recommended_dtype,
     get_recommended_quantized_dtype,
+    KV_CACHE_DTYPE_POLICY,
+    get_kv_cache_dtype,
+    get_kv_cache_dtypes,
 )
 
 from .kv_cache import (
@@ -223,6 +226,9 @@ __all__ = [
     "resolve_preferred_dtype",
     "get_recommended_dtype",
     "get_recommended_quantized_dtype",
+    "KV_CACHE_DTYPE_POLICY",
+    "get_kv_cache_dtype",
+    "get_kv_cache_dtypes",
     # kv_cache exports
     "KVCacheManager",
     "KVCacheBackend",

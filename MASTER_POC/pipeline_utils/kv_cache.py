@@ -407,7 +407,7 @@ class KVCacheManager:
         num_layers: int,
         num_kv_heads: int,
         head_dim: int,
-        dtype: Any = np.float16,
+        dtype: Any = None,
         batch_size: int = 1,
         backend: Any = KVCacheBackend.CPU,
         max_seq_len: Optional[int] = None,
@@ -428,7 +428,11 @@ class KVCacheManager:
             num_layers: Number of transformer layers
             num_kv_heads: Number of key-value attention heads
             head_dim: Dimension of each attention head
-            dtype: Numpy dtype for cache tensors (default: float16)
+            dtype: Numpy dtype for cache tensors. Omitted values use
+                ``KV_CACHE_DTYPE_POLICY['default']`` (float16).
+                ``get_kv_cache_dtype`` selects NPU, ROCm, CPU, or a
+                compressed scheme. Key and value can differ through
+                ``get_kv_cache_dtypes``.
             batch_size: Batch size for inference (default: 1)
             backend: cpu, cuda, rocm, vitisai, ryzenai, pinned_host,
                 or hybrid_npu_igpu
@@ -452,6 +456,7 @@ class KVCacheManager:
             kv_quantization: None, fp16, bf16, int8, fp8, int4, or fp4.
                 None keeps the compute buffer as the stored form.
         """
+        dtype = _default_compute_dtype(dtype)
         self.num_layers = num_layers
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
@@ -2324,6 +2329,15 @@ def _scheme_storage_dtype(scheme: str) -> np.dtype:
     raise ValueError(f"Unknown kv_quantization '{scheme}'")
 
 
+def _default_compute_dtype(dtype: Any) -> Any:
+    """Use the default KV policy when the caller omitted a compute dtype."""
+    if dtype is not None:
+        return dtype
+    from .dtypes import get_kv_cache_dtype
+
+    return get_kv_cache_dtype("default")
+
+
 def _resolve_cache_dtype(
     scheme: Optional[str], requested: Any, compute: Any
 ) -> np.dtype:
@@ -2598,7 +2612,7 @@ class RecurrentStateCache:
         num_layers: int,
         num_heads: int,
         head_dim: int,
-        dtype: Any = np.float16,
+        dtype: Any = None,
         batch_size: int = 1,
         state_dim: Optional[int] = None,
         conv_dim: Optional[int] = None,
@@ -2606,6 +2620,7 @@ class RecurrentStateCache:
         backend: Any = KVCacheBackend.CPU,
         device_id: int = 0,
     ):
+        dtype = _default_compute_dtype(dtype)
         if num_layers < 1:
             raise ValueError(f"num_layers must be positive, got {num_layers}")
         if num_heads < 1 or head_dim < 1:
@@ -2823,7 +2838,7 @@ class SparseKVCache:
         num_layers: int,
         num_kv_heads: int,
         head_dim: int,
-        dtype: Any = np.float16,
+        dtype: Any = None,
         batch_size: int = 1,
         max_blocks: Optional[int] = None,
         block_size: int = 16,
@@ -2831,6 +2846,7 @@ class SparseKVCache:
         backend: Any = KVCacheBackend.CPU,
         device_id: int = 0,
     ):
+        dtype = _default_compute_dtype(dtype)
         if num_layers < 1 or num_kv_heads < 1 or head_dim < 1:
             raise ValueError("num_layers, num_kv_heads, and head_dim must be positive")
         self.block_size = int(block_size)
@@ -3274,7 +3290,7 @@ class HybridKVCacheManager:
         layer_types: Sequence[Any],
         num_kv_heads: int,
         head_dim: int,
-        dtype: Any = np.float16,
+        dtype: Any = None,
         batch_size: int = 1,
         backend: Any = KVCacheBackend.CPU,
         max_seq_len: Optional[int] = None,
@@ -3289,6 +3305,7 @@ class HybridKVCacheManager:
         draft: Any = None,
         verify: Any = None,
     ):
+        dtype = _default_compute_dtype(dtype)
         if not isinstance(layer_types, (list, tuple)) or len(layer_types) < 1:
             raise ValueError("layer_types must list at least one layer")
         self.num_kv_heads = int(num_kv_heads)

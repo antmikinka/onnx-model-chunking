@@ -35,6 +35,9 @@ def test_dtypes():
         get_recommended_quantized_dtype,
         resolve_preferred_dtype,
         PROVIDER_DTYPE_POLICY,
+        KV_CACHE_DTYPE_POLICY,
+        get_kv_cache_dtype,
+        get_kv_cache_dtypes,
         supports_float8,
         get_float8_dtype,
         float8_storage_dtype,
@@ -536,6 +539,61 @@ def test_dtypes():
     assert pipeline_utils.safe_cast is safe_cast
     print("  safe_cast: range check raises, saturate clamps")
 
+    assert KV_CACHE_DTYPE_POLICY == {
+        "default": np.float16,
+        "npu": np.float16,
+        "rocm": np.float16,
+        "cpu": np.float32,
+        "compressed": np.int8,
+    }
+    assert get_kv_cache_dtype("default") == np.dtype(np.float16)
+    assert get_kv_cache_dtype("npu") == np.float16
+    assert get_kv_cache_dtype("VitisAIExecutionProvider") == np.float16
+    assert get_kv_cache_dtype("ryzenai") == np.float16
+    assert get_kv_cache_dtype("ROCmExecutionProvider") == np.float16
+    assert get_kv_cache_dtype("hip") == np.float16
+    assert get_kv_cache_dtype("igpu") == np.float16
+    assert get_kv_cache_dtype("cpu") == np.float32
+    assert get_kv_cache_dtype("CPUExecutionProvider") == np.dtype(np.float32)
+    assert get_kv_cache_dtype("npu", "compressed") == np.dtype(np.int8)
+    assert get_kv_cache_dtype("rocm", "int8") == np.dtype(np.int8)
+    assert get_kv_cache_dtype("cpu", "fp16") == np.dtype(np.float16)
+    bf16_kv = get_kv_cache_dtype("npu", "bf16")
+    if supports_bfloat16():
+        assert bf16_kv == np.dtype(get_bfloat16_dtype())
+    else:
+        assert bf16_kv == np.dtype(np.uint16)
+    assert get_kv_cache_dtype("default", "fp8") == float8_storage_dtype("e4m3fn")
+    assert get_kv_cache_dtype("default", "int4") == np.dtype(np.uint8)
+    assert get_kv_cache_dtype("default", "fp4") == np.dtype(np.uint8)
+    key_dtype, value_dtype = get_kv_cache_dtypes("npu", key="bf16", value="fp8")
+    assert key_dtype == bf16_kv
+    assert value_dtype == float8_storage_dtype("e4m3fn")
+    split_key, split_value = get_kv_cache_dtypes("cpu", "key:fp16,value:int8")
+    assert split_key == np.dtype(np.float16)
+    assert split_value == np.dtype(np.int8)
+    same_key, same_value = get_kv_cache_dtypes("rocm")
+    assert same_key == same_value == np.dtype(np.float16)
+    try:
+        get_kv_cache_dtype("CUDAExecutionProvider")
+        raise AssertionError("CUDA has no KV cache dtype policy")
+    except ValueError as exc:
+        assert "CUDAExecutionProvider" in str(exc)
+    try:
+        get_kv_cache_dtype("npu", "int3")
+        raise AssertionError("int3 is not a KV compression")
+    except ValueError as exc:
+        assert "int3" in str(exc)
+    try:
+        get_kv_cache_dtype("npu", "key:bf16,value:fp8")
+        raise AssertionError("a split scheme is not one dtype")
+    except ValueError as exc:
+        assert "get_kv_cache_dtypes" in str(exc)
+    assert pipeline_utils.KV_CACHE_DTYPE_POLICY is KV_CACHE_DTYPE_POLICY
+    assert pipeline_utils.get_kv_cache_dtype is get_kv_cache_dtype
+    assert pipeline_utils.get_kv_cache_dtypes is get_kv_cache_dtypes
+    print("  kv cache dtype: fp16 default, cpu fp32, compressed int8, split key and value")
+
     print("dtypes module: OK\n")
     return True
 
@@ -560,6 +618,10 @@ def test_kv_cache():
     
     print(f"  Created: {cache}")
     print(f"  Initial sequence length: {cache.get_sequence_length()}")
+    omitted_dtype = KVCacheManager(1, 1, 4, max_seq_len=2)
+    from pipeline_utils.dtypes import get_kv_cache_dtype as kv_dtype_for_default
+    assert omitted_dtype.dtype == kv_dtype_for_default("default")
+    assert omitted_dtype.dtype == np.float16
     
     # Test inject into registry
     registry = {}
