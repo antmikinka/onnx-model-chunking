@@ -6,8 +6,8 @@ weight/node name prefixes for both SafeTensors and ONNX formats.
 
 To add support for a new architecture:
 1. Add it to ArchitectureType enum
-2. Add prefix mappings to SAFETENSORS_PREFIXES and ONNX_PREFIXES
-3. Add to LLAMA_STYLE_ARCHITECTURES if it follows LLaMA conventions
+2. Add it to LLAMA_STYLE_ARCHITECTURES when it uses the shared LLaMA prefixes
+3. Otherwise add its own record to SAFETENSORS_PREFIXES and ONNX_PREFIXES
 """
 
 from enum import Enum
@@ -64,68 +64,36 @@ class ArchitecturePrefixes:
     lm_head_prefix: str
 
 
+# One SafeTensors record for every LLaMA-style architecture.
+_LLAMA_STYLE = ArchitecturePrefixes(
+    embed_prefix="model.embed_tokens.",
+    layer_prefix="model.layers.",
+    norm_prefix="model.norm.",
+    lm_head_prefix="lm_head.",
+)
+
+# One ONNX record for every LLaMA-style architecture.
+_LLAMA_STYLE_ONNX = ArchitecturePrefixes(
+    embed_prefix="/model/embed",
+    layer_prefix="/model/layers.",
+    norm_prefix="/model/norm",
+    lm_head_prefix="/lm_head",
+)
+
+
 # ==============================================================================
 # SafeTensors Prefix Mappings (PyTorch weight key format)
 # ==============================================================================
 
 SAFETENSORS_PREFIXES: Dict[ArchitectureType, ArchitecturePrefixes] = {
-    # LLaMA and LLaMA-style architectures
-    ArchitectureType.LLAMA: ArchitecturePrefixes(
-        embed_prefix="model.embed_tokens.",
-        layer_prefix="model.layers.",
-        norm_prefix="model.norm.",
-        lm_head_prefix="lm_head."
-    ),
-    ArchitectureType.MISTRAL: ArchitecturePrefixes(
-        embed_prefix="model.embed_tokens.",
-        layer_prefix="model.layers.",
-        norm_prefix="model.norm.",
-        lm_head_prefix="lm_head."
-    ),
-    ArchitectureType.PHI: ArchitecturePrefixes(
-        embed_prefix="model.embed_tokens.",
-        layer_prefix="model.layers.",
-        norm_prefix="model.norm.",
-        lm_head_prefix="lm_head."
-    ),
-    ArchitectureType.GEMMA: ArchitecturePrefixes(
-        embed_prefix="model.embed_tokens.",
-        layer_prefix="model.layers.",
-        norm_prefix="model.norm.",
-        lm_head_prefix="lm_head."
-    ),
-    ArchitectureType.QWEN: ArchitecturePrefixes(
-        embed_prefix="model.embed_tokens.",
-        layer_prefix="model.layers.",
-        norm_prefix="model.norm.",
-        lm_head_prefix="lm_head."
-    ),
-    ArchitectureType.QWEN2: ArchitecturePrefixes(
-        embed_prefix="model.embed_tokens.",
-        layer_prefix="model.layers.",
-        norm_prefix="model.norm.",
-        lm_head_prefix="lm_head."
-    ),
-    ArchitectureType.QWEN3: ArchitecturePrefixes(
-        embed_prefix="model.embed_tokens.",
-        layer_prefix="model.layers.",
-        norm_prefix="model.norm.",
-        lm_head_prefix="lm_head."
-    ),
-    # GPT-2 style
+    **{arch: _LLAMA_STYLE for arch in LLAMA_STYLE_ARCHITECTURES},
     ArchitectureType.GPT2: ArchitecturePrefixes(
         embed_prefix="transformer.wte.",
         layer_prefix="transformer.h.",
         norm_prefix="transformer.ln_f.",
-        lm_head_prefix="lm_head."
+        lm_head_prefix="lm_head.",
     ),
-    # Default/Unknown uses LLaMA style
-    ArchitectureType.UNKNOWN: ArchitecturePrefixes(
-        embed_prefix="model.embed_tokens.",
-        layer_prefix="model.layers.",
-        norm_prefix="model.norm.",
-        lm_head_prefix="lm_head."
-    ),
+    ArchitectureType.UNKNOWN: _LLAMA_STYLE,
 }
 
 
@@ -134,63 +102,14 @@ SAFETENSORS_PREFIXES: Dict[ArchitectureType, ArchitecturePrefixes] = {
 # ==============================================================================
 
 ONNX_PREFIXES: Dict[ArchitectureType, ArchitecturePrefixes] = {
-    # LLaMA and LLaMA-style architectures
-    ArchitectureType.LLAMA: ArchitecturePrefixes(
-        embed_prefix="/model/embed",
-        layer_prefix="/model/layers.",
-        norm_prefix="/model/norm",
-        lm_head_prefix="/lm_head"
-    ),
-    ArchitectureType.MISTRAL: ArchitecturePrefixes(
-        embed_prefix="/model/embed",
-        layer_prefix="/model/layers.",
-        norm_prefix="/model/norm",
-        lm_head_prefix="/lm_head"
-    ),
-    ArchitectureType.PHI: ArchitecturePrefixes(
-        embed_prefix="/model/embed",
-        layer_prefix="/model/layers.",
-        norm_prefix="/model/norm",
-        lm_head_prefix="/lm_head"
-    ),
-    ArchitectureType.GEMMA: ArchitecturePrefixes(
-        embed_prefix="/model/embed",
-        layer_prefix="/model/layers.",
-        norm_prefix="/model/norm",
-        lm_head_prefix="/lm_head"
-    ),
-    ArchitectureType.QWEN: ArchitecturePrefixes(
-        embed_prefix="/model/embed",
-        layer_prefix="/model/layers.",
-        norm_prefix="/model/norm",
-        lm_head_prefix="/lm_head"
-    ),
-    ArchitectureType.QWEN2: ArchitecturePrefixes(
-        embed_prefix="/model/embed",
-        layer_prefix="/model/layers.",
-        norm_prefix="/model/norm",
-        lm_head_prefix="/lm_head"
-    ),
-    ArchitectureType.QWEN3: ArchitecturePrefixes(
-        embed_prefix="/model/embed",
-        layer_prefix="/model/layers.",
-        norm_prefix="/model/norm",
-        lm_head_prefix="/lm_head"
-    ),
-    # GPT-2 style
+    **{arch: _LLAMA_STYLE_ONNX for arch in LLAMA_STYLE_ARCHITECTURES},
     ArchitectureType.GPT2: ArchitecturePrefixes(
         embed_prefix="/transformer/wte",
         layer_prefix="/transformer/h.",
         norm_prefix="/transformer/ln_f",
-        lm_head_prefix="/lm_head"
+        lm_head_prefix="/lm_head",
     ),
-    # Default/Unknown uses LLaMA style
-    ArchitectureType.UNKNOWN: ArchitecturePrefixes(
-        embed_prefix="/model/embed",
-        layer_prefix="/model/layers.",
-        norm_prefix="/model/norm",
-        lm_head_prefix="/lm_head"
-    ),
+    ArchitectureType.UNKNOWN: _LLAMA_STYLE_ONNX,
 }
 
 

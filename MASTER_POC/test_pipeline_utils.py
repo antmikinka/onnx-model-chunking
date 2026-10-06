@@ -8727,6 +8727,105 @@ def test_hf_integration():
     return True
 
 
+def test_architecture():
+    """LLaMA-style architectures share one prefix record per format."""
+    print("=" * 50)
+    print("Testing architecture prefixes...")
+    print("=" * 50)
+
+    import chunking_utils.common as common
+    from chunking_utils.common.architecture import (
+        LLAMA_STYLE_ARCHITECTURES,
+        ONNX_PREFIXES,
+        SAFETENSORS_PREFIXES,
+        ArchitecturePrefixes,
+        ArchitectureType,
+        _LLAMA_STYLE,
+        _LLAMA_STYLE_ONNX,
+        architecture_from_string,
+        get_prefixes,
+        get_prefixes_tuple,
+    )
+
+    assert common.SAFETENSORS_PREFIXES is SAFETENSORS_PREFIXES
+    assert common.ONNX_PREFIXES is ONNX_PREFIXES
+    assert set(SAFETENSORS_PREFIXES) == set(ArchitectureType)
+    assert set(ONNX_PREFIXES) == set(ArchitectureType)
+    assert ArchitectureType.GPT2 not in LLAMA_STYLE_ARCHITECTURES
+    assert ArchitectureType.UNKNOWN not in LLAMA_STYLE_ARCHITECTURES
+    assert len(LLAMA_STYLE_ARCHITECTURES) == 7
+    assert _LLAMA_STYLE is not _LLAMA_STYLE_ONNX
+    assert isinstance(_LLAMA_STYLE, ArchitecturePrefixes)
+
+    for arch in LLAMA_STYLE_ARCHITECTURES:
+        assert SAFETENSORS_PREFIXES[arch] is _LLAMA_STYLE
+        assert ONNX_PREFIXES[arch] is _LLAMA_STYLE_ONNX
+        assert get_prefixes(arch, "safetensors") is _LLAMA_STYLE
+        assert get_prefixes(arch, "ONNX") is _LLAMA_STYLE_ONNX
+
+    assert SAFETENSORS_PREFIXES[ArchitectureType.UNKNOWN] is _LLAMA_STYLE
+    assert ONNX_PREFIXES[ArchitectureType.UNKNOWN] is _LLAMA_STYLE_ONNX
+    assert get_prefixes(ArchitectureType.LLAMA, "SafeTensors") is _LLAMA_STYLE
+    assert _LLAMA_STYLE.embed_prefix == "model.embed_tokens."
+    assert _LLAMA_STYLE.layer_prefix == "model.layers."
+    assert _LLAMA_STYLE.norm_prefix == "model.norm."
+    assert _LLAMA_STYLE.lm_head_prefix == "lm_head."
+    assert _LLAMA_STYLE_ONNX.embed_prefix == "/model/embed"
+    assert _LLAMA_STYLE_ONNX.layer_prefix == "/model/layers."
+    assert _LLAMA_STYLE_ONNX.norm_prefix == "/model/norm"
+    assert _LLAMA_STYLE_ONNX.lm_head_prefix == "/lm_head"
+    assert get_prefixes_tuple(ArchitectureType.MISTRAL, "safetensors") == (
+        "model.embed_tokens.",
+        "model.layers.",
+        "model.norm.",
+        "lm_head.",
+    )
+    assert get_prefixes_tuple(ArchitectureType.QWEN3, "onnx") == (
+        "/model/embed",
+        "/model/layers.",
+        "/model/norm",
+        "/lm_head",
+    )
+
+    gpt2 = SAFETENSORS_PREFIXES[ArchitectureType.GPT2]
+    gpt2_onnx = ONNX_PREFIXES[ArchitectureType.GPT2]
+    assert gpt2 is not _LLAMA_STYLE
+    assert gpt2_onnx is not _LLAMA_STYLE_ONNX
+    assert gpt2.embed_prefix == "transformer.wte."
+    assert gpt2.layer_prefix == "transformer.h."
+    assert gpt2.norm_prefix == "transformer.ln_f."
+    assert gpt2.lm_head_prefix == "lm_head."
+    assert gpt2_onnx.embed_prefix == "/transformer/wte"
+    assert gpt2_onnx.layer_prefix == "/transformer/h."
+    assert gpt2_onnx.norm_prefix == "/transformer/ln_f"
+    assert gpt2_onnx.lm_head_prefix == "/lm_head"
+    assert get_prefixes(ArchitectureType.GPT2, "safetensors") is gpt2
+
+    try:
+        _LLAMA_STYLE.embed_prefix = "other"
+        raise AssertionError("a shared prefix record was changed")
+    except AttributeError:
+        pass
+
+    try:
+        get_prefixes(ArchitectureType.LLAMA, "gguf")
+        raise AssertionError("an unknown format was accepted")
+    except ValueError as exc:
+        assert "Unknown format" in str(exc)
+        assert "gguf" in str(exc)
+
+    assert architecture_from_string("llama") is ArchitectureType.LLAMA
+    assert architecture_from_string("Qwen2") is ArchitectureType.QWEN2
+    assert architecture_from_string("qwen3") is ArchitectureType.QWEN3
+    assert architecture_from_string("qwen") is ArchitectureType.QWEN
+    assert architecture_from_string("") is ArchitectureType.UNKNOWN
+    assert get_prefixes(architecture_from_string("mixtral"), "safetensors") is _LLAMA_STYLE
+
+    print("  architecture prefixes: one llama style record, gpt2 stays separate")
+    print("architecture prefixes: OK\n")
+    return True
+
+
 if __name__ == "__main__":
     print("\n" + "=" * 60)
     print("Pipeline Utils Module Tests")
@@ -8781,6 +8880,12 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"hf_integration: FAILED - {e}")
         results.append(("hf_integration", False))
+
+    try:
+        results.append(("architecture", test_architecture()))
+    except Exception as e:
+        print(f"architecture: FAILED - {e}")
+        results.append(("architecture", False))
     
     # Summary
     print("=" * 60)
