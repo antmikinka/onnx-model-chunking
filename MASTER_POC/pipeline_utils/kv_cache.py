@@ -26,6 +26,12 @@ Usage:
     )
     past_key, past_value = cache.get_device_tensors(0)
     cache.bind_cache_to_session(session, io_binding, layer_idx=0)
+
+Hybrid stacks use one cache type per layer. Dense attention stays on
+``DenseKVCache``. Gated DeltaNet and linear attention use
+``RecurrentStateCache``. Sparse attention uses ``SparseKVCache``.
+``HybridKVCacheManager`` mixes those with MoE router history and can hold
+a draft cache beside a verify cache for speculative decoding.
 """
 
 from enum import Enum
@@ -355,6 +361,10 @@ class KVCacheManager:
     """
     Manages KV (Key-Value) cache state for incremental transformer decoding.
 
+    This is the dense-attention cache. ``entry()`` exposes each layer as a
+    ``CacheEntry``. Recurrent, sparse, router, and speculative state live on
+    ``RecurrentStateCache``, ``SparseKVCache``, and ``HybridKVCacheManager``.
+
     In autoregressive generation with KV caching:
     - First iteration (prefill): Process full prompt, populate cache
     - Subsequent iterations (decode): Process only new token, use cached keys/values
@@ -380,6 +390,8 @@ class KVCacheManager:
             paged blocks, and hybrid sparse keep a bounded working set
             inside the same allocation.
     """
+
+    cache_type = "dense_kv"
 
     def __init__(
         self,
@@ -958,6 +970,34 @@ class KVCacheManager:
         if layer_idx not in self._cache:
             raise KeyError(f"Layer {layer_idx} not in cache (have {self.num_layers} layers)")
         return self._cache[layer_idx]["key"], self._cache[layer_idx]["value"]
+
+    def entry(self, layer_idx: int) -> "CacheEntry":
+        """
+        One layer as a ``CacheEntry``.
+
+        ``tensors`` holds the resident key and value. ``metadata`` records
+        the valid length, policy, and backend. The tensors are the stored
+        objects, so a device layer still points at its OrtValue.
+        """
+        key, value = self.get_past_tensors(layer_idx)
+        return CacheEntry(
+            layer_idx,
+            self.cache_type,
+            {"key": key, "value": value},
+            {
+                "seq_len": self.layer_length(layer_idx),
+                "max_seq_len": self.max_seq_len,
+                "policy": self.policy_for(layer_idx).value,
+                "backend": self.backend.value,
+                "num_kv_heads": self.num_kv_heads,
+                "head_dim": self.head_dim,
+                "batch_size": self.batch_size,
+            },
+        )
+
+    def entries(self) -> List["CacheEntry"]:
+        """A ``CacheEntry`` for every layer, in layer order."""
+        return [self.entry(layer) for layer in range(self.num_layers)]
 
     def get_ort_values(self, layer_idx: int) -> Tuple[Any, Any]:
         """
@@ -2168,6 +2208,1086 @@ def _dequantize_array(
 
 
 # =============================================================================
+# MODULAR CACHE TYPES
+# =============================================================================
+
+_CACHE_TYPE_ALIASES = {
+    "dense": "dense_kv",
+    "dense_kv": "dense_kv",
+    "kv": "dense_kv",
+    "attention": "dense_kv",
+    "recurrent": "recurrent_state",
+    "recurrent_state": "recurrent_state",
+    "deltanet": "recurrent_state",
+    "gated_deltanet": "recurrent_state",
+    "linear": "recurrent_state",
+    "linear_attention": "recurrent_state",
+    "sparse": "sparse_kv",
+    "sparse_kv": "sparse_kv",
+    "sparse_attention": "sparse_kv",
+    "router": "router",
+    "moe": "router",
+    "moe_routing": "router",
+    "expert": "router",
+    "draft": "draft",
+    "speculative": "draft",
+    "verify": "verify",
+    "verification": "verify",
+}
+
+
+def _coerce_cache_type(cache_type: Any) -> str:
+    """Map an attention-style name onto a cache type string."""
+    text = str(cache_type).strip().lower().replace("-", "_").replace(" ", "_")
+    if text in _CACHE_TYPE_ALIASES:
+        return _CACHE_TYPE_ALIASES[text]
+    allowed = "dense_kv, recurrent_state, sparse_kv, router, draft, verify"
+    raise ValueError(
+        f"Unknown cache type '{cache_type}'. Expected one of: {allowed}"
+    )
+
+
+class CacheEntry:
+    """
+    One layer of cache, independent of the attention math that produced it.
+
+    ``tensors`` holds the resident arrays or OrtValues. ``metadata`` holds
+    lengths, indices, and anything else a consumer needs to interpret them.
+    """
+
+    def __init__(
+        self,
+        layer_idx: int,
+        cache_type: str,
+        tensors: Optional[Dict[str, Any]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ):
+        layer = int(layer_idx)
+        if layer < -1:
+            raise ValueError(f"layer_idx must be >= -1, got {layer}")
+        self.layer_idx = layer
+        self.cache_type = _coerce_cache_type(cache_type)
+        self.tensors: Dict[str, Any] = {} if tensors is None else dict(tensors)
+        self.metadata: Dict[str, Any] = {} if metadata is None else dict(metadata)
+
+    def __repr__(self) -> str:
+        names = ", ".join(self.tensors)
+        return (
+            f"CacheEntry(layer={self.layer_idx}, type={self.cache_type}, "
+            f"tensors=[{names}])"
+        )
+
+
+class DenseKVCache(KVCacheManager):
+    """
+    Standard key/value cache for dense attention.
+
+    This is ``KVCacheManager`` with ``cache_type`` ``dense_kv``. Policies,
+    static OrtValues, and quantization behave the same way.
+    """
+
+    cache_type = "dense_kv"
+
+
+class RecurrentStateCache:
+    """
+    Fixed recurrent state for Gated DeltaNet and linear attention.
+
+    The state is ``[batch, heads, head_dim, state_dim]`` and is updated in
+    place. ``recurrent_step`` applies ``state = decay * state + update``.
+    An optional convolution window of length ``conv_kernel - 1`` shifts
+    when ``push_conv`` receives the next frame.
+    """
+
+    cache_type = "recurrent_state"
+
+    def __init__(
+        self,
+        num_layers: int,
+        num_heads: int,
+        head_dim: int,
+        dtype: Any = np.float16,
+        batch_size: int = 1,
+        state_dim: Optional[int] = None,
+        conv_dim: Optional[int] = None,
+        conv_kernel: Optional[int] = None,
+        backend: Any = KVCacheBackend.CPU,
+        device_id: int = 0,
+    ):
+        if num_layers < 1:
+            raise ValueError(f"num_layers must be positive, got {num_layers}")
+        if num_heads < 1 or head_dim < 1:
+            raise ValueError(
+                f"num_heads and head_dim must be positive, got {num_heads}, {head_dim}"
+            )
+        self.num_layers = int(num_layers)
+        self.num_heads = int(num_heads)
+        self.head_dim = int(head_dim)
+        self.state_dim = int(head_dim if state_dim is None else state_dim)
+        if self.state_dim < 1:
+            raise ValueError(f"state_dim must be positive, got {self.state_dim}")
+        self.dtype = dtype
+        self.batch_size = int(batch_size)
+        self.backend = coerce_kv_backend(backend)
+        self.device_id = int(device_id)
+        self.conv_dim = None if conv_dim is None else int(conv_dim)
+        self.conv_kernel = None if conv_kernel is None else int(conv_kernel)
+        if self.conv_kernel is not None and self.conv_kernel < 2:
+            raise ValueError(
+                f"conv_kernel must be at least 2 so the cache has a window, "
+                f"got {self.conv_kernel}"
+            )
+        if (self.conv_dim is None) != (self.conv_kernel is None):
+            raise ValueError("conv_dim and conv_kernel must be set together")
+        state_shape = (
+            self.batch_size,
+            self.num_heads,
+            self.head_dim,
+            self.state_dim,
+        )
+        self._state = [
+            np.zeros(state_shape, dtype=self.dtype) for _ in range(self.num_layers)
+        ]
+        self._conv: List[Optional[np.ndarray]] = [None] * self.num_layers
+        if self.conv_dim is not None:
+            conv_shape = (
+                self.batch_size,
+                self.conv_dim,
+                self.conv_kernel - 1,
+            )
+            self._conv = [
+                np.zeros(conv_shape, dtype=self.dtype) for _ in range(self.num_layers)
+            ]
+
+    def _check_layer(self, layer_idx: int) -> int:
+        layer = int(layer_idx)
+        if layer < 0 or layer >= self.num_layers:
+            raise KeyError(
+                f"Layer {layer} not in cache (have {self.num_layers} layers)"
+            )
+        return layer
+
+    def reset(self) -> None:
+        """Zero every recurrent state and convolution window."""
+        for layer in range(self.num_layers):
+            self._state[layer].fill(0)
+            conv = self._conv[layer]
+            if conv is not None:
+                conv.fill(0)
+
+    def get_state(self, layer_idx: int) -> np.ndarray:
+        """Resident recurrent state for one layer. The array is not copied."""
+        return self._state[self._check_layer(layer_idx)]
+
+    def get_conv_state(self, layer_idx: int) -> np.ndarray:
+        """Short-convolution window for one layer."""
+        layer = self._check_layer(layer_idx)
+        conv = self._conv[layer]
+        if conv is None:
+            raise ValueError(f"Layer {layer} has no convolution cache")
+        return conv
+
+    def update_state(
+        self,
+        layer_idx: int,
+        state: np.ndarray,
+        conv_state: Optional[np.ndarray] = None,
+    ) -> None:
+        """Replace one layer's state in the preallocated buffer."""
+        layer = self._check_layer(layer_idx)
+        incoming = np.asarray(state, dtype=self.dtype)
+        slot = self._state[layer]
+        if incoming.shape != slot.shape:
+            raise ValueError(
+                f"Layer {layer}: recurrent state shape {incoming.shape} "
+                f"does not match {slot.shape}"
+            )
+        slot[...] = incoming
+        if conv_state is None:
+            return
+        conv = self._conv[layer]
+        if conv is None:
+            raise ValueError(f"Layer {layer} has no convolution cache")
+        incoming_conv = np.asarray(conv_state, dtype=self.dtype)
+        if incoming_conv.shape != conv.shape:
+            raise ValueError(
+                f"Layer {layer}: conv state shape {incoming_conv.shape} "
+                f"does not match {conv.shape}"
+            )
+        conv[...] = incoming_conv
+
+    def recurrent_step(
+        self,
+        layer_idx: int,
+        decay: Any,
+        update: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Carry the state forward: ``state = decay * state + update``.
+
+        ``decay`` and ``update`` broadcast onto the resident state. The
+        same array is returned.
+        """
+        layer = self._check_layer(layer_idx)
+        slot = self._state[layer]
+        incoming = np.asarray(update, dtype=self.dtype)
+        try:
+            stepped = slot * np.asarray(decay, dtype=self.dtype) + incoming
+        except ValueError as exc:
+            raise ValueError(
+                f"Layer {layer}: cannot apply decay and update to state {slot.shape}"
+            ) from exc
+        if stepped.shape != slot.shape:
+            raise ValueError(
+                f"Layer {layer}: recurrent update produced {stepped.shape}, "
+                f"expected {slot.shape}"
+            )
+        slot[...] = stepped
+        return slot
+
+    def push_conv(self, layer_idx: int, features: np.ndarray) -> np.ndarray:
+        """
+        Shift the convolution window left and append one frame.
+
+        ``features`` is ``[batch, conv_dim]`` or ``[conv_dim]``.
+        """
+        layer = self._check_layer(layer_idx)
+        conv = self._conv[layer]
+        if conv is None:
+            raise ValueError(f"Layer {layer} has no convolution cache")
+        frame = np.asarray(features, dtype=self.dtype)
+        if frame.ndim == 1:
+            frame = np.broadcast_to(frame, (self.batch_size, self.conv_dim)).copy()
+        if frame.shape != (self.batch_size, self.conv_dim):
+            raise ValueError(
+                f"Layer {layer}: conv frame shape {frame.shape} does not match "
+                f"({self.batch_size}, {self.conv_dim})"
+            )
+        if conv.shape[-1] == 1:
+            conv[..., 0] = frame
+        else:
+            conv[..., :-1] = np.array(conv[..., 1:], copy=True)
+            conv[..., -1] = frame
+        return conv
+
+    def entry(self, layer_idx: int) -> CacheEntry:
+        layer = self._check_layer(layer_idx)
+        tensors: Dict[str, Any] = {"state": self._state[layer]}
+        if self._conv[layer] is not None:
+            tensors["conv_state"] = self._conv[layer]
+        return CacheEntry(
+            layer,
+            self.cache_type,
+            tensors,
+            {
+                "num_heads": self.num_heads,
+                "head_dim": self.head_dim,
+                "state_dim": self.state_dim,
+                "conv_dim": self.conv_dim,
+                "conv_kernel": self.conv_kernel,
+                "backend": self.backend.value,
+                "batch_size": self.batch_size,
+            },
+        )
+
+    def entries(self) -> List[CacheEntry]:
+        return [self.entry(layer) for layer in range(self.num_layers)]
+
+    def get_memory_usage(self) -> Dict[str, Any]:
+        total = 0
+        per_layer = []
+        for layer in range(self.num_layers):
+            nbytes = int(self._state[layer].nbytes)
+            conv = self._conv[layer]
+            if conv is not None:
+                nbytes += int(conv.nbytes)
+            per_layer.append(nbytes)
+            total += nbytes
+        return {
+            "total_bytes": total,
+            "total_mb": total / (1024 * 1024),
+            "per_layer_bytes": per_layer,
+            "num_layers": self.num_layers,
+            "dtype": str(np.dtype(self.dtype)),
+            "cache_type": self.cache_type,
+            "backend": self.backend.value,
+        }
+
+
+class SparseKVCache:
+    """
+    Block and index cache for sparse attention.
+
+    Keys and values live in ``[batch, heads, max_blocks, block_size, head_dim]``.
+    ``block_indices`` records which logical block occupies each physical slot
+    (``-1`` is empty). ``token_indices`` records the selected positions for
+    the next sparse attention call.
+    """
+
+    cache_type = "sparse_kv"
+
+    def __init__(
+        self,
+        num_layers: int,
+        num_kv_heads: int,
+        head_dim: int,
+        dtype: Any = np.float16,
+        batch_size: int = 1,
+        max_blocks: Optional[int] = None,
+        block_size: int = 16,
+        max_seq_len: Optional[int] = None,
+        backend: Any = KVCacheBackend.CPU,
+        device_id: int = 0,
+    ):
+        if num_layers < 1 or num_kv_heads < 1 or head_dim < 1:
+            raise ValueError("num_layers, num_kv_heads, and head_dim must be positive")
+        self.block_size = int(block_size)
+        if self.block_size < 1:
+            raise ValueError(f"block_size must be positive, got {self.block_size}")
+        if max_blocks is None:
+            if max_seq_len is None:
+                raise ValueError("sparse cache needs max_blocks or max_seq_len")
+            limit = int(max_seq_len)
+            if limit < 1:
+                raise ValueError(f"max_seq_len must be positive, got {limit}")
+            max_blocks = (limit + self.block_size - 1) // self.block_size
+        self.num_layers = int(num_layers)
+        self.num_kv_heads = int(num_kv_heads)
+        self.head_dim = int(head_dim)
+        self.dtype = dtype
+        self.batch_size = int(batch_size)
+        self.max_blocks = int(max_blocks)
+        if self.max_blocks < 1:
+            raise ValueError(f"max_blocks must be positive, got {self.max_blocks}")
+        self.max_seq_len = self.max_blocks * self.block_size
+        self.backend = coerce_kv_backend(backend)
+        self.device_id = int(device_id)
+        shape = (
+            self.batch_size,
+            self.num_kv_heads,
+            self.max_blocks,
+            self.block_size,
+            self.head_dim,
+        )
+        self._key = [np.zeros(shape, dtype=self.dtype) for _ in range(self.num_layers)]
+        self._value = [np.zeros(shape, dtype=self.dtype) for _ in range(self.num_layers)]
+        self._block_indices = [
+            np.full((self.batch_size, self.max_blocks), -1, dtype=np.int32)
+            for _ in range(self.num_layers)
+        ]
+        capacity = self.max_seq_len
+        self._token_indices = [
+            np.full((self.batch_size, capacity), -1, dtype=np.int32)
+            for _ in range(self.num_layers)
+        ]
+        self._selected = [0] * self.num_layers
+
+    def _check_layer(self, layer_idx: int) -> int:
+        layer = int(layer_idx)
+        if layer < 0 or layer >= self.num_layers:
+            raise KeyError(
+                f"Layer {layer} not in cache (have {self.num_layers} layers)"
+            )
+        return layer
+
+    def reset(self) -> None:
+        """Clear blocks, indices, and the selection list."""
+        for layer in range(self.num_layers):
+            self._key[layer].fill(0)
+            self._value[layer].fill(0)
+            self._block_indices[layer].fill(-1)
+            self._token_indices[layer].fill(-1)
+            self._selected[layer] = 0
+
+    def block_indices(self, layer_idx: int) -> np.ndarray:
+        return self._block_indices[self._check_layer(layer_idx)]
+
+    def token_indices(self, layer_idx: int) -> np.ndarray:
+        return self._token_indices[self._check_layer(layer_idx)]
+
+    def write_blocks(
+        self,
+        layer_idx: int,
+        key: np.ndarray,
+        value: np.ndarray,
+        block_ids: np.ndarray,
+        logical_ids: Optional[np.ndarray] = None,
+    ) -> None:
+        """
+        Scatter blocks into physical slots.
+
+        ``key`` and ``value`` have shape
+        ``[batch, heads, count, block_size, head_dim]``. ``block_ids[i] < 0``
+        skips that block. ``logical_ids`` is what ``block_indices`` stores;
+        it defaults to the physical slot.
+        """
+        layer = self._check_layer(layer_idx)
+        keys = np.asarray(key, dtype=self.dtype)
+        values = np.asarray(value, dtype=self.dtype)
+        if keys.shape != values.shape:
+            raise ValueError(
+                f"Layer {layer}: sparse key shape {keys.shape} != value shape {values.shape}"
+            )
+        if keys.ndim != 5:
+            raise ValueError(
+                f"Layer {layer}: sparse blocks must be "
+                f"[batch, heads, count, block_size, head_dim], got {keys.shape}"
+            )
+        ids = np.asarray(block_ids, dtype=np.int32).reshape(-1)
+        if keys.shape[2] != ids.shape[0]:
+            raise ValueError(
+                f"Layer {layer}: {keys.shape[2]} blocks and {ids.shape[0]} block ids"
+            )
+        labels = ids if logical_ids is None else np.asarray(logical_ids, dtype=np.int32).reshape(-1)
+        if labels.shape[0] != ids.shape[0]:
+            raise ValueError(
+                f"Layer {layer}: logical id count {labels.shape[0]} != {ids.shape[0]}"
+            )
+        slot_key = self._key[layer]
+        slot_value = self._value[layer]
+        table = self._block_indices[layer]
+        for index, slot in enumerate(ids.tolist()):
+            if slot < 0:
+                continue
+            if slot >= self.max_blocks:
+                raise ValueError(
+                    f"Layer {layer}: block id {slot} is outside max_blocks {self.max_blocks}"
+                )
+            slot_key[:, :, slot] = keys[:, :, index]
+            slot_value[:, :, slot] = values[:, :, index]
+            table[:, slot] = int(labels[index])
+
+    def set_indices(self, layer_idx: int, indices: np.ndarray) -> None:
+        """Record the selected token positions. The unused tail stays ``-1``."""
+        layer = self._check_layer(layer_idx)
+        selected = np.asarray(indices, dtype=np.int32)
+        if selected.ndim == 1:
+            selected = np.broadcast_to(
+                selected, (self.batch_size, selected.shape[0])
+            ).copy()
+        if selected.ndim != 2 or selected.shape[0] != self.batch_size:
+            raise ValueError(
+                f"Layer {layer}: token indices shape {selected.shape} does not match "
+                f"batch {self.batch_size}"
+            )
+        count = int(selected.shape[1])
+        capacity = int(self._token_indices[layer].shape[1])
+        if count > capacity:
+            raise ValueError(
+                f"Layer {layer}: {count} token indices exceed capacity {capacity}"
+            )
+        if np.any(selected < -1):
+            raise ValueError(f"Layer {layer}: token indices must be >= -1")
+        table = self._token_indices[layer]
+        table[:, :count] = selected
+        table[:, count:] = -1
+        self._selected[layer] = count
+
+    def update(
+        self,
+        layer_idx: int,
+        key: np.ndarray,
+        value: np.ndarray,
+        indices: np.ndarray,
+    ) -> None:
+        """
+        Pack a selected token prefix into the block buffer and store its indices.
+
+        ``key`` and ``value`` are ``[batch, heads, selected, head_dim]``.
+        The tail of the buffer is cleared, so this replaces a previous
+        ``write_blocks`` fill.
+        """
+        layer = self._check_layer(layer_idx)
+        keys = np.asarray(key, dtype=self.dtype)
+        values = np.asarray(value, dtype=self.dtype)
+        if keys.shape != values.shape or keys.ndim != 4:
+            raise ValueError(
+                f"Layer {layer}: sparse update expects matching "
+                f"[batch, heads, selected, head_dim] tensors, got {keys.shape}"
+            )
+        flat_key = self._key[layer].reshape(
+            self.batch_size, self.num_kv_heads, self.max_seq_len, self.head_dim
+        )
+        flat_value = self._value[layer].reshape(flat_key.shape)
+        count = int(keys.shape[2])
+        if count > self.max_seq_len:
+            raise ValueError(
+                f"Layer {layer}: {count} selected tokens exceed capacity {self.max_seq_len}"
+            )
+        incoming_indices = np.asarray(indices)
+        if incoming_indices.ndim == 1:
+            index_count = int(incoming_indices.shape[0])
+        elif (
+            incoming_indices.ndim == 2
+            and incoming_indices.shape[0] == self.batch_size
+        ):
+            index_count = int(incoming_indices.shape[1])
+        else:
+            index_count = -1
+        if index_count != count:
+            raise ValueError(
+                f"Layer {layer}: {count} selected tokens and {index_count} indices"
+            )
+        flat_key[:, :, :count] = keys
+        flat_key[:, :, count:] = 0
+        flat_value[:, :, :count] = values
+        flat_value[:, :, count:] = 0
+        self._block_indices[layer].fill(-1)
+        occupied = (count + self.block_size - 1) // self.block_size if count else 0
+        if occupied:
+            self._block_indices[layer][:, :occupied] = np.arange(occupied, dtype=np.int32)
+        self.set_indices(layer, indices)
+
+    def entry(self, layer_idx: int) -> CacheEntry:
+        layer = self._check_layer(layer_idx)
+        return CacheEntry(
+            layer,
+            self.cache_type,
+            {
+                "key": self._key[layer],
+                "value": self._value[layer],
+                "block_indices": self._block_indices[layer],
+                "token_indices": self._token_indices[layer],
+            },
+            {
+                "max_blocks": self.max_blocks,
+                "block_size": self.block_size,
+                "selected": self._selected[layer],
+                "backend": self.backend.value,
+                "num_kv_heads": self.num_kv_heads,
+                "head_dim": self.head_dim,
+            },
+        )
+
+    def entries(self) -> List[CacheEntry]:
+        return [self.entry(layer) for layer in range(self.num_layers)]
+
+    def get_memory_usage(self) -> Dict[str, Any]:
+        total = 0
+        per_layer = []
+        for layer in range(self.num_layers):
+            nbytes = (
+                int(self._key[layer].nbytes)
+                + int(self._value[layer].nbytes)
+                + int(self._block_indices[layer].nbytes)
+                + int(self._token_indices[layer].nbytes)
+            )
+            per_layer.append(nbytes)
+            total += nbytes
+        return {
+            "total_bytes": total,
+            "total_mb": total / (1024 * 1024),
+            "per_layer_bytes": per_layer,
+            "num_layers": self.num_layers,
+            "dtype": str(np.dtype(self.dtype)),
+            "cache_type": self.cache_type,
+            "backend": self.backend.value,
+            "max_blocks": self.max_blocks,
+        }
+
+
+class RouterCache:
+    """
+    Ring of MoE expert choices.
+
+    ``expert_ids`` is ``[batch, history, top_k]`` with ``-1`` in unused
+    slots. ``record`` advances the ring and drops the oldest choice once
+    ``history`` is full.
+    """
+
+    cache_type = "router"
+
+    def __init__(
+        self,
+        num_layers: int,
+        num_experts: int,
+        top_k: int = 1,
+        history: int = 16,
+        batch_size: int = 1,
+    ):
+        if num_layers < 1:
+            raise ValueError(f"num_layers must be positive, got {num_layers}")
+        if num_experts < 1:
+            raise ValueError(f"num_experts must be positive, got {num_experts}")
+        if top_k < 1 or top_k > num_experts:
+            raise ValueError(
+                f"top_k must be in 1..{num_experts}, got {top_k}"
+            )
+        if history < 1:
+            raise ValueError(f"history must be positive, got {history}")
+        self.num_layers = int(num_layers)
+        self.num_experts = int(num_experts)
+        self.top_k = int(top_k)
+        self.history = int(history)
+        self.batch_size = int(batch_size)
+        self._expert_ids = [
+            np.full((self.batch_size, self.history, self.top_k), -1, dtype=np.int32)
+            for _ in range(self.num_layers)
+        ]
+        self._weights = [
+            np.zeros((self.batch_size, self.history, self.top_k), dtype=np.float32)
+            for _ in range(self.num_layers)
+        ]
+        self._cursor = [0] * self.num_layers
+        self._count = [0] * self.num_layers
+
+    def _check_layer(self, layer_idx: int) -> int:
+        layer = int(layer_idx)
+        if layer < 0 or layer >= self.num_layers:
+            raise KeyError(
+                f"Layer {layer} not in cache (have {self.num_layers} layers)"
+            )
+        return layer
+
+    def reset(self) -> None:
+        for layer in range(self.num_layers):
+            self._expert_ids[layer].fill(-1)
+            self._weights[layer].fill(0)
+            self._cursor[layer] = 0
+            self._count[layer] = 0
+
+    def record(
+        self,
+        layer_idx: int,
+        expert_ids: np.ndarray,
+        weights: Optional[np.ndarray] = None,
+    ) -> None:
+        """Append one routing decision. The oldest decision falls out of the ring."""
+        layer = self._check_layer(layer_idx)
+        ids = np.asarray(expert_ids, dtype=np.int32)
+        if ids.ndim == 1:
+            ids = np.broadcast_to(ids, (self.batch_size, self.top_k)).copy()
+        if ids.shape != (self.batch_size, self.top_k):
+            raise ValueError(
+                f"Layer {layer}: expert ids shape {ids.shape} does not match "
+                f"({self.batch_size}, {self.top_k})"
+            )
+        if np.any(ids < 0) or np.any(ids >= self.num_experts):
+            raise ValueError(
+                f"Layer {layer}: expert ids must be in 0..{self.num_experts - 1}"
+            )
+        if weights is None:
+            chosen = np.full(ids.shape, 1.0 / self.top_k, dtype=np.float32)
+        else:
+            chosen = np.asarray(weights, dtype=np.float32)
+            if chosen.ndim == 1:
+                chosen = np.broadcast_to(chosen, ids.shape).copy()
+            if chosen.shape != ids.shape:
+                raise ValueError(
+                    f"Layer {layer}: router weights shape {chosen.shape} "
+                    f"does not match {ids.shape}"
+                )
+        slot = self._cursor[layer] % self.history
+        self._expert_ids[layer][:, slot, :] = ids
+        self._weights[layer][:, slot, :] = chosen
+        self._cursor[layer] += 1
+        self._count[layer] = min(self.history, self._count[layer] + 1)
+
+    def recent(self, layer_idx: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Expert ids and weights from oldest to newest."""
+        layer = self._check_layer(layer_idx)
+        count = self._count[layer]
+        ids = self._expert_ids[layer]
+        weights = self._weights[layer]
+        if count == 0:
+            empty_ids = ids[:, :0, :]
+            return empty_ids, weights[:, :0, :]
+        if self._cursor[layer] <= self.history:
+            return ids[:, :count, :].copy(), weights[:, :count, :].copy()
+        start = self._cursor[layer] % self.history
+        ordered_ids = np.concatenate([ids[:, start:, :], ids[:, :start, :]], axis=1)
+        ordered_weights = np.concatenate(
+            [weights[:, start:, :], weights[:, :start, :]], axis=1
+        )
+        return ordered_ids, ordered_weights
+
+    def entry(self, layer_idx: int) -> CacheEntry:
+        layer = self._check_layer(layer_idx)
+        return CacheEntry(
+            layer,
+            self.cache_type,
+            {
+                "expert_ids": self._expert_ids[layer],
+                "weights": self._weights[layer],
+            },
+            {
+                "num_experts": self.num_experts,
+                "top_k": self.top_k,
+                "history": self.history,
+                "filled": self._count[layer],
+                "cursor": self._cursor[layer],
+            },
+        )
+
+    def entries(self) -> List[CacheEntry]:
+        return [self.entry(layer) for layer in range(self.num_layers)]
+
+    def get_memory_usage(self) -> Dict[str, Any]:
+        total = 0
+        per_layer = []
+        for layer in range(self.num_layers):
+            nbytes = int(self._expert_ids[layer].nbytes) + int(self._weights[layer].nbytes)
+            per_layer.append(nbytes)
+            total += nbytes
+        return {
+            "total_bytes": total,
+            "total_mb": total / (1024 * 1024),
+            "per_layer_bytes": per_layer,
+            "num_layers": self.num_layers,
+            "cache_type": self.cache_type,
+            "num_experts": self.num_experts,
+            "history": self.history,
+        }
+
+
+def _layer_spec(item: Any) -> Tuple[str, Dict[str, Any]]:
+    if isinstance(item, str):
+        return _coerce_cache_type(item), {}
+    if isinstance(item, dict):
+        if "type" not in item and "cache_type" not in item:
+            raise ValueError("layer spec needs a type or cache_type")
+        kind = _coerce_cache_type(item.get("type", item.get("cache_type")))
+        options = {
+            key: value
+            for key, value in item.items()
+            if key not in {"type", "cache_type"}
+        }
+        return kind, options
+    raise TypeError(
+        f"Layer spec must be a cache type name or a dict, got {type(item).__name__}"
+    )
+
+
+def _take_options(options: Dict[str, Any], allowed: Sequence[str], kind: str) -> Dict[str, Any]:
+    unknown = sorted(key for key in options if key not in allowed)
+    if unknown:
+        raise ValueError(
+            f"{kind} layer received unknown options: {', '.join(unknown)}"
+        )
+    return options
+
+
+class HybridKVCacheManager:
+    """
+    One cache object per layer for a hybrid model.
+
+    ``layer_types`` names the cache for each layer: dense attention,
+    Gated DeltaNet, sparse attention, or MoE routing. ``draft`` and
+    ``verify`` hold the speculative pair. They can be an existing cache,
+    a layer-type list, or a dense layer count.
+    """
+
+    def __init__(
+        self,
+        layer_types: Sequence[Any],
+        num_kv_heads: int,
+        head_dim: int,
+        dtype: Any = np.float16,
+        batch_size: int = 1,
+        backend: Any = KVCacheBackend.CPU,
+        max_seq_len: Optional[int] = None,
+        device_id: int = 0,
+        block_size: int = 16,
+        state_dim: Optional[int] = None,
+        conv_dim: Optional[int] = None,
+        conv_kernel: Optional[int] = None,
+        num_experts: Optional[int] = None,
+        top_k: int = 1,
+        history: int = 16,
+        draft: Any = None,
+        verify: Any = None,
+    ):
+        if not isinstance(layer_types, (list, tuple)) or len(layer_types) < 1:
+            raise ValueError("layer_types must list at least one layer")
+        self.num_kv_heads = int(num_kv_heads)
+        self.head_dim = int(head_dim)
+        self.dtype = dtype
+        self.batch_size = int(batch_size)
+        self.backend = coerce_kv_backend(backend)
+        self.max_seq_len = None if max_seq_len is None else int(max_seq_len)
+        self.device_id = int(device_id)
+        self.block_size = int(block_size)
+        self._common = {
+            "num_kv_heads": self.num_kv_heads,
+            "num_heads": self.num_kv_heads,
+            "head_dim": self.head_dim,
+            "dtype": self.dtype,
+            "batch_size": self.batch_size,
+            "backend": self.backend,
+            "max_seq_len": self.max_seq_len,
+            "device_id": self.device_id,
+            "block_size": self.block_size,
+            "state_dim": state_dim,
+            "conv_dim": conv_dim,
+            "conv_kernel": conv_kernel,
+            "num_experts": num_experts,
+            "top_k": int(top_k),
+            "history": int(history),
+        }
+        self._layers = [
+            self._build_layer(*_layer_spec(item)) for item in layer_types
+        ]
+        self.draft_cache = self._build_role(draft, "draft")
+        self.verify_cache = self._build_role(verify, "verify")
+
+    @property
+    def num_layers(self) -> int:
+        return len(self._layers)
+
+    def _build_layer(self, kind: str, options: Dict[str, Any]) -> Any:
+        merged = dict(self._common)
+        merged.update(options)
+        if kind == "dense_kv":
+            allowed = (
+                "num_kv_heads", "head_dim", "dtype", "batch_size", "backend",
+                "max_seq_len", "device_id", "policy", "window_size", "block_size",
+                "sink_size", "retrieval_blocks", "cache_dtype", "kv_quantization",
+            )
+            chosen = _take_options(options, allowed, kind)
+            body = {key: merged[key] for key in allowed if key in merged and merged[key] is not None}
+            body.update(chosen)
+            return DenseKVCache(num_layers=1, **body)
+        if kind == "recurrent_state":
+            allowed = (
+                "num_heads", "head_dim", "dtype", "batch_size", "state_dim",
+                "conv_dim", "conv_kernel", "backend", "device_id",
+            )
+            chosen = _take_options(options, allowed, kind)
+            return RecurrentStateCache(
+                num_layers=1,
+                num_heads=int(chosen.get("num_heads", merged["num_heads"])),
+                head_dim=int(chosen.get("head_dim", merged["head_dim"])),
+                dtype=chosen.get("dtype", merged["dtype"]),
+                batch_size=int(chosen.get("batch_size", merged["batch_size"])),
+                state_dim=chosen.get("state_dim", merged["state_dim"]),
+                conv_dim=chosen.get("conv_dim", merged["conv_dim"]),
+                conv_kernel=chosen.get("conv_kernel", merged["conv_kernel"]),
+                backend=chosen.get("backend", merged["backend"]),
+                device_id=int(chosen.get("device_id", merged["device_id"])),
+            )
+        if kind == "sparse_kv":
+            allowed = (
+                "num_kv_heads", "head_dim", "dtype", "batch_size", "max_blocks",
+                "block_size", "max_seq_len", "backend", "device_id",
+            )
+            chosen = _take_options(options, allowed, kind)
+            return SparseKVCache(
+                num_layers=1,
+                num_kv_heads=int(chosen.get("num_kv_heads", merged["num_kv_heads"])),
+                head_dim=int(chosen.get("head_dim", merged["head_dim"])),
+                dtype=chosen.get("dtype", merged["dtype"]),
+                batch_size=int(chosen.get("batch_size", merged["batch_size"])),
+                max_blocks=chosen.get("max_blocks"),
+                block_size=int(chosen.get("block_size", merged["block_size"])),
+                max_seq_len=chosen.get("max_seq_len", merged["max_seq_len"]),
+                backend=chosen.get("backend", merged["backend"]),
+                device_id=int(chosen.get("device_id", merged["device_id"])),
+            )
+        if kind == "router":
+            allowed = ("num_experts", "top_k", "history", "batch_size")
+            chosen = _take_options(options, allowed, kind)
+            experts = chosen.get("num_experts", merged["num_experts"])
+            if experts is None:
+                raise ValueError("router cache needs num_experts")
+            return RouterCache(
+                num_layers=1,
+                num_experts=int(experts),
+                top_k=int(chosen.get("top_k", merged["top_k"])),
+                history=int(chosen.get("history", merged["history"])),
+                batch_size=int(chosen.get("batch_size", merged["batch_size"])),
+            )
+        raise ValueError(
+            f"Cache type '{kind}' cannot be a model layer. "
+            "Use dense_kv, recurrent_state, sparse_kv, or router."
+        )
+
+    def _build_role(self, spec: Any, role: str) -> Any:
+        if spec is None:
+            return None
+        if hasattr(spec, "entry") and hasattr(spec, "reset"):
+            return spec
+        if isinstance(spec, int):
+            if spec < 1:
+                raise ValueError(f"{role} layer count must be positive, got {spec}")
+            return DenseKVCache(
+                num_layers=spec,
+                num_kv_heads=self.num_kv_heads,
+                head_dim=self.head_dim,
+                dtype=self.dtype,
+                batch_size=self.batch_size,
+                backend=self.backend,
+                max_seq_len=self.max_seq_len,
+                device_id=self.device_id,
+                block_size=self.block_size,
+            )
+        if isinstance(spec, (list, tuple)):
+            return HybridKVCacheManager(
+                layer_types=spec,
+                num_kv_heads=self.num_kv_heads,
+                head_dim=self.head_dim,
+                dtype=self.dtype,
+                batch_size=self.batch_size,
+                backend=self.backend,
+                max_seq_len=self.max_seq_len,
+                device_id=self.device_id,
+                block_size=self.block_size,
+                state_dim=self._common["state_dim"],
+                conv_dim=self._common["conv_dim"],
+                conv_kernel=self._common["conv_kernel"],
+                num_experts=self._common["num_experts"],
+                top_k=self._common["top_k"],
+                history=self._common["history"],
+            )
+        raise TypeError(
+            f"{role} cache must be a layer count, a layer-type list, or a cache object"
+        )
+
+    def _child(self, layer_idx: int) -> Any:
+        if layer_idx < 0 or layer_idx >= self.num_layers:
+            raise KeyError(
+                f"Layer {layer_idx} not in cache (have {self.num_layers} layers)"
+            )
+        return self._layers[layer_idx]
+
+    def cache_for(self, layer_idx: int) -> Any:
+        """The cache object that owns one model layer."""
+        return self._child(layer_idx)
+
+    def cache_type_for(self, layer_idx: int) -> str:
+        return self._child(layer_idx).cache_type
+
+    def update(self, layer_idx: int, **payload: Any) -> None:
+        """Write one layer. The accepted fields depend on its cache type."""
+        child = self._child(layer_idx)
+        kind = child.cache_type
+        if kind == "dense_kv":
+            child.update_from_present(0, payload["key"], payload["value"])
+            return
+        if kind == "recurrent_state":
+            if "state" in payload:
+                child.update_state(0, payload["state"], payload.get("conv_state"))
+                return
+            if "update" in payload:
+                child.recurrent_step(0, payload.get("decay", 1), payload["update"])
+                if "conv_token" in payload:
+                    child.push_conv(0, payload["conv_token"])
+                return
+            if "conv_token" in payload:
+                child.push_conv(0, payload["conv_token"])
+                return
+            raise TypeError(
+                f"Layer {layer_idx}: recurrent cache needs state, update, or conv_token"
+            )
+        if kind == "sparse_kv":
+            if "block_ids" in payload:
+                child.write_blocks(
+                    0,
+                    payload["key"],
+                    payload["value"],
+                    payload["block_ids"],
+                    payload.get("logical_ids"),
+                )
+                return
+            child.update(0, payload["key"], payload["value"], payload["indices"])
+            return
+        if kind == "router":
+            child.record(0, payload["expert_ids"], payload.get("weights"))
+            return
+        raise TypeError(f"Layer {layer_idx}: unsupported cache type {kind}")
+
+    def entry(self, layer_idx: int) -> CacheEntry:
+        inner = self._child(layer_idx).entry(0)
+        metadata = dict(inner.metadata)
+        metadata["model_layer"] = int(layer_idx)
+        return CacheEntry(layer_idx, inner.cache_type, inner.tensors, metadata)
+
+    def entries(self) -> List[CacheEntry]:
+        return [self.entry(layer) for layer in range(self.num_layers)]
+
+    def _role_cache(self, role: str) -> Any:
+        kind = _coerce_cache_type(role)
+        if kind == "draft":
+            child = self.draft_cache
+        elif kind == "verify":
+            child = self.verify_cache
+        else:
+            raise ValueError(f"Speculative role must be draft or verify, got '{role}'")
+        if child is None:
+            raise ValueError(f"No {kind} cache is attached")
+        return child
+
+    def role_entry(self, role: str) -> CacheEntry:
+        """A single entry describing the draft or verify cache."""
+        kind = _coerce_cache_type(role)
+        child = self._role_cache(kind)
+        return CacheEntry(
+            -1,
+            kind,
+            {},
+            {
+                "role": kind,
+                "num_layers": int(getattr(child, "num_layers", 1)),
+                "child_cache_type": getattr(child, "cache_type", kind),
+            },
+        )
+
+    def role_entries(self, role: str) -> List[CacheEntry]:
+        """Per-layer entries of the draft or verify cache, tagged with that role."""
+        kind = _coerce_cache_type(role)
+        child = self._role_cache(kind)
+        if isinstance(child, HybridKVCacheManager):
+            found = child.entries()
+        else:
+            found = child.entries()
+        for item in found:
+            item.metadata["role"] = kind
+        return found
+
+    def reset(self) -> None:
+        """Clear every layer and both speculative caches."""
+        for child in self._layers:
+            child.reset()
+        if self.draft_cache is not None:
+            self.draft_cache.reset()
+        if self.verify_cache is not None:
+            self.verify_cache.reset()
+
+    def get_memory_usage(self) -> Dict[str, Any]:
+        per_layer = []
+        total = 0
+        types = []
+        for child in self._layers:
+            usage = child.get_memory_usage()
+            layer_bytes = int(usage["total_bytes"])
+            per_layer.append(layer_bytes)
+            total += layer_bytes
+            types.append(child.cache_type)
+        draft_bytes = 0
+        verify_bytes = 0
+        if self.draft_cache is not None:
+            draft_bytes = int(self.draft_cache.get_memory_usage()["total_bytes"])
+            total += draft_bytes
+        if self.verify_cache is not None:
+            verify_bytes = int(self.verify_cache.get_memory_usage()["total_bytes"])
+            total += verify_bytes
+        return {
+            "total_bytes": total,
+            "total_mb": total / (1024 * 1024),
+            "per_layer_bytes": per_layer,
+            "num_layers": self.num_layers,
+            "cache_types": types,
+            "draft_bytes": draft_bytes,
+            "verify_bytes": verify_bytes,
+            "dtype": str(np.dtype(self.dtype)),
+            "backend": self.backend.value,
+        }
+
+    def __repr__(self) -> str:
+        kinds = ",".join(child.cache_type for child in self._layers)
+        return f"HybridKVCacheManager(layers={self.num_layers}, types=[{kinds}])"
+
+
+# =============================================================================
 # CONVENIENCE EXPORTS
 # =============================================================================
 
@@ -2177,4 +3297,10 @@ __all__ = [
     "KVCachePolicy",
     "coerce_kv_backend",
     "coerce_kv_policy",
+    "CacheEntry",
+    "DenseKVCache",
+    "RecurrentStateCache",
+    "SparseKVCache",
+    "RouterCache",
+    "HybridKVCacheManager",
 ]

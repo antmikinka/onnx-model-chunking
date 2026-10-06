@@ -35,6 +35,12 @@ from .kv_cache import (
     KVCachePolicy,
     coerce_kv_backend,
     coerce_kv_policy,
+    CacheEntry,
+    DenseKVCache,
+    RecurrentStateCache,
+    SparseKVCache,
+    RouterCache,
+    HybridKVCacheManager,
 )
 
 from .config_loader import (
@@ -147,6 +153,12 @@ __all__ = [
     "KVCachePolicy",
     "coerce_kv_backend",
     "coerce_kv_policy",
+    "CacheEntry",
+    "DenseKVCache",
+    "RecurrentStateCache",
+    "SparseKVCache",
+    "RouterCache",
+    "HybridKVCacheManager",
     # config_loader exports
     "ModelConfig",
     "load_model_config",

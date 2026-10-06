@@ -739,6 +739,210 @@ def test_kv_cache():
     assert device_value.shape == device_key.shape
     print("  quantization: fp16, bf16, int8, fp8, int4, fp4")
 
+    from pipeline_utils.kv_cache import (
+        CacheEntry,
+        DenseKVCache,
+        RecurrentStateCache,
+        SparseKVCache,
+        HybridKVCacheManager,
+    )
+
+    dense = DenseKVCache(
+        num_layers=2,
+        num_kv_heads=2,
+        head_dim=4,
+        dtype=np.float32,
+        max_seq_len=8,
+    )
+    assert isinstance(dense, KVCacheManager)
+    assert dense.cache_type == "dense_kv"
+    dense_present = np.arange(1 * 2 * 3 * 4, dtype=np.float32).reshape(1, 2, 3, 4)
+    dense.update_from_present(0, dense_present, dense_present + 1)
+    dense_entry = dense.entry(0)
+    assert isinstance(dense_entry, CacheEntry)
+    assert dense_entry.layer_idx == 0
+    assert dense_entry.cache_type == "dense_kv"
+    assert dense_entry.tensors["key"] is dense.get_past_tensors(0)[0]
+    assert dense_entry.metadata["seq_len"] == 3
+    assert len(dense.entries()) == 2
+
+    recurrent = RecurrentStateCache(
+        num_layers=1,
+        num_heads=2,
+        head_dim=4,
+        dtype=np.float32,
+        state_dim=4,
+        conv_dim=3,
+        conv_kernel=4,
+    )
+    recurrent_state = recurrent.get_state(0)
+    assert recurrent_state.shape == (1, 2, 4, 4)
+    assert np.all(recurrent_state == 0)
+    recurrent.recurrent_step(0, decay=0.5, update=np.ones_like(recurrent_state))
+    assert recurrent.get_state(0) is recurrent_state
+    assert np.allclose(recurrent_state, 1)
+    recurrent.recurrent_step(0, decay=0.5, update=np.ones_like(recurrent_state))
+    assert np.allclose(recurrent_state, 1.5)
+    frames = [
+        np.array([1, 0, 0], dtype=np.float32),
+        np.array([0, 1, 0], dtype=np.float32),
+        np.array([0, 0, 1], dtype=np.float32),
+        np.array([4, 5, 6], dtype=np.float32),
+    ]
+    for frame in frames:
+        recurrent.push_conv(0, frame)
+    conv_state = recurrent.get_conv_state(0)
+    assert conv_state.shape == (1, 3, 3)
+    assert np.allclose(conv_state[0, :, 0], frames[1])
+    assert np.allclose(conv_state[0, :, 1], frames[2])
+    assert np.allclose(conv_state[0, :, 2], frames[3])
+    recurrent_entry = recurrent.entry(0)
+    assert recurrent_entry.cache_type == "recurrent_state"
+    assert recurrent_entry.tensors["state"] is recurrent_state
+    assert recurrent_entry.tensors["conv_state"] is conv_state
+
+    sparse = SparseKVCache(
+        num_layers=1,
+        num_kv_heads=2,
+        head_dim=4,
+        dtype=np.float32,
+        max_blocks=4,
+        block_size=2,
+    )
+    sparse_entry = sparse.entry(0)
+    assert sparse_entry.cache_type == "sparse_kv"
+    assert sparse_entry.tensors["key"].shape == (1, 2, 4, 2, 4)
+    sparse_block = np.arange(1 * 2 * 1 * 2 * 4, dtype=np.float32).reshape(1, 2, 1, 2, 4)
+    sparse.write_blocks(0, sparse_block, sparse_block + 1, block_ids=np.array([2]))
+    assert sparse.entry(0).tensors["key"] is sparse_entry.tensors["key"]
+    assert np.allclose(sparse.entry(0).tensors["key"][:, :, 2], sparse_block[:, :, 0])
+    assert np.all(sparse.block_indices(0)[0, :2] == -1)
+    assert int(sparse.block_indices(0)[0, 2]) == 2
+    sparse.set_indices(0, np.array([5, 8, 9]))
+    assert list(sparse.token_indices(0)[0, :3]) == [5, 8, 9]
+    assert int(sparse.token_indices(0)[0, 3]) == -1
+    sparse_flat = np.ones((1, 2, 3, 4), dtype=np.float32)
+    sparse.update(0, sparse_flat, sparse_flat, np.array([1, 2, 4]))
+    flat_view = sparse.entry(0).tensors["key"].reshape(1, 2, -1, 4)
+    assert np.allclose(flat_view[:, :, :3], sparse_flat)
+    assert list(sparse.token_indices(0)[0, :3]) == [1, 2, 4]
+
+    hybrid = HybridKVCacheManager(
+        layer_types=["dense", "gated_deltanet", "sparse", "moe"],
+        num_kv_heads=2,
+        head_dim=4,
+        dtype=np.float32,
+        max_seq_len=8,
+        block_size=2,
+        conv_kernel=3,
+        conv_dim=4,
+        num_experts=8,
+        top_k=2,
+        history=3,
+        draft=2,
+        verify=["dense", "dense"],
+    )
+    assert hybrid.num_layers == 4
+    assert [hybrid.cache_type_for(i) for i in range(4)] == [
+        "dense_kv",
+        "recurrent_state",
+        "sparse_kv",
+        "router",
+    ]
+    hybrid_tokens = np.arange(1 * 2 * 2 * 4, dtype=np.float32).reshape(1, 2, 2, 4)
+    hybrid.update(0, key=hybrid_tokens, value=hybrid_tokens + 1)
+    assert hybrid.entry(0).layer_idx == 0
+    assert hybrid.entry(0).metadata["seq_len"] == 2
+    assert hybrid.entry(0).tensors["key"] is hybrid.cache_for(0).get_past_tensors(0)[0]
+    recurrent_update = np.ones((1, 2, 4, 4), dtype=np.float32)
+    hybrid.update(1, decay=0.0, update=recurrent_update)
+    assert np.allclose(hybrid.entry(1).tensors["state"], recurrent_update)
+    hybrid.update(
+        2,
+        key=sparse_block,
+        value=sparse_block,
+        block_ids=np.array([1]),
+        logical_ids=np.array([7]),
+    )
+    assert np.allclose(hybrid.entry(2).tensors["key"][:, :, 1], sparse_block[:, :, 0])
+    assert int(hybrid.entry(2).tensors["block_indices"][0, 1]) == 7
+    hybrid.update(3, expert_ids=np.array([1, 4]), weights=np.array([0.7, 0.3]))
+    hybrid.update(3, expert_ids=np.array([2, 5]))
+    hybrid.update(3, expert_ids=np.array([3, 6]))
+    hybrid.update(3, expert_ids=np.array([0, 7]))
+    recent_ids, recent_weights = hybrid.cache_for(3).recent(0)
+    assert recent_ids.shape == (1, 3, 2)
+    assert list(recent_ids[0, 0]) == [2, 5]
+    assert list(recent_ids[0, -1]) == [0, 7]
+    assert hybrid.entry(3).metadata["filled"] == 3
+    assert np.allclose(recent_weights[0, 0], [0.5, 0.5])
+    draft_token = np.ones((1, 2, 1, 4), dtype=np.float32)
+    hybrid.draft_cache.update_from_present(0, draft_token, draft_token)
+    assert hybrid.draft_cache.get_sequence_length() == 1
+    assert hybrid.verify_cache.cache_for(0).get_sequence_length() == 0
+    assert hybrid.role_entry("draft").cache_type == "draft"
+    assert hybrid.role_entry("verification").metadata["num_layers"] == 2
+    verify_entries = hybrid.role_entries("verify")
+    assert len(verify_entries) == 2
+    assert verify_entries[0].cache_type == "dense_kv"
+    assert verify_entries[0].metadata["role"] == "verify"
+    hybrid_memory = hybrid.get_memory_usage()
+    assert hybrid_memory["total_bytes"] > 0
+    assert hybrid_memory["cache_types"] == [
+        "dense_kv",
+        "recurrent_state",
+        "sparse_kv",
+        "router",
+    ]
+    assert len(hybrid_memory["per_layer_bytes"]) == 4
+    assert hybrid_memory["draft_bytes"] > 0
+    assert hybrid_memory["verify_bytes"] > 0
+    hybrid.reset()
+    assert hybrid.entry(0).metadata["seq_len"] == 0
+    assert np.all(hybrid.entry(1).tensors["state"] == 0)
+    assert hybrid.entry(3).metadata["filled"] == 0
+    assert hybrid.draft_cache.get_sequence_length() == 0
+    assert hybrid.verify_cache.cache_for(0).get_sequence_length() == 0
+
+    plain_entry = cache.entry(0)
+    assert plain_entry.cache_type == "dense_kv"
+    assert plain_entry.tensors["key"] is cache.get_past_tensors(0)[0]
+
+    device_hybrid = HybridKVCacheManager(
+        layer_types=["dense"],
+        num_kv_heads=1,
+        head_dim=4,
+        dtype=np.float16,
+        backend=KVCacheBackend.VITISAI,
+        max_seq_len=4,
+    )
+    assert device_hybrid.cache_for(0).backend is KVCacheBackend.VITISAI
+    assert device_hybrid.cache_for(0).uses_device_memory
+
+    try:
+        HybridKVCacheManager(layer_types=["tape"], num_kv_heads=1, head_dim=1)
+        raise AssertionError("unknown cache type was accepted")
+    except ValueError as exc:
+        assert "tape" in str(exc)
+    try:
+        RecurrentStateCache(1, 1, 4, dtype=np.float32).update_state(
+            0, np.zeros((1, 1, 2, 2), dtype=np.float32)
+        )
+        raise AssertionError("mismatched recurrent state was accepted")
+    except ValueError as exc:
+        assert "does not match" in str(exc)
+    try:
+        sparse.write_blocks(0, sparse_block, sparse_block, block_ids=np.array([9]))
+        raise AssertionError("block id past max_blocks was accepted")
+    except ValueError as exc:
+        assert "max_blocks" in str(exc)
+    try:
+        hybrid.update(3, expert_ids=np.array([8, 1]))
+        raise AssertionError("expert id outside the router was accepted")
+    except ValueError as exc:
+        assert "expert" in str(exc)
+    print("  hybrid caches: dense, recurrent, sparse, router, draft, verify")
+
     print("kv_cache module: OK\n")
     return True
 
