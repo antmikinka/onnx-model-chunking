@@ -24,6 +24,7 @@ from .types import (
     PROVIDER_FALLBACK,
     SplitConfig,
     SplitResult,
+    ComponentInfo,
     MergeResult,
 )
 
@@ -69,6 +70,7 @@ __all__ = [
     "PROVIDER_FALLBACK",
     "SplitConfig",
     "SplitResult",
+    "ComponentInfo",
     "MergeResult",
     # HuggingFace integration
     "TORCH_DTYPE_MAP",

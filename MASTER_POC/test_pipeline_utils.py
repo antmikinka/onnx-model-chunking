@@ -6353,6 +6353,8 @@ def test_backend():
             ExecutionPolicy as canonical_policy,
             PROVIDER_FALLBACK,
             SplitConfig,
+            ComponentInfo,
+            ComponentType,
         )
         from pipeline_utils.session_manager import ExecutionPolicy as session_policy
         assert DeviceType is canonical_device
@@ -6449,6 +6451,85 @@ def test_backend():
             raise AssertionError("persistent NPU execution was accepted")
         except ValueError as exc:
             assert "persistent" in str(exc)
+        from chunking_utils.common import ComponentInfo as package_component
+        assert package_component is ComponentInfo
+        bare = ComponentInfo(component_type="embedding")
+        other_component = ComponentInfo(component_type=ComponentType.NORM)
+        assert bare.phase is None
+        assert bare.device_preference is None
+        assert bare.resident_policy == "auto"
+        assert bare.execution_order == 0
+        assert bare.input_names == []
+        bare.input_names.append("hidden")
+        assert other_component.input_names == []
+        assert other_component.name == "norm"
+        layer = ComponentInfo(component_type="layer", layer_id=0)
+        assert layer.name == "layer_0"
+        assert layer.phase is None
+        prefill = ComponentInfo(
+            component_type="layer",
+            layer_id=1,
+            file_path="layer_1.onnx",
+            num_tensors=4,
+            size_bytes=256,
+            input_names=["hidden", "mask"],
+            output_names=["hidden"],
+            input_types={"hidden": "float16", "mask": "int64"},
+            output_types={"hidden": "float16"},
+            input_shapes={"hidden": [1, None, 16], "mask": [1, None]},
+            output_shapes={"hidden": [1, None, 16]},
+            external_data_files=["layer_1.onnx.data"],
+            depends_on=["embedding"],
+            execution_order=2,
+            device_preference="xdna",
+            resident_policy="resident",
+            phase="prefill",
+        )
+        assert prefill.name == "layer_1"
+        assert prefill.device_preference == "npu"
+        assert prefill.phase == "prefill"
+        assert prefill.input_shapes["hidden"] == [1, None, 16]
+        recorded = prefill.to_dict()
+        assert recorded["external_data_files"] == ["layer_1.onnx.data"]
+        assert recorded["depends_on"] == ["embedding"]
+        assert recorded["execution_order"] == 2
+        recorded["input_names"].append("extra")
+        assert prefill.input_names == ["hidden", "mask"]
+        draft = ComponentInfo(
+            component_type="other",
+            phase="draft",
+            resident_policy="transient",
+            device_preference="rdna",
+        )
+        assert draft.phase == "speculative_draft"
+        assert draft.resident_policy == "on_demand"
+        assert draft.device_preference == "igpu"
+        verify = ComponentInfo(component_type="other", phase="verify")
+        assert verify.phase == "verification"
+        try:
+            ComponentInfo(component_type="embedding", input_names="hidden")
+            raise AssertionError("a string of input names was accepted")
+        except ValueError as exc:
+            assert "input_names" in str(exc)
+        try:
+            ComponentInfo(component_type="embedding", phase="sideband")
+            raise AssertionError("an unknown phase was accepted")
+        except ValueError as exc:
+            assert "sideband" in str(exc)
+        try:
+            ComponentInfo(
+                component_type="embedding",
+                input_names=["hidden"],
+                input_types={"mask": "float16"},
+            )
+            raise AssertionError("a type for an unnamed input was accepted")
+        except ValueError as exc:
+            assert "input_types" in str(exc)
+        try:
+            ComponentInfo(component_type="layer", layer_id=0, depends_on=["layer_0"])
+            raise AssertionError("a self dependency was accepted")
+        except ValueError as exc:
+            assert "depends_on" in str(exc)
         try:
             SplitConfig(model="weights", output="out", target_device="tpu")
             raise AssertionError("an unknown device was accepted")
@@ -7012,6 +7093,7 @@ def test_backend():
     print("  model format: one enum for onnx, safetensors, gguf, pytorch_bin")
     print("  device policy: providers, npu, ipu, hybrid execution")
     print("  execution policy: monolithic, sequential rejected on NPU, hybrid and moe allowed")
+    print("  component contract: inputs, shapes, phase, residency")
     print("backend module: OK\n")
     return True
 

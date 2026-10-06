@@ -322,33 +322,277 @@ class SplitResult:
     format: ModelFormat = ModelFormat.SAFETENSORS
 
 
+# Phases a split component may be assigned. A layer index is not a phase.
+# Aliases collapse onto the names the session scheduler already accepts.
+_COMPONENT_PHASES = frozenset({
+    "prefill",
+    "decode",
+    "router",
+    "expert",
+    "kv_cache",
+    "speculative_draft",
+    "verification",
+    "norm",
+    "lm_head",
+    "embedding",
+})
+
+_COMPONENT_PHASE_ALIASES = {
+    "prefill": "prefill",
+    "decode": "decode",
+    "router": "router",
+    "moe_router": "router",
+    "moe": "router",
+    "expert": "expert",
+    "expert_execution": "expert",
+    "experts": "expert",
+    "kv_cache": "kv_cache",
+    "kv_cache_management": "kv_cache",
+    "kv": "kv_cache",
+    "speculative_draft": "speculative_draft",
+    "speculative": "speculative_draft",
+    "draft": "speculative_draft",
+    "verification": "verification",
+    "verify": "verification",
+    "norm": "norm",
+    "lm_head": "lm_head",
+    "embedding": "embedding",
+}
+
+_COMPONENT_RESIDENT_POLICIES = frozenset({"auto", "resident", "on_demand", "evict"})
+
+_COMPONENT_DEVICE_ALIASES = {
+    "auto": "auto",
+    "npu": "npu",
+    "xdna": "npu",
+    "igpu": "igpu",
+    "rdna": "igpu",
+    "gpu": "gpu",
+    "cpu": "cpu",
+}
+
+
+def _coerce_component_type(value: Any) -> ComponentType:
+    """Accept a ComponentType or its value, such as layer or lm_head."""
+    if isinstance(value, ComponentType):
+        return value
+    text = str(value).split(".")[-1].strip().lower()
+    try:
+        return ComponentType(text)
+    except ValueError as exc:
+        known = ", ".join(item.value for item in ComponentType)
+        raise ValueError(
+            f"Unknown component_type {value!r}. Expected one of: {known}"
+        ) from exc
+
+
+def _as_non_negative_int(value: Any, name: str) -> int:
+    """Reject bools and negatives. A count or an order is a real integer."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be a non-negative integer, got {value!r}")
+    if value < 0:
+        raise ValueError(f"{name} must be a non-negative integer, got {value!r}")
+    return value
+
+
+def _copy_name_list(value: Any, name: str) -> List[str]:
+    """Copy a list of tensor, file, or component names."""
+    if isinstance(value, (str, bytes)) or not isinstance(value, list):
+        raise ValueError(f"{name} must be a list of names, got {value!r}")
+    cleaned: List[str] = []
+    seen = set()
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(f"{name} entry must be a non-empty string, got {item!r}")
+        text = item.strip()
+        if text in seen:
+            raise ValueError(f"{name} contains a duplicate name {text!r}")
+        seen.add(text)
+        cleaned.append(text)
+    return cleaned
+
+
+def _copy_type_map(value: Any, names: List[str], field_name: str, names_field: str) -> Dict[str, str]:
+    """Copy dtype names. Every key must already be listed in the name list."""
+    if not isinstance(value, dict):
+        raise ValueError(f"{field_name} must be a dict, got {value!r}")
+    allowed = set(names)
+    cleaned: Dict[str, str] = {}
+    for key, dtype in value.items():
+        if not isinstance(key, str) or not key.strip():
+            raise ValueError(f"{field_name} key must be a non-empty string, got {key!r}")
+        text = key.strip()
+        if text not in allowed:
+            raise ValueError(f"{field_name} key {text!r} is not in {names_field}")
+        if not isinstance(dtype, str) or not dtype.strip():
+            raise ValueError(
+                f"{field_name}[{text!r}] must be a non-empty type name, got {dtype!r}"
+            )
+        cleaned[text] = dtype.strip()
+    return cleaned
+
+
+def _copy_shape_map(
+    value: Any,
+    names: List[str],
+    field_name: str,
+    names_field: str,
+) -> Dict[str, List[Optional[int]]]:
+    """Copy shapes. None is a symbolic axis. Every other axis is a non-negative int."""
+    if not isinstance(value, dict):
+        raise ValueError(f"{field_name} must be a dict, got {value!r}")
+    allowed = set(names)
+    cleaned: Dict[str, List[Optional[int]]] = {}
+    for key, shape in value.items():
+        if not isinstance(key, str) or not key.strip():
+            raise ValueError(f"{field_name} key must be a non-empty string, got {key!r}")
+        text = key.strip()
+        if text not in allowed:
+            raise ValueError(f"{field_name} key {text!r} is not in {names_field}")
+        if isinstance(shape, (str, bytes)) or not isinstance(shape, list):
+            raise ValueError(f"{field_name}[{text!r}] must be a list of dimensions, got {shape!r}")
+        dims: List[Optional[int]] = []
+        for dim in shape:
+            if dim is None:
+                dims.append(None)
+                continue
+            dims.append(_as_non_negative_int(dim, f"{field_name}[{text!r}] dimension"))
+        cleaned[text] = dims
+    return cleaned
+
+
+def _coerce_component_phase(phase: Any) -> Optional[str]:
+    """None stays unset. Draft and verify collapse onto the scheduler names."""
+    if phase is None or phase == "":
+        return None
+    text = str(getattr(phase, "value", phase)).strip().lower().replace("-", "_").replace(" ", "_")
+    text = _COMPONENT_PHASE_ALIASES.get(text, text)
+    if text not in _COMPONENT_PHASES:
+        allowed = ", ".join(sorted(_COMPONENT_PHASES))
+        raise ValueError(f"Unknown phase {phase!r}. Expected one of: {allowed}")
+    return text
+
+
+def _coerce_component_device(preference: Any) -> Optional[str]:
+    """None uses the caller provider list. xdna is the NPU and rdna is the iGPU."""
+    if preference is None or preference == "":
+        return None
+    text = str(preference).strip().lower()
+    if text not in _COMPONENT_DEVICE_ALIASES:
+        allowed = ", ".join(sorted({"auto", "npu", "igpu", "gpu", "cpu"}))
+        raise ValueError(
+            f"Unknown device_preference {preference!r}. Expected one of: {allowed}"
+        )
+    return _COMPONENT_DEVICE_ALIASES[text]
+
+
+def _coerce_component_resident(policy: Any) -> str:
+    """Normalize residency. transient is the on-demand policy."""
+    text = str(policy if policy is not None else "auto").strip().lower().replace("-", "_")
+    if text == "transient":
+        text = "on_demand"
+    if text not in _COMPONENT_RESIDENT_POLICIES:
+        allowed = ", ".join(sorted(_COMPONENT_RESIDENT_POLICIES))
+        raise ValueError(
+            f"Unknown resident_policy {policy!r}. Expected one of: {allowed}"
+        )
+    return text
+
+
 @dataclass
 class ComponentInfo:
     """
-    Information about a semantic model component.
-    
-    This is a base class that can be extended by format-specific implementations.
-    Used to track metadata about extracted model components during splitting.
-    
-    Attributes:
-        component_type: Type of component (embedding, layer, norm, lm_head, other).
-        layer_id: For layer components, the layer index (0-indexed).
-        file_path: Path to the saved component file.
-        num_tensors: Number of tensors/weights in this component.
-        size_bytes: Approximate size in bytes.
+    Execution contract for one split component.
+
+    The type, layer, file, tensor count, and size identify the artifact.
+    Names, dtypes, and shapes describe the boundary. External data, dependencies,
+    order, device, residency, and phase describe how it runs. An omitted phase
+    stays unset, including for a layer.
     """
     component_type: ComponentType
     layer_id: Optional[int] = None
     file_path: Optional[str] = None
     num_tensors: int = 0
     size_bytes: int = 0
-    
+
+    input_names: List[str] = field(default_factory=list)
+    output_names: List[str] = field(default_factory=list)
+    input_types: Dict[str, str] = field(default_factory=dict)
+    output_types: Dict[str, str] = field(default_factory=dict)
+    input_shapes: Dict[str, List[Optional[int]]] = field(default_factory=dict)
+    output_shapes: Dict[str, List[Optional[int]]] = field(default_factory=dict)
+
+    external_data_files: List[str] = field(default_factory=list)
+    depends_on: List[str] = field(default_factory=list)
+    execution_order: int = 0
+    device_preference: Optional[str] = None
+    resident_policy: str = "auto"
+    phase: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        self.component_type = _coerce_component_type(self.component_type)
+        if self.layer_id is not None:
+            self.layer_id = _as_non_negative_int(self.layer_id, "layer_id")
+        if self.file_path is not None:
+            if not isinstance(self.file_path, str) or not self.file_path.strip():
+                raise ValueError(f"file_path must be a non-empty string, got {self.file_path!r}")
+            self.file_path = self.file_path.strip()
+        self.num_tensors = _as_non_negative_int(self.num_tensors, "num_tensors")
+        self.size_bytes = _as_non_negative_int(self.size_bytes, "size_bytes")
+        self.input_names = _copy_name_list(self.input_names, "input_names")
+        self.output_names = _copy_name_list(self.output_names, "output_names")
+        self.input_types = _copy_type_map(
+            self.input_types, self.input_names, "input_types", "input_names"
+        )
+        self.output_types = _copy_type_map(
+            self.output_types, self.output_names, "output_types", "output_names"
+        )
+        self.input_shapes = _copy_shape_map(
+            self.input_shapes, self.input_names, "input_shapes", "input_names"
+        )
+        self.output_shapes = _copy_shape_map(
+            self.output_shapes, self.output_names, "output_shapes", "output_names"
+        )
+        self.external_data_files = _copy_name_list(
+            self.external_data_files, "external_data_files"
+        )
+        self.depends_on = _copy_name_list(self.depends_on, "depends_on")
+        if self.name in self.depends_on:
+            raise ValueError(f"depends_on cannot include this component {self.name!r}")
+        self.execution_order = _as_non_negative_int(self.execution_order, "execution_order")
+        self.device_preference = _coerce_component_device(self.device_preference)
+        self.resident_policy = _coerce_component_resident(self.resident_policy)
+        self.phase = _coerce_component_phase(self.phase)
+
     @property
     def name(self) -> str:
         """Generate a canonical name for this component."""
         if self.component_type == ComponentType.LAYER:
             return f"layer_{self.layer_id}"
         return self.component_type.value
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Copy the execution contract. Callers can store this in model info."""
+        return {
+            "name": self.name,
+            "component_type": self.component_type.value,
+            "layer_id": self.layer_id,
+            "file_path": self.file_path,
+            "num_tensors": self.num_tensors,
+            "size_bytes": self.size_bytes,
+            "input_names": list(self.input_names),
+            "output_names": list(self.output_names),
+            "input_types": dict(self.input_types),
+            "output_types": dict(self.output_types),
+            "input_shapes": {key: list(shape) for key, shape in self.input_shapes.items()},
+            "output_shapes": {key: list(shape) for key, shape in self.output_shapes.items()},
+            "external_data_files": list(self.external_data_files),
+            "depends_on": list(self.depends_on),
+            "execution_order": self.execution_order,
+            "device_preference": self.device_preference,
+            "resident_policy": self.resident_policy,
+            "phase": self.phase,
+        }
 
 
 @dataclass
