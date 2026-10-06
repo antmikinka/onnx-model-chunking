@@ -8328,8 +8328,15 @@ def test_hf_integration():
         assert split["files"] == ["embeddings.onnx", "layer_0.onnx", "layer_1.onnx"]
         by_name = {item["name"]: item for item in split["boundary_tensors"]}
         assert by_name["past_key_values.0.key"]["is_stateful"] is True
+        assert by_name["past_key_values.0.key"]["cache_role"] == "past_key"
+        assert by_name["past_key_values.0.key"]["zero_copy"] is True
+        assert by_name["past_key_values.0.key"]["device_preference"] == "npu"
+        assert by_name["past_key_values.0.key"]["producer"] == "layer_0"
         assert by_name["hidden_states"]["is_stateful"] is False
+        assert by_name["hidden_states"]["cache_role"] is None
+        assert by_name["hidden_states"]["zero_copy"] is True
         assert by_name["presentation"]["is_stateful"] is False
+        assert by_name["presentation"]["cache_role"] is None
         assert by_name["hidden_states"]["producer_component"] == "embedding"
         split["external_data"].append("extra")
         split["boundary_tensors"].append({"name": "extra"})
@@ -8438,6 +8445,9 @@ def test_hf_integration():
         assert past_boundary["is_stateful"] is True
         assert past_boundary["producer_component"] == "external"
         assert past_boundary["consumer_components"] == ["model"]
+        assert past_boundary["cache_role"] == "past_key"
+        assert past_boundary["zero_copy"] is True
+        assert past_boundary["device_preference"] == "npu"
 
     with tempfile.TemporaryDirectory() as directory:
         _write_json(directory, "model_info.json", {
@@ -9644,6 +9654,339 @@ def test_graph_topology():
     return True
 
 
+def test_boundary_contract():
+    """Boundary tensors carry dtype, shape, role, device, and zero-copy."""
+    print("=" * 50)
+    print("Testing boundary contract...")
+    print("=" * 50)
+
+    import json
+    import os
+    import sys
+    import tempfile
+    import types
+    import chunking_utils
+    from chunking_utils.common.types import BoundaryTensor, SplitResult
+
+    try:
+        from chunking_utils.onnx.splitter import collect_boundary_tensors
+    except ModuleNotFoundError:
+        for name in list(sys.modules):
+            if name == "chunking_utils.onnx" or name.startswith("chunking_utils.onnx."):
+                del sys.modules[name]
+        onnx_stub = types.ModuleType("onnx")
+        onnx_stub.ModelProto = type("ModelProto", (), {})
+        onnx_stub.numpy_helper = types.SimpleNamespace()
+        onnx_stub.helper = types.SimpleNamespace()
+        onnx_stub.TensorProto = types.SimpleNamespace()
+        onnx_stub.shape_inference = types.SimpleNamespace()
+        sys.modules["onnx"] = onnx_stub
+        from chunking_utils.onnx.splitter import collect_boundary_tensors
+
+    assert chunking_utils.collect_boundary_tensors is collect_boundary_tensors
+
+    hidden = BoundaryTensor(
+        name="hidden_states",
+        dtype="float16",
+        shape=[1, None, 16],
+        producer="embedding",
+        consumers=["layer_0"],
+    )
+    assert hidden.producer == "embedding"
+    assert hidden.producer_component == "embedding"
+    assert hidden.consumers == ["layer_0"]
+    assert hidden.cache_role is None
+    assert hidden.device_preference is None
+    assert hidden.zero_copy is True
+    recorded = hidden.to_dict()
+    restored = BoundaryTensor.from_dict(json.loads(json.dumps(recorded)))
+    recorded["consumers"].append("norm")
+    recorded["consumer_components"].append("lm_head")
+    assert hidden.consumer_components == ["layer_0"]
+    assert restored.producer_component == "embedding"
+    assert restored.shape[1] is None
+    assert restored.zero_copy is True
+    alias_only = BoundaryTensor.from_dict({
+        "name": "attention_mask",
+        "dtype": "int64",
+        "shape": [1, None],
+        "producer": "external",
+        "consumers": ["layer_0", "layer_1"],
+    })
+    assert alias_only.producer_component == "external"
+    assert alias_only.consumer_components == ["layer_0", "layer_1"]
+    assert alias_only.zero_copy is False
+    past = BoundaryTensor(
+        name="past_key_values.0.key",
+        dtype="float16",
+        shape=[1, 8, None, 128],
+        producer_component="external",
+        consumer_components=["layer_0"],
+        is_stateful=False,
+        device_preference=None,
+    )
+    assert past.is_stateful is True
+    assert past.cache_role == "past_key"
+    assert past.device_preference == "npu"
+    assert past.zero_copy is True
+    present = BoundaryTensor(
+        name="present.0.value",
+        dtype="fp16",
+        shape=[1, 8, None, 128],
+        producer_component="layer_0",
+        consumer_components=[],
+    )
+    assert present.cache_role == "present_value"
+    assert present.zero_copy is True
+    kept = BoundaryTensor(
+        name="past_key_values.0.value",
+        dtype="float16",
+        shape=[1, 8, None, 128],
+        producer_component="external",
+        consumer_components=["layer_0"],
+        zero_copy=False,
+        device_preference="cpu",
+    )
+    assert kept.cache_role == "past_value"
+    assert kept.zero_copy is False
+    assert kept.device_preference == "cpu"
+    try:
+        BoundaryTensor(
+            name="hidden_states",
+            dtype="float16",
+            shape=[1, None, 16],
+            producer="embedding",
+            producer_component="norm",
+            consumer_components=["layer_0"],
+        )
+        raise AssertionError("disagreeing producers were accepted")
+    except ValueError as exc:
+        assert "producer" in str(exc)
+    try:
+        BoundaryTensor(
+            name="hidden_states",
+            dtype="float16",
+            shape=[1, None, 16],
+            producer_component="embedding",
+            consumers=["norm"],
+            consumer_components=["layer_0"],
+        )
+        raise AssertionError("disagreeing consumers were accepted")
+    except ValueError as exc:
+        assert "consumers" in str(exc)
+    try:
+        BoundaryTensor(
+            name="past_key_values.0.key",
+            dtype="float16",
+            shape=[1],
+            producer_component="external",
+            consumer_components=["layer_0"],
+            cache_role="present_key",
+        )
+        raise AssertionError("a mismatched cache role was accepted")
+    except ValueError as exc:
+        assert "cache_role" in str(exc)
+    try:
+        BoundaryTensor(
+            name="hidden_states",
+            dtype="float16",
+            shape=[1],
+            producer_component="embedding",
+            consumer_components=["layer_0"],
+            cache_role="sideband",
+        )
+        raise AssertionError("an unknown cache role was accepted")
+    except ValueError as exc:
+        assert "cache_role" in str(exc)
+    try:
+        BoundaryTensor(
+            name="hidden_states",
+            dtype="float16",
+            shape=[1],
+            producer_component="embedding",
+            consumer_components=["layer_0"],
+            zero_copy=1,
+        )
+        raise AssertionError("a non-bool zero_copy was accepted")
+    except ValueError as exc:
+        assert "zero_copy" in str(exc)
+    try:
+        BoundaryTensor(
+            name="  ",
+            dtype="float16",
+            shape=[1],
+            producer_component="embedding",
+            consumer_components=["layer_0"],
+        )
+        raise AssertionError("a blank boundary name was accepted")
+    except ValueError as exc:
+        assert "name" in str(exc)
+
+    class _Node:
+        def __init__(self, name, inputs, outputs):
+            self.name = name
+            self.input = list(inputs)
+            self.output = list(outputs)
+            self.op_type = "MatMul"
+
+    class _Init:
+        def __init__(self, name):
+            self.name = name
+
+    class _Dim:
+        def __init__(self, value=None, param=""):
+            self.dim_value = 0 if value is None else value
+            self.dim_param = param
+
+    class _Value:
+        def __init__(self, name, elem, dims):
+            self.name = name
+            self.type = types.SimpleNamespace(
+                tensor_type=types.SimpleNamespace(
+                    elem_type=elem,
+                    shape=types.SimpleNamespace(dim=dims),
+                )
+            )
+
+    class _Graph:
+        def __init__(self):
+            self.node = [
+                _Node("embed", ["input_ids", "embed_weight"], ["hidden"]),
+                _Node("q_proj", ["hidden"], ["q"]),
+                _Node(
+                    "out_proj",
+                    ["q", "past_key_values.0.key", "attention_mask"],
+                    ["hidden_1", "present.0.key"],
+                ),
+                _Node(
+                    "layer1",
+                    ["hidden_1", "past_key_values.1.key", "attention_mask"],
+                    ["hidden_2", "present.1.key"],
+                ),
+                _Node("final_norm", ["hidden_2"], ["norm_out"]),
+                _Node("head", ["norm_out"], ["logits"]),
+            ]
+            self.initializer = [_Init("embed_weight")]
+            self.input = [
+                _Value("input_ids", 7, [_Dim(1), _Dim(param="seq")]),
+                _Value("past_key_values.0.key", 10, [_Dim(1), _Dim(8), _Dim(param="seq"), _Dim(128)]),
+                _Value("past_key_values.1.key", 10, [_Dim(1), _Dim(8), _Dim(param="seq"), _Dim(128)]),
+                _Value("attention_mask", 7, [_Dim(1), _Dim(param="seq")]),
+            ]
+            self.output = [
+                _Value("logits", 10, [_Dim(1), _Dim(param="seq"), _Dim(16)]),
+                _Value("present.0.key", 10, [_Dim(1), _Dim(8), _Dim(param="seq"), _Dim(128)]),
+                _Value("present.1.key", 10, [_Dim(1), _Dim(8), _Dim(param="seq"), _Dim(128)]),
+            ]
+            self.value_info = [
+                _Value("hidden", 10, [_Dim(1), _Dim(param="seq"), _Dim(16)]),
+                _Value("hidden_1", 10, [_Dim(1), _Dim(param="seq"), _Dim(16)]),
+                _Value("q", 10, [_Dim(1), _Dim(param="seq"), _Dim(16)]),
+            ]
+
+    class _Part:
+        def __init__(self, indices):
+            self.node_indices = list(indices)
+
+    graph = _Graph()
+    components = {
+        "embedding": _Part([0]),
+        "layer_0": _Part([1, 2]),
+        "layer_1": _Part([3]),
+        "norm": _Part([4]),
+        "lm_head": _Part([5]),
+    }
+    found = collect_boundary_tensors(graph, components)
+    by_name = {item.name: item for item in found}
+    assert "q" not in by_name
+    assert "embed_weight" not in by_name
+    assert by_name["hidden"].producer == "embedding"
+    assert by_name["hidden"].consumers == ["layer_0"]
+    assert by_name["hidden"].dtype == "float16"
+    assert by_name["hidden"].shape == [1, None, 16]
+    assert by_name["hidden"].zero_copy is True
+    assert by_name["hidden"].cache_role is None
+    assert by_name["past_key_values.0.key"].producer == "external"
+    assert by_name["past_key_values.0.key"].consumers == ["layer_0"]
+    assert by_name["past_key_values.0.key"].cache_role == "past_key"
+    assert by_name["past_key_values.0.key"].zero_copy is True
+    assert by_name["past_key_values.0.key"].device_preference == "npu"
+    assert by_name["past_key_values.0.key"].shape[2] is None
+    assert by_name["present.0.key"].producer == "layer_0"
+    assert by_name["present.0.key"].consumers == []
+    assert by_name["present.0.key"].cache_role == "present_key"
+    assert by_name["present.0.key"].zero_copy is True
+    assert by_name["attention_mask"].producer == "external"
+    assert by_name["attention_mask"].consumers == ["layer_0", "layer_1"]
+    assert by_name["attention_mask"].dtype == "int64"
+    assert by_name["attention_mask"].zero_copy is False
+    assert by_name["logits"].producer == "lm_head"
+    assert by_name["logits"].consumers == []
+    assert by_name["logits"].zero_copy is False
+    assert by_name["logits"].cache_role is None
+    assert by_name["input_ids"].dtype == "int64"
+    names = [item.name for item in found]
+    assert names.index("input_ids") < names.index("hidden")
+    document = [item.to_dict() for item in found]
+    assert document[0]["producer"] == document[0]["producer_component"]
+    assert "cache_role" in document[0]
+    assert "zero_copy" in document[0]
+    BoundaryTensor.from_dict(document[0])
+    try:
+        collect_boundary_tensors(None, {})
+        raise AssertionError("a missing graph was accepted")
+    except ValueError as exc:
+        assert "graph" in str(exc)
+    try:
+        collect_boundary_tensors(1, {})
+        raise AssertionError("a non-graph was accepted")
+    except ValueError as exc:
+        assert "graph" in str(exc)
+    try:
+        collect_boundary_tensors(graph, {"embedding": _Part([0])})
+        raise AssertionError("an unassigned node was accepted")
+    except ValueError as exc:
+        assert "node 1" in str(exc)
+    try:
+        collect_boundary_tensors(graph, {
+            "embedding": _Part([0]),
+            "layer_0": _Part([0, 1, 2, 3, 4, 5]),
+        })
+        raise AssertionError("a shared node was accepted")
+    except ValueError as exc:
+        assert "belongs" in str(exc)
+    graph.value_info.append(_Value("logits", 99, [_Dim(1)]))
+    try:
+        collect_boundary_tensors(graph, components)
+        raise AssertionError("an unknown element type was accepted")
+    except ValueError as exc:
+        assert "logits" in str(exc)
+    graph.value_info.pop()
+
+    with tempfile.TemporaryDirectory() as directory:
+        embed_path = os.path.join(directory, "embedding.onnx")
+        layer_path = os.path.join(directory, "layer_0.onnx")
+        for path in (embed_path, layer_path):
+            with open(path, "wb") as handle:
+                handle.write(b"onnx")
+        result = SplitResult(
+            output_dir=directory,
+            num_layers=1,
+            component_files={"embedding": embed_path, "layer_0": layer_path},
+            model_info={"boundary_tensors": [past.to_dict()]},
+            boundary_tensors=[past],
+        )
+        result.validate()
+        assert result.model_info["boundary_tensors"][0]["cache_role"] == "past_key"
+        assert result.boundary_tensors[0].zero_copy is True
+
+    print("boundary contract: OK")
+    print("  dtype, shape, producer, and consumers")
+    print("  KV cache role prefers the NPU and stays zero-copy")
+    print("  model_info stores the boundary list")
+    return True
+
+
 def test_path_manager():
     """ONNX discovery, external data, split directories, and NPU cache paths."""
     print("=" * 50)
@@ -9966,6 +10309,12 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"graph_topology: FAILED - {e}")
         results.append(("graph_topology", False))
+
+    try:
+        results.append(("boundary_contract", test_boundary_contract()))
+    except Exception as e:
+        print(f"boundary_contract: FAILED - {e}")
+        results.append(("boundary_contract", False))
 
     try:
         results.append(("path_manager", test_path_manager()))

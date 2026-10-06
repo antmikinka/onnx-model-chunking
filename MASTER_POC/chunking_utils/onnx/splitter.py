@@ -21,7 +21,7 @@ from ..common.architecture import (
 )
 from ..common.architecture_detector import detect_architecture
 from ..common.graph_topology import analyze_graph_topology
-from ..common.types import SplitConfig, ModelFormat
+from ..common.types import BoundaryTensor, ModelFormat, SplitConfig
 
 from .types import ComponentInfo, OnnxSplitResult
 from .loader import load_onnx_model
@@ -304,6 +304,273 @@ def create_component_onnx(
     return component_model
 
 
+_ONNX_ELEM_DTYPE = {
+    1: "float32",
+    2: "uint8",
+    3: "int8",
+    4: "uint16",
+    5: "int16",
+    6: "int32",
+    7: "int64",
+    9: "bool",
+    10: "float16",
+    11: "float64",
+    12: "uint32",
+    13: "uint64",
+    16: "bfloat16",
+}
+
+
+def _boundary_graph(model):
+    """Return the ONNX graph object. A model is unwrapped. A non-graph raises."""
+    if model is None:
+        raise ValueError("graph must be an ONNX graph")
+    graph = model
+    if not hasattr(graph, "node") and hasattr(graph, "graph"):
+        graph = getattr(graph, "graph")
+    nodes = getattr(graph, "node", None)
+    if nodes is None or isinstance(nodes, (str, bytes)):
+        raise ValueError("graph must be an ONNX graph")
+    try:
+        return graph, list(nodes)
+    except TypeError as exc:
+        raise ValueError("graph must be an ONNX graph") from exc
+
+
+def _component_owners(components, node_count: int) -> Dict[int, str]:
+    """Map each node index to the component that owns it."""
+    if not isinstance(components, dict):
+        raise ValueError(f"components must be a dict, got {components!r}")
+    owners: Dict[int, str] = {}
+    for raw_name, info in components.items():
+        if not isinstance(raw_name, str) or not raw_name.strip():
+            raise ValueError(f"component name must be a non-empty string, got {raw_name!r}")
+        name = raw_name.strip()
+        indices = getattr(info, "node_indices", None)
+        if indices is None and isinstance(info, dict):
+            indices = info.get("node_indices")
+        if indices is None or isinstance(indices, (str, bytes)):
+            raise ValueError(f"component {name} must list node_indices")
+        try:
+            index_list = list(indices)
+        except TypeError as exc:
+            raise ValueError(f"component {name} must list node_indices") from exc
+        for index in index_list:
+            if isinstance(index, bool) or not isinstance(index, int):
+                raise ValueError(
+                    f"component {name} node index must be an integer, got {index!r}"
+                )
+            if index < 0 or index >= node_count:
+                raise ValueError(
+                    f"component {name} node index {index} is outside the graph"
+                )
+            previous = owners.get(index)
+            if previous is not None:
+                raise ValueError(f"node {index} belongs to {previous} and {name}")
+            owners[index] = name
+    for index in range(node_count):
+        if index not in owners:
+            raise ValueError(f"node {index} is not in a component")
+    return owners
+
+
+def _value_info_map(graph) -> Dict[str, Any]:
+    """Tensor name to the value info that carries dtype and shape."""
+    found: Dict[str, Any] = {}
+    for collection in (
+        getattr(graph, "value_info", ()) or (),
+        getattr(graph, "input", ()) or (),
+        getattr(graph, "output", ()) or (),
+    ):
+        for item in collection:
+            name = getattr(item, "name", None)
+            if isinstance(name, str) and name and name not in found:
+                found[name] = item
+    return found
+
+
+def _dims_from_value(value) -> Optional[List[Optional[int]]]:
+    """Read a shape. A symbolic axis is None. A missing shape stays unset."""
+    type_proto = getattr(value, "type", None)
+    tensor_type = getattr(type_proto, "tensor_type", None) if type_proto is not None else None
+    if tensor_type is None:
+        return None
+    shape_proto = getattr(tensor_type, "shape", None)
+    if shape_proto is None:
+        return None
+    dims = getattr(shape_proto, "dim", None)
+    if dims is None:
+        return None
+    parsed: List[Optional[int]] = []
+    for dim in dims:
+        param = getattr(dim, "dim_param", "") or ""
+        if isinstance(param, str) and param:
+            parsed.append(None)
+            continue
+        number = getattr(dim, "dim_value", 0)
+        if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
+            parsed.append(None)
+        else:
+            parsed.append(number)
+    return parsed
+
+
+def _dtype_from_value(value, name: str) -> Optional[str]:
+    """ONNX element type as a dtype name. An unset type stays unset."""
+    type_proto = getattr(value, "type", None)
+    tensor_type = getattr(type_proto, "tensor_type", None) if type_proto is not None else None
+    if tensor_type is None:
+        return None
+    elem = getattr(tensor_type, "elem_type", 0)
+    if isinstance(elem, bool) or not isinstance(elem, int) or elem == 0:
+        return None
+    dtype = _ONNX_ELEM_DTYPE.get(elem)
+    if dtype is None:
+        raise ValueError(f"boundary {name} has unsupported ONNX element type {elem}")
+    return dtype
+
+
+def _heuristic_dtype(name: str) -> str:
+    """Dtype used when the graph does not record an element type."""
+    lowered = name.lower()
+    if any(word in lowered for word in ("position", "mask", "idx", "constants")):
+        return "int64"
+    return "float16"
+
+
+def _heuristic_shape(name: str) -> List[Optional[int]]:
+    """Rank guessed from a 2D, 3D, or 4D marker in the tensor name."""
+    rank = 1
+    if "4D" in name:
+        rank = 4
+    elif "3D" in name:
+        rank = 3
+    elif "2D" in name:
+        rank = 2
+    return [None] * rank
+
+
+def _unique_component_names(names: List[str]) -> List[str]:
+    seen = set()
+    unique: List[str] = []
+    for name in names:
+        if name in seen:
+            continue
+        seen.add(name)
+        unique.append(name)
+    return unique
+
+
+def collect_boundary_tensors(model, components) -> List[BoundaryTensor]:
+    """
+    Build the boundary contract for a split ONNX graph.
+
+    A boundary is a tensor that leaves a component: a graph input, a graph
+    output, a stateful KV tensor, or a value one component writes and another
+    reads. Initializers stay inside the component that owns them. Dtype and
+    shape come from value info. A missing type uses the same name heuristic
+    as ``create_component_onnx``. KV tensors prefer the NPU and are zero-copy.
+
+    Args:
+        model: ONNX model or graph.
+        components: Component name to an object with ``node_indices``.
+
+    Returns:
+        Boundary tensors in graph-input order, then producer order.
+
+    Raises:
+        ValueError: If the graph, a node index, or an element type is invalid.
+    """
+    graph, nodes = _boundary_graph(model)
+    owners = _component_owners(components, len(nodes))
+    initializer_names = set()
+    for init in getattr(graph, "initializer", ()) or ():
+        name = getattr(init, "name", None)
+        if isinstance(name, str) and name:
+            initializer_names.add(name)
+
+    producer_node: Dict[str, int] = {}
+    consumer_nodes: Dict[str, List[int]] = {}
+    for index, node in enumerate(nodes):
+        for output in getattr(node, "output", ()) or ():
+            if isinstance(output, str) and output and output not in producer_node:
+                producer_node[output] = index
+        for inp in getattr(node, "input", ()) or ():
+            if isinstance(inp, str) and inp:
+                consumer_nodes.setdefault(inp, []).append(index)
+
+    graph_inputs = []
+    for item in getattr(graph, "input", ()) or ():
+        name = getattr(item, "name", None)
+        if isinstance(name, str) and name and name not in initializer_names:
+            graph_inputs.append(name)
+    graph_outputs = []
+    for item in getattr(graph, "output", ()) or ():
+        name = getattr(item, "name", None)
+        if isinstance(name, str) and name:
+            graph_outputs.append(name)
+    input_names = set(graph_inputs)
+    output_names = set(graph_outputs)
+    info = _value_info_map(graph)
+
+    ordered: List[str] = []
+    seen = set()
+    for name in graph_inputs:
+        if name not in seen:
+            ordered.append(name)
+            seen.add(name)
+    produced = sorted(
+        producer_node.items(),
+        key=lambda item: (item[1], item[0]),
+    )
+    for name, _index in produced:
+        if name in initializer_names or name in seen:
+            continue
+        ordered.append(name)
+        seen.add(name)
+    for name in graph_outputs:
+        if name not in seen and name not in initializer_names:
+            ordered.append(name)
+            seen.add(name)
+
+    boundaries: List[BoundaryTensor] = []
+    for name in ordered:
+        writer = producer_node.get(name)
+        producer = owners[writer] if writer is not None else "external"
+        if writer is None and name not in input_names and name not in output_names:
+            continue
+        consumer_components = _unique_component_names(
+            [owners[index] for index in consumer_nodes.get(name, [])]
+        )
+        other = [item for item in consumer_components if item != producer]
+        stateful = (
+            name.lower() == "past_key_values"
+            or name.lower().startswith("past_key_values.")
+            or name.lower() == "present"
+            or name.lower().startswith("present.")
+        )
+        activation = name in {"hidden_states", "attention_mask", "position_ids"}
+        crosses = bool(other) or name in output_names or (name in input_names and consumer_components)
+        if not stateful and not activation and not crosses:
+            continue
+        value = info.get(name)
+        dtype = _dtype_from_value(value, name) if value is not None else None
+        shape = _dims_from_value(value) if value is not None else None
+        if dtype is None:
+            dtype = _heuristic_dtype(name)
+        if shape is None:
+            shape = _heuristic_shape(name)
+        boundaries.append(BoundaryTensor(
+            name=name,
+            dtype=dtype,
+            shape=shape,
+            producer_component=producer,
+            consumer_components=consumer_components,
+            is_stateful=stateful,
+        ))
+    return boundaries
+
+
 def split_onnx(
     model: Optional[str] = None,
     output: Optional[str] = None,
@@ -362,8 +629,9 @@ def split_onnx(
     except Exception as e:
         print(f"  Warning: Shape inference failed: {e}. Subgraphs may have unknown shapes.")
     
-    # Extract components
+    # Extract components and the tensors that cross them
     components = extract_components(onnx_model)
+    boundaries = collect_boundary_tensors(onnx_model, components)
     
     # Count layers
     layer_components = {k: v for k, v in components.items() if v.component_type == "layer"}
@@ -439,7 +707,8 @@ def split_onnx(
                 "file": os.path.basename(component_files.get(name, ""))
             }
             for name, info in components.items()
-        }
+        },
+        "boundary_tensors": [tensor.to_dict() for tensor in boundaries],
     }
     
     info_path = os.path.join(output_dir, "model_info.json")
@@ -458,4 +727,5 @@ def split_onnx(
         ir_version=onnx_model.ir_version,
         producer=onnx_model.producer_name,
         components=components,
+        boundary_tensors=boundaries,
     )

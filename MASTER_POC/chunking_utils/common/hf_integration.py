@@ -12,7 +12,7 @@ import re
 import warnings
 from typing import Optional, Dict, Any, Iterable, List, Tuple
 
-from .types import TensorDtype, MemoryMode
+from .types import BoundaryTensor, MemoryMode, TensorDtype
 from .architecture import architecture_from_string, ArchitectureType
 
 # Optional imports. ONNX Runtime is the execution target, so this module
@@ -916,6 +916,46 @@ def _declared_boundary_items(info: Dict[str, Any]) -> Tuple[List[Any], bool]:
     return [], False
 
 
+def _boundary_alias(item: Dict[str, Any], primary: str, alias: str, label: str) -> str:
+    """Read a component name from either the stored key or the short alias."""
+    primary_value = item.get(primary) if primary in item else None
+    alias_value = item.get(alias) if alias in item else None
+    if primary_value is None and alias_value is None:
+        raise ValueError(f"{label} must be a non-empty string, got None")
+    if (
+        primary_value is not None
+        and alias_value is not None
+        and (
+            not isinstance(primary_value, str)
+            or not isinstance(alias_value, str)
+            or primary_value.strip() != alias_value.strip()
+        )
+    ):
+        raise ValueError(
+            f"{alias} {alias_value!r} does not match {primary} {primary_value!r}"
+        )
+    chosen = primary_value if primary_value is not None else alias_value
+    if not isinstance(chosen, str) or not chosen.strip():
+        raise ValueError(f"{label} must be a non-empty string, got {chosen!r}")
+    return chosen.strip()
+
+
+def _boundary_consumer_alias(item: Dict[str, Any]) -> List[str]:
+    """Read consumer components from either stored name."""
+    has_primary = "consumer_components" in item and item.get("consumer_components") is not None
+    has_alias = "consumers" in item and item.get("consumers") is not None
+    if not has_primary and not has_alias:
+        raise ValueError("consumer_components must be a list of names, got None")
+    primary = _name_list(item.get("consumer_components"), "consumer_components") if has_primary else None
+    alias = _name_list(item.get("consumers"), "consumers") if has_alias else None
+    if primary is not None and alias is not None and primary != alias:
+        raise ValueError(
+            f"consumers {alias!r} does not match consumer_components {primary!r}"
+        )
+    chosen = primary if primary is not None else alias
+    return list(chosen or [])
+
+
 def _boundary_from_document(item: Any, component_names: set) -> Dict[str, Any]:
     if not isinstance(item, dict):
         raise ValueError(f"boundary tensor must be a dict, got {item!r}")
@@ -926,21 +966,16 @@ def _boundary_from_document(item: Any, component_names: set) -> Dict[str, Any]:
     dtype = item.get("dtype")
     if not isinstance(dtype, str) or not dtype.strip():
         raise ValueError(f"boundary tensor dtype must be a non-empty string, got {dtype!r}")
-    producer = item.get("producer_component")
-    if not isinstance(producer, str) or not producer.strip():
-        raise ValueError(
-            f"producer_component must be a non-empty string, got {producer!r}"
-        )
-    producer = producer.strip()
-    if component_names and producer not in component_names:
+    producer = _boundary_alias(
+        item, "producer_component", "producer", "producer_component"
+    )
+    if component_names and producer not in component_names and producer != "external":
         raise ValueError(
             f"boundary {name} producer {producer} is not a component"
         )
-    consumers = _name_list(item.get("consumer_components"), "consumer_components")
-    if consumers is None:
-        raise ValueError("consumer_components must be a list of names, got None")
+    consumers = _boundary_consumer_alias(item)
     for consumer in consumers:
-        if component_names and consumer not in component_names:
+        if component_names and consumer not in component_names and consumer != "external":
             raise ValueError(
                 f"boundary {name} consumer {consumer} is not a component"
             )
@@ -952,22 +987,25 @@ def _boundary_from_document(item: Any, component_names: set) -> Dict[str, Any]:
         stateful = item["is_stateful"]
     else:
         stateful = False
-    if _name_is_stateful(name):
-        stateful = True
-    device = item.get("device_preference")
+    device = item.get("device_preference") if "device_preference" in item else None
     if device is not None:
         if isinstance(device, bool) or not isinstance(device, str):
             raise ValueError(f"device_preference must be a string, got {device!r}")
         device = device.strip() or None
-    return {
-        "name": name,
-        "dtype": dtype.strip(),
-        "shape": _boundary_shape(name, item.get("shape")),
-        "producer_component": producer,
-        "consumer_components": consumers,
-        "is_stateful": stateful,
-        "device_preference": device,
-    }
+    cache_role = item.get("cache_role") if "cache_role" in item else None
+    zero_copy = item.get("zero_copy") if "zero_copy" in item else None
+    tensor = BoundaryTensor(
+        name=name,
+        dtype=dtype.strip(),
+        shape=_boundary_shape(name, item.get("shape")),
+        producer_component=producer,
+        consumer_components=consumers,
+        is_stateful=stateful,
+        cache_role=cache_role,
+        device_preference=device,
+        zero_copy=zero_copy,
+    )
+    return tensor.to_dict()
 
 
 def _io_index(records: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
@@ -1029,15 +1067,17 @@ def _synthesized_boundaries(records: List[Dict[str, Any]]) -> List[Dict[str, Any
             and not other_consumers
         ):
             continue
-        boundaries.append({
-            "name": name,
-            "dtype": item["dtype"],
-            "shape": list(item["shape"]),
-            "producer_component": producers.get(name, "external"),
-            "consumer_components": list(consumers.get(name, [])),
-            "is_stateful": _name_is_stateful(name),
-            "device_preference": None,
-        })
+        producer = producers.get(name, "external")
+        consumer_names = list(consumers.get(name, []))
+        tensor = BoundaryTensor(
+            name=name,
+            dtype=item["dtype"],
+            shape=list(item["shape"]),
+            producer_component=producer,
+            consumer_components=consumer_names,
+            is_stateful=_name_is_stateful(name),
+        )
+        boundaries.append(tensor.to_dict())
     return boundaries
 
 

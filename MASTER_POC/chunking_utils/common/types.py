@@ -882,14 +882,133 @@ def _boundary_name_is_stateful(name: str) -> bool:
     )
 
 
+_CACHE_ROLES = (
+    "past_key",
+    "past_value",
+    "present_key",
+    "present_value",
+    "past",
+    "present",
+)
+
+
+def _infer_cache_role(name: str) -> Optional[str]:
+    """KV role implied by a past or present tensor name. Other names stay unset."""
+    lowered = name.lower()
+    if lowered == "past_key_values" or lowered.startswith("past_key_values."):
+        if ".key" in lowered:
+            return "past_key"
+        if ".value" in lowered:
+            return "past_value"
+        return "past"
+    if lowered == "present" or lowered.startswith("present."):
+        if ".key" in lowered:
+            return "present_key"
+        if ".value" in lowered:
+            return "present_value"
+        return "present"
+    return None
+
+
+def normalize_cache_role(name: str, value: Any = None) -> Optional[str]:
+    """
+    Return the KV cache role for one boundary.
+
+    None and a blank string use the role implied by ``name``. An unknown role
+    raises. A past or present name rejects a role that disagrees with that name.
+    """
+    inferred = _infer_cache_role(name)
+    if value is None:
+        return inferred
+    if isinstance(value, bool) or not isinstance(value, str):
+        raise ValueError(f"cache_role must be a string, got {value!r}")
+    text = value.strip().lower().replace("-", "_").replace(" ", "_")
+    if not text:
+        return inferred
+    if text not in _CACHE_ROLES:
+        known = ", ".join(_CACHE_ROLES)
+        raise ValueError(f"Unknown cache_role {value!r}. Expected one of: {known}")
+    if inferred is not None and text != inferred:
+        raise ValueError(f"cache_role {value!r} does not match boundary {name!r}")
+    return text
+
+
+def boundary_zero_copy(
+    producer: str,
+    consumers: List[str],
+    is_stateful: bool,
+    declared: Any = None,
+) -> bool:
+    """
+    True when the tensor must stay one OrtValue across the boundary.
+
+    A stateful KV tensor is zero-copy. A tensor written by one component and
+    read by another is zero-copy. An omitted declaration uses that rule.
+    """
+    if declared is None:
+        handoff = producer != "external" and any(item != producer for item in consumers)
+        return bool(is_stateful or handoff)
+    if not isinstance(declared, bool):
+        raise ValueError(f"zero_copy must be a bool, got {declared!r}")
+    return declared
+
+
+def _boundary_alias_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """Accept producer and consumers as the same fields as the stored names."""
+    payload = dict(kwargs)
+    if "producer" in payload:
+        producer = payload.pop("producer")
+        existing = payload.get("producer_component")
+        if existing is None:
+            payload["producer_component"] = producer
+        elif _boundary_parties_differ(existing, producer):
+            raise ValueError(
+                f"producer {producer!r} does not match producer_component {existing!r}"
+            )
+    if "consumers" in payload:
+        consumers = payload.pop("consumers")
+        existing = payload.get("consumer_components")
+        if existing is None:
+            payload["consumer_components"] = consumers
+        elif _boundary_consumer_lists_differ(existing, consumers):
+            raise ValueError(
+                f"consumers {consumers!r} does not match consumer_components {existing!r}"
+            )
+    return payload
+
+
+def _boundary_parties_differ(left: Any, right: Any) -> bool:
+    if not isinstance(left, str) or not isinstance(right, str):
+        return True
+    return left.strip() != right.strip()
+
+
+def _boundary_consumer_lists_differ(left: Any, right: Any) -> bool:
+    if isinstance(left, (str, bytes)) or not isinstance(left, list):
+        return True
+    if isinstance(right, (str, bytes)) or not isinstance(right, list):
+        return True
+    if len(left) != len(right):
+        return True
+    for first, second in zip(left, right):
+        if not isinstance(first, str) or not isinstance(second, str):
+            return True
+        if first.strip() != second.strip():
+            return True
+    return False
+
+
 @dataclass
 class BoundaryTensor:
     """
     One tensor that crosses a component boundary.
 
-    ``hidden_states``, ``attention_mask``, and ``position_ids`` are activations.
-    ``past_key_values.*`` and ``present.*`` are stateful. ``None`` in ``shape``
-    is a symbolic axis such as the sequence length.
+    ``producer`` and ``consumers`` name the components. ``producer_component``
+    and ``consumer_components`` are the same fields. ``hidden_states``,
+    ``attention_mask``, and ``position_ids`` are activations.
+    ``past_key_values.*`` and ``present.*`` are stateful, carry a KV
+    ``cache_role``, and prefer the NPU. ``zero_copy`` is true when that tensor
+    must stay one OrtValue. ``None`` in ``shape`` is a symbolic axis.
     """
     name: str
     dtype: str
@@ -897,7 +1016,9 @@ class BoundaryTensor:
     producer_component: str
     consumer_components: List[str]
     is_stateful: bool = False
+    cache_role: Optional[str] = None
     device_preference: Optional[str] = None
+    zero_copy: Optional[bool] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name.strip():
@@ -919,24 +1040,58 @@ class BoundaryTensor:
             raise ValueError(f"is_stateful must be a bool, got {self.is_stateful!r}")
         if _boundary_name_is_stateful(self.name):
             self.is_stateful = True
+        self.cache_role = normalize_cache_role(self.name, self.cache_role)
         self.device_preference = _coerce_component_device(self.device_preference)
+        if self.device_preference is None and self.is_stateful:
+            self.device_preference = "npu"
+        self.zero_copy = boundary_zero_copy(
+            self.producer_component,
+            self.consumer_components,
+            self.is_stateful,
+            self.zero_copy,
+        )
+
+    @property
+    def producer(self) -> str:
+        """Component that writes this tensor. A graph input uses external."""
+        return self.producer_component
+
+    @property
+    def consumers(self) -> List[str]:
+        """Components that read this tensor."""
+        return self.consumer_components
 
     def to_dict(self) -> Dict[str, Any]:
         """Copy the boundary so IO binding can allocate without sharing this object."""
+        consumers = list(self.consumer_components)
         return {
             "name": self.name,
             "dtype": self.dtype,
             "shape": list(self.shape),
+            "producer": self.producer_component,
             "producer_component": self.producer_component,
-            "consumer_components": list(self.consumer_components),
+            "consumers": consumers,
+            "consumer_components": list(consumers),
             "is_stateful": self.is_stateful,
+            "cache_role": self.cache_role,
             "device_preference": self.device_preference,
+            "zero_copy": self.zero_copy,
         }
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "BoundaryTensor":
         """Build a boundary tensor from a JSON object. A symbolic axis stays None."""
         return _from_record(cls, data, "boundary tensor")
+
+
+_boundary_tensor_init = BoundaryTensor.__init__
+
+
+def _boundary_tensor_init_with_aliases(self, *args, **kwargs):
+    _boundary_tensor_init(self, *args, **_boundary_alias_kwargs(kwargs))
+
+
+BoundaryTensor.__init__ = _boundary_tensor_init_with_aliases
 
 
 def _coerce_boundary_tensor(value: Any) -> BoundaryTensor:
@@ -1324,13 +1479,13 @@ class SplitResult:
                 raise ValueError(f"missing component {layer_name}")
         for tensor in self.boundary_tensors:
             _canonical_dtype_name(tensor.dtype)
-            if tensor.producer_component not in names:
+            if tensor.producer_component != "external" and tensor.producer_component not in names:
                 raise ValueError(
                     f"boundary {tensor.name!r} depends on {tensor.producer_component!r}, "
                     "which is not in component_files"
                 )
             for consumer in tensor.consumer_components:
-                if consumer not in names:
+                if consumer != "external" and consumer not in names:
                     raise ValueError(
                         f"boundary {tensor.name!r} depends on {consumer!r}, "
                         "which is not in component_files"
