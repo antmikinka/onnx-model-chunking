@@ -24,6 +24,7 @@ from .types import (
     PROVIDER_FALLBACK,
     SplitConfig,
     SplitResult,
+    BoundaryTensor,
     ComponentInfo,
     MergeResult,
 )
@@ -70,6 +71,7 @@ __all__ = [
     "PROVIDER_FALLBACK",
     "SplitConfig",
     "SplitResult",
+    "BoundaryTensor",
     "ComponentInfo",
     "MergeResult",
     # HuggingFace integration

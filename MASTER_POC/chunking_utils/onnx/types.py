@@ -87,7 +87,8 @@ class OnnxSplitResult(SplitResult):
     components: Dict[str, ComponentInfo] = field(default_factory=dict)
     
     def __post_init__(self):
-        """Ensure format is set to ONNX."""
+        """Validate boundary tensors, then keep this result on ONNX."""
+        super().__post_init__()
         self.format = ModelFormat.ONNX
 
 

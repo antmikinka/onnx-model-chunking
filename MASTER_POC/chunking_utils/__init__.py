@@ -67,6 +67,7 @@ from .common.types import (
     PROVIDER_FALLBACK,
     SplitConfig,
     SplitResult,
+    BoundaryTensor,
     MergeResult,
 )
 
@@ -210,6 +211,7 @@ __all__ = [
     "PROVIDER_FALLBACK",
     "SplitConfig",
     "SplitResult",
+    "BoundaryTensor",
     "MergeResult",
     "ComponentInfo",
     "OnnxSplitResult",

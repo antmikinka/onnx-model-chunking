@@ -6355,6 +6355,8 @@ def test_backend():
             SplitConfig,
             ComponentInfo,
             ComponentType,
+            BoundaryTensor,
+            SplitResult,
         )
         from pipeline_utils.session_manager import ExecutionPolicy as session_policy
         assert DeviceType is canonical_device
@@ -6530,6 +6532,132 @@ def test_backend():
             raise AssertionError("a self dependency was accepted")
         except ValueError as exc:
             assert "depends_on" in str(exc)
+        from chunking_utils.common import BoundaryTensor as package_boundary
+        assert package_boundary is BoundaryTensor
+        hidden = BoundaryTensor(
+            name="hidden_states",
+            dtype="float16",
+            shape=[1, None, 16],
+            producer_component="embedding",
+            consumer_components=["layer_0"],
+            device_preference="xdna",
+        )
+        mask = BoundaryTensor(
+            name="attention_mask",
+            dtype="int64",
+            shape=[1, None],
+            producer_component="embedding",
+            consumer_components=["layer_0"],
+        )
+        positions = BoundaryTensor(
+            name="position_ids",
+            dtype="int64",
+            shape=[1, None],
+            producer_component="embedding",
+            consumer_components=["layer_0"],
+        )
+        past = BoundaryTensor(
+            name="past_key_values.0.key",
+            dtype="float16",
+            shape=[1, 8, None, 128],
+            producer_component="layer_0",
+            consumer_components=["layer_1"],
+        )
+        present = {
+            "name": "present.0.key",
+            "dtype": "float16",
+            "shape": [1, 8, None, 128],
+            "producer_component": "layer_0",
+            "consumer_components": ["layer_1"],
+            "is_stateful": False,
+        }
+        assert hidden.is_stateful is False
+        assert hidden.device_preference == "npu"
+        assert hidden.shape[1] is None
+        assert past.is_stateful is True
+        first_result = SplitResult(
+            output_dir="out",
+            num_layers=2,
+            component_files={"embedding": "embedding.onnx"},
+            model_info={},
+            boundary_tensors=[hidden, mask, positions, past, present],
+        )
+        second_result = SplitResult(
+            output_dir="out",
+            num_layers=2,
+            component_files={},
+            model_info={},
+        )
+        assert second_result.boundary_tensors == []
+        assert [item.name for item in first_result.boundary_tensors] == [
+            "hidden_states",
+            "attention_mask",
+            "position_ids",
+            "past_key_values.0.key",
+            "present.0.key",
+        ]
+        assert first_result.boundary_by_name()["present.0.key"].is_stateful is True
+        copied = hidden.to_dict()
+        copied["consumer_components"].append("norm")
+        assert hidden.consumer_components == ["layer_0"]
+        first_result.boundary_tensors.append(hidden)
+        assert second_result.boundary_tensors == []
+        try:
+            BoundaryTensor(
+                name="hidden_states",
+                dtype="float16",
+                shape=[1, None],
+                producer_component="embedding",
+                consumer_components="layer_0",
+            )
+            raise AssertionError("a consumer string was accepted")
+        except ValueError as exc:
+            assert "consumer_components" in str(exc)
+        try:
+            SplitResult(
+                output_dir="out",
+                num_layers=1,
+                component_files={},
+                model_info={},
+                boundary_tensors=[hidden, hidden],
+            )
+            raise AssertionError("a duplicate boundary name was accepted")
+        except ValueError as exc:
+            assert "hidden_states" in str(exc)
+        import importlib.util
+        import types as pytypes
+        saved_onnx = sys.modules.get("chunking_utils.onnx")
+        saved_onnx_types = sys.modules.get("chunking_utils.onnx.types")
+        onnx_dir = os.path.join("/workspace/MASTER_POC", "chunking_utils", "onnx")
+        onnx_pkg = pytypes.ModuleType("chunking_utils.onnx")
+        onnx_pkg.__path__ = [onnx_dir]
+        onnx_pkg.__package__ = "chunking_utils.onnx"
+        sys.modules["chunking_utils.onnx"] = onnx_pkg
+        spec = importlib.util.spec_from_file_location(
+            "chunking_utils.onnx.types",
+            os.path.join(onnx_dir, "types.py"),
+        )
+        onnx_types = importlib.util.module_from_spec(spec)
+        onnx_types.__package__ = "chunking_utils.onnx"
+        sys.modules["chunking_utils.onnx.types"] = onnx_types
+        spec.loader.exec_module(onnx_types)
+        onnx_result = onnx_types.OnnxSplitResult(
+            output_dir="out",
+            num_layers=1,
+            component_files={},
+            model_info={},
+            boundary_tensors=[hidden],
+        )
+        assert onnx_result.format is ModelFormat.ONNX
+        assert onnx_result.boundary_tensors[0] is hidden
+        if saved_onnx is None:
+            sys.modules.pop("chunking_utils.onnx", None)
+        else:
+            sys.modules["chunking_utils.onnx"] = saved_onnx
+        if saved_onnx_types is None:
+            sys.modules.pop("chunking_utils.onnx.types", None)
+        else:
+            sys.modules["chunking_utils.onnx.types"] = saved_onnx_types
         try:
             SplitConfig(model="weights", output="out", target_device="tpu")
             raise AssertionError("an unknown device was accepted")
@@ -7094,6 +7222,7 @@ def test_backend():
     print("  device policy: providers, npu, ipu, hybrid execution")
     print("  execution policy: monolithic, sequential rejected on NPU, hybrid and moe allowed")
     print("  component contract: inputs, shapes, phase, residency")
+    print("  boundary tensors: hidden, mask, past and present")
     print("backend module: OK\n")
     return True
 

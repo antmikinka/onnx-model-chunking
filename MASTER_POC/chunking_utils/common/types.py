@@ -300,26 +300,147 @@ class SplitConfig:
 
 from .architecture import ArchitectureType  # Re-export for convenience
 
+
+def _copy_dim_list(shape: Any, name: str) -> List[Optional[int]]:
+    """Copy one shape. None is a symbolic axis. Every other axis is a non-negative int."""
+    if isinstance(shape, (str, bytes)) or not isinstance(shape, list):
+        raise ValueError(f"{name} must be a list of dimensions, got {shape!r}")
+    dims: List[Optional[int]] = []
+    for dim in shape:
+        if dim is None:
+            dims.append(None)
+            continue
+        if isinstance(dim, bool) or not isinstance(dim, int) or dim < 0:
+            raise ValueError(f"{name} dimension must be a non-negative integer or None, got {dim!r}")
+        dims.append(dim)
+    return dims
+
+
+def _boundary_name_is_stateful(name: str) -> bool:
+    """Past and present KV tensors carry state across steps."""
+    lowered = name.lower()
+    return (
+        lowered == "past_key_values"
+        or lowered.startswith("past_key_values.")
+        or lowered == "present"
+        or lowered.startswith("present.")
+    )
+
+
+@dataclass
+class BoundaryTensor:
+    """
+    One tensor that crosses a component boundary.
+
+    ``hidden_states``, ``attention_mask``, and ``position_ids`` are activations.
+    ``past_key_values.*`` and ``present.*`` are stateful. ``None`` in ``shape``
+    is a symbolic axis such as the sequence length.
+    """
+    name: str
+    dtype: str
+    shape: List[Optional[int]]
+    producer_component: str
+    consumer_components: List[str]
+    is_stateful: bool = False
+    device_preference: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError(f"boundary tensor name must be a non-empty string, got {self.name!r}")
+        self.name = self.name.strip()
+        if not isinstance(self.dtype, str) or not self.dtype.strip():
+            raise ValueError(f"boundary tensor dtype must be a non-empty string, got {self.dtype!r}")
+        self.dtype = self.dtype.strip()
+        self.shape = _copy_dim_list(self.shape, f"shape of {self.name!r}")
+        if not isinstance(self.producer_component, str) or not self.producer_component.strip():
+            raise ValueError(
+                f"producer_component must be a non-empty string, got {self.producer_component!r}"
+            )
+        self.producer_component = self.producer_component.strip()
+        self.consumer_components = _copy_name_list(
+            self.consumer_components, "consumer_components"
+        )
+        if not isinstance(self.is_stateful, bool):
+            raise ValueError(f"is_stateful must be a bool, got {self.is_stateful!r}")
+        if _boundary_name_is_stateful(self.name):
+            self.is_stateful = True
+        self.device_preference = _coerce_component_device(self.device_preference)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Copy the boundary so IO binding can allocate without sharing this object."""
+        return {
+            "name": self.name,
+            "dtype": self.dtype,
+            "shape": list(self.shape),
+            "producer_component": self.producer_component,
+            "consumer_components": list(self.consumer_components),
+            "is_stateful": self.is_stateful,
+            "device_preference": self.device_preference,
+        }
+
+
+def _coerce_boundary_tensor(value: Any) -> BoundaryTensor:
+    """Accept a BoundaryTensor or a mapping with the same fields."""
+    if isinstance(value, BoundaryTensor):
+        return value
+    if isinstance(value, dict):
+        try:
+            return BoundaryTensor(**value)
+        except TypeError as exc:
+            raise ValueError(f"boundary tensor fields are incomplete, got {value!r}") from exc
+    raise ValueError(f"boundary tensor must be a BoundaryTensor, got {value!r}")
+
+
 @dataclass
 class SplitResult:
     """
     Result of a model splitting operation.
-    
+
     This is a unified result type that works for both ONNX and SafeTensors
     splitting operations.
-    
+
     Attributes:
         output_dir: Directory where split files were saved.
         num_layers: Number of transformer layers in the model.
         component_files: Mapping of component names to file paths.
         model_info: Additional model metadata and information.
         format: The format that was split (safetensors or onnx).
+        boundary_tensors: Tensors passed between components, including KV state.
     """
     output_dir: str
     num_layers: int
     component_files: Dict[str, str]
     model_info: Dict[str, Any]
     format: ModelFormat = ModelFormat.SAFETENSORS
+    boundary_tensors: List[BoundaryTensor] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.format, ModelFormat):
+            text = str(self.format).split(".")[-1].strip().lower()
+            try:
+                self.format = ModelFormat(text)
+            except ValueError as exc:
+                known = ", ".join(item.value for item in ModelFormat)
+                raise ValueError(
+                    f"Unknown format {self.format!r}. Expected one of: {known}"
+                ) from exc
+        if isinstance(self.boundary_tensors, (str, bytes)) or not isinstance(self.boundary_tensors, list):
+            raise ValueError(
+                f"boundary_tensors must be a list, got {self.boundary_tensors!r}"
+            )
+        cleaned: List[BoundaryTensor] = []
+        seen = set()
+        for item in self.boundary_tensors:
+            tensor = _coerce_boundary_tensor(item)
+            if tensor.name in seen:
+                raise ValueError(f"boundary_tensors contains a duplicate name {tensor.name!r}")
+            seen.add(tensor.name)
+            cleaned.append(tensor)
+        self.boundary_tensors = cleaned
+
+    def boundary_by_name(self) -> Dict[str, BoundaryTensor]:
+        """Lookup used when IO binding allocates one buffer per boundary name."""
+        return {tensor.name: tensor for tensor in self.boundary_tensors}
 
 
 # Phases a split component may be assigned. A layer index is not a phase.
