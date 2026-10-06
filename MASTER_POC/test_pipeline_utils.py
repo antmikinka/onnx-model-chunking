@@ -3248,6 +3248,273 @@ def test_io_binding():
     return True
 
 
+def test_backend():
+    """OnnxRuntimeBackend.generate runs a split pipeline or a monolithic loop."""
+    print("=" * 50)
+    print("Testing backend module...")
+    print("=" * 50)
+
+    import os
+    import tempfile
+
+    import onnxruntime as ort
+
+    from pipeline_utils.backend import (
+        BackendConfig,
+        OnnxRuntimeBackend,
+        _pair_present_to_past,
+        _sample_next_token,
+        _sequential_pipeline_class,
+    )
+
+    unloaded = OnnxRuntimeBackend()
+    try:
+        unloaded.generate("Hello")
+        raise AssertionError("generate before load was accepted")
+    except RuntimeError as exc:
+        assert "load()" in str(exc)
+
+    assert _sample_next_token(np.array([1.0, 3.0, 2.0]), temperature=0, top_p=0.9) == 1
+    assert _sample_next_token(np.array([0.0, 0.0, 5.0]), temperature=1.0, top_p=0.1) == 2
+    assert _pair_present_to_past(
+        "present.0.key",
+        ["past_key_values.0.key", "past_key_values.0.value"],
+    ) == "past_key_values.0.key"
+    assert _pair_present_to_past(
+        "present.0.value",
+        ["past_key_values.0.key", "past_key_values.0.value"],
+    ) == "past_key_values.0.value"
+
+    class _Node:
+        def __init__(self, name, shape=None, type_name="tensor(float)"):
+            self.name = name
+            self.shape = shape or []
+            self.type = type_name
+
+    class _Tokenizer:
+        eos_token_id = None
+
+        def __call__(self, prompt, return_tensors="np"):
+            assert prompt == "Hello"
+            return {"input_ids": np.array([[1, 2, 3]], dtype=np.int64)}
+
+        def decode(self, ids):
+            return ",".join(str(int(token)) for token in ids)
+
+    class _GreedySession:
+        def __init__(self):
+            self.lengths = []
+
+        def get_inputs(self):
+            return [
+                _Node("input_ids", [1, "seq"], "tensor(int64)"),
+                _Node("attention_mask", [1, "seq"], "tensor(int64)"),
+                _Node("position_ids", [1, "seq"], "tensor(int64)"),
+            ]
+
+        def get_outputs(self):
+            return [_Node("logits", [1, "seq", 6])]
+
+        def run(self, names, feeds):
+            self.lengths.append(int(feeds["input_ids"].shape[1]))
+            seq = self.lengths[-1]
+            logits = np.zeros((1, seq, 6), dtype=np.float32)
+            logits[:, -1, 4] = 8
+            return [logits]
+
+    greedy = _GreedySession()
+    monolithic = OnnxRuntimeBackend()
+    monolithic.is_loaded = True
+    monolithic._is_split = False
+    monolithic.model = greedy
+    monolithic._tokenizer = _Tokenizer()
+    assert monolithic.generate("Hello", max_tokens=2, temperature=0) == "1,2,3,4,4"
+    assert greedy.lengths == [3, 4]
+    assert monolithic.generate("Hello", max_tokens=0, temperature=0) == "1,2,3"
+
+    class _EosTokenizer(_Tokenizer):
+        eos_token_id = 4
+
+    monolithic._tokenizer = _EosTokenizer()
+    assert monolithic.generate("Hello", max_tokens=5, temperature=0) == "1,2,3,4"
+
+    class _KvSession:
+        def __init__(self):
+            self.past_lengths = []
+            self.masks = []
+
+        def get_inputs(self):
+            return [
+                _Node("input_ids", [1, "seq"], "tensor(int64)"),
+                _Node("attention_mask", [1, "total"], "tensor(int64)"),
+                _Node("past_key_values.0.key", [1, 1, "past", 2]),
+                _Node("past_key_values.0.value", [1, 1, "past", 2]),
+            ]
+
+        def get_outputs(self):
+            return [
+                _Node("logits"),
+                _Node("present.0.key"),
+                _Node("present.0.value"),
+            ]
+
+        def run(self, names, feeds):
+            past = feeds["past_key_values.0.key"]
+            self.past_lengths.append(int(past.shape[2]))
+            self.masks.append(int(feeds["attention_mask"].shape[1]))
+            seq = int(feeds["input_ids"].shape[1])
+            total = int(past.shape[2]) + seq
+            logits = np.zeros((1, seq, 6), dtype=np.float32)
+            logits[:, -1, 3] = 4
+            present = np.ones((1, 1, total, 2), dtype=np.float32)
+            return [logits, present, present + 1]
+
+    kv_session = _KvSession()
+    kv_backend = OnnxRuntimeBackend()
+    kv_backend.is_loaded = True
+    kv_backend.model = kv_session
+    kv_backend._tokenizer = _Tokenizer()
+    assert kv_backend.generate("Hello", max_tokens=2, temperature=0) == "1,2,3,3,3"
+    assert kv_session.past_lengths == [0, 3]
+    assert kv_session.masks == [3, 4]
+    assert kv_backend.get_memory_usage()["split"] is False
+
+    class _OddSession(_GreedySession):
+        def get_inputs(self):
+            return [_Node("input_ids"), _Node("custom_bias")]
+
+    odd = OnnxRuntimeBackend()
+    odd.is_loaded = True
+    odd.model = _OddSession()
+    odd._tokenizer = _Tokenizer()
+    try:
+        odd.generate("Hello", max_tokens=1, temperature=0)
+        raise AssertionError("an unknown ONNX input was accepted")
+    except RuntimeError as exc:
+        assert "custom_bias" in str(exc)
+
+    class _FakePipeline:
+        def __init__(self, model_path, providers=None, verbose=True, persist_sessions=False):
+            self.model_path = model_path
+            self.providers = list(providers or [])
+            self.verbose = verbose
+            self.persist_sessions = persist_sessions
+            self.session_manager = type("Manager", (), {
+                "get_memory_usage": lambda self: {"sessions": 2},
+            })()
+            self.tokenizer = _Tokenizer()
+            self.calls = []
+            self.cleaned = False
+
+        def generate(self, prompt, max_new_tokens=20):
+            self.calls.append((prompt, max_new_tokens))
+            return f"split:{prompt}:{max_new_tokens}"
+
+        def cleanup(self):
+            self.cleaned = True
+
+    created = {}
+
+    def _fake_pipeline_class():
+        def _factory(*args, **kwargs):
+            pipeline = _FakePipeline(*args, **kwargs)
+            created["pipeline"] = pipeline
+            return pipeline
+        return _factory
+
+    import pipeline_utils.backend as backend_mod
+    original_factory = backend_mod._sequential_pipeline_class
+    backend_mod._sequential_pipeline_class = _fake_pipeline_class
+    split_dir = tempfile.mkdtemp(prefix="onnx-split-")
+    try:
+        split = OnnxRuntimeBackend(BackendConfig(
+            onnx_providers=["CPUExecutionProvider"],
+            low_memory=False,
+        ))
+        split.load(split_dir)
+        assert split._is_split is True
+        assert split.is_loaded is True
+        pipeline = created["pipeline"]
+        assert pipeline.persist_sessions is True
+        assert pipeline.providers == ["CPUExecutionProvider"]
+        assert pipeline.verbose is False
+        assert split.generate("Hello", max_tokens=7, temperature=0.2, top_p=0.5) == "split:Hello:7"
+        assert pipeline.calls == [("Hello", 7)]
+        assert split.get_memory_usage()["sessions"] == 2
+        assert split.get_memory_usage()["split"] is True
+        split.cleanup()
+        assert pipeline.cleaned is True
+        assert split.is_loaded is False
+
+        low_memory = OnnxRuntimeBackend(BackendConfig(low_memory=True))
+        low_memory.load(split_dir)
+        assert created["pipeline"].persist_sessions is False
+        low_memory.cleanup()
+    finally:
+        backend_mod._sequential_pipeline_class = original_factory
+        os.rmdir(split_dir)
+
+    captured = {}
+    real_session = ort.InferenceSession
+
+    class _PatchedSession:
+        def __init__(self, model_path, sess_options=None, providers=None):
+            captured["path"] = model_path
+            captured["level"] = sess_options.graph_optimization_level
+            captured["threads"] = sess_options.intra_op_num_threads
+            captured["providers"] = list(providers)
+
+        def get_inputs(self):
+            return []
+
+        def get_outputs(self):
+            return []
+
+    ort.InferenceSession = _PatchedSession
+    model_file = tempfile.NamedTemporaryFile(suffix=".onnx", delete=False)
+    model_file.close()
+    try:
+        single = OnnxRuntimeBackend(BackendConfig(
+            onnx_providers=["CPUExecutionProvider"],
+            onnx_optimization_level="DISABLE",
+            n_threads=2,
+        ))
+        single.load(model_file.name)
+        assert single._is_split is False
+        assert single._pipeline is None
+        assert single.is_loaded is True
+        assert captured["providers"] == ["CPUExecutionProvider"]
+        assert captured["threads"] == 2
+        assert captured["level"] == ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    finally:
+        ort.InferenceSession = real_session
+        os.remove(model_file.name)
+
+    import sys
+    import types
+    inserted_transformers = "transformers" not in sys.modules
+    if inserted_transformers:
+        stub = types.ModuleType("transformers")
+
+        class _AutoTokenizer:
+            @staticmethod
+            def from_pretrained(*args, **kwargs):
+                raise RuntimeError("stub tokenizer")
+
+        stub.AutoTokenizer = _AutoTokenizer
+        sys.modules["transformers"] = stub
+    try:
+        pipeline_cls = _sequential_pipeline_class()
+        assert pipeline_cls.__name__ == "SequentialModelPipeline"
+    finally:
+        if inserted_transformers:
+            sys.modules.pop("transformers", None)
+
+    print("  generate: split pipeline and monolithic prefill/decode")
+    print("backend module: OK\n")
+    return True
+
+
 if __name__ == "__main__":
     print("\n" + "=" * 60)
     print("Pipeline Utils Module Tests")
@@ -3290,6 +3557,12 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"io_binding: FAILED - {e}")
         results.append(("io_binding", False))
+
+    try:
+        results.append(("backend", test_backend()))
+    except Exception as e:
+        print(f"backend: FAILED - {e}")
+        results.append(("backend", False))
     
     # Summary
     print("=" * 60)
