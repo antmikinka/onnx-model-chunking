@@ -97,6 +97,13 @@ from .common.path_utils import (
     is_local_path,
     sanitize_model_name,
 )
+from .common.path_manager import (
+    find_onnx_model,
+    find_external_data,
+    validate_split_model_dir,
+    get_cache_dir,
+    resolve_npu_artifact_cache,
+)
 
 # SafeTensors and ONNX splitters import torch and onnx. They load on first use
 # so ModelFormat can be imported without those packages.
@@ -251,6 +258,11 @@ __all__ = [
     # Path utilities
     "is_local_path",
     "sanitize_model_name",
+    "find_onnx_model",
+    "find_external_data",
+    "validate_split_model_dir",
+    "get_cache_dir",
+    "resolve_npu_artifact_cache",
     
     # SafeTensors operations
     "split_safetensors",

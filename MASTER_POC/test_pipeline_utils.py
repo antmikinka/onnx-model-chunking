@@ -9160,6 +9160,147 @@ def test_architecture():
     return True
 
 
+def test_path_manager():
+    """ONNX discovery, external data, split directories, and NPU cache paths."""
+    print("=" * 50)
+    print("Testing path manager...")
+    print("=" * 50)
+
+    import json
+    import os
+    import tempfile
+    import chunking_utils
+    import chunking_utils.common as common
+    from chunking_utils.common.path_manager import (
+        find_external_data,
+        find_onnx_model,
+        get_cache_dir,
+        resolve_npu_artifact_cache,
+        sanitize_model_name,
+        validate_split_model_dir,
+    )
+    from chunking_utils.common.path_utils import is_local_path
+
+    assert common.find_onnx_model is find_onnx_model
+    assert common.find_external_data is find_external_data
+    assert common.validate_split_model_dir is validate_split_model_dir
+    assert common.get_cache_dir is get_cache_dir
+    assert common.resolve_npu_artifact_cache is resolve_npu_artifact_cache
+    assert chunking_utils.find_onnx_model is find_onnx_model
+    assert chunking_utils.resolve_npu_artifact_cache is resolve_npu_artifact_cache
+    assert sanitize_model_name("meta-llama/Llama-2-7b") == "meta-llama--Llama-2-7b"
+    assert is_local_path("/home/user/model") is True
+
+    def _location(text):
+        encoded = text.encode("utf-8")
+        return b"\x0a\x08location\x12" + bytes([len(encoded)]) + encoded
+
+    with tempfile.TemporaryDirectory() as root:
+        empty = os.path.join(root, "empty")
+        os.makedirs(empty)
+        assert find_onnx_model(empty) is None
+        nested = os.path.join(empty, ".ort_cache")
+        os.makedirs(nested)
+        with open(os.path.join(nested, "model.onnx"), "wb") as handle:
+            handle.write(b"nested")
+        assert find_onnx_model(empty) is None
+
+        mono = os.path.join(root, "mono")
+        os.makedirs(mono)
+        model = os.path.join(mono, "model.onnx")
+        other = os.path.join(mono, "layer_0.onnx")
+        with open(model, "wb") as handle:
+            handle.write(_location("weights.onnx.data"))
+        with open(other, "wb") as handle:
+            handle.write(b"layer")
+        assert find_onnx_model(mono) == model
+        assert find_onnx_model(model) == model
+        assert find_onnx_model(os.path.join(mono, "readme.txt")) is None
+
+        weights = os.path.join(mono, "weights.onnx.data")
+        sibling = model + ".data"
+        with open(weights, "wb") as handle:
+            handle.write(b"weights")
+        with open(sibling, "wb") as handle:
+            handle.write(b"sibling")
+        assert find_external_data(mono) == weights
+        assert find_external_data(weights) == weights
+        os.remove(weights)
+        assert find_external_data(model) == sibling
+        os.remove(sibling)
+        assert find_external_data(model) is None
+
+        layers = os.path.join(root, "layers")
+        os.makedirs(layers)
+        embed = os.path.join(layers, "embeddings.onnx")
+        layer = os.path.join(layers, "layer_1.onnx")
+        with open(embed, "wb") as handle:
+            handle.write(b"embed")
+        with open(layer, "wb") as handle:
+            handle.write(b"layer")
+        assert find_onnx_model(layers) == embed
+        assert validate_split_model_dir(layers) is False
+        assert validate_split_model_dir(mono) is False
+
+        info = os.path.join(layers, "model_info.json")
+        with open(info, "w", encoding="utf-8") as handle:
+            json.dump(
+                {"components": {"embedding": {"file": "embeddings.onnx"}, "layer_1": {"file": "layer_1.onnx"}}},
+                handle,
+            )
+        assert validate_split_model_dir(layers) is True
+        with open(info, "w", encoding="utf-8") as handle:
+            handle.write("{")
+        assert validate_split_model_dir(layers) is False
+        with open(info, "w", encoding="utf-8") as handle:
+            json.dump({"num_layers": 1}, handle)
+        assert validate_split_model_dir(layers) is True
+        with open(info, "w", encoding="utf-8") as handle:
+            json.dump({"components": {"layer_9": {"file": "missing.onnx"}}}, handle)
+        assert validate_split_model_dir(layers) is False
+        assert validate_split_model_dir(os.path.join(root, "missing")) is False
+
+        cache = get_cache_dir(os.path.join(root, "caches"), "meta-llama/Llama-2-7b")
+        assert cache == os.path.join(root, "caches", "meta-llama--Llama-2-7b")
+        assert os.path.isdir(cache)
+        assert get_cache_dir(os.path.join(root, "caches"), "meta-llama/Llama-2-7b") == cache
+
+        artifact = resolve_npu_artifact_cache(mono)
+        assert artifact == os.path.join(mono, ".ort_cache")
+        assert os.path.isdir(os.path.join(artifact, "xclbin"))
+        assert os.path.isdir(os.path.join(artifact, "vitisai"))
+        from_file = resolve_npu_artifact_cache(model)
+        assert from_file == artifact
+
+    for label, func, bad in (
+        ("directory", find_onnx_model, "  "),
+        ("model_path", find_external_data, None),
+        ("directory", validate_split_model_dir, ""),
+        ("base_dir", get_cache_dir, ""),
+        ("model_dir", resolve_npu_artifact_cache, None),
+    ):
+        try:
+            if func is get_cache_dir:
+                func(bad, "model")
+            else:
+                func(bad)
+            raise AssertionError(f"a blank {label} was accepted")
+        except ValueError as exc:
+            assert label in str(exc)
+    try:
+        get_cache_dir(root, "<>")
+        raise AssertionError("an empty model folder was accepted")
+    except ValueError as exc:
+        assert "model_id" in str(exc)
+
+    print("  onnx discovery: model.onnx, embeddings, no nested cache")
+    print("  external data: embedded location, then onnx.data sibling")
+    print("  split dir: model_info.json and component files")
+    print("  cache: sanitized model folder, .ort_cache xclbin and vitisai")
+    print("path manager: OK\n")
+    return True
+
+
 if __name__ == "__main__":
     print("\n" + "=" * 60)
     print("Pipeline Utils Module Tests")
@@ -9220,6 +9361,12 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"architecture: FAILED - {e}")
         results.append(("architecture", False))
+
+    try:
+        results.append(("path_manager", test_path_manager()))
+    except Exception as e:
+        print(f"path_manager: FAILED - {e}")
+        results.append(("path_manager", False))
     
     # Summary
     print("=" * 60)

@@ -4,6 +4,9 @@ Path utilities for model chunking operations.
 This module provides utilities for handling filesystem paths,
 including detection of local vs remote paths and sanitization
 of model names for safe filesystem usage.
+
+Model discovery, external data, split directories, and the NPU
+artifact cache live in path_manager.py.
 """
 
 import os
