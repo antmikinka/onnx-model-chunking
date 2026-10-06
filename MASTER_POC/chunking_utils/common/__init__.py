@@ -43,6 +43,7 @@ _HF_EXPORTS = (
     "get_model_config",
     "get_split_model_config",
     "estimate_model_memory",
+    "recommend_execution_strategy",
     "check_dependencies",
 )
 
@@ -96,6 +97,7 @@ __all__ = [
     "get_model_config",
     "get_split_model_config",
     "estimate_model_memory",
+    "recommend_execution_strategy",
     "check_dependencies",
 ]
 

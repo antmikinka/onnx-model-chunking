@@ -1353,6 +1353,375 @@ def estimate_model_memory(
     }
 
 
+# Backend NPU order is VitisAI, then RyzenAI. The iGPU follows DirectML,
+# MIGraphX, then ROCm. CUDA is a discrete GPU. CPU is last.
+_NPU_PROVIDERS = ("VitisAIExecutionProvider", "RyzenAIExecutionProvider")
+_IGPU_PROVIDERS = (
+    "DmlExecutionProvider",
+    "MIGraphXExecutionProvider",
+    "ROCmExecutionProvider",
+)
+_GPU_PROVIDERS = ("CUDAExecutionProvider",)
+_CPU_PROVIDER = "CPUExecutionProvider"
+_PROVIDER_ALIASES = {
+    "vitisai": "VitisAIExecutionProvider",
+    "vitisaiexecutionprovider": "VitisAIExecutionProvider",
+    "ryzenai": "RyzenAIExecutionProvider",
+    "ryzenaiexecutionprovider": "RyzenAIExecutionProvider",
+    "rocm": "ROCmExecutionProvider",
+    "hip": "ROCmExecutionProvider",
+    "rocmeexecutionprovider": "ROCmExecutionProvider",
+    "cuda": "CUDAExecutionProvider",
+    "cudaexecutionprovider": "CUDAExecutionProvider",
+    "dml": "DmlExecutionProvider",
+    "directml": "DmlExecutionProvider",
+    "dmlexecutionprovider": "DmlExecutionProvider",
+    "migraphx": "MIGraphXExecutionProvider",
+    "migraphxexecutionprovider": "MIGraphXExecutionProvider",
+    "cpu": "CPUExecutionProvider",
+    "cpuexecutionprovider": "CPUExecutionProvider",
+}
+_NPU_LEGAL_DTYPES = {TensorDtype.FLOAT16, TensorDtype.INT8, TensorDtype.INT4}
+_KV_ELEMENT_BYTES = {
+    "float32": 4,
+    "float16": 2,
+    "bfloat16": 2,
+    "int8": 1,
+    "int4": 1,
+}
+
+
+def _canonical_provider(name: Any) -> str:
+    """Map an alias onto an ONNX Runtime provider name."""
+    if isinstance(name, bool) or not isinstance(name, str) or not name.strip():
+        raise ValueError(f"available_providers entry must be a provider name, got {name!r}")
+    key = name.strip().lower().replace(" ", "").replace("-", "").replace("_", "")
+    if key not in _PROVIDER_ALIASES:
+        raise ValueError(f"Unknown provider {name!r}")
+    return _PROVIDER_ALIASES[key]
+
+
+def _available_provider_set(available_providers: List[str]) -> List[str]:
+    """Copy recognized providers. The caller list is left unchanged."""
+    if isinstance(available_providers, (str, bytes)) or not isinstance(available_providers, list):
+        raise ValueError(
+            f"available_providers must be a list of provider names, got {available_providers!r}"
+        )
+    if not available_providers:
+        raise ValueError("available_providers must name at least one provider")
+    found: List[str] = []
+    for name in available_providers:
+        canonical = _canonical_provider(name)
+        if canonical not in found:
+            found.append(canonical)
+    return found
+
+
+def _config_field(config: Dict[str, Any], names: Iterable[str]) -> Any:
+    """First present non-null field."""
+    for name in names:
+        if name in config and config[name] is not None:
+            return config[name]
+    return None
+
+
+def _optional_positive(config: Dict[str, Any], names: Iterable[str], label: str) -> Optional[int]:
+    value = _config_field(config, names)
+    if value is None:
+        return None
+    return _positive_config_int(value, label)
+
+
+def _estimate_num_params(config: Dict[str, Any]) -> int:
+    """
+    Use num_params when it is present.
+
+    Otherwise count a Llama-style model: one embedding, SwiGLU layers, and an
+    untied lm_head. tie_word_embeddings drops the second vocabulary matrix.
+    A missing intermediate size uses four times hidden_size. MoE weights count
+    every expert.
+    """
+    supplied = _config_field(config, ("num_params",))
+    if supplied is not None:
+        count = _as_config_int(supplied, "num_params")
+        if count < 0:
+            raise ValueError(f"num_params must be non-negative, got {count}")
+        return count
+    hidden = _optional_positive(config, ("hidden_size",), "hidden_size")
+    layers = _optional_positive(config, ("num_hidden_layers", "num_layers"), "num_hidden_layers")
+    vocab = _optional_positive(config, ("vocab_size",), "vocab_size")
+    if hidden is None or layers is None or vocab is None:
+        raise ValueError(
+            "num_params is required when hidden_size, num_hidden_layers, and vocab_size are absent"
+        )
+    heads = _optional_positive(config, ("num_attention_heads",), "num_attention_heads") or 1
+    head_dim = _optional_positive(config, ("head_dim", "head_size"), "head_dim")
+    if head_dim is None:
+        if hidden % heads != 0:
+            warnings.warn(
+                f"hidden_size ({hidden}) not divisible by num_attention_heads ({heads}). "
+                "The parameter estimate uses floor division.",
+                UserWarning,
+            )
+        head_dim = hidden // heads
+    kv_heads = _optional_positive(
+        config, ("num_key_value_heads", "num_kv_heads"), "num_key_value_heads"
+    ) or heads
+    intermediate = _optional_positive(
+        config, ("intermediate_size",), "intermediate_size"
+    )
+    experts = _optional_positive(config, ("num_experts", "num_local_experts"), "num_experts") or 0
+    moe_intermediate = _optional_positive(
+        config, ("moe_intermediate_size",), "moe_intermediate_size"
+    )
+    if intermediate is None:
+        intermediate = 4 * hidden
+    query = heads * head_dim
+    key_value = kv_heads * head_dim
+    attention = hidden * query + (2 * hidden * key_value) + (query * hidden)
+    if experts > 0:
+        expert_width = moe_intermediate or intermediate
+        mlp = experts * 3 * hidden * expert_width
+    else:
+        mlp = 3 * hidden * intermediate
+    embedding = vocab * hidden
+    total = embedding + layers * (attention + mlp)
+    if config.get("tie_word_embeddings") is not True:
+        total += embedding
+    return total
+
+
+def _kv_cache_bytes(config: Dict[str, Any]) -> int:
+    """Bytes for key and value at the static context, or 0 when the shape is incomplete."""
+    layers = _optional_positive(config, ("num_hidden_layers", "num_layers"), "num_hidden_layers")
+    kv_heads = _optional_positive(
+        config, ("num_key_value_heads", "num_kv_heads"), "num_key_value_heads"
+    )
+    head_dim = _optional_positive(config, ("head_dim", "head_size"), "head_dim")
+    sliding = _optional_positive(config, ("sliding_window", "sliding_window_size"), "sliding_window")
+    context = _optional_positive(
+        config, ("max_seq_len", "max_position_embeddings", "max_sequence_length"), "max_seq_len"
+    )
+    if config.get("use_sliding_window") is False:
+        seq = context
+    elif sliding is not None:
+        seq = sliding
+    else:
+        seq = context
+    if layers is None or kv_heads is None or head_dim is None or seq is None:
+        return 0
+    cache_dtype = _config_field(config, ("kv_cache_dtype",))
+    if cache_dtype is None:
+        token = "float16"
+    else:
+        token = _coerce_memory_dtype(cache_dtype).value
+    elements = layers * kv_heads * seq * head_dim
+    if token == "int4":
+        per_tensor = (elements + 1) // 2
+    else:
+        per_tensor = elements * _KV_ELEMENT_BYTES[token]
+    return 2 * per_tensor
+
+
+def _plan_is_npu_legal(dtype: TensorDtype, scheme: Optional[str]) -> bool:
+    """True when the stored weights are float16, int8, or int4."""
+    if scheme in {"awq", "gptq", "matmul_nbits", "blocked", "quark", "bitsandbytes"}:
+        return True
+    return dtype in _NPU_LEGAL_DTYPES
+
+
+def _quantization_ladder(
+    dtype: TensorDtype,
+    scheme: Optional[str],
+) -> List[Tuple[TensorDtype, Optional[str]]]:
+    """Current weights first, then float16, int8, and MatMulNBits int4."""
+    ladder: List[Tuple[TensorDtype, Optional[str]]] = [(dtype, scheme)]
+    for candidate in (
+        (TensorDtype.FLOAT16, None),
+        (TensorDtype.INT8, None),
+        (TensorDtype.INT4, "matmul_nbits"),
+    ):
+        if candidate not in ladder:
+            ladder.append(candidate)
+    return ladder
+
+
+def _providers_for_device(device: str, available: List[str]) -> List[str]:
+    if device == "npu":
+        order = _NPU_PROVIDERS + (_CPU_PROVIDER,)
+    elif device == "igpu":
+        order = _IGPU_PROVIDERS + (_CPU_PROVIDER,)
+    elif device == "gpu":
+        order = _GPU_PROVIDERS + ("ROCmExecutionProvider", _CPU_PROVIDER)
+    else:
+        order = (_CPU_PROVIDER,)
+    return [name for name in order if name in available]
+
+
+def _fallback_device(available: List[str]) -> Tuple[str, str]:
+    """iGPU, then CUDA, then CPU."""
+    for name in _IGPU_PROVIDERS:
+        if name in available:
+            return "igpu", name
+    for name in _GPU_PROVIDERS:
+        if name in available:
+            return "gpu", name
+    if _CPU_PROVIDER in available:
+        return "cpu", _CPU_PROVIDER
+    raise ValueError("available_providers must include a CPU, GPU, or NPU provider")
+
+
+def recommend_execution_strategy(
+    model_config: Dict[str, Any],
+    available_providers: List[str],
+    memory_budget_mb: int,
+) -> Dict[str, Any]:
+    """
+    Recommend an AMD ONNX Runtime placement for one model.
+
+    The NPU preference is VitisAI, then RyzenAI. Prefill uses that provider
+    when the weights are float16, int8, or int4 and the weight plus KV bytes
+    fit in ``memory_budget_mb``. Decode uses the iGPU when DirectML, MIGraphX,
+    or ROCm is available, so the execution is hybrid. The NPU graph stays
+    monolithic. A sequential layer split is recommended only off the NPU.
+
+    A float32 or bfloat16 model is offered float16, then int8, then MatMulNBits
+    int4. The first scheme that fits is the one that is needed. When int4
+    still exceeds the budget, the execution is split and ``fits_npu_memory``
+    stays false.
+
+    Args:
+        model_config: Architecture and dtype fields from get_model_config or
+            get_split_model_config. ``num_params`` overrides the estimate.
+        available_providers: ONNX Runtime providers this process can run.
+        memory_budget_mb: NPU memory budget in mebibytes.
+
+    Returns:
+        Provider, devices, execution, memory fit, and the quantization needed.
+    """
+    if not isinstance(model_config, dict):
+        raise ValueError(f"model_config must be a dict, got {model_config!r}")
+    if isinstance(memory_budget_mb, bool) or not isinstance(memory_budget_mb, int):
+        raise ValueError(f"memory_budget_mb must be an integer, got {memory_budget_mb!r}")
+    if memory_budget_mb < 0:
+        raise ValueError(f"memory_budget_mb must be non-negative, got {memory_budget_mb}")
+    available = _available_provider_set(available_providers)
+    num_params = _estimate_num_params(model_config)
+    raw_dtype = _config_field(model_config, ("torch_dtype", "dtype", "weight_dtype"))
+    dtype = TensorDtype.FLOAT16 if raw_dtype is None else _coerce_memory_dtype(raw_dtype)
+    scheme = _coerce_memory_quantization(
+        _config_field(model_config, ("quantization", "quantization_method"))
+    )
+    group_size = _config_field(model_config, ("group_size", "quantization_group_size"))
+    if group_size is not None:
+        group_size = _as_config_int(group_size, "group_size")
+    kv_bytes = _kv_cache_bytes(model_config)
+    budget_bytes = memory_budget_mb * 1024 * 1024
+    has_npu = any(name in available for name in _NPU_PROVIDERS)
+    chosen_memory = None
+    chosen_dtype = dtype
+    chosen_scheme = scheme
+    fits = False
+    saw_candidate = False
+    for candidate_dtype, candidate_scheme in _quantization_ladder(dtype, scheme):
+        if has_npu and not _plan_is_npu_legal(candidate_dtype, candidate_scheme):
+            continue
+        memory = estimate_model_memory(
+            num_params,
+            candidate_dtype,
+            candidate_scheme,
+            group_size,
+        )
+        saw_candidate = True
+        chosen_memory = memory
+        chosen_dtype = candidate_dtype
+        chosen_scheme = candidate_scheme
+        total_bytes = memory["bytes"] + kv_bytes
+        if total_bytes <= budget_bytes:
+            fits = True
+            break
+    if not saw_candidate:
+        chosen_memory = estimate_model_memory(num_params, dtype, scheme, group_size)
+        total_bytes = chosen_memory["bytes"] + kv_bytes
+        fits = total_bytes <= budget_bytes
+    else:
+        total_bytes = chosen_memory["bytes"] + kv_bytes
+    npu_legal = _plan_is_npu_legal(chosen_dtype, chosen_scheme)
+    if has_npu and npu_legal:
+        device = "npu"
+        provider = next(name for name in _NPU_PROVIDERS if name in available)
+        others = [name for name in available if name not in _NPU_PROVIDERS]
+        if others:
+            decode_device, decode_provider = _fallback_device(others)
+        else:
+            decode_device = "npu"
+            decode_provider = provider
+        if not fits:
+            execution = "split"
+        elif decode_device != "npu":
+            execution = "hybrid"
+        else:
+            execution = "monolithic"
+        sequential_split_safe = False
+    else:
+        device, provider = _fallback_device(available)
+        decode_device = device
+        decode_provider = provider
+        execution = "monolithic" if fits else "split"
+        sequential_split_safe = True
+    session_providers = _providers_for_device(device, available)
+    if provider not in session_providers:
+        session_providers.insert(0, provider)
+    quantization_needed = chosen_dtype is not dtype or chosen_scheme != scheme
+    supports_static_kv = kv_bytes > 0 or _optional_positive(
+        model_config,
+        ("max_seq_len", "max_position_embeddings", "sliding_window", "sliding_window_size"),
+        "max_seq_len",
+    ) is not None
+    if execution == "hybrid" and decode_device == "igpu":
+        reason = "Prefill stays on the NPU and decode stays on the iGPU. The NPU graph stays monolithic."
+    elif execution == "hybrid":
+        reason = "Prefill stays on the NPU. The NPU graph stays monolithic."
+    elif execution == "split" and device == "npu":
+        reason = "The weights and KV cache exceed the NPU budget, so the run is split. The NPU graph stays monolithic."
+    elif execution == "split":
+        reason = "The weights and KV cache exceed the memory budget, so the run is split."
+    elif device == "npu":
+        reason = "The model fits one monolithic NPU graph."
+    else:
+        reason = "This provider keeps one monolithic graph."
+    if quantization_needed and chosen_scheme == "matmul_nbits":
+        reason = reason + " MatMulNBits int4 is the quantization that fits."
+    elif quantization_needed and chosen_scheme is None and chosen_dtype is TensorDtype.FLOAT16:
+        reason = reason + " Float16 weights are required for the NPU."
+    elif quantization_needed and chosen_dtype is TensorDtype.INT8:
+        reason = reason + " Int8 weights are required to fit the budget."
+    return {
+        "provider": provider,
+        "providers": session_providers,
+        "decode_provider": decode_provider,
+        "device": device,
+        "prefill_device": device,
+        "decode_device": decode_device,
+        "execution": execution,
+        "npu_mode": "monolithic",
+        "fits_npu_memory": bool(has_npu and npu_legal and fits),
+        "fits_memory": fits,
+        "memory_budget_mb": memory_budget_mb,
+        "estimated_memory_mb": total_bytes / (1024 ** 2),
+        "weight_bytes": chosen_memory["bytes"],
+        "kv_bytes": kv_bytes,
+        "num_params": num_params,
+        "dtype": chosen_memory["dtype"],
+        "quantization": chosen_scheme,
+        "quantization_needed": quantization_needed,
+        "npu_safe": npu_legal,
+        "sequential_split_safe": sequential_split_safe,
+        "supports_static_kv_cache": supports_static_kv,
+        "reason": reason,
+    }
+
+
 def check_dependencies() -> Dict[str, bool]:
     """
     Check available optional dependencies.

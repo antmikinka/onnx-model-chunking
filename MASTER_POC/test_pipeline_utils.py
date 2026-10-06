@@ -7893,6 +7893,7 @@ def test_hf_integration():
         get_onnx_dtype as direct_get,
         get_split_model_config,
         get_torch_dtype,
+        recommend_execution_strategy,
     )
     from chunking_utils.common.types import TensorDtype
     from pipeline_utils.dtypes import get_numpy_dtype
@@ -8451,6 +8452,214 @@ def test_hf_integration():
             assert "could not read ONNX graph layer_0.onnx" in str(exc)
 
     print("  onnx split: components, boundaries, external data, kv shape")
+
+    assert common.recommend_execution_strategy is recommend_execution_strategy
+    amd = ["CPUExecutionProvider", "DmlExecutionProvider", "VitisAIExecutionProvider"]
+    small = {"num_params": 1000, "torch_dtype": "float16", "num_hidden_layers": 2}
+    hybrid = recommend_execution_strategy(small, amd, 16)
+    assert hybrid["provider"] == "VitisAIExecutionProvider"
+    assert hybrid["providers"] == ["VitisAIExecutionProvider", "CPUExecutionProvider"]
+    assert hybrid["decode_provider"] == "DmlExecutionProvider"
+    assert hybrid["device"] == "npu"
+    assert hybrid["prefill_device"] == "npu"
+    assert hybrid["decode_device"] == "igpu"
+    assert hybrid["execution"] == "hybrid"
+    assert hybrid["npu_mode"] == "monolithic"
+    assert hybrid["fits_npu_memory"] is True
+    assert hybrid["fits_memory"] is True
+    assert hybrid["dtype"] == "float16"
+    assert hybrid["quantization"] is None
+    assert hybrid["quantization_needed"] is False
+    assert hybrid["npu_safe"] is True
+    assert hybrid["sequential_split_safe"] is False
+    assert hybrid["num_params"] == 1000
+    assert "monolithic" in hybrid["reason"]
+    assert "iGPU" in hybrid["reason"]
+    hybrid["providers"].append("extra")
+    again = recommend_execution_strategy(small, ["vitisai", "directml", "cpu"], 16)
+    assert again["providers"] == ["VitisAIExecutionProvider", "CPUExecutionProvider"]
+    assert again["provider"] == hybrid["provider"]
+
+    ryzen = recommend_execution_strategy(
+        small, ["RyzenAIExecutionProvider", "CPUExecutionProvider"], 16
+    )
+    assert ryzen["provider"] == "RyzenAIExecutionProvider"
+    assert ryzen["providers"] == ["RyzenAIExecutionProvider", "CPUExecutionProvider"]
+    assert ryzen["decode_device"] == "cpu"
+    assert ryzen["execution"] == "hybrid"
+    assert ryzen["sequential_split_safe"] is False
+
+    npu_only = recommend_execution_strategy(small, ["VitisAIExecutionProvider"], 16)
+    assert npu_only["execution"] == "monolithic"
+    assert npu_only["decode_device"] == "npu"
+    assert npu_only["providers"] == ["VitisAIExecutionProvider"]
+
+    wide = recommend_execution_strategy(
+        {"num_params": 1000, "torch_dtype": "float32"}, amd, 16
+    )
+    assert wide["provider"] == "VitisAIExecutionProvider"
+    assert wide["dtype"] == "float16"
+    assert wide["quantization"] is None
+    assert wide["quantization_needed"] is True
+    assert wide["execution"] == "hybrid"
+    assert "Float16" in wide["reason"]
+
+    packed = estimate_model_memory(2_000_000, TensorDtype.INT4, quantization="matmul_nbits")
+    int8_bytes = estimate_model_memory(2_000_000, TensorDtype.INT8)["bytes"]
+    budget_mb = (int8_bytes - 1) // (1024 * 1024)
+    assert packed["bytes"] <= budget_mb * 1024 * 1024
+    assert int8_bytes > budget_mb * 1024 * 1024
+    tightened = recommend_execution_strategy(
+        {"num_params": 2_000_000, "dtype": "float16"}, amd, budget_mb
+    )
+    assert tightened["quantization"] == "matmul_nbits"
+    assert tightened["dtype"] == "int4"
+    assert tightened["quantization_needed"] is True
+    assert tightened["fits_npu_memory"] is True
+    assert tightened["execution"] == "hybrid"
+    assert tightened["weight_bytes"] == packed["bytes"]
+
+    oversized = recommend_execution_strategy(
+        {"num_params": 10_000_000, "torch_dtype": "float16"}, amd, 1
+    )
+    assert oversized["quantization"] == "matmul_nbits"
+    assert oversized["fits_npu_memory"] is False
+    assert oversized["fits_memory"] is False
+    assert oversized["execution"] == "split"
+    assert oversized["npu_mode"] == "monolithic"
+    assert oversized["sequential_split_safe"] is False
+    assert "split" in oversized["reason"]
+
+    cpu_only = recommend_execution_strategy(
+        small, ["CPUExecutionProvider"], 16
+    )
+    assert cpu_only["provider"] == "CPUExecutionProvider"
+    assert cpu_only["device"] == "cpu"
+    assert cpu_only["execution"] == "monolithic"
+    assert cpu_only["sequential_split_safe"] is True
+    assert cpu_only["fits_npu_memory"] is False
+    assert cpu_only["fits_memory"] is True
+
+    cuda_only = recommend_execution_strategy(small, ["CUDAExecutionProvider"], 16)
+    assert cuda_only["provider"] == "CUDAExecutionProvider"
+    assert cuda_only["device"] == "gpu"
+    assert cuda_only["execution"] == "monolithic"
+    assert cuda_only["sequential_split_safe"] is True
+
+    kept = recommend_execution_strategy(
+        {"num_params": 256, "torch_dtype": "float16", "quantization": "awq"}, amd, 16
+    )
+    assert kept["quantization"] == "awq"
+    assert kept["quantization_needed"] is False
+    assert kept["dtype"] == "int4"
+    assert kept["fits_npu_memory"] is True
+
+    hidden = 32
+    heads = 4
+    kv_heads = 2
+    head_dim = 8
+    intermediate = 64
+    layers = 2
+    vocab = 16
+    attention = hidden * (heads * head_dim) + 2 * hidden * (kv_heads * head_dim) + (heads * head_dim) * hidden
+    mlp = 3 * hidden * intermediate
+    embedding = vocab * hidden
+    expected_params = embedding + layers * (attention + mlp)
+    counted = recommend_execution_strategy({
+        "hidden_size": hidden,
+        "num_hidden_layers": layers,
+        "vocab_size": vocab,
+        "num_attention_heads": heads,
+        "num_key_value_heads": kv_heads,
+        "head_dim": head_dim,
+        "intermediate_size": intermediate,
+        "tie_word_embeddings": True,
+        "torch_dtype": "float16",
+        "max_seq_len": 4,
+    }, amd, 16)
+    assert counted["num_params"] == expected_params
+    weight = estimate_model_memory(expected_params, TensorDtype.FLOAT16)
+    kv_bytes = 2 * layers * kv_heads * 4 * head_dim * 2
+    assert counted["kv_bytes"] == kv_bytes
+    assert counted["weight_bytes"] == weight["bytes"]
+    assert counted["estimated_memory_mb"] == (weight["bytes"] + kv_bytes) / (1024 ** 2)
+    assert counted["supports_static_kv_cache"] is True
+    assert counted["fits_npu_memory"] is True
+
+    windowed = recommend_execution_strategy({
+        "num_params": 1000,
+        "torch_dtype": "float16",
+        "num_hidden_layers": 2,
+        "num_key_value_heads": 2,
+        "head_dim": 8,
+        "max_seq_len": 4096,
+        "sliding_window": 4,
+        "use_sliding_window": True,
+    }, amd, 16)
+    assert windowed["kv_bytes"] == 2 * 2 * 2 * 4 * 8 * 2
+
+    blocked_window = recommend_execution_strategy({
+        "num_params": 1000,
+        "torch_dtype": "float16",
+        "num_hidden_layers": 2,
+        "num_key_value_heads": 2,
+        "head_dim": 8,
+        "max_seq_len": 4,
+        "sliding_window": 128,
+        "use_sliding_window": False,
+    }, amd, 16)
+    assert blocked_window["kv_bytes"] == 2 * 2 * 2 * 4 * 8 * 2
+
+    heavy_kv = recommend_execution_strategy({
+        "num_params": 1000,
+        "torch_dtype": "float16",
+        "num_hidden_layers": 2,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "max_seq_len": 4096,
+    }, amd, 1)
+    assert heavy_kv["kv_bytes"] == 2 * 2 * 8 * 4096 * 128 * 2
+    assert heavy_kv["fits_npu_memory"] is False
+    assert heavy_kv["execution"] == "split"
+    assert heavy_kv["quantization"] == "matmul_nbits"
+
+    try:
+        recommend_execution_strategy(["num_params"], amd, 16)
+        raise AssertionError("a list config was accepted")
+    except ValueError as exc:
+        assert "model_config" in str(exc)
+    try:
+        recommend_execution_strategy(small, "VitisAIExecutionProvider", 16)
+        raise AssertionError("a provider string was accepted")
+    except ValueError as exc:
+        assert "available_providers" in str(exc)
+    try:
+        recommend_execution_strategy(small, ["TensorrtExecutionProvider"], 16)
+        raise AssertionError("an unknown provider was accepted")
+    except ValueError as exc:
+        assert "TensorrtExecutionProvider" in str(exc)
+    try:
+        recommend_execution_strategy(small, [], 16)
+        raise AssertionError("an empty provider list was accepted")
+    except ValueError as exc:
+        assert "available_providers" in str(exc)
+    try:
+        recommend_execution_strategy(small, amd, -1)
+        raise AssertionError("a negative budget was accepted")
+    except ValueError as exc:
+        assert "memory_budget_mb" in str(exc)
+    try:
+        recommend_execution_strategy(small, amd, True)
+        raise AssertionError("a boolean budget was accepted")
+    except ValueError as exc:
+        assert "memory_budget_mb" in str(exc)
+    try:
+        recommend_execution_strategy({"torch_dtype": "float16"}, amd, 16)
+        raise AssertionError("a config without a parameter count was accepted")
+    except ValueError as exc:
+        assert "num_params" in str(exc)
+
+    print("  execution strategy: npu hybrid, int4 budget, split when the cache does not fit")
     print("hf integration: OK\n")
     return True
 
