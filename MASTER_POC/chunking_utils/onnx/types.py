@@ -13,9 +13,22 @@ from ..common.types import (
     SplitResult,
     _boundary_name_is_stateful,
     _coerce_component_device,
+    _coerce_group_size,
+    _coerce_quant_dtype,
+    _coerce_quant_method,
     _copy_dim_list,
     normalize_cache_role,
 )
+
+# Bit width implied by a canonical weight dtype. auto has no implied width.
+_WEIGHT_DTYPE_BITS = {
+    "float32": 32,
+    "float16": 16,
+    "bfloat16": 16,
+    "int8": 8,
+    "int4": 4,
+}
+_OPEN_WEIGHT_BITS = frozenset({2, 3, 4, 8, 16, 32})
 
 
 @dataclass
@@ -171,6 +184,96 @@ class ComponentInfo:
         }
 
 
+def _coerce_info_dtype(value: Any, field_name: str) -> str:
+    """Store a canonical dtype name. None is not a dtype."""
+    if value is None:
+        raise ValueError(f"{field_name} must be a string, got {value!r}")
+    return _coerce_quant_dtype(value, field_name).value
+
+
+def _coerce_weight_bits(value: Any, weight_dtype: str) -> int:
+    """A bool is not a bit count. The count must match the weight dtype."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"weight_bits must be an integer, got {value!r}")
+    if value <= 0:
+        raise ValueError(f"weight_bits must be positive, got {value}")
+    expected = _WEIGHT_DTYPE_BITS.get(weight_dtype)
+    if expected is not None and value != expected:
+        raise ValueError(
+            f"weight_bits {value} does not match weight_dtype {weight_dtype!r}"
+        )
+    if expected is None and value not in _OPEN_WEIGHT_BITS:
+        known = ", ".join(str(item) for item in sorted(_OPEN_WEIGHT_BITS))
+        raise ValueError(f"weight_bits must be one of {known}, got {value}")
+    return value
+
+
+@dataclass
+class QuantizationInfo:
+    """
+    Quantization contract for one ONNX split.
+
+    ``method`` accepts MatMulNBits, AWQ, and GPTQ. ``weight_dtype`` and
+    ``activation_dtype`` are canonical names such as float16 or int4.
+    ``group_size`` -1 is per-channel. ``weight_bits`` matches the weight dtype.
+    """
+    method: Optional[str] = None  # "MatMulNBits", "AWQ", "GPTQ"
+    weight_bits: int = 16
+    weight_dtype: str = "float16"
+    activation_dtype: str = "float16"
+    group_size: Optional[int] = None
+    has_zero_point: bool = False
+
+    def __post_init__(self) -> None:
+        self.method = _coerce_quant_method(self.method)
+        self.weight_dtype = _coerce_info_dtype(self.weight_dtype, "weight_dtype")
+        self.activation_dtype = _coerce_info_dtype(
+            self.activation_dtype, "activation_dtype"
+        )
+        self.weight_bits = _coerce_weight_bits(self.weight_bits, self.weight_dtype)
+        self.group_size = _coerce_group_size(self.group_size)
+        if not isinstance(self.has_zero_point, bool):
+            raise ValueError(
+                f"has_zero_point must be a boolean, got {self.has_zero_point!r}"
+            )
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Copy the record so a caller can serialize it without sharing this object."""
+        return {
+            "method": self.method,
+            "weight_bits": self.weight_bits,
+            "weight_dtype": self.weight_dtype,
+            "activation_dtype": self.activation_dtype,
+            "group_size": self.group_size,
+            "has_zero_point": self.has_zero_point,
+        }
+
+
+def _coerce_quantization_info(value: Any) -> Optional[QuantizationInfo]:
+    """None stays unset. A QuantizationInfo is copied. A dict builds one."""
+    if value is None:
+        return None
+    if isinstance(value, QuantizationInfo):
+        return QuantizationInfo(
+            method=value.method,
+            weight_bits=value.weight_bits,
+            weight_dtype=value.weight_dtype,
+            activation_dtype=value.activation_dtype,
+            group_size=value.group_size,
+            has_zero_point=value.has_zero_point,
+        )
+    if isinstance(value, dict):
+        try:
+            return QuantizationInfo(**value)
+        except TypeError as exc:
+            raise ValueError(
+                f"quantization fields are incomplete, got {value!r}"
+            ) from exc
+    raise ValueError(
+        f"quantization must be a QuantizationInfo or a dict, got {value!r}"
+    )
+
+
 @dataclass
 class OnnxSplitResult(SplitResult):
     """
@@ -187,15 +290,26 @@ class OnnxSplitResult(SplitResult):
         ir_version: ONNX IR version of the original model.
         producer: Producer name from the original model.
         components: Dictionary of ComponentInfo objects.
+        quantization: MatMulNBits, AWQ, or GPTQ contract for this split.
     """
     ir_version: int = 0
     producer: str = ""
     components: Dict[str, ComponentInfo] = field(default_factory=dict)
-    
+    quantization: Optional[QuantizationInfo] = None
+
     def __post_init__(self):
-        """Validate boundary tensors, then keep this result on ONNX."""
+        """Validate boundary tensors, keep this result on ONNX, and copy quantization."""
         super().__post_init__()
         self.format = ModelFormat.ONNX
+        self.quantization = _coerce_quantization_info(self.quantization)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Copy the split result and include the quantization record."""
+        recorded = super().to_dict()
+        recorded["quantization"] = (
+            None if self.quantization is None else self.quantization.to_dict()
+        )
+        return recorded
 
 
 @dataclass

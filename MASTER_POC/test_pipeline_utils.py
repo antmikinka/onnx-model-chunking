@@ -14812,6 +14812,142 @@ def test_boundary_tensor_info():
     return True
 
 
+def test_quantization_info():
+    """An ONNX split records MatMulNBits, AWQ, or GPTQ quantization."""
+    print("=" * 50)
+    print("Testing quantization info...")
+    print("=" * 50)
+
+    import sys
+    import types
+
+    try:
+        from chunking_utils.onnx.types import OnnxSplitResult, QuantizationInfo
+        import chunking_utils.onnx as onnx_pkg
+    except ModuleNotFoundError:
+        for name in list(sys.modules):
+            if name == "chunking_utils.onnx" or name.startswith("chunking_utils.onnx."):
+                del sys.modules[name]
+        onnx_stub = types.ModuleType("onnx")
+        onnx_stub.ModelProto = type("ModelProto", (), {})
+        onnx_stub.numpy_helper = types.SimpleNamespace()
+        onnx_stub.helper = types.SimpleNamespace()
+        onnx_stub.TensorProto = types.SimpleNamespace()
+        onnx_stub.shape_inference = types.SimpleNamespace()
+        sys.modules["onnx"] = onnx_stub
+        from chunking_utils.onnx.types import OnnxSplitResult, QuantizationInfo
+        import chunking_utils.onnx as onnx_pkg
+
+    assert "QuantizationInfo" not in onnx_pkg.__all__
+
+    def expect_value_error(callable_check, text):
+        try:
+            callable_check()
+            raise AssertionError(text)
+        except ValueError:
+            return
+
+    bare = OnnxSplitResult(
+        output_dir="out",
+        num_layers=1,
+        component_files={},
+        model_info={},
+    )
+    assert bare.format.value == "onnx"
+    assert bare.quantization is None
+    assert bare.to_dict()["quantization"] is None
+
+    shared = QuantizationInfo(
+        method="MatMulNBits",
+        weight_bits=4,
+        weight_dtype="int4",
+        activation_dtype="fp16",
+        group_size=128,
+        has_zero_point=True,
+    )
+    assert shared.method == "matmul_nbits"
+    assert shared.weight_bits == 4
+    assert shared.weight_dtype == "int4"
+    assert shared.activation_dtype == "float16"
+    assert shared.group_size == 128
+    assert shared.has_zero_point is True
+
+    first = OnnxSplitResult(
+        output_dir="out",
+        num_layers=1,
+        component_files={},
+        model_info={},
+        quantization=shared,
+    )
+    second = OnnxSplitResult(
+        output_dir="out",
+        num_layers=1,
+        component_files={},
+        model_info={},
+        quantization={
+            "method": "AWQ",
+            "weight_bits": 4,
+            "weight_dtype": "int4",
+            "activation_dtype": "float16",
+            "group_size": 128,
+            "has_zero_point": False,
+        },
+    )
+    assert first.quantization is not shared
+    assert first.quantization is not second.quantization
+    assert second.quantization.method == "awq"
+    assert second.quantization.has_zero_point is False
+    first.quantization.group_size = 32
+    assert shared.group_size == 128
+    assert second.quantization.group_size == 128
+
+    recorded = first.to_dict()["quantization"]
+    assert recorded["method"] == "matmul_nbits"
+    assert recorded["weight_bits"] == 4
+    assert recorded["has_zero_point"] is True
+    recorded["group_size"] = 0
+    assert first.quantization.group_size == 32
+
+    expect_value_error(
+        lambda: QuantizationInfo(method="smoothquant"),
+        "an unknown quantization method was accepted",
+    )
+    expect_value_error(
+        lambda: QuantizationInfo(weight_bits=True),
+        "a bool weight bit count was accepted",
+    )
+    expect_value_error(
+        lambda: QuantizationInfo(weight_dtype="int4", weight_bits=16),
+        "a bit count that disagrees with the weight dtype was accepted",
+    )
+    expect_value_error(
+        lambda: QuantizationInfo(group_size=0),
+        "a zero group size was accepted",
+    )
+    expect_value_error(
+        lambda: QuantizationInfo(group_size=True),
+        "a bool group size was accepted",
+    )
+    expect_value_error(
+        lambda: QuantizationInfo(has_zero_point=1),
+        "an integer zero point flag was accepted",
+    )
+    expect_value_error(
+        lambda: OnnxSplitResult(
+            output_dir="out",
+            num_layers=1,
+            component_files={},
+            model_info={},
+            quantization="MatMulNBits",
+        ),
+        "a string quantization record was accepted",
+    )
+
+    print("quantization info: OK")
+    print("  MatMulNBits stores int4 weights and a zero point, two split results do not share the record, and a bool bit count raises")
+    return True
+
+
 def test_path_manager():
     """ONNX discovery, external data, split directories, and NPU cache paths."""
     print("=" * 50)
@@ -15230,6 +15366,12 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"boundary_tensor_info: FAILED - {e}")
         results.append(("boundary_tensor_info", False))
+
+    try:
+        results.append(("quantization_info", test_quantization_info()))
+    except Exception as e:
+        print(f"quantization_info: FAILED - {e}")
+        results.append(("quantization_info", False))
 
     try:
         results.append(("path_manager", test_path_manager()))
