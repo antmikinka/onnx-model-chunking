@@ -64,6 +64,8 @@ from .dtypes import (
     KV_CACHE_DTYPE_POLICY,
     get_kv_cache_dtype,
     get_kv_cache_dtypes,
+    PROVIDER_DTYPE_SUPPORT,
+    is_dtype_supported_by_provider,
 )
 
 from .kv_cache import (
@@ -229,6 +231,8 @@ __all__ = [
     "KV_CACHE_DTYPE_POLICY",
     "get_kv_cache_dtype",
     "get_kv_cache_dtypes",
+    "PROVIDER_DTYPE_SUPPORT",
+    "is_dtype_supported_by_provider",
     # kv_cache exports
     "KVCacheManager",
     "KVCacheBackend",

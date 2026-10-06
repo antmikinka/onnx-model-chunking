@@ -1585,6 +1585,153 @@ def get_kv_cache_dtypes(
 
 
 # =============================================================================
+# PROVIDER DTYPE SUPPORT
+# =============================================================================
+
+# Hard limits for an ONNX Runtime execution provider. This is separate from
+# PROVIDER_DTYPE_POLICY, which only orders preferred dtypes.
+# CPU accepts the numeric ONNX types this module already maps.
+# VitisAI and RyzenAI share the NPU limit: INT4, INT8, and FP16.
+# ROCm runs the preferred FP16/BF16 path plus FP32, FP8, and INT8/INT4.
+# DirectML is limited to FP16 and FP32.
+_CPU_DTYPE_SUPPORT = (
+    "fp64", "fp32", "fp16", "bf16", "fp8",
+    "int4", "int8", "int16", "int32", "int64",
+    "uint4", "uint8", "uint16", "uint32", "uint64",
+    "bool", "complex64", "complex128",
+)
+_NPU_DTYPE_SUPPORT = ("int4", "int8", "fp16")
+_ROCM_DTYPE_SUPPORT = ("fp16", "bf16", "fp32", "fp8", "int8", "int4")
+_DML_DTYPE_SUPPORT = ("fp16", "fp32")
+
+PROVIDER_DTYPE_SUPPORT = {
+    "CPUExecutionProvider": _CPU_DTYPE_SUPPORT,
+    "ROCmExecutionProvider": _ROCM_DTYPE_SUPPORT,
+    "VitisAIExecutionProvider": _NPU_DTYPE_SUPPORT,
+    "RyzenAIExecutionProvider": _NPU_DTYPE_SUPPORT,
+    "DmlExecutionProvider": _DML_DTYPE_SUPPORT,
+}
+
+_SUPPORT_PROVIDER_ALIASES = {
+    "cpu": "CPUExecutionProvider",
+    "cpuexecutionprovider": "CPUExecutionProvider",
+    "rocm": "ROCmExecutionProvider",
+    "rocmexecutionprovider": "ROCmExecutionProvider",
+    "hip": "ROCmExecutionProvider",
+    "igpu": "ROCmExecutionProvider",
+    "vitisai": "VitisAIExecutionProvider",
+    "vitisaiexecutionprovider": "VitisAIExecutionProvider",
+    "npu": "VitisAIExecutionProvider",
+    "ryzenai": "RyzenAIExecutionProvider",
+    "ryzenaiexecutionprovider": "RyzenAIExecutionProvider",
+    "dml": "DmlExecutionProvider",
+    "directml": "DmlExecutionProvider",
+    "dmlexecutionprovider": "DmlExecutionProvider",
+}
+
+_DTYPE_SUPPORT_ALIASES = {
+    "fp64": "fp64",
+    "float64": "fp64",
+    "double": "fp64",
+    "fp32": "fp32",
+    "float32": "fp32",
+    "float": "fp32",
+    "fp16": "fp16",
+    "float16": "fp16",
+    "half": "fp16",
+    "bf16": "bf16",
+    "bfloat16": "bf16",
+    "fp8": "fp8",
+    "float8": "fp8",
+    "float8e4m3fn": "fp8",
+    "float8e5m2": "fp8",
+    "float8e4m3fnuz": "fp8",
+    "float8e5m2fnuz": "fp8",
+    "e4m3": "fp8",
+    "e4m3fn": "fp8",
+    "e5m2": "fp8",
+    "int4": "int4",
+    "uint4": "uint4",
+    "int8": "int8",
+    "int16": "int16",
+    "int32": "int32",
+    "int64": "int64",
+    "uint8": "uint8",
+    "uint16": "uint16",
+    "uint32": "uint32",
+    "uint64": "uint64",
+    "bool": "bool",
+    "complex64": "complex64",
+    "complex128": "complex128",
+}
+
+_NUMPY_SUPPORT_DTYPES = {
+    np.dtype(np.float64): "fp64",
+    np.dtype(np.float32): "fp32",
+    np.dtype(np.float16): "fp16",
+    np.dtype(np.int8): "int8",
+    np.dtype(np.int16): "int16",
+    np.dtype(np.int32): "int32",
+    np.dtype(np.int64): "int64",
+    np.dtype(np.uint8): "uint8",
+    np.dtype(np.uint16): "uint16",
+    np.dtype(np.uint32): "uint32",
+    np.dtype(np.uint64): "uint64",
+    np.dtype(np.bool_): "bool",
+    np.dtype(np.complex64): "complex64",
+    np.dtype(np.complex128): "complex128",
+}
+
+
+def _support_provider(provider: str) -> str:
+    """ORT provider name for the support map. RyzenAI stays its own row."""
+    key = _normalize_kv_token(provider)
+    if key not in _SUPPORT_PROVIDER_ALIASES:
+        known = ", ".join(PROVIDER_DTYPE_SUPPORT)
+        raise ValueError(
+            f"Unrecognized provider for dtype support: {provider}. Known providers: {known}"
+        )
+    return _SUPPORT_PROVIDER_ALIASES[key]
+
+
+def _logical_dtype_for_support(dtype) -> str:
+    """Map a numpy dtype or ONNX type string onto a support-map name."""
+    if isinstance(dtype, str):
+        text = dtype.strip()
+        lowered = text.lower()
+        if lowered.startswith("tensor(") and lowered.endswith(")"):
+            text = text[text.find("(") + 1:-1]
+        key = _normalize_kv_token(text)
+        if key not in _DTYPE_SUPPORT_ALIASES:
+            raise ValueError(f"Unrecognized dtype for provider support: {dtype}")
+        return _DTYPE_SUPPORT_ALIASES[key]
+    try:
+        resolved = np.dtype(dtype)
+    except TypeError as exc:
+        raise ValueError(f"Unrecognized dtype for provider support: {dtype}") from exc
+    name = resolved.name.lower()
+    if "bfloat16" in name:
+        return "bf16"
+    if "float8" in name:
+        return "fp8"
+    if resolved not in _NUMPY_SUPPORT_DTYPES:
+        raise ValueError(f"Unrecognized dtype for provider support: {dtype}")
+    return _NUMPY_SUPPORT_DTYPES[resolved]
+
+
+def is_dtype_supported_by_provider(dtype, provider: str) -> bool:
+    """True when ``provider`` can consume ``dtype``.
+
+    ``dtype`` may be a numpy dtype or an ONNX name such as ``tensor(float16)``
+    or ``int4``. INT4 stays distinct from the int8 container, so a packed
+    INT4 weight is supported on the NPU even though its storage dtype is int8.
+    """
+    canonical = _support_provider(provider)
+    logical = _logical_dtype_for_support(dtype)
+    return logical in PROVIDER_DTYPE_SUPPORT[canonical]
+
+
+# =============================================================================
 # CONVENIENCE EXPORTS
 # =============================================================================
 
@@ -1600,6 +1747,7 @@ __all__ = [
     "QUANTIZED_DTYPE_MAP",
     "PROVIDER_DTYPE_POLICY",
     "KV_CACHE_DTYPE_POLICY",
+    "PROVIDER_DTYPE_SUPPORT",
     # Quantized metadata
     "QuantizedDtype",
     "INT4_BLOCKWISE",
@@ -1639,4 +1787,5 @@ __all__ = [
     "get_recommended_quantized_dtype",
     "get_kv_cache_dtype",
     "get_kv_cache_dtypes",
+    "is_dtype_supported_by_provider",
 ]

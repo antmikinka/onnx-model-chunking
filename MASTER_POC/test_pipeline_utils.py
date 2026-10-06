@@ -38,6 +38,8 @@ def test_dtypes():
         KV_CACHE_DTYPE_POLICY,
         get_kv_cache_dtype,
         get_kv_cache_dtypes,
+        PROVIDER_DTYPE_SUPPORT,
+        is_dtype_supported_by_provider,
         supports_float8,
         get_float8_dtype,
         float8_storage_dtype,
@@ -593,6 +595,58 @@ def test_dtypes():
     assert pipeline_utils.get_kv_cache_dtype is get_kv_cache_dtype
     assert pipeline_utils.get_kv_cache_dtypes is get_kv_cache_dtypes
     print("  kv cache dtype: fp16 default, cpu fp32, compressed int8, split key and value")
+
+    assert set(PROVIDER_DTYPE_SUPPORT) == {
+        "CPUExecutionProvider",
+        "ROCmExecutionProvider",
+        "VitisAIExecutionProvider",
+        "RyzenAIExecutionProvider",
+        "DmlExecutionProvider",
+    }
+    assert PROVIDER_DTYPE_SUPPORT["VitisAIExecutionProvider"] == ("int4", "int8", "fp16")
+    assert PROVIDER_DTYPE_SUPPORT["RyzenAIExecutionProvider"] == ("int4", "int8", "fp16")
+    assert PROVIDER_DTYPE_SUPPORT["DmlExecutionProvider"] == ("fp16", "fp32")
+    assert "fp64" in PROVIDER_DTYPE_SUPPORT["CPUExecutionProvider"]
+    assert "bf16" in PROVIDER_DTYPE_SUPPORT["ROCmExecutionProvider"]
+    assert is_dtype_supported_by_provider(np.float64, "CPUExecutionProvider")
+    assert is_dtype_supported_by_provider("tensor(float)", "cpu")
+    assert is_dtype_supported_by_provider("int4", "cpu")
+    assert is_dtype_supported_by_provider(np.complex128, "CPUExecutionProvider")
+    assert is_dtype_supported_by_provider("tensor(int4)", "VitisAIExecutionProvider")
+    assert is_dtype_supported_by_provider(np.int8, "npu")
+    assert is_dtype_supported_by_provider(np.float16, "npu")
+    assert is_dtype_supported_by_provider(np.float32, "VitisAIExecutionProvider") is False
+    assert is_dtype_supported_by_provider("bf16", "ryzenai") is False
+    assert is_dtype_supported_by_provider(np.float16, "RyzenAIExecutionProvider")
+    assert is_dtype_supported_by_provider("bf16", "ROCmExecutionProvider")
+    assert is_dtype_supported_by_provider("fp8", "hip")
+    assert is_dtype_supported_by_provider(np.float64, "igpu") is False
+    assert is_dtype_supported_by_provider(np.float32, "DmlExecutionProvider")
+    assert is_dtype_supported_by_provider(np.float16, "directml")
+    assert is_dtype_supported_by_provider(np.int8, "dml") is False
+    assert is_dtype_supported_by_provider("int4", "DmlExecutionProvider") is False
+    assert is_dtype_supported_by_provider("bf16", "directml") is False
+    for provider in PROVIDER_DTYPE_SUPPORT:
+        for role in ("weight", "activation", "kv"):
+            recommended = get_recommended_dtype(provider, role)
+            assert is_dtype_supported_by_provider(recommended, provider)
+    assert is_dtype_supported_by_provider(get_kv_cache_dtype("cpu"), "cpu")
+    assert is_dtype_supported_by_provider(get_kv_cache_dtype("npu"), "npu")
+    assert is_dtype_supported_by_provider(get_kv_cache_dtype("npu", "compressed"), "VitisAIExecutionProvider")
+    assert is_dtype_supported_by_provider(get_kv_cache_dtype("rocm", "compressed"), "DmlExecutionProvider") is False
+    try:
+        is_dtype_supported_by_provider(np.float16, "CUDAExecutionProvider")
+        raise AssertionError("CUDA has no dtype support row")
+    except ValueError as exc:
+        assert "CUDAExecutionProvider" in str(exc)
+    try:
+        is_dtype_supported_by_provider("int3", "cpu")
+        raise AssertionError("int3 is not a support dtype")
+    except ValueError as exc:
+        assert "int3" in str(exc)
+    assert pipeline_utils.PROVIDER_DTYPE_SUPPORT is PROVIDER_DTYPE_SUPPORT
+    assert pipeline_utils.is_dtype_supported_by_provider is is_dtype_supported_by_provider
+    print("  provider dtype support: CPU broad, NPU int4/int8/fp16, ROCm fp16/bf16, DirectML fp16/fp32")
 
     print("dtypes module: OK\n")
     return True
