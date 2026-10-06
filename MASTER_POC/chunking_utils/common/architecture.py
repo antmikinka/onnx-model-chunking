@@ -317,37 +317,67 @@ def classify_qwen_family(names: Iterable[str]) -> Optional[ArchitectureType]:
     return None
 
 
+# Longest key wins. qwen3_moe must not collapse to dense qwen3.
+EXACT_MAP = {
+    "qwen3_moe": ArchitectureType.QWEN3_MOE,
+    "qwen3": ArchitectureType.QWEN3,
+    "qwen2": ArchitectureType.QWEN2,
+    "qwen": ArchitectureType.QWEN,
+}
+
+
+def _normalized_arch_name(model_type: str) -> str:
+    """Lowercase and turn hyphen, space, and dot into underscores."""
+    return (
+        model_type.strip()
+        .lower()
+        .replace("-", "_")
+        .replace(" ", "_")
+        .replace(".", "_")
+    )
+
+
+def _match_exact_map(normalized: str) -> Optional[ArchitectureType]:
+    """Return the architecture for the longest EXACT_MAP key contained in the name."""
+    for key, arch in sorted(EXACT_MAP.items(), key=lambda item: len(item[0]), reverse=True):
+        if key in normalized:
+            return arch
+    return None
+
+
 def architecture_from_string(model_type: str) -> ArchitectureType:
     """
     Convert a model_type string to ArchitectureType enum.
-    
+
+    An exact enum value wins. Qwen names then use EXACT_MAP, longest key
+    first, so qwen3_moe stays MoE and a plain qwen3 stays dense. Qwen3.8
+    stays the hybrid. A blank name is unknown.
+
     Args:
         model_type: The model_type string from config.json.
-    
+
     Returns:
         Corresponding ArchitectureType, or UNKNOWN if not recognized.
     """
-    model_type_lower = model_type.lower() if model_type else ""
-    
+    if not isinstance(model_type, str) or not model_type.strip():
+        return ArchitectureType.UNKNOWN
+    folded = model_type.strip().lower()
+
     for arch in ArchitectureType:
-        if arch.value == model_type_lower:
+        if arch.value == folded:
             return arch
-    
-    # Check for partial matches
-    if "llama" in model_type_lower:
+
+    if "llama" in folded:
         return ArchitectureType.LLAMA
-    if "qwen" in model_type_lower:
-        # Only check for explicit qwen3/qwen2 - NOT just "3" or "2" which causes false positives
-        if "qwen3" in model_type_lower:
-            if _is_qwen3_hybrid_name(model_type_lower):
-                return ArchitectureType.QWEN3_HYBRID
-            if "moe" in model_type_lower:
-                return ArchitectureType.QWEN3_MOE
-            return ArchitectureType.QWEN3
-        if "qwen2" in model_type_lower:
-            return ArchitectureType.QWEN2
-        return ArchitectureType.QWEN
-    
+
+    # Qwen3.8 normalizes to a name that still contains the shorter qwen3 key.
+    if "qwen3" in folded and _is_qwen3_hybrid_name(folded):
+        return ArchitectureType.QWEN3_HYBRID
+
+    mapped = _match_exact_map(_normalized_arch_name(model_type))
+    if mapped is not None:
+        return mapped
+
     return ArchitectureType.UNKNOWN
 
 

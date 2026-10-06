@@ -8746,6 +8746,7 @@ def test_architecture():
         _LLAMA_STYLE_ONNX,
         architecture_from_string,
         classify_qwen_family,
+        EXACT_MAP,
         get_architecture_descriptor,
         QUANTIZED_OP_PATTERNS,
         get_prefixes,
@@ -8837,6 +8838,28 @@ def test_architecture():
     assert architecture_from_string("Qwen3.8") is ArchitectureType.QWEN3_HYBRID
     assert architecture_from_string("qwen3-8") is ArchitectureType.QWEN3_HYBRID
     assert architecture_from_string("qwen3_8") is ArchitectureType.QWEN3_HYBRID
+    assert common.EXACT_MAP is EXACT_MAP
+    import chunking_utils
+    assert chunking_utils.EXACT_MAP is EXACT_MAP
+    assert EXACT_MAP == {
+        "qwen3_moe": ArchitectureType.QWEN3_MOE,
+        "qwen3": ArchitectureType.QWEN3,
+        "qwen2": ArchitectureType.QWEN2,
+        "qwen": ArchitectureType.QWEN,
+    }
+    longest = sorted(EXACT_MAP, key=len, reverse=True)
+    assert longest[0] == "qwen3_moe"
+    assert longest.index("qwen3_moe") < longest.index("qwen3")
+    assert longest.index("qwen2") < longest.index("qwen")
+    assert architecture_from_string("model_qwen3_moe") is ArchitectureType.QWEN3_MOE
+    assert architecture_from_string("model_qwen3") is ArchitectureType.QWEN3
+    assert architecture_from_string("Qwen/Qwen3-MoE") is ArchitectureType.QWEN3_MOE
+    assert architecture_from_string("qwen2.5") is ArchitectureType.QWEN2
+    assert architecture_from_string("llama-3") is ArchitectureType.LLAMA
+    assert architecture_from_string("mistral") is ArchitectureType.MISTRAL
+    assert architecture_from_string("gpt2") is ArchitectureType.GPT2
+    assert architecture_from_string("  ") is ArchitectureType.UNKNOWN
+    assert architecture_from_string(None) is ArchitectureType.UNKNOWN
     assert ArchitectureType.QWEN3.value == "qwen3"
     assert ArchitectureType.QWEN3_MOE.value == "qwen3_moe"
     assert ArchitectureType.QWEN3_HYBRID.value == "qwen3_hybrid"
@@ -9130,6 +9153,7 @@ def test_architecture():
         assert "node name" in str(exc)
 
     print("  architecture prefixes: dense llama record, moe router and expert, hybrid mtp head")
+    print("  architecture names: longest qwen3_moe, dense qwen3, qwen2.5")
     print("  quantized onnx nodes: MatMulNBits int4, QLinearMatMul int8, AWQMatMul awq")
     print("  architecture descriptor: gqa, moe counts, sliding window, tied embeddings, hybrid attention")
     print("architecture prefixes: OK\n")
