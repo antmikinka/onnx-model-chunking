@@ -5,10 +5,13 @@ kv_cache.py - KV Cache Management Module
 This module provides a KVCacheManager class for managing key-value cache state
 during incremental transformer decoding.
 
-CPU storage uses NumPy arrays. NPU, iGPU, CUDA, pinned host, and hybrid
-NPU/iGPU storage keep each tensor in one ort.OrtValue wrapped by a
-DeviceBuffer, so decode can bind the same address instead of copying
-through a host array.
+CPU storage uses NumPy arrays. When ``max_seq_len`` is set, CPU and every
+device backend preallocate one buffer of shape
+``[batch, num_kv_heads, max_seq_len, head_dim]`` and write new tokens at
+``current_seq_len`` instead of allocating a larger array per token.
+NPU, iGPU, CUDA, pinned host, and hybrid NPU/iGPU storage keep that buffer
+in one ort.OrtValue wrapped by a DeviceBuffer. The attention mask and
+``sequence_length_scalar`` tell the graph how much of the buffer is valid.
 
 Usage:
     from pipeline_utils.kv_cache import KVCacheManager, KVCacheBackend
@@ -130,34 +133,76 @@ def _as_numpy(value: Any) -> np.ndarray:
     )
 
 
-def _write_prefix(ort_value: Any, data: np.ndarray, seq_axis: int = _SEQ_AXIS) -> None:
+def _placement(
+    data: np.ndarray,
+    position: int,
+    seq_axis: int = _SEQ_AXIS,
+) -> Tuple[Optional[np.ndarray], int, int]:
     """
-    Copy ``data`` into the sequence prefix of an existing OrtValue.
+    Decide which slice to write at ``position``.
 
-    The OrtValue shape stays at max_seq_len. A host view is written in
-    place. A host copy is pushed back with ``update_inplace``.
+    A present tensor longer than the tokens already stored is the full
+    cache, so only the unseen tail is written and the length becomes that
+    tensor's sequence axis. A shorter tensor is new tokens and is written
+    at ``position``. An equal length adds nothing.
     """
-    host = ort_value.numpy()
+    seq = int(data.shape[seq_axis])
+    if seq > position:
+        tail_slice = [slice(None)] * data.ndim
+        tail_slice[seq_axis] = slice(position, seq)
+        return data[tuple(tail_slice)], position, seq
+    if seq == position:
+        return None, position, position
+    return data, position, position + seq
+
+
+def _write_window(
+    storage: Any,
+    data: np.ndarray,
+    start: int,
+    seq_axis: int = _SEQ_AXIS,
+) -> None:
+    """
+    Copy ``data`` into an existing buffer at sequence index ``start``.
+
+    The allocated shape stays ``[batch, heads, max_seq_len, head_dim]``.
+    A NumPy cache is updated in place. An OrtValue host view is written
+    in place, and a host copy is pushed back with ``update_inplace``.
+    """
+    ort_value = getattr(storage, "ort_value", None)
+    if isinstance(storage, np.ndarray):
+        host = storage
+        resident = None
+    elif ort_value is not None:
+        host = ort_value.numpy()
+        resident = ort_value
+    else:
+        host = storage.numpy()
+        resident = storage
     incoming = np.ascontiguousarray(data, dtype=host.dtype)
     if incoming.ndim != host.ndim:
         raise ValueError(
             f"KV rank mismatch: allocated {host.shape}, got {incoming.shape}"
         )
+    if start < 0:
+        raise ValueError(f"KV write index must be >= 0, got {start}")
     for index, (allocated, requested) in enumerate(zip(host.shape, incoming.shape)):
         if index == seq_axis:
-            if requested <= 0 or requested > allocated:
+            end = start + requested
+            if requested <= 0 or end > allocated:
                 raise ValueError(
-                    f"Sequence length {requested} does not fit KV capacity {allocated}"
+                    f"Sequence window [{start}, {end}) does not fit "
+                    f"max_seq_len capacity {allocated}"
                 )
         elif allocated != requested:
             raise ValueError(
                 f"KV axis {index} is fixed at {allocated}, got {requested}"
             )
     slices: List[slice] = [slice(None)] * host.ndim
-    slices[seq_axis] = slice(0, incoming.shape[seq_axis])
+    slices[seq_axis] = slice(start, start + int(incoming.shape[seq_axis]))
     host[tuple(slices)] = incoming
-    if int(host.ctypes.data) != int(ort_value.data_ptr()):
-        ort_value.update_inplace(np.ascontiguousarray(host))
+    if resident is not None and int(host.ctypes.data) != int(resident.data_ptr()):
+        resident.update_inplace(np.ascontiguousarray(host))
 
 
 class KVCacheManager:
@@ -168,10 +213,13 @@ class KVCacheManager:
     - First iteration (prefill): Process full prompt, populate cache
     - Subsequent iterations (decode): Process only new token, use cached keys/values
 
-    ``backend`` selects the memory. CPU keeps NumPy arrays and may grow the
-    sequence axis. Every other backend allocates ``max_seq_len`` once and
-    stores an OrtValue inside a DeviceBuffer. Hybrid NPU/iGPU uses one
-    shared allocation so prefill and decode bind the same pointer.
+    ``backend`` selects the memory. A cache with ``max_seq_len`` allocates
+    ``[batch, heads, max_seq_len, head_dim]`` once. Decode writes the new
+    token at ``[:, :, current_seq_len, :]`` and advances that length.
+    CPU without ``max_seq_len`` still replaces NumPy arrays as the sequence
+    grows. Device backends store an OrtValue inside a DeviceBuffer. Hybrid
+    NPU/iGPU uses one shared allocation so prefill and decode bind the same
+    pointer.
 
     Attributes:
         num_layers: Number of transformer layers
@@ -180,7 +228,8 @@ class KVCacheManager:
         dtype: Data type for cache tensors
         batch_size: Batch size (default 1)
         backend: KVCacheBackend value
-        max_seq_len: Allocated sequence length for device backends
+        max_seq_len: Preallocated sequence capacity, when the cache is static
+        current_seq_len: Tokens written into the static buffer
     """
 
     def __init__(
@@ -205,8 +254,9 @@ class KVCacheManager:
             batch_size: Batch size for inference (default: 1)
             backend: cpu, cuda, rocm, vitisai, ryzenai, pinned_host,
                 or hybrid_npu_igpu
-            max_seq_len: Capacity of a device-resident cache. CPU ignores
-                this and starts at sequence length 0. Device backends
+            max_seq_len: Preallocated sequence capacity. CPU with this set
+                keeps one NumPy buffer and writes tokens into it. CPU
+                without it grows by replacing arrays. Device backends
                 default to the NPU window of 4096.
             device_id: Device index for the OrtValue allocation
         """
@@ -217,16 +267,22 @@ class KVCacheManager:
         self.batch_size = batch_size
         self.backend = coerce_kv_backend(backend)
         self.device_id = int(device_id)
-        if self.backend is KVCacheBackend.CPU:
-            self.max_seq_len = None
+        if max_seq_len is None:
+            self.max_seq_len = (
+                None
+                if self.backend is KVCacheBackend.CPU
+                else DEFAULT_NPU_MAX_SEQ_LEN
+            )
         else:
-            limit = DEFAULT_NPU_MAX_SEQ_LEN if max_seq_len is None else int(max_seq_len)
+            limit = int(max_seq_len)
             if limit <= 0:
                 raise ValueError(f"max_seq_len must be positive, got {limit}")
             self.max_seq_len = limit
+        self._static = self.max_seq_len is not None
 
         self._cache: Dict[int, Dict[str, Any]] = {}
         self._seq_len = 0
+        self._layer_len: List[int] = [0] * self.num_layers
         self._binder: Optional[IOBindingManager] = None
         self._bridge: Optional[HeterogeneousIOBindingManager] = None
         self._shared: List[SharedBuffer] = []
@@ -242,17 +298,24 @@ class KVCacheManager:
         """True when tensors are OrtValues rather than host NumPy arrays."""
         return self.backend is not KVCacheBackend.CPU
 
+    @property
+    def static(self) -> bool:
+        """True when the sequence axis is preallocated at ``max_seq_len``."""
+        return self._static
+
     def reset(self) -> None:
         """
         Reset the cache to empty state.
 
-        CPU creates empty tensors with shape [batch, heads, 0, head_dim].
-        Device backends keep the allocated OrtValues and mark zero tokens
-        valid, so the next prefill binds the same address.
+        A dynamic CPU cache creates empty tensors with shape
+        ``[batch, heads, 0, head_dim]``. A static cache keeps the
+        preallocated buffers and marks zero tokens valid, so the next
+        prefill binds the same address.
         """
-        if self.backend is KVCacheBackend.CPU:
+        self._seq_len = 0
+        self._layer_len = [0] * self.num_layers
+        if not self._static:
             self._cache.clear()
-            self._seq_len = 0
             for i in range(self.num_layers):
                 self._cache[i] = {
                     "key": np.zeros(
@@ -265,11 +328,42 @@ class KVCacheManager:
                     ),
                 }
             return
+        if self.backend is KVCacheBackend.CPU:
+            shape = (
+                self.batch_size,
+                self.num_kv_heads,
+                int(self.max_seq_len),
+                self.head_dim,
+            )
+            if not self._cache:
+                for i in range(self.num_layers):
+                    self._cache[i] = {
+                        "key": np.zeros(shape, dtype=self.dtype),
+                        "value": np.zeros(shape, dtype=self.dtype),
+                    }
+            else:
+                for i in range(self.num_layers):
+                    self._cache[i]["key"].fill(0)
+                    self._cache[i]["value"].fill(0)
+            return
         if not self._cache:
             self._allocate_device_cache()
-        self._seq_len = 0
         if self._binder is not None:
             self._binder.set_valid_sequence_length(0, "kv")
+
+    def _commit_length(self, layer_idx: int, new_len: int) -> None:
+        """Publish one layer's valid prefix without reallocating."""
+        if new_len < 0 or (
+            self.max_seq_len is not None and new_len > int(self.max_seq_len)
+        ):
+            raise ValueError(
+                f"Layer {layer_idx}: sequence length {new_len} exceeds "
+                f"max_seq_len {self.max_seq_len}"
+            )
+        self._layer_len[layer_idx] = int(new_len)
+        self._seq_len = int(new_len)
+        if self._binder is not None:
+            self._binder.set_valid_sequence_length(self._seq_len, "kv")
 
     def _allocate_device_cache(self) -> None:
         """Allocate one resident OrtValue per key and value."""
@@ -356,19 +450,33 @@ class KVCacheManager:
         """
         Get the current cached sequence length.
 
-        Device backends report the valid prefix. The allocated OrtValue
-        stays at ``max_seq_len``. CPU reports the NumPy sequence axis.
+        A static cache reports the valid prefix. Its buffer stays at
+        ``max_seq_len``. A dynamic CPU cache reports the NumPy sequence axis.
 
         Returns:
             Number of tokens currently in the cache (0 if empty)
         """
-        if self.uses_device_memory:
+        if self._static:
             if self._binder is not None:
                 return int(self._binder.get_static_kv_pool("kv").valid_seq_len)
             return int(self._seq_len)
         if 0 in self._cache and _tensor_shape(self._cache[0]["key"])[2] > 0:
             return int(_tensor_shape(self._cache[0]["key"])[2])
         return 0
+
+    @property
+    def current_seq_len(self) -> int:
+        """Tokens written into the cache. The static buffer is not resized."""
+        return self.get_sequence_length()
+
+    def sequence_length_scalar(self) -> np.ndarray:
+        """
+        0-d int64 length for a graph that takes a sequence-length scalar.
+
+        The value is ``current_seq_len``. Pair it with ``attention_mask``
+        when the session needs both.
+        """
+        return np.array(self.current_seq_len, dtype=np.int64)
 
     def get_past_tensors(self, layer_idx: int) -> Tuple[Any, Any]:
         """
@@ -404,9 +512,11 @@ class KVCacheManager:
         """
         Mask for the valid prefix.
 
-        Device backends return shape ``(batch, max_seq_len)`` and do not
-        resize the KV OrtValues. CPU returns a mask for the tokens stored
-        so far.
+        Static caches return shape ``(batch, max_seq_len)``. Ones cover
+        ``current_seq_len`` and zeros cover the unused capacity, so the
+        NPU graph keeps a fixed KV shape. A dynamic CPU cache returns a
+        mask for the tokens stored so far. ``sequence_length_scalar`` is
+        the same length as a 0-d int64.
         """
         valid = self.get_sequence_length()
         if self._binder is not None:
@@ -428,9 +538,13 @@ class KVCacheManager:
         """
         Update cache for a layer with new present key/value tensors.
 
-        CPU replaces the stored arrays. A device backend writes into the
-        existing OrtValue. If ``present_key`` is already that OrtValue or
-        DeviceBuffer, the pointer is kept and only the valid length changes.
+        A dynamic CPU cache replaces the stored arrays. A static cache
+        writes into the preallocated buffer at that layer's
+        ``current_seq_len`` and leaves the buffer object in place. A
+        present tensor longer than the tokens already stored contributes
+        only its unseen tail. A shorter tensor is appended. If the caller
+        passes the resident buffer with ``valid_seq_len``, only the valid
+        length changes.
 
         Args:
             layer_idx: Index of the transformer layer
@@ -438,7 +552,8 @@ class KVCacheManager:
             present_value: The present.{layer_idx}.value output from the layer
             validate_shape: If True, validate tensor shapes (default True)
             valid_seq_len: Prefix length when the caller passes the resident
-                buffer itself. Defaults to the sequence axis of ``present_key``.
+                buffer itself. The resident buffer's sequence axis is the
+                capacity, not the logical length.
         """
         if layer_idx not in self._cache:
             raise KeyError(f"Layer {layer_idx} not in cache (have {self.num_layers} layers)")
@@ -467,31 +582,41 @@ class KVCacheManager:
                     f"got {key_shape[3]}"
                 )
 
-        if self.backend is KVCacheBackend.CPU:
+        if not self._static:
             self._cache[layer_idx]["key"] = present_key
             self._cache[layer_idx]["value"] = present_value
             return
-
-        seq_len = int(valid_seq_len if valid_seq_len is not None else key_shape[_SEQ_AXIS])
-        if self.max_seq_len is not None and seq_len > int(self.max_seq_len):
-            raise ValueError(
-                f"Layer {layer_idx}: sequence length {seq_len} exceeds "
-                f"max_seq_len {self.max_seq_len}"
-            )
-        if seq_len < 0:
-            raise ValueError(f"Layer {layer_idx}: sequence length must be >= 0, got {seq_len}")
 
         stored_key = self._cache[layer_idx]["key"]
         stored_value = self._cache[layer_idx]["value"]
         key_is_resident = _same_storage(stored_key, present_key)
         value_is_resident = _same_storage(stored_value, present_value)
-        if not key_is_resident:
-            _write_prefix(_require_ort(stored_key), _as_numpy(present_key))
-        if not value_is_resident:
-            _write_prefix(_require_ort(stored_value), _as_numpy(present_value))
-        self._seq_len = seq_len
-        if self._binder is not None:
-            self._binder.set_valid_sequence_length(seq_len, "kv")
+        if key_is_resident and value_is_resident:
+            if valid_seq_len is not None:
+                self._commit_length(layer_idx, int(valid_seq_len))
+            return
+
+        position = self._layer_len[layer_idx]
+        key_np = None if key_is_resident else _as_numpy(present_key)
+        value_np = None if value_is_resident else _as_numpy(present_value)
+        reference = key_np if key_np is not None else value_np
+        _, _, new_len = _placement(reference, position)
+        if new_len < 0 or (
+            self.max_seq_len is not None and new_len > int(self.max_seq_len)
+        ):
+            raise ValueError(
+                f"Layer {layer_idx}: sequence length {new_len} exceeds "
+                f"max_seq_len {self.max_seq_len}"
+            )
+        if key_np is not None:
+            window, start, _ = _placement(key_np, position)
+            if window is not None:
+                _write_window(stored_key, window, start)
+        if value_np is not None:
+            window, start, _ = _placement(value_np, position)
+            if window is not None:
+                _write_window(stored_value, window, start)
+        self._commit_length(layer_idx, new_len)
 
     def inject_into_registry(
         self,
@@ -578,6 +703,8 @@ class KVCacheManager:
             "dtype": str(self.dtype),
             "backend": self.backend.value,
             "max_seq_len": self.max_seq_len,
+            "current_seq_len": seq_len,
+            "static": self._static,
             "storage": "device_buffer" if self.uses_device_memory else "numpy",
         }
 
@@ -601,13 +728,6 @@ def _nbytes(value: Any) -> int:
     if nbytes is not None:
         return int(nbytes)
     return 0
-
-
-def _require_ort(value: Any) -> Any:
-    ort_value = getattr(value, "ort_value", None)
-    if ort_value is None:
-        raise RuntimeError("Device KV tensor has no OrtValue")
-    return ort_value
 
 
 def _ort_value_of(value: Any) -> Any:

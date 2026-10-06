@@ -82,6 +82,9 @@ def test_kv_cache():
     fake_present = np.random.randn(1, 8, 5, 128).astype(np.float16)  # 5 tokens cached
     cache.update_from_present(0, fake_present, fake_present)
     print(f"  After update layer 0: seq_len = {cache.get_sequence_length()}")
+    assert not cache.static
+    assert cache.current_seq_len == 5
+    assert int(cache.sequence_length_scalar()) == 5
     
     # Test memory usage
     cache.reset()
@@ -99,8 +102,55 @@ def test_kv_cache():
     assert cache.backend is KVCacheBackend.CPU
     assert isinstance(cache.get_past_tensors(0)[0], np.ndarray)
     assert cache.get_memory_usage()["storage"] == "numpy"
+    assert cache.get_memory_usage()["static"] is False
 
     present = np.arange(1 * 2 * 4 * 8, dtype=np.float16).reshape(1, 2, 4, 8)
+    static_cpu = KVCacheManager(
+        num_layers=2,
+        num_kv_heads=2,
+        head_dim=8,
+        dtype=np.float16,
+        batch_size=1,
+        backend=KVCacheBackend.CPU,
+        max_seq_len=8,
+    )
+    static_key, static_value = static_cpu.get_past_tensors(0)
+    assert static_cpu.static
+    assert tuple(static_key.shape) == (1, 2, 8, 8)
+    assert static_cpu.current_seq_len == 0
+    static_cpu.update_from_present(0, present, present.copy())
+    static_cpu.update_from_present(1, present, present.copy())
+    assert static_cpu.get_past_tensors(0)[0] is static_key
+    assert static_cpu.get_past_tensors(0)[1] is static_value
+    assert static_cpu.current_seq_len == 4
+    assert np.array_equal(static_key[:, :, :4, :], present)
+    token = np.full((1, 2, 1, 8), 7, dtype=np.float16)
+    static_cpu.update_from_present(0, token, token.copy())
+    static_cpu.update_from_present(1, token, token.copy())
+    assert static_cpu.current_seq_len == 5
+    assert np.array_equal(static_key[:, :, :4, :], present)
+    assert np.array_equal(static_key[:, :, 4, :], token[:, :, 0, :])
+    longer = np.zeros((1, 2, 6, 8), dtype=np.float16)
+    longer[:, :, :5, :] = static_key[:, :, :5, :]
+    longer[:, :, 5, :] = 3
+    static_cpu.update_from_present(0, longer, longer.copy())
+    assert static_cpu.current_seq_len == 6
+    assert np.array_equal(static_key[:, :, :5, :], longer[:, :, :5, :])
+    assert np.array_equal(static_key[:, :, 5, :], np.full((1, 2, 8), 3, dtype=np.float16))
+    scalar = static_cpu.sequence_length_scalar()
+    assert scalar.shape == ()
+    assert scalar.dtype == np.int64
+    assert int(scalar) == 6
+    static_mask = static_cpu.attention_mask()
+    assert static_mask.shape == (1, 8)
+    assert int(static_mask[0, 5]) == 1
+    assert int(static_mask[0, 6]) == 0
+    assert static_cpu.get_memory_usage()["static"] is True
+    assert static_cpu.get_memory_usage()["current_seq_len"] == 6
+    static_cpu.reset()
+    assert static_cpu.get_past_tensors(0)[0] is static_key
+    assert static_cpu.current_seq_len == 0
+    print("  static CPU KV: preallocated max_seq_len, append at current_seq_len")
     for backend in (
         KVCacheBackend.VITISAI,
         KVCacheBackend.RYZENAI,
@@ -131,6 +181,18 @@ def test_kv_cache():
         assert int(key.ort_value.data_ptr()) == before
         written = key.to_numpy()[:, :, :4, :]
         assert np.array_equal(written, present)
+        assert resident.get_past_tensors(0)[0] is key
+        token = np.full((1, 2, 1, 8), 7, dtype=np.float16)
+        resident.update_from_present(0, token, token.copy())
+        resident.update_from_present(1, token, token.copy())
+        assert resident.current_seq_len == 5
+        assert int(key.ort_value.data_ptr()) == before
+        assert np.array_equal(key.to_numpy()[:, :, :4, :], present)
+        assert np.array_equal(key.to_numpy()[:, :, 4, :], token[:, :, 0, :])
+        appended = resident.sequence_length_scalar()
+        assert appended.shape == ()
+        assert appended.dtype == np.int64
+        assert int(appended) == 5
         again_key, again_value = resident.get_past_tensors(0)
         resident.update_from_present(0, again_key, again_value, valid_seq_len=3)
         assert resident.get_sequence_length() == 3
