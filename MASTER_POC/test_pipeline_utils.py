@@ -521,6 +521,224 @@ def test_kv_cache():
         assert "window_size" in str(exc)
     print("  policies: sliding window, paged blocks, hybrid sparse")
 
+    assert cache.kv_quantization is None
+    assert cache.cache_dtype == np.dtype(np.float16)
+    assert cache.key_scale is None and cache.value_scale is None
+    try:
+        cache.quantize_kv()
+        raise AssertionError("quantize_kv ran without a scheme")
+    except ValueError as exc:
+        assert "fp16" in str(exc) and "fp4" in str(exc)
+    written = np.linspace(-2, 3, 1 * 8 * 5 * 128, dtype=np.float32).astype(np.float16)
+    written = written.reshape(1, 8, 5, 128)
+    cache.update_from_present(0, written, written.copy())
+    plain_key, plain_value = cache.dequantize_kv(0)
+    assert plain_key.shape == written.shape
+    assert np.array_equal(plain_key, written)
+    assert np.array_equal(plain_value, written)
+
+    fp16_cache = KVCacheManager(
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=8,
+        dtype=np.float32,
+        kv_quantization="half",
+        max_seq_len=4,
+    )
+    fp16_src = np.linspace(-4, 4, 32, dtype=np.float32).reshape(1, 1, 4, 8)
+    fp16_cache.update_from_present(0, fp16_src, fp16_src)
+    fp16_cache.quantize_kv(0)
+    assert fp16_cache.kv_quantization == "fp16"
+    assert fp16_cache.cache_dtype == np.dtype(np.float16)
+    assert fp16_cache.key_scale is None
+    fp16_key, _ = fp16_cache.dequantize_kv(0)
+    assert np.allclose(fp16_key, fp16_src.astype(np.float16).astype(np.float32))
+
+    int8_cache = KVCacheManager(
+        num_layers=2,
+        num_kv_heads=2,
+        head_dim=8,
+        dtype=np.float32,
+        kv_quantization="int8",
+        max_seq_len=8,
+    )
+    int8_src = (np.linspace(-3, 5, 1 * 2 * 4 * 8, dtype=np.float32)).reshape(1, 2, 4, 8)
+    int8_cache.update_from_present(0, int8_src, -int8_src)
+    int8_cache.quantize_kv(0)
+    assert int8_cache.cache_dtype == np.dtype(np.int8)
+    assert float(int8_cache.key_scale[0]) > 0
+    assert np.isnan(int8_cache.key_scale[1])
+    int8_key, int8_value = int8_cache.dequantize_kv(0)
+    int8_scale = float(int8_cache.key_scale[0])
+    assert np.max(np.abs(int8_key - int8_src)) <= 0.5 * int8_scale + 1e-4
+    assert np.max(np.abs(int8_value + int8_src)) <= 0.5 * float(int8_cache.value_scale[0]) + 1e-4
+    int8_mem = int8_cache.get_memory_usage()
+    assert int8_mem["quantized_layers"] == 1
+    assert int8_mem["compressed_bytes"] < int8_src.nbytes * 2
+    assert int8_mem["kv_quantization"] == "int8"
+    int8_cache.reset()
+    assert np.isnan(int8_cache.key_scale[0])
+    assert int8_cache.kv_quantization == "int8"
+
+    fresh = KVCacheManager(
+        num_layers=1,
+        num_kv_heads=2,
+        head_dim=8,
+        dtype=np.float32,
+        kv_quantization="int8",
+    )
+    fresh.update_from_present(0, int8_src, -int8_src)
+    fresh.quantize_kv(0)
+    assert np.isfinite(fresh.key_scale[0])
+    longer = np.concatenate([int8_src, int8_src[:, :, :1, :] + 1], axis=2)
+    fresh.update_from_present(0, longer, -longer)
+    assert np.isnan(fresh.key_scale[0])
+    assert np.allclose(fresh.dequantize_kv(0)[0], longer)
+
+    int4_cache = KVCacheManager(
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=8,
+        dtype=np.float32,
+        kv_quantization="int4",
+        max_seq_len=4,
+    )
+    int4_src = np.linspace(-4, 4, 24, dtype=np.float32).reshape(1, 1, 3, 8)
+    int4_cache.update_from_present(0, int4_src, int4_src)
+    int4_cache.quantize_kv()
+    assert int4_cache._compressed[0]["key"].dtype == np.dtype(np.uint8)
+    assert int4_cache._compressed[0]["key"].shape[-1] == 4
+    int4_key, _ = int4_cache.dequantize_kv(0)
+    assert int4_key.shape == int4_src.shape
+    assert np.max(np.abs(int4_key - int4_src)) <= 0.5 * float(int4_cache.key_scale[0]) + 1e-4
+
+    odd_cache = KVCacheManager(
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=5,
+        dtype=np.float32,
+        kv_quantization="int4",
+        max_seq_len=2,
+    )
+    odd_src = np.linspace(-2, 2, 10, dtype=np.float32).reshape(1, 1, 2, 5)
+    odd_cache.update_from_present(0, odd_src, odd_src)
+    odd_cache.quantize_kv(0)
+    assert odd_cache._compressed[0]["key"].shape[-1] == 3
+    odd_key, _ = odd_cache.dequantize_kv(0)
+    assert odd_key.shape[-1] == 5
+    assert np.max(np.abs(odd_key - odd_src)) <= 0.5 * float(odd_cache.key_scale[0]) + 1e-4
+
+    fp8_cache = KVCacheManager(
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=8,
+        dtype=np.float32,
+        kv_quantization="e4m3",
+        max_seq_len=2,
+    )
+    fp8_src = np.array([0, 1, -1, 2, 4, 16, 32, 448], dtype=np.float32).reshape(1, 1, 1, 8)
+    fp8_cache.update_from_present(0, fp8_src, fp8_src)
+    fp8_cache.quantize_kv(0)
+    assert fp8_cache.kv_quantization == "fp8"
+    assert fp8_cache.cache_dtype == np.dtype(np.uint8)
+    fp8_key, _ = fp8_cache.dequantize_kv(0)
+    assert np.all(np.isfinite(fp8_key))
+    assert np.allclose(fp8_key, fp8_src, rtol=0, atol=0)
+
+    fp4_cache = KVCacheManager(
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=8,
+        dtype=np.float32,
+        kv_quantization="float4",
+        max_seq_len=2,
+    )
+    fp4_src = np.array([0, 0.5, 1, 1.5, 2, 3, 4, 6], dtype=np.float32).reshape(1, 1, 1, 8)
+    fp4_cache.update_from_present(0, fp4_src, -fp4_src)
+    fp4_cache.quantize_kv(0)
+    assert fp4_cache.kv_quantization == "fp4"
+    assert fp4_cache._compressed[0]["key"].shape[-1] == 4
+    fp4_key, fp4_value = fp4_cache.dequantize_kv(0)
+    assert np.allclose(fp4_key, fp4_src)
+    assert np.allclose(fp4_value, -fp4_src)
+    fp4_span = np.linspace(-6, 6, 16, dtype=np.float32).reshape(1, 1, 2, 8)
+    fp4_bounded = KVCacheManager(
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=8,
+        dtype=np.float32,
+        kv_quantization="fp4",
+        max_seq_len=4,
+    )
+    fp4_bounded.update_from_present(0, fp4_span, fp4_span)
+    fp4_bounded.quantize_kv(0)
+    fp4_round, _ = fp4_bounded.dequantize_kv(0)
+    assert np.max(np.abs(fp4_round - fp4_span)) <= 1.0 + 1e-5
+
+    bf16_cache = KVCacheManager(
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=8,
+        dtype=np.float32,
+        kv_quantization="bfloat16",
+        max_seq_len=4,
+    )
+    assert bf16_cache.kv_quantization == "bf16"
+    assert bf16_cache.cache_dtype == np.dtype(np.uint16) or str(bf16_cache.cache_dtype) == "bfloat16"
+    assert bf16_cache.key_scale is None
+    bf16_src = np.arange(16, dtype=np.float32).reshape(1, 1, 2, 8)
+    bf16_cache.update_from_present(0, bf16_src, bf16_src)
+    bf16_cache.quantize_kv(0)
+    bf16_key, _ = bf16_cache.dequantize_kv(0)
+    assert np.array_equal(bf16_key, bf16_src)
+
+    try:
+        KVCacheManager(1, 1, 4, kv_quantization="int3")
+        raise AssertionError("unknown kv quantization was accepted")
+    except ValueError as exc:
+        assert "int3" in str(exc)
+    try:
+        KVCacheManager(1, 1, 4, dtype=np.float16, cache_dtype=np.int8)
+        raise AssertionError("cache_dtype without a scheme was accepted")
+    except ValueError as exc:
+        assert "kv_quantization" in str(exc)
+
+    covered = KVCacheManager(
+        num_layers=3,
+        num_kv_heads=1,
+        head_dim=4,
+        dtype=np.float16,
+        kv_quantization="int8",
+        max_seq_len=4,
+    )
+    token = np.ones((1, 1, 2, 4), dtype=np.float16)
+    for layer in range(3):
+        covered.update_from_present(layer, token * (layer + 1), token)
+    covered.quantize_kv()
+    assert covered.get_memory_usage()["quantized_layers"] == 3
+    assert np.all(np.isfinite(covered.key_scale))
+    assert np.all(np.isfinite(covered.value_scale))
+
+    device_quant = KVCacheManager(
+        num_layers=1,
+        num_kv_heads=2,
+        head_dim=8,
+        dtype=np.float16,
+        backend=KVCacheBackend.VITISAI,
+        max_seq_len=8,
+        kv_quantization="int8",
+    )
+    device_present = np.linspace(-1, 1, 1 * 2 * 4 * 8, dtype=np.float32).astype(np.float16)
+    device_present = device_present.reshape(1, 2, 4, 8)
+    device_quant.update_from_present(0, device_present, device_present)
+    device_ptr = int(device_quant.get_device_tensors(0)[0].data_ptr())
+    device_quant.quantize_kv(0)
+    assert int(device_quant.get_device_tensors(0)[0].data_ptr()) == device_ptr
+    device_key, device_value = device_quant.dequantize_kv(0)
+    assert device_key.shape[2] == device_quant.layer_length(0)
+    assert device_value.shape == device_key.shape
+    print("  quantization: fp16, bf16, int8, fp8, int4, fp4")
+
     print("kv_cache module: OK\n")
     return True
 

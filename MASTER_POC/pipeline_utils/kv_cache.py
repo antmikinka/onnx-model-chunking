@@ -397,6 +397,8 @@ class KVCacheManager:
         sink_size: int = 0,
         retrieval_blocks: int = 0,
         layer_policies: Optional[Sequence[Any]] = None,
+        cache_dtype: Any = None,
+        kv_quantization: Optional[str] = None,
     ):
         """
         Initialize the KV cache manager.
@@ -424,6 +426,10 @@ class KVCacheManager:
             layer_policies: Optional per-layer policies. Length must match
                 ``num_layers``. Full-attention layers stay dense while
                 sliding layers drop history.
+            cache_dtype: Stored element type. Defaults from ``dtype`` or
+                from ``kv_quantization``.
+            kv_quantization: None, fp16, bf16, int8, fp8, int4, or fp4.
+                None keeps the compute buffer as the stored form.
         """
         self.num_layers = num_layers
         self.num_kv_heads = num_kv_heads
@@ -465,6 +471,18 @@ class KVCacheManager:
         self._retrieved_len: List[int] = [0] * self.num_layers
         self._physical_blocks = 0
         self._pages: List["_PageState"] = []
+        self.kv_quantization = _coerce_kv_quantization(kv_quantization)
+        self.cache_dtype = _resolve_cache_dtype(
+            self.kv_quantization, cache_dtype, dtype
+        )
+        if _quantization_uses_scale(self.kv_quantization):
+            self.key_scale = np.full((self.num_layers,), np.nan, dtype=np.float32)
+            self.value_scale = np.full((self.num_layers,), np.nan, dtype=np.float32)
+        else:
+            self.key_scale = None
+            self.value_scale = None
+        self._compressed: Dict[int, Dict[str, np.ndarray]] = {}
+        self._quant_valid: List[bool] = [False] * self.num_layers
         self._binder: Optional[IOBindingManager] = None
         self._bridge: Optional[HeterogeneousIOBindingManager] = None
         self._shared: List[SharedBuffer] = []
@@ -503,6 +521,7 @@ class KVCacheManager:
         self._layer_len = [0] * self.num_layers
         self._mask_layer = 0
         self._reset_policy_state()
+        self._reset_quant_state()
         if self.device_resident:
             if not self._cache:
                 if self._binder is not None:
@@ -579,6 +598,14 @@ class KVCacheManager:
             physical = int(self.max_seq_len) // int(self.block_size)
         self._physical_blocks = physical
         self._pages = [_PageState(physical) for _ in range(self.num_layers)]
+
+    def _reset_quant_state(self) -> None:
+        """Drop compressed copies. The compute buffer stays allocated."""
+        self._compressed = {}
+        self._quant_valid = [False] * self.num_layers
+        if self.key_scale is not None:
+            self.key_scale.fill(np.nan)
+            self.value_scale.fill(np.nan)
 
     def policy_for(self, layer_idx: int) -> KVCachePolicy:
         """Retention policy for one transformer layer."""
@@ -1187,6 +1214,8 @@ class KVCacheManager:
                     f"got {key_shape[3]}"
                 )
 
+        self._invalidate_quant(layer_idx)
+
         if not self._static:
             self._seen[layer_idx] = int(key_shape[_SEQ_AXIS])
             self._seen_published = self._seen[layer_idx]
@@ -1506,6 +1535,90 @@ class KVCacheManager:
 
         return updated
 
+    def quantize_kv(self, layer_idx: Optional[int] = None) -> None:
+        """
+        Compress resident KV into ``cache_dtype``.
+
+        ``key_scale`` and ``value_scale`` receive one float32 scale per
+        layer for int8, fp8, int4, and fp4. fp16 and bf16 are stored by
+        casting. The compute buffer and its OrtValue stay in place.
+        """
+        if self.kv_quantization is None:
+            raise ValueError(
+                "kv_quantization is not set. Choose fp16, bf16, int8, fp8, int4, or fp4."
+            )
+        if layer_idx is None:
+            layers = range(self.num_layers)
+        else:
+            if layer_idx < 0 or layer_idx >= self.num_layers:
+                raise KeyError(
+                    f"Layer {layer_idx} not in cache (have {self.num_layers} layers)"
+                )
+            layers = (layer_idx,)
+        for layer in layers:
+            key, value = self._quant_source(layer)
+            stored_key, key_scale = _quantize_array(key, self.kv_quantization)
+            stored_value, value_scale = _quantize_array(value, self.kv_quantization)
+            if stored_key.dtype != self.cache_dtype or stored_value.dtype != self.cache_dtype:
+                raise RuntimeError(
+                    f"Quantized KV dtype {stored_key.dtype} does not match "
+                    f"cache_dtype {self.cache_dtype}"
+                )
+            self._compressed[layer] = {"key": stored_key, "value": stored_value}
+            self._quant_valid[layer] = True
+            if self.key_scale is not None:
+                self.key_scale[layer] = np.float32(key_scale)
+                self.value_scale[layer] = np.float32(value_scale)
+
+    def dequantize_kv(self, layer_idx: int) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Return one layer in the compute ``dtype``.
+
+        A fresh quantized copy is expanded from ``cache_dtype``. After an
+        update, the compressed copy is stale and this reads the compute
+        buffer until ``quantize_kv`` runs again.
+        """
+        if layer_idx < 0 or layer_idx >= self.num_layers:
+            raise KeyError(
+                f"Layer {layer_idx} not in cache (have {self.num_layers} layers)"
+            )
+        if self.kv_quantization is None or not self._quant_valid[layer_idx]:
+            key, value = self._quant_source(layer_idx)
+            return (
+                np.ascontiguousarray(key, dtype=self.dtype),
+                np.ascontiguousarray(value, dtype=self.dtype),
+            )
+        stored = self._compressed[layer_idx]
+        key_scale = None if self.key_scale is None else float(self.key_scale[layer_idx])
+        value_scale = None if self.value_scale is None else float(self.value_scale[layer_idx])
+        key = _dequantize_array(
+            stored["key"], self.kv_quantization, key_scale, self.head_dim
+        )
+        value = _dequantize_array(
+            stored["value"], self.kv_quantization, value_scale, self.head_dim
+        )
+        return (
+            np.ascontiguousarray(key, dtype=self.dtype),
+            np.ascontiguousarray(value, dtype=self.dtype),
+        )
+
+    def _invalidate_quant(self, layer_idx: int) -> None:
+        self._quant_valid[layer_idx] = False
+        if self.key_scale is not None:
+            self.key_scale[layer_idx] = np.float32(np.nan)
+            self.value_scale[layer_idx] = np.float32(np.nan)
+
+    def _quant_source(self, layer_idx: int) -> Tuple[np.ndarray, np.ndarray]:
+        key = _as_numpy(self._cache[layer_idx]["key"])
+        value = _as_numpy(self._cache[layer_idx]["value"])
+        if self.policy_for(layer_idx) is KVCachePolicy.PAGED_BLOCKS and self.max_seq_len:
+            length = int(self.max_seq_len)
+        elif self._static:
+            length = int(self.layer_length(layer_idx))
+        else:
+            length = int(key.shape[_SEQ_AXIS])
+        return key[:, :, :length, :], value[:, :, :length, :]
+
     def get_memory_usage(self) -> Dict[str, Any]:
         """
         Get memory usage statistics for the cache.
@@ -1527,6 +1640,13 @@ class KVCacheManager:
             total_bytes += layer_bytes
 
         seq_len = self.get_sequence_length()
+        compressed_bytes = 0
+        quantized_layers = 0
+        for layer, blob in self._compressed.items():
+            if not self._quant_valid[layer]:
+                continue
+            quantized_layers += 1
+            compressed_bytes += int(blob["key"].nbytes) + int(blob["value"].nbytes)
 
         return {
             "total_bytes": total_bytes,
@@ -1535,6 +1655,10 @@ class KVCacheManager:
             "sequence_length": seq_len,
             "num_layers": self.num_layers,
             "dtype": str(self.dtype),
+            "cache_dtype": str(self.cache_dtype),
+            "kv_quantization": self.kv_quantization,
+            "compressed_bytes": compressed_bytes,
+            "quantized_layers": quantized_layers,
             "backend": self.backend.value,
             "max_seq_len": self.max_seq_len,
             "current_seq_len": seq_len,
@@ -1741,6 +1865,306 @@ def _same_storage(stored: Any, incoming: Any) -> bool:
     left = _data_pointer(stored)
     right = _data_pointer(incoming)
     return left is not None and left == right
+
+
+_QUANT_ALIASES = {
+    "none": None,
+    "fp16": "fp16",
+    "float16": "fp16",
+    "half": "fp16",
+    "bf16": "bf16",
+    "bfloat16": "bf16",
+    "int8": "int8",
+    "fp8": "fp8",
+    "float8": "fp8",
+    "e4m3": "fp8",
+    "e4m3fn": "fp8",
+    "int4": "int4",
+    "fp4": "fp4",
+    "float4": "fp4",
+}
+
+_FP4_MAGNITUDES = np.array(
+    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=np.float32
+)
+
+
+def _build_fp8_e4m3_table() -> np.ndarray:
+    """OCP E4M3FN codes. Only exponent 15 with mantissa 7 is NaN."""
+    table = np.empty(256, dtype=np.float32)
+    for code in range(256):
+        sign = -1.0 if code & 0x80 else 1.0
+        exp = (code >> 3) & 0xF
+        mant = code & 0x7
+        if exp == 15 and mant == 7:
+            table[code] = np.nan
+            continue
+        if exp == 0:
+            mag = (mant / 8.0) * (2.0 ** -6)
+        else:
+            mag = (1.0 + mant / 8.0) * (2.0 ** (exp - 7))
+        table[code] = np.float32(sign * mag)
+    return table
+
+
+_FP8_E4M3 = _build_fp8_e4m3_table()
+_FP8_POS_ORDER = np.argsort(_FP8_E4M3[:128], kind="stable")
+_FP8_POS_ORDER = np.array(
+    [code for code in _FP8_POS_ORDER if np.isfinite(_FP8_E4M3[code])],
+    dtype=np.uint8,
+)
+_FP8_POS_LEVELS = np.ascontiguousarray(_FP8_E4M3[_FP8_POS_ORDER])
+
+
+def _coerce_kv_quantization(scheme: Optional[str]) -> Optional[str]:
+    """Map aliases onto fp16, bf16, int8, fp8, int4, or fp4."""
+    if scheme is None:
+        return None
+    text = str(scheme).strip().lower().replace("-", "_")
+    if text in _QUANT_ALIASES:
+        return _QUANT_ALIASES[text]
+    allowed = "fp16, bf16, int8, fp8, int4, fp4"
+    raise ValueError(
+        f"Unknown kv_quantization '{scheme}'. Expected one of: {allowed}"
+    )
+
+
+def _quantization_uses_scale(scheme: Optional[str]) -> bool:
+    return scheme in {"int8", "fp8", "int4", "fp4"}
+
+
+def _bf16_storage_dtype() -> np.dtype:
+    try:
+        from .dtypes import get_bfloat16_dtype
+
+        native = get_bfloat16_dtype()
+    except Exception:
+        native = None
+    if native is None:
+        return np.dtype(np.uint16)
+    return np.dtype(native)
+
+
+def _fp8_storage_dtype() -> np.dtype:
+    if hasattr(np, "float8_e4m3fn"):
+        return np.dtype(np.float8_e4m3fn)
+    return np.dtype(np.uint8)
+
+
+def _scheme_storage_dtype(scheme: str) -> np.dtype:
+    if scheme == "fp16":
+        return np.dtype(np.float16)
+    if scheme == "bf16":
+        return _bf16_storage_dtype()
+    if scheme == "int8":
+        return np.dtype(np.int8)
+    if scheme == "fp8":
+        return _fp8_storage_dtype()
+    if scheme in {"int4", "fp4"}:
+        return np.dtype(np.uint8)
+    raise ValueError(f"Unknown kv_quantization '{scheme}'")
+
+
+def _resolve_cache_dtype(
+    scheme: Optional[str], requested: Any, compute: Any
+) -> np.dtype:
+    """Storage dtype for the compressed copy. Compute dtype stays ``dtype``."""
+    compute_dtype = np.dtype(compute)
+    if scheme is None:
+        if requested is None:
+            return compute_dtype
+        requested_dtype = np.dtype(requested)
+        if requested_dtype != compute_dtype:
+            raise ValueError(
+                f"cache_dtype {requested_dtype} requires kv_quantization "
+                f"when the compute dtype is {compute_dtype}"
+            )
+        return requested_dtype
+    expected = _scheme_storage_dtype(scheme)
+    if requested is None:
+        return expected
+    requested_dtype = np.dtype(requested)
+    if requested_dtype != expected:
+        raise ValueError(
+            f"cache_dtype {requested_dtype} does not match {scheme} storage {expected}"
+        )
+    return expected
+
+
+def _as_float32(array: np.ndarray) -> np.ndarray:
+    return np.ascontiguousarray(array, dtype=np.float32)
+
+
+def _finite_float32(array: np.ndarray) -> np.ndarray:
+    values = _as_float32(array)
+    if values.size == 0:
+        return values
+    return np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _symmetric_scale(values: np.ndarray, qmax: float) -> float:
+    if values.size == 0:
+        return 1.0
+    peak = float(np.max(np.abs(values)))
+    if peak == 0.0 or not np.isfinite(peak):
+        return 1.0
+    return peak / float(qmax)
+
+
+def _quantize_bf16(values: np.ndarray) -> np.ndarray:
+    storage = _bf16_storage_dtype()
+    if storage != np.dtype(np.uint16):
+        return np.ascontiguousarray(values, dtype=storage)
+    bits = _as_float32(values).view(np.uint32).astype(np.uint64)
+    rounded = (
+        bits + np.uint64(0x7FFF) + ((bits >> np.uint64(16)) & np.uint64(1))
+    ) >> np.uint64(16)
+    return np.ascontiguousarray(rounded.astype(np.uint16))
+
+
+def _dequantize_bf16(stored: np.ndarray) -> np.ndarray:
+    if stored.dtype != np.dtype(np.uint16):
+        return np.asarray(stored, dtype=np.float32)
+    wide = np.ascontiguousarray(stored, dtype=np.uint16).astype(np.uint32) << np.uint32(16)
+    return wide.view(np.float32)
+
+
+def _fp8_bit_codes(stored: np.ndarray) -> np.ndarray:
+    if stored.dtype == np.dtype(np.uint8):
+        return np.ascontiguousarray(stored)
+    return np.ascontiguousarray(stored).view(np.uint8)
+
+
+def _store_fp8_codes(codes: np.ndarray) -> np.ndarray:
+    packed = np.ascontiguousarray(codes, dtype=np.uint8)
+    storage = _fp8_storage_dtype()
+    if storage == np.dtype(np.uint8):
+        return packed
+    return packed.view(storage)
+
+
+def _quantize_fp8(values: np.ndarray, scale: float) -> np.ndarray:
+    scaled = _finite_float32(values) / np.float32(scale)
+    abs_vals = np.minimum(np.abs(scaled), _FP8_POS_LEVELS[-1])
+    index = np.searchsorted(_FP8_POS_LEVELS, abs_vals, side="left")
+    index = np.clip(index, 1, len(_FP8_POS_LEVELS) - 1)
+    left = index - 1
+    right_dist = np.abs(_FP8_POS_LEVELS[index] - abs_vals)
+    left_dist = np.abs(_FP8_POS_LEVELS[left] - abs_vals)
+    pick = np.where(right_dist < left_dist, index, left)
+    codes = _FP8_POS_ORDER[pick].astype(np.uint8)
+    codes = np.where(scaled < 0, codes | np.uint8(0x80), codes).astype(np.uint8)
+    return _store_fp8_codes(codes)
+
+
+def _dequantize_fp8(stored: np.ndarray, scale: float) -> np.ndarray:
+    codes = _fp8_bit_codes(stored)
+    return _FP8_E4M3[codes] * np.float32(scale)
+
+
+def _pack_nibbles(nibbles: np.ndarray) -> np.ndarray:
+    """Pack two 4-bit codes into each uint8 along the last axis."""
+    width = int(nibbles.shape[-1]) if nibbles.ndim else 0
+    if width % 2:
+        pad = [(0, 0)] * (nibbles.ndim - 1) + [(0, 1)]
+        nibbles = np.pad(nibbles, pad, mode="constant")
+    lo = nibbles[..., 0::2].astype(np.uint8)
+    hi = nibbles[..., 1::2].astype(np.uint8)
+    return np.ascontiguousarray(lo | (hi << np.uint8(4)))
+
+
+def _unpack_nibbles(packed: np.ndarray, head_dim: int) -> np.ndarray:
+    packed = np.ascontiguousarray(packed, dtype=np.uint8)
+    lo = packed & np.uint8(0x0F)
+    hi = (packed >> np.uint8(4)) & np.uint8(0x0F)
+    restored = np.empty(packed.shape[:-1] + (packed.shape[-1] * 2,), dtype=np.uint8)
+    restored[..., 0::2] = lo
+    restored[..., 1::2] = hi
+    return restored[..., : int(head_dim)]
+
+
+def _int_to_nibble(codes: np.ndarray) -> np.ndarray:
+    return (codes.astype(np.int16) & np.int16(0xF)).astype(np.uint8)
+
+
+def _nibble_to_int(nibbles: np.ndarray) -> np.ndarray:
+    signed = nibbles.astype(np.int16)
+    return np.where(signed >= 8, signed - 16, signed).astype(np.int8)
+
+
+def _quantize_int4(values: np.ndarray, scale: float) -> np.ndarray:
+    scaled = _finite_float32(values) / np.float32(scale)
+    codes = np.clip(np.rint(scaled), -7, 7).astype(np.int8)
+    return _pack_nibbles(_int_to_nibble(codes))
+
+
+def _dequantize_int4(stored: np.ndarray, scale: float, head_dim: int) -> np.ndarray:
+    codes = _nibble_to_int(_unpack_nibbles(stored, head_dim))
+    return codes.astype(np.float32) * np.float32(scale)
+
+
+def _quantize_fp4(values: np.ndarray, scale: float) -> np.ndarray:
+    scaled = _finite_float32(values) / np.float32(scale)
+    nearest = np.abs(np.abs(scaled)[..., None] - _FP4_MAGNITUDES).argmin(axis=-1)
+    nibbles = nearest.astype(np.uint8)
+    nibbles = np.where(scaled < 0, nibbles | np.uint8(0x8), nibbles).astype(np.uint8)
+    return _pack_nibbles(nibbles)
+
+
+def _dequantize_fp4(stored: np.ndarray, scale: float, head_dim: int) -> np.ndarray:
+    nibbles = _unpack_nibbles(stored, head_dim)
+    magnitudes = _FP4_MAGNITUDES[(nibbles & np.uint8(0x7)).astype(np.intp)]
+    signed = np.where(nibbles & np.uint8(0x8), -magnitudes, magnitudes)
+    return signed.astype(np.float32) * np.float32(scale)
+
+
+def _quantize_array(array: np.ndarray, scheme: str) -> Tuple[np.ndarray, Optional[float]]:
+    """Compress one tensor. The scale is 1 when the block is empty or all zeros."""
+    if scheme == "fp16":
+        return np.ascontiguousarray(array, dtype=np.float16), None
+    if scheme == "bf16":
+        return _quantize_bf16(array), None
+    if scheme == "int8":
+        values = _finite_float32(array)
+        scale = _symmetric_scale(values, 127.0)
+        codes = np.clip(np.rint(values / np.float32(scale)), -127, 127).astype(np.int8)
+        return np.ascontiguousarray(codes), float(scale)
+    if scheme == "fp8":
+        values = _finite_float32(array)
+        scale = _symmetric_scale(values, 448.0)
+        return _quantize_fp8(values, scale), float(scale)
+    if scheme == "int4":
+        values = _finite_float32(array)
+        scale = _symmetric_scale(values, 7.0)
+        return _quantize_int4(values, scale), float(scale)
+    if scheme == "fp4":
+        values = _finite_float32(array)
+        scale = _symmetric_scale(values, 6.0)
+        return _quantize_fp4(values, scale), float(scale)
+    raise ValueError(f"Unknown kv_quantization '{scheme}'")
+
+
+def _dequantize_array(
+    stored: np.ndarray,
+    scheme: str,
+    scale: Optional[float],
+    head_dim: int,
+) -> np.ndarray:
+    """Expand one compressed tensor back to float32."""
+    if scheme == "fp16":
+        return np.asarray(stored, dtype=np.float32)
+    if scheme == "bf16":
+        return _dequantize_bf16(stored)
+    factor = 1.0 if scale is None else float(scale)
+    if scheme == "int8":
+        return np.asarray(stored, dtype=np.float32) * np.float32(factor)
+    if scheme == "fp8":
+        return _dequantize_fp8(stored, factor)
+    if scheme == "int4":
+        return _dequantize_int4(stored, factor, head_dim)
+    if scheme == "fp4":
+        return _dequantize_fp4(stored, factor, head_dim)
+    raise ValueError(f"Unknown kv_quantization '{scheme}'")
 
 
 # =============================================================================
