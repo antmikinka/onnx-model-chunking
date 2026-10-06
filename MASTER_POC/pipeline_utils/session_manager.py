@@ -902,6 +902,10 @@ class SessionInfo:
         device_type: Device the plan assigned (npu, igpu, gpu, cpu)
         resident: Whether the plan keeps this session loaded
         scheduled_provider: Provider the plan resolved for this step
+        input_shapes: Declared input shapes, including symbolic dimensions
+        output_shapes: Declared output shapes, including symbolic dimensions
+        input_dtypes: Dtype name for each input
+        output_dtypes: Dtype name for each output
     """
     name: str
     file_path: str
@@ -911,6 +915,10 @@ class SessionInfo:
     output_names: List[str] = field(default_factory=list)
     input_types: Dict[str, str] = field(default_factory=dict)
     output_types: Dict[str, str] = field(default_factory=dict)
+    input_shapes: Dict[str, Tuple[Any, ...]] = field(default_factory=dict)
+    output_shapes: Dict[str, Tuple[Any, ...]] = field(default_factory=dict)
+    input_dtypes: Dict[str, str] = field(default_factory=dict)
+    output_dtypes: Dict[str, str] = field(default_factory=dict)
     provider_used: Optional[str] = None
     phase: Optional[str] = None
     device_type: Optional[str] = None
@@ -929,6 +937,10 @@ class SessionInfo:
             "output_names": self.output_names,
             "input_types": self.input_types,
             "output_types": self.output_types,
+            "input_shapes": {key: list(value) for key, value in self.input_shapes.items()},
+            "output_shapes": {key: list(value) for key, value in self.output_shapes.items()},
+            "input_dtypes": self.input_dtypes,
+            "output_dtypes": self.output_dtypes,
             "provider_used": self.provider_used,
             "phase": self.phase,
             "device_type": self.device_type,
@@ -1110,6 +1122,159 @@ class ExecutionPlan:
         return [step for step in self.ordered_steps() if step.phase == selected]
 
 
+_BATCH_DIM_NAMES = frozenset({"batch", "batch_size", "n", "b"})
+_SEQ_DIM_NAMES = frozenset({
+    "seq",
+    "sequence",
+    "seq_len",
+    "sequence_length",
+    "total_sequence_length",
+    "s",
+})
+
+
+def _dtype_name(value: Any) -> str:
+    """Map an ONNX or model-config type string to a NumPy dtype name."""
+    if value is None or value == "":
+        return "float16"
+    text = str(value).lower().replace("tensor(", "").replace(")", "")
+    if "float16" in text or text in {"fp16", "f16"}:
+        return "float16"
+    if "bfloat16" in text or "bf16" in text:
+        return "bfloat16"
+    if "float64" in text or "double" in text:
+        return "float64"
+    if "float" in text or text in {"fp32", "f32"}:
+        return "float32"
+    if "int64" in text:
+        return "int64"
+    if "int32" in text or text == "int":
+        return "int32"
+    if "bool" in text:
+        return "bool"
+    return "float16"
+
+
+def _as_shape(value: Any) -> Tuple[Any, ...]:
+    """Normalize a model_info or ONNX shape to a tuple."""
+    if value is None:
+        return ()
+    if isinstance(value, (str, int)):
+        return (value,)
+    return tuple(value)
+
+
+def _copy_shape_map(raw: Any) -> Dict[str, Tuple[Any, ...]]:
+    if not isinstance(raw, dict):
+        return {}
+    return {str(name): _as_shape(shape) for name, shape in raw.items()}
+
+
+def _copy_dtype_map(raw: Any) -> Dict[str, str]:
+    if not isinstance(raw, dict):
+        return {}
+    return {str(name): _dtype_name(dtype) for name, dtype in raw.items()}
+
+
+def _dynamic_axes(shape: Tuple[Any, ...]) -> Tuple[int, ...]:
+    axes = []
+    for index, dim in enumerate(shape):
+        if isinstance(dim, int) and dim > 0:
+            continue
+        axes.append(index)
+    return tuple(axes)
+
+
+def _dim_is_batch(dim: Any) -> bool:
+    return isinstance(dim, str) and dim.strip().lower() in _BATCH_DIM_NAMES
+
+
+def _dim_is_sequence(dim: Any) -> bool:
+    if dim is None or (isinstance(dim, int) and dim <= 0):
+        return True
+    if not isinstance(dim, str):
+        return False
+    text = dim.strip().lower()
+    return text in _SEQ_DIM_NAMES or "seq" in text
+
+
+def resolve_static_shape(
+    shape: Tuple[Any, ...],
+    *,
+    static: bool,
+    batch_size: int,
+    max_seq_len: int,
+) -> Tuple[Optional[int], ...]:
+    """
+    Replace symbolic batch and sequence axes with concrete sizes.
+
+    Positive integers stay as declared. With ``static`` false, symbolic
+    axes stay unset so the caller can see that the tensor is not allocatable.
+    """
+    resolved: List[Optional[int]] = []
+    for dim in shape:
+        if isinstance(dim, int) and dim > 0:
+            resolved.append(dim)
+            continue
+        if not static:
+            resolved.append(None)
+            continue
+        if _dim_is_batch(dim):
+            resolved.append(int(batch_size))
+            continue
+        if _dim_is_sequence(dim):
+            resolved.append(int(max_seq_len))
+            continue
+        raise ValueError(
+            f"Cannot freeze symbolic dimension '{dim}'. "
+            "Use a positive size, or name it batch or seq."
+        )
+    return tuple(resolved)
+
+
+@dataclass
+class TensorIO:
+    """One session input or output."""
+
+    name: str
+    shape: Tuple[Any, ...]
+    dtype: str
+    dynamic_axes: Tuple[int, ...] = ()
+
+
+@dataclass
+class IOMetadata:
+    """Shapes and dtypes SessionManager can hand to an IO binding manager."""
+
+    component_name: str
+    inputs: List[TensorIO]
+    outputs: List[TensorIO]
+    phase: Optional[str] = None
+    device_type: Optional[str] = None
+    resident: bool = False
+
+
+@dataclass
+class PreparedIO:
+    """Buffers allocated for one component, plus a binding when a session is loaded."""
+
+    component_name: str
+    metadata: IOMetadata
+    buffers: Dict[str, Any]
+    binding: Any = None
+
+
+@dataclass
+class StaticBufferAllocation:
+    """Static KV pool, resident activations, and NPU-to-iGPU shared buffers."""
+
+    max_seq_len: int
+    batch_size: int
+    kv_pool: Any
+    resident_hidden: Dict[str, Any]
+    bridges: Dict[str, Any]
+
+
 # =============================================================================
 # SESSION MANAGER
 # =============================================================================
@@ -1174,6 +1339,8 @@ class SessionManager:
         self._policy_signature: Optional[Tuple[Any, ...]] = None
         self.execution_plan: Optional[ExecutionPlan] = None
         self._resolved_providers: Dict[str, str] = {}
+        self._static_batch: Optional[int] = None
+        self._static_seq: Optional[int] = None
         
         # Pre-populate session info (without loading)
         self._discover_sessions()
@@ -1228,8 +1395,12 @@ class SessionManager:
                 file_path=filepath,
                 file_size_bytes=file_size,
                 is_loaded=False,
-                input_names=comp_info.get("input_names", []),
-                output_names=comp_info.get("output_names", []),
+                input_names=list(comp_info.get("input_names", [])),
+                output_names=list(comp_info.get("output_names", [])),
+                input_shapes=_copy_shape_map(comp_info.get("input_shapes")),
+                output_shapes=_copy_shape_map(comp_info.get("output_shapes")),
+                input_dtypes=_copy_dtype_map(comp_info.get("input_dtypes")),
+                output_dtypes=_copy_dtype_map(comp_info.get("output_dtypes")),
             )
     
     def _load_single_session(
@@ -1278,6 +1449,10 @@ class SessionManager:
             info.output_names = [out.name for out in session.get_outputs()]
             info.input_types = {inp.name: inp.type for inp in session.get_inputs()}
             info.output_types = {out.name: out.type for out in session.get_outputs()}
+            info.input_shapes = {inp.name: _as_shape(inp.shape) for inp in session.get_inputs()}
+            info.output_shapes = {out.name: _as_shape(out.shape) for out in session.get_outputs()}
+            info.input_dtypes = {inp.name: _dtype_name(inp.type) for inp in session.get_inputs()}
+            info.output_dtypes = {out.name: _dtype_name(out.type) for out in session.get_outputs()}
             
             # Determine which provider is actually being used
             try:
@@ -1597,6 +1772,385 @@ class SessionManager:
                 "hybrid_npu_moe_routing requires a router step and an expert step."
             )
 
+    def get_io_metadata(self, name: str) -> IOMetadata:
+        """
+        Return the input and output tensors for one component.
+
+        A loaded session supplies the shapes. Otherwise they come from the
+        component record in ``model_info``.
+        """
+        info = self._session_info.get(name)
+        if info is None:
+            raise KeyError(f"Session '{name}' is not in this model")
+        component = self.model_info.get("components", {}).get(name, {})
+        default_dtype = _dtype_name(
+            component.get("dtype") or self.model_info.get("dtype") or "float16"
+        )
+        inputs = self._tensor_list(
+            info.input_names,
+            info.input_shapes or _copy_shape_map(component.get("input_shapes")),
+            info.input_dtypes or _copy_dtype_map(component.get("input_dtypes")),
+            default_dtype,
+        )
+        outputs = self._tensor_list(
+            info.output_names,
+            info.output_shapes or _copy_shape_map(component.get("output_shapes")),
+            info.output_dtypes or _copy_dtype_map(component.get("output_dtypes")),
+            default_dtype,
+        )
+        return IOMetadata(
+            component_name=name,
+            inputs=inputs,
+            outputs=outputs,
+            phase=info.phase,
+            device_type=info.device_type,
+            resident=info.resident,
+        )
+
+    def prepare_io_binding(
+        self,
+        component_name: str,
+        io_manager: Any,
+        static_shapes: bool = True,
+    ) -> PreparedIO:
+        """
+        Allocate this component's inputs and outputs on ``io_manager``.
+
+        ``static_shapes`` replaces symbolic batch and sequence axes with the
+        static batch and ``max_seq_len``. An NPU output that a later iGPU
+        step consumes is allocated once and reused. When the session is
+        loaded, those buffers are bound to it.
+        """
+        metadata = self.get_io_metadata(component_name)
+        batch_size = self._static_batch or 1
+        max_seq_len = self._sequence_limit(io_manager)
+        buffers: Dict[str, Any] = {}
+        for tensor in list(metadata.inputs) + list(metadata.outputs):
+            if tensor.name in buffers:
+                continue
+            if not tensor.shape:
+                raise ValueError(
+                    f"Component '{component_name}' has no shape for '{tensor.name}'"
+                )
+            shape = resolve_static_shape(
+                tensor.shape,
+                static=static_shapes,
+                batch_size=batch_size,
+                max_seq_len=max_seq_len,
+            )
+            if any(dim is None for dim in shape):
+                raise ValueError(
+                    f"Tensor '{tensor.name}' still has a dynamic dimension. "
+                    "Pass static_shapes=True to freeze it for the NPU."
+                )
+            concrete = tuple(int(dim) for dim in shape if dim is not None)
+            buffers[tensor.name] = self._place_tensor(
+                io_manager,
+                component_name,
+                tensor.name,
+                concrete,
+                tensor.dtype,
+            )
+        binding = None
+        session = self._sessions.get(component_name)
+        if session is not None:
+            binding = session.io_binding()
+            self._bind_prepared_buffers(
+                io_manager, binding, component_name, metadata, buffers
+            )
+        return PreparedIO(
+            component_name=component_name,
+            metadata=metadata,
+            buffers=buffers,
+            binding=binding,
+        )
+
+    def allocate_static_buffers(
+        self,
+        io_manager: Any,
+        max_seq_len: int,
+        batch_size: int = 1,
+    ) -> StaticBufferAllocation:
+        """
+        Preallocate the NPU KV cache and the resident activations.
+
+        KV tensors stay at ``max_seq_len``. Hidden states named by resident
+        plan steps stay allocated. An NPU output consumed by an iGPU step
+        is one shared buffer, so the decode input is the prefill output.
+        """
+        if max_seq_len <= 0 or batch_size <= 0:
+            raise ValueError(
+                f"max_seq_len and batch_size must be positive, "
+                f"got {max_seq_len} and {batch_size}"
+            )
+        self._static_seq = int(max_seq_len)
+        self._static_batch = int(batch_size)
+        architecture = self._architecture()
+        kv_target = self._static_kv_target(io_manager)
+        kv_pool = kv_target.allocate_static_kv_cache(
+            name="kv",
+            num_layers=architecture["num_layers"],
+            num_kv_heads=architecture["num_kv_heads"],
+            head_dim=architecture["head_dim"],
+            dtype=architecture["dtype"],
+            batch_size=batch_size,
+            max_seq_len=max_seq_len,
+        )
+        bridges: Dict[str, Any] = {}
+        resident_hidden: Dict[str, Any] = {}
+        for _producer, _consumer, buffer_name in self._npu_igpu_bridges():
+            shape, dtype = self._activation_shape(
+                buffer_name, batch_size, max_seq_len, architecture["hidden_size"]
+            )
+            bridges[buffer_name] = self._shared_or_device_buffer(
+                io_manager, buffer_name, shape, dtype, shared=True
+            )
+        if self.execution_plan is not None:
+            for step in self.execution_plan.steps:
+                if not step.resident:
+                    continue
+                for buffer_name in step.output_buffers:
+                    if buffer_name in bridges or buffer_name in resident_hidden:
+                        continue
+                    if buffer_name == "kv" or buffer_name.startswith("kv."):
+                        continue
+                    shape, dtype = self._activation_shape(
+                        buffer_name,
+                        batch_size,
+                        max_seq_len,
+                        architecture["hidden_size"],
+                    )
+                    resident_hidden[buffer_name] = self._shared_or_device_buffer(
+                        io_manager,
+                        buffer_name,
+                        shape,
+                        dtype,
+                        shared=False,
+                        device_type=step.device_type,
+                    )
+        return StaticBufferAllocation(
+            max_seq_len=int(max_seq_len),
+            batch_size=int(batch_size),
+            kv_pool=kv_pool,
+            resident_hidden=resident_hidden,
+            bridges=bridges,
+        )
+
+    def _tensor_list(
+        self,
+        names: Sequence[str],
+        shapes: Dict[str, Tuple[Any, ...]],
+        dtypes: Dict[str, str],
+        default_dtype: str,
+    ) -> List[TensorIO]:
+        selected = list(names) or list(shapes)
+        tensors = []
+        for tensor_name in selected:
+            shape = shapes.get(tensor_name, ())
+            tensors.append(TensorIO(
+                name=tensor_name,
+                shape=shape,
+                dtype=dtypes.get(tensor_name, default_dtype),
+                dynamic_axes=_dynamic_axes(shape),
+            ))
+        return tensors
+
+    def _sequence_limit(self, io_manager: Any) -> int:
+        if self._static_seq:
+            return int(self._static_seq)
+        prefill = getattr(io_manager, "prefill", None)
+        limit = getattr(io_manager, "max_seq_len", None)
+        if not limit and prefill is not None:
+            limit = getattr(prefill, "max_seq_len", None)
+        return int(limit or 4096)
+
+    def _architecture(self) -> Dict[str, Any]:
+        info = self.model_info
+        num_layers = info.get("num_hidden_layers", info.get("num_layers"))
+        if not num_layers:
+            num_layers = sum(
+                1 for name in self._session_info if _LAYER_COMPONENT.search(str(name))
+            ) or 1
+        heads = info.get("num_key_value_heads", info.get("num_kv_heads"))
+        hidden = info.get("hidden_size")
+        head_dim = info.get("head_dim")
+        attention_heads = info.get("num_attention_heads")
+        if not head_dim and hidden and attention_heads:
+            if int(hidden) % int(attention_heads) != 0:
+                raise ValueError(
+                    f"hidden_size ({hidden}) is not divisible by "
+                    f"num_attention_heads ({attention_heads})"
+                )
+            head_dim = int(hidden) // int(attention_heads)
+        if not heads or not head_dim:
+            raise ValueError(
+                "model_info needs num_key_value_heads and head_dim, or "
+                "hidden_size and num_attention_heads, before static KV allocation."
+            )
+        return {
+            "num_layers": int(num_layers),
+            "num_kv_heads": int(heads),
+            "head_dim": int(head_dim),
+            "hidden_size": int(hidden) if hidden else None,
+            "dtype": _dtype_name(info.get("dtype") or info.get("torch_dtype") or "float16"),
+        }
+
+    def _npu_igpu_bridges(self) -> List[Tuple[ExecutionStep, ExecutionStep, str]]:
+        """Output buffers that leave an NPU step and enter an iGPU step."""
+        if self.execution_plan is None:
+            return []
+        by_name = {step.component_name: step for step in self.execution_plan.steps}
+        bridges = []
+        for step in self.execution_plan.steps:
+            if step.device_type not in {"igpu", "gpu"}:
+                continue
+            for dependency in step.depends_on:
+                producer = by_name.get(dependency)
+                if producer is None or not _step_targets_npu(producer):
+                    continue
+                for buffer_name in producer.output_buffers:
+                    bridges.append((producer, step, buffer_name))
+        return bridges
+
+    def _activation_shape(
+        self,
+        buffer_name: str,
+        batch_size: int,
+        max_seq_len: int,
+        hidden_size: Optional[int],
+    ) -> Tuple[Tuple[int, ...], str]:
+        """Use a declared tensor shape, otherwise a resident hidden state."""
+        if self.execution_plan is not None:
+            for step in self.execution_plan.steps:
+                if buffer_name not in step.output_buffers and buffer_name not in (
+                    tensor.name for tensor in self.get_io_metadata(step.component_name).outputs
+                ):
+                    continue
+                metadata = self.get_io_metadata(step.component_name)
+                for tensor in list(metadata.outputs) + list(metadata.inputs):
+                    if tensor.name != buffer_name or not tensor.shape:
+                        continue
+                    shape = resolve_static_shape(
+                        tensor.shape,
+                        static=True,
+                        batch_size=batch_size,
+                        max_seq_len=max_seq_len,
+                    )
+                    return tuple(int(dim) for dim in shape if dim is not None), tensor.dtype
+        if hidden_size:
+            return (batch_size, max_seq_len, int(hidden_size)), _dtype_name(
+                self.model_info.get("dtype") or "float16"
+            )
+        raise ValueError(
+            f"No shape is declared for resident buffer '{buffer_name}'"
+        )
+
+    def _static_kv_target(self, io_manager: Any) -> Any:
+        if hasattr(io_manager, "allocate_static_kv_cache"):
+            return io_manager
+        prefill = getattr(io_manager, "prefill", None)
+        if prefill is not None and hasattr(prefill, "allocate_static_kv_cache"):
+            return prefill
+        raise TypeError(
+            "allocate_static_buffers needs an IOBindingManager or a "
+            "HeterogeneousIOBindingManager"
+        )
+
+    def _allocator_for(self, io_manager: Any, device_type: Optional[str]) -> Any:
+        if device_type == "npu" and getattr(io_manager, "prefill", None) is not None:
+            return io_manager.prefill
+        if device_type in {"igpu", "gpu"} and getattr(io_manager, "decode", None) is not None:
+            return io_manager.decode
+        if hasattr(io_manager, "get_or_allocate"):
+            return io_manager
+        raise TypeError(
+            "prepare_io_binding needs an IOBindingManager or a "
+            "HeterogeneousIOBindingManager"
+        )
+
+    def _lookup_shared(self, io_manager: Any, name: str) -> Any:
+        getter = getattr(io_manager, "get_shared_buffer", None)
+        if getter is None:
+            return None
+        try:
+            return getter(name)
+        except KeyError:
+            return None
+
+    def _shared_or_device_buffer(
+        self,
+        io_manager: Any,
+        name: str,
+        shape: Tuple[int, ...],
+        dtype: str,
+        *,
+        shared: bool,
+        device_type: Optional[str] = None,
+    ) -> Any:
+        if shared and hasattr(io_manager, "allocate_shared_buffer"):
+            existing = self._lookup_shared(io_manager, name)
+            if existing is not None:
+                return existing
+            return io_manager.allocate_shared_buffer(name, shape, dtype)
+        allocator = self._allocator_for(io_manager, device_type)
+        existing = allocator.get_buffer(name) if hasattr(allocator, "get_buffer") else None
+        if existing is not None:
+            return existing
+        return allocator.get_or_allocate(name, shape, dtype)
+
+    def _shared_buffer_names(self) -> set:
+        return {buffer_name for _producer, _consumer, buffer_name in self._npu_igpu_bridges()}
+
+    def _place_tensor(
+        self,
+        io_manager: Any,
+        component_name: str,
+        tensor_name: str,
+        shape: Tuple[int, ...],
+        dtype: str,
+    ) -> Any:
+        info = self._session_info.get(component_name)
+        device_type = info.device_type if info is not None else None
+        if tensor_name in self._shared_buffer_names() and hasattr(io_manager, "allocate_shared_buffer"):
+            return self._shared_or_device_buffer(
+                io_manager, tensor_name, shape, dtype, shared=True
+            )
+        return self._shared_or_device_buffer(
+            io_manager,
+            tensor_name,
+            shape,
+            dtype,
+            shared=False,
+            device_type=device_type,
+        )
+
+    def _bind_prepared_buffers(
+        self,
+        io_manager: Any,
+        binding: Any,
+        component_name: str,
+        metadata: IOMetadata,
+        buffers: Dict[str, Any],
+    ) -> None:
+        shared_names = self._shared_buffer_names()
+        input_names = {tensor.name for tensor in metadata.inputs}
+        output_names = {tensor.name for tensor in metadata.outputs}
+        for tensor_name, buffer in buffers.items():
+            if tensor_name in shared_names and hasattr(io_manager, "bind_prefill_output"):
+                if metadata.phase == "prefill" and tensor_name in output_names:
+                    io_manager.bind_prefill_output(binding, tensor_name, tensor_name)
+                    continue
+                if metadata.phase == "decode" and tensor_name in input_names:
+                    io_manager.bind_decode_input(binding, tensor_name, tensor_name)
+                    continue
+            ort_value = getattr(buffer, "ort_value", None)
+            if ort_value is None:
+                continue
+            if tensor_name in input_names:
+                binding.bind_ortvalue_input(tensor_name, ort_value)
+            elif tensor_name in output_names:
+                binding.bind_ortvalue_output(tensor_name, ort_value)
+
     def _prepare_profile_cache(self) -> None:
         """Create the compile-cache directory when this profile uses one."""
         profile = self.provider_profile
@@ -1698,6 +2252,10 @@ __all__ = [
     "ExecutionStep",
     "ExecutionPlan",
     "ProviderProfile",
+    "TensorIO",
+    "IOMetadata",
+    "PreparedIO",
+    "StaticBufferAllocation",
     # Functions
     "get_available_providers",
     "get_provider_for_device",
@@ -1715,4 +2273,5 @@ __all__ = [
     "NPU_SEQUENTIAL_SPLIT_ERROR",
     "NPU_PROVIDER_MARKERS",
     "EXECUTION_PHASES",
+    "resolve_static_shape",
 ]

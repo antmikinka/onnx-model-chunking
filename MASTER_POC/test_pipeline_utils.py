@@ -657,6 +657,115 @@ def test_session_manager():
         pass
     print("  execution plan: dependency order, phase split, MoE residency, monolithic NPU guard")
 
+    from pipeline_utils.io_binding import HeterogeneousIOBindingManager, IOBindingManager
+
+    sync_info = {
+        "num_hidden_layers": 2,
+        "num_key_value_heads": 4,
+        "head_dim": 8,
+        "hidden_size": 16,
+        "dtype": "float16",
+        "components": {
+            "prefill": {
+                "file": "prefill.onnx",
+                "input_names": ["hidden", "attention_mask"],
+                "output_names": ["hidden"],
+                "input_shapes": {
+                    "hidden": [1, "seq", 16],
+                    "attention_mask": ["batch", "seq"],
+                },
+                "output_shapes": {"hidden": [1, "seq", 16]},
+                "input_dtypes": {"hidden": "float16", "attention_mask": "int64"},
+                "output_dtypes": {"hidden": "float16"},
+            },
+            "decode": {
+                "file": "decode.onnx",
+                "input_names": ["hidden"],
+                "output_names": ["logits"],
+                "input_shapes": {"hidden": [1, "seq", 16]},
+                "output_shapes": {"logits": [1, "seq", 32]},
+            },
+        },
+    }
+    sync_manager = SessionManager(
+        ".",
+        SessionConfig(
+            providers=[
+                "VitisAIExecutionProvider",
+                "DmlExecutionProvider",
+                "CPUExecutionProvider",
+            ],
+            execution_policy=ExecutionPolicy.HYBRID_NPU_IGPU_PHASE_SPLIT,
+        ),
+        model_info=sync_info,
+        available_providers=[
+            "VitisAIExecutionProvider",
+            "DmlExecutionProvider",
+            "CPUExecutionProvider",
+        ],
+    )
+    sync_manager.load_from_plan(ExecutionPlan(steps=[
+        ExecutionStep(
+            "prefill", "VitisAIExecutionProvider", "npu", "prefill",
+            output_buffers=["hidden"], resident=True,
+        ),
+        ExecutionStep(
+            "decode", "DmlExecutionProvider", "igpu", "decode",
+            depends_on=["prefill"], output_buffers=["logits"], resident=True,
+        ),
+    ]))
+    prefill_meta = sync_manager.get_io_metadata("prefill")
+    assert prefill_meta.device_type == "npu"
+    assert prefill_meta.inputs[0].name == "hidden"
+    assert prefill_meta.inputs[0].dynamic_axes == (1,)
+    assert prefill_meta.inputs[1].dynamic_axes == (0, 1)
+    assert prefill_meta.inputs[1].dtype == "int64"
+    bridge = HeterogeneousIOBindingManager(max_seq_len=32)
+    allocation = sync_manager.allocate_static_buffers(bridge, max_seq_len=32, batch_size=1)
+    assert allocation.kv_pool.max_seq_len == 32
+    assert allocation.kv_pool.num_layers == 2
+    assert allocation.kv_pool.kv_shape == (1, 4, 32, 8)
+    assert "hidden" in allocation.bridges
+    assert "logits" in allocation.resident_hidden
+    assert tuple(allocation.resident_hidden["logits"].shape) == (1, 32, 32)
+    shared_ptr = allocation.bridges["hidden"].data_ptr
+    assert shared_ptr != 0
+    prefill_io = sync_manager.prepare_io_binding("prefill", bridge, static_shapes=True)
+    decode_io = sync_manager.prepare_io_binding("decode", bridge, static_shapes=True)
+    assert tuple(prefill_io.buffers["hidden"].shape) == (1, 32, 16)
+    assert tuple(prefill_io.buffers["attention_mask"].shape) == (1, 32)
+    assert prefill_io.buffers["hidden"].data_ptr == shared_ptr
+    assert decode_io.buffers["hidden"].data_ptr == shared_ptr
+    again = sync_manager.prepare_io_binding("decode", bridge, static_shapes=True)
+    assert again.buffers["hidden"].data_ptr == shared_ptr
+    try:
+        sync_manager.prepare_io_binding("prefill", bridge, static_shapes=False)
+        raise AssertionError("dynamic sequence was allocated")
+    except ValueError as exc:
+        assert "dynamic" in str(exc).lower()
+    try:
+        sync_manager.get_io_metadata("missing")
+        raise AssertionError("missing component returned metadata")
+    except KeyError:
+        pass
+    bare = SessionManager(
+        ".",
+        SessionConfig(providers=["CPUExecutionProvider"]),
+        model_info={"components": {"bare": {"file": "bare.onnx", "input_names": ["x"]}}},
+        available_providers=["CPUExecutionProvider"],
+    )
+    try:
+        bare.prepare_io_binding("bare", IOBindingManager("cpu"))
+        raise AssertionError("missing shape was allocated")
+    except ValueError as exc:
+        assert "no shape" in str(exc)
+    try:
+        bare.allocate_static_buffers(IOBindingManager("cpu"), max_seq_len=8)
+        raise AssertionError("KV allocation ran without architecture")
+    except ValueError as exc:
+        assert "num_key_value_heads" in str(exc)
+    print("  io sync: static KV, resident hidden, shared NPU to iGPU pointer")
+
     print("session_manager module: OK\n")
     return True
 
