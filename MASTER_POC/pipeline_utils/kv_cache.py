@@ -36,6 +36,7 @@ a draft cache beside a verify cache for speculative decoding.
 
 from enum import Enum
 import re
+import threading
 from typing import Dict, Iterable, Tuple, Optional, Any, List, Sequence
 import numpy as np
 import onnxruntime as ort
@@ -365,6 +366,12 @@ class KVCacheManager:
     ``CacheEntry``. Recurrent, sparse, router, and speculative state live on
     ``RecurrentStateCache``, ``SparseKVCache``, and ``HybridKVCacheManager``.
 
+    ``_lock`` is a ``threading.RLock``. ``reset``, ``update_from_present``,
+    ``inject_into_registry``, and ``extract_from_registry`` hold it so
+    prefill, decode, and registry copies do not interleave. The lock is
+    reentrant because extract updates each layer through
+    ``update_from_present``.
+
     In autoregressive generation with KV caching:
     - First iteration (prefill): Process full prompt, populate cache
     - Subsequent iterations (decode): Process only new token, use cached keys/values
@@ -498,6 +505,10 @@ class KVCacheManager:
         self._binder: Optional[IOBindingManager] = None
         self._bridge: Optional[HeterogeneousIOBindingManager] = None
         self._shared: List[SharedBuffer] = []
+        # Reentrant so extract_from_registry can call update_from_present.
+        # Acquire this before an IOBindingManager lock. The binder methods
+        # used here take the IO lock and do not call back into the cache.
+        self._lock = threading.RLock()
         self.reset()
 
     @property
@@ -529,56 +540,57 @@ class KVCacheManager:
         preallocated buffers and marks zero tokens valid, so the next
         prefill binds the same address.
         """
-        self._seq_len = 0
-        self._layer_len = [0] * self.num_layers
-        self._mask_layer = 0
-        self._reset_policy_state()
-        self._reset_quant_state()
-        if self.device_resident:
-            if not self._cache:
+        with self._lock:
+            self._seq_len = 0
+            self._layer_len = [0] * self.num_layers
+            self._mask_layer = 0
+            self._reset_policy_state()
+            self._reset_quant_state()
+            if self.device_resident:
+                if not self._cache:
+                    if self._binder is not None:
+                        self._install_manager_cache(self._binder, int(self.max_seq_len))
+                    else:
+                        self._allocate_device_cache()
                 if self._binder is not None:
-                    self._install_manager_cache(self._binder, int(self.max_seq_len))
-                else:
-                    self._allocate_device_cache()
-            if self._binder is not None:
-                self._binder.set_valid_sequence_length(0, "kv")
-            return
-        if not self._static:
-            self._cache.clear()
-            for i in range(self.num_layers):
-                self._cache[i] = {
-                    "key": np.zeros(
-                        (self.batch_size, self.num_kv_heads, 0, self.head_dim),
-                        dtype=self.dtype,
-                    ),
-                    "value": np.zeros(
-                        (self.batch_size, self.num_kv_heads, 0, self.head_dim),
-                        dtype=self.dtype,
-                    ),
-                }
-            return
-        if self.backend is KVCacheBackend.CPU:
-            shape = (
-                self.batch_size,
-                self.num_kv_heads,
-                int(self.max_seq_len),
-                self.head_dim,
-            )
-            if not self._cache:
+                    self._binder.set_valid_sequence_length(0, "kv")
+                return
+            if not self._static:
+                self._cache.clear()
                 for i in range(self.num_layers):
                     self._cache[i] = {
-                        "key": np.zeros(shape, dtype=self.dtype),
-                        "value": np.zeros(shape, dtype=self.dtype),
+                        "key": np.zeros(
+                            (self.batch_size, self.num_kv_heads, 0, self.head_dim),
+                            dtype=self.dtype,
+                        ),
+                        "value": np.zeros(
+                            (self.batch_size, self.num_kv_heads, 0, self.head_dim),
+                            dtype=self.dtype,
+                        ),
                     }
-            else:
-                for i in range(self.num_layers):
-                    self._cache[i]["key"].fill(0)
-                    self._cache[i]["value"].fill(0)
-            return
-        if not self._cache:
-            self._allocate_device_cache()
-        if self._binder is not None:
-            self._binder.set_valid_sequence_length(0, "kv")
+                return
+            if self.backend is KVCacheBackend.CPU:
+                shape = (
+                    self.batch_size,
+                    self.num_kv_heads,
+                    int(self.max_seq_len),
+                    self.head_dim,
+                )
+                if not self._cache:
+                    for i in range(self.num_layers):
+                        self._cache[i] = {
+                            "key": np.zeros(shape, dtype=self.dtype),
+                            "value": np.zeros(shape, dtype=self.dtype),
+                        }
+                else:
+                    for i in range(self.num_layers):
+                        self._cache[i]["key"].fill(0)
+                        self._cache[i]["value"].fill(0)
+                return
+            if not self._cache:
+                self._allocate_device_cache()
+            if self._binder is not None:
+                self._binder.set_valid_sequence_length(0, "kv")
 
     def _commit_length(self, layer_idx: int, new_len: int) -> None:
         """Publish one layer's valid prefix without reallocating."""
@@ -1227,80 +1239,81 @@ class KVCacheManager:
                 buffer itself. The resident buffer's sequence axis is the
                 capacity, not the logical length.
         """
-        if layer_idx not in self._cache:
-            raise KeyError(f"Layer {layer_idx} not in cache (have {self.num_layers} layers)")
+        with self._lock:
+            if layer_idx not in self._cache:
+                raise KeyError(f"Layer {layer_idx} not in cache (have {self.num_layers} layers)")
 
-        key_shape = _tensor_shape(present_key)
-        value_shape = _tensor_shape(present_value)
-        if validate_shape:
-            if key_shape != value_shape:
-                raise ValueError(
-                    f"Layer {layer_idx}: present_key shape {key_shape} != "
-                    f"present_value shape {value_shape}"
+            key_shape = _tensor_shape(present_key)
+            value_shape = _tensor_shape(present_value)
+            if validate_shape:
+                if key_shape != value_shape:
+                    raise ValueError(
+                        f"Layer {layer_idx}: present_key shape {key_shape} != "
+                        f"present_value shape {value_shape}"
+                    )
+                if len(key_shape) != 4:
+                    raise ValueError(
+                        f"Layer {layer_idx}: Expected 4D tensor [batch, heads, seq, head_dim], "
+                        f"got shape {key_shape}"
+                    )
+                if key_shape[1] != self.num_kv_heads:
+                    raise ValueError(
+                        f"Layer {layer_idx}: Expected {self.num_kv_heads} KV heads, "
+                        f"got {key_shape[1]}"
+                    )
+                if key_shape[3] != self.head_dim:
+                    raise ValueError(
+                        f"Layer {layer_idx}: Expected head_dim {self.head_dim}, "
+                        f"got {key_shape[3]}"
+                    )
+
+            self._invalidate_quant(layer_idx)
+
+            if not self._static:
+                self._seen[layer_idx] = int(key_shape[_SEQ_AXIS])
+                self._seen_published = self._seen[layer_idx]
+                self._cache[layer_idx]["key"] = present_key
+                self._cache[layer_idx]["value"] = present_value
+                return
+
+            stored_key = self._cache[layer_idx]["key"]
+            stored_value = self._cache[layer_idx]["value"]
+            key_is_resident = _same_storage(stored_key, present_key)
+            value_is_resident = _same_storage(stored_value, present_value)
+            if key_is_resident and value_is_resident:
+                if valid_seq_len is not None:
+                    self._commit_length(layer_idx, int(valid_seq_len))
+                return
+
+            if self.policy_for(layer_idx) is not KVCachePolicy.DENSE_CONTIGUOUS:
+                self._update_bounded(
+                    layer_idx, stored_key, stored_value, present_key, present_value
                 )
-            if len(key_shape) != 4:
+                return
+
+            position = self._layer_len[layer_idx]
+            key_np = None if key_is_resident else _as_numpy(present_key)
+            value_np = None if value_is_resident else _as_numpy(present_value)
+            reference = key_np if key_np is not None else value_np
+            _, _, new_len = _placement(reference, position)
+            if new_len < 0 or (
+                self.max_seq_len is not None and new_len > int(self.max_seq_len)
+            ):
                 raise ValueError(
-                    f"Layer {layer_idx}: Expected 4D tensor [batch, heads, seq, head_dim], "
-                    f"got shape {key_shape}"
+                    f"Layer {layer_idx}: sequence length {new_len} exceeds "
+                    f"max_seq_len {self.max_seq_len}"
                 )
-            if key_shape[1] != self.num_kv_heads:
-                raise ValueError(
-                    f"Layer {layer_idx}: Expected {self.num_kv_heads} KV heads, "
-                    f"got {key_shape[1]}"
-                )
-            if key_shape[3] != self.head_dim:
-                raise ValueError(
-                    f"Layer {layer_idx}: Expected head_dim {self.head_dim}, "
-                    f"got {key_shape[3]}"
-                )
-
-        self._invalidate_quant(layer_idx)
-
-        if not self._static:
-            self._seen[layer_idx] = int(key_shape[_SEQ_AXIS])
-            self._seen_published = self._seen[layer_idx]
-            self._cache[layer_idx]["key"] = present_key
-            self._cache[layer_idx]["value"] = present_value
-            return
-
-        stored_key = self._cache[layer_idx]["key"]
-        stored_value = self._cache[layer_idx]["value"]
-        key_is_resident = _same_storage(stored_key, present_key)
-        value_is_resident = _same_storage(stored_value, present_value)
-        if key_is_resident and value_is_resident:
-            if valid_seq_len is not None:
-                self._commit_length(layer_idx, int(valid_seq_len))
-            return
-
-        if self.policy_for(layer_idx) is not KVCachePolicy.DENSE_CONTIGUOUS:
-            self._update_bounded(
-                layer_idx, stored_key, stored_value, present_key, present_value
-            )
-            return
-
-        position = self._layer_len[layer_idx]
-        key_np = None if key_is_resident else _as_numpy(present_key)
-        value_np = None if value_is_resident else _as_numpy(present_value)
-        reference = key_np if key_np is not None else value_np
-        _, _, new_len = _placement(reference, position)
-        if new_len < 0 or (
-            self.max_seq_len is not None and new_len > int(self.max_seq_len)
-        ):
-            raise ValueError(
-                f"Layer {layer_idx}: sequence length {new_len} exceeds "
-                f"max_seq_len {self.max_seq_len}"
-            )
-        if key_np is not None:
-            window, start, _ = _placement(key_np, position)
-            if window is not None:
-                _write_window(stored_key, window, start)
-        if value_np is not None:
-            window, start, _ = _placement(value_np, position)
-            if window is not None:
-                _write_window(stored_value, window, start)
-        self._commit_length(layer_idx, new_len)
-        self._seen[layer_idx] = int(new_len)
-        self._seen_published = int(new_len)
+            if key_np is not None:
+                window, start, _ = _placement(key_np, position)
+                if window is not None:
+                    _write_window(stored_key, window, start)
+            if value_np is not None:
+                window, start, _ = _placement(value_np, position)
+                if window is not None:
+                    _write_window(stored_value, window, start)
+            self._commit_length(layer_idx, new_len)
+            self._seen[layer_idx] = int(new_len)
+            self._seen_published = int(new_len)
 
     def _append_position(self, layer_idx: int) -> int:
         if self.policy_for(layer_idx) is KVCachePolicy.PAGED_BLOCKS:
@@ -1538,11 +1551,12 @@ class KVCacheManager:
             key_format: Format string for key tensor names (use {layer} placeholder)
             value_format: Format string for value tensor names (use {layer} placeholder)
         """
-        for i in range(self.num_layers):
-            key_name = key_format.format(layer=i)
-            value_name = value_format.format(layer=i)
-            registry[key_name] = self._cache[i]["key"]
-            registry[value_name] = self._cache[i]["value"]
+        with self._lock:
+            for i in range(self.num_layers):
+                key_name = key_format.format(layer=i)
+                value_name = value_format.format(layer=i)
+                registry[key_name] = self._cache[i]["key"]
+                registry[value_name] = self._cache[i]["value"]
 
     def extract_from_registry(
         self,
@@ -1564,16 +1578,17 @@ class KVCacheManager:
         Returns:
             Number of layers successfully updated
         """
-        updated = 0
-        for i in range(self.num_layers):
-            key_name = present_key_format.format(layer=i)
-            value_name = present_value_format.format(layer=i)
+        with self._lock:
+            updated = 0
+            for i in range(self.num_layers):
+                key_name = present_key_format.format(layer=i)
+                value_name = present_value_format.format(layer=i)
 
-            if key_name in registry and value_name in registry:
-                self.update_from_present(i, registry[key_name], registry[value_name])
-                updated += 1
+                if key_name in registry and value_name in registry:
+                    self.update_from_present(i, registry[key_name], registry[value_name])
+                    updated += 1
 
-        return updated
+            return updated
 
     def quantize_kv(self, layer_idx: Optional[int] = None) -> None:
         """

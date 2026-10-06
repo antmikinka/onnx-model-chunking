@@ -943,6 +943,71 @@ def test_kv_cache():
         assert "expert" in str(exc)
     print("  hybrid caches: dense, recurrent, sparse, router, draft, verify")
 
+    import threading
+
+    locked = KVCacheManager(num_layers=4, num_kv_heads=2, head_dim=4, dtype=np.float32)
+    assert type(locked._lock) is type(threading.RLock())
+    present_registry = {}
+    for layer in range(4):
+        token = np.full((1, 2, 2, 4), layer + 1, dtype=np.float32)
+        present_registry[f"present.{layer}.key"] = token
+        present_registry[f"present.{layer}.value"] = token + 1
+    with locked._lock:
+        extracted = locked.extract_from_registry(present_registry)
+    assert extracted == 4
+    assert locked.get_sequence_length() == 2
+    copied = {}
+    locked.inject_into_registry(copied)
+    assert copied["past_key_values.3.key"].shape[2] == 2
+    assert np.allclose(copied["past_key_values.3.value"], present_registry["present.3.value"])
+
+    errors = []
+
+    def _writer(mark):
+        try:
+            local = {}
+            token = np.full((1, 2, 1, 4), mark, dtype=np.float32)
+            for layer in range(4):
+                local[f"present.{layer}.key"] = token
+                local[f"present.{layer}.value"] = token
+            for _ in range(20):
+                locked.extract_from_registry(local)
+                snapshot = {}
+                locked.inject_into_registry(snapshot)
+                lengths = [
+                    int(snapshot[f"past_key_values.{layer}.key"].shape[2])
+                    for layer in range(4)
+                ]
+                if len(set(lengths)) != 1 or lengths[0] not in (0, 1):
+                    raise AssertionError(f"torn cache lengths {lengths}")
+                if lengths[0] == 1:
+                    values = [
+                        float(snapshot[f"past_key_values.{layer}.key"].reshape(-1)[0])
+                        for layer in range(4)
+                    ]
+                    if len(set(values)) != 1:
+                        raise AssertionError(f"torn cache values {values}")
+        except Exception as exc:
+            errors.append(exc)
+
+    def _resetter():
+        try:
+            for _ in range(20):
+                locked.reset()
+        except Exception as exc:
+            errors.append(exc)
+
+    workers = [threading.Thread(target=_writer, args=(i + 1,)) for i in range(4)]
+    workers.append(threading.Thread(target=_resetter))
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join()
+    assert errors == []
+    locked.reset()
+    assert locked.get_sequence_length() == 0
+    print("  lock: reentrant RLock around reset, update, inject, and extract")
+
     print("kv_cache module: OK\n")
     return True
 
