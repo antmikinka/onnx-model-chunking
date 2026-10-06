@@ -214,10 +214,16 @@ def test_io_binding():
         IOBindingManager,
         DeviceBuffer,
         MemoryMode,
+        MemoryPlacement,
         get_supported_devices,
         get_onnx_element_type,
         NUMPY_TO_ONNX_ELEMENT_TYPE,
+        VALID_ORTVALUE_DEVICES,
+        ort_memory_candidates,
+        create_ortvalue_from_numpy,
     )
+    import pipeline_utils.io_binding as io_binding_module
+    import warnings
     
     # Test MemoryMode enum
     print(f"  MemoryMode.MINIMAL: {MemoryMode.MINIMAL.value}")
@@ -267,7 +273,73 @@ def test_io_binding():
     # Test deallocate
     manager.deallocate_all()
     print(f"  After deallocate: {len(manager)} buffers")
-    
+
+    # AMD OrtValue devices stay in the validation set (no eager CPU rewrite).
+    for required in ("rocm", "hip", "vitisai", "ryzenai"):
+        assert required in VALID_ORTVALUE_DEVICES, required
+    npu_chain = [candidate.device_type for candidate in ort_memory_candidates("vitisai")]
+    print(f"  vitisai memory chain: {npu_chain}")
+    assert npu_chain[0] == "vitisai"
+    assert "npu" in npu_chain
+    assert npu_chain.index("vitisai") < npu_chain.index("hip_pinned")
+    assert npu_chain.index("hip_pinned") < npu_chain.index("rocm_pinned")
+    assert npu_chain.index("rocm_pinned") < npu_chain.index("cuda_pinned")
+    assert npu_chain.index("cuda_pinned") < npu_chain.index("cpu")
+    gpu_chain = [candidate.device_type for candidate in ort_memory_candidates("rocm")]
+    assert gpu_chain[0] == "rocm"
+    assert gpu_chain[1] == "gpu"
+
+    vitis = IOBindingManager(device_type="vitisai", device_id=0)
+    assert vitis.ortvalue_device == "vitisai"
+    assert vitis.memory_placement == MemoryPlacement.DEVICE
+    assert vitis.memory_resolved is False
+
+    # Direct device strings fail on this wheel; pinned strings fail next;
+    # the manager must still allocate rather than crash.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        npu_data = np.arange(6, dtype=np.float32).reshape(1, 2, 3)
+        npu_buffer = vitis.allocate_buffer("npu_hidden", npu_data.shape, np.float32, npu_data)
+        empty = vitis.allocate_buffer("empty_hidden", (2, 3), np.float32)
+    assert npu_buffer.is_allocated
+    assert np.array_equal(npu_buffer.to_numpy(), npu_data)
+    assert empty.ort_value is not None and empty.ort_value.numpy().shape == (2, 3)
+    assert empty.memory_placement == vitis.memory_placement
+    assert vitis.memory_resolved is True
+    assert vitis.memory_placement in (MemoryPlacement.PINNED_HOST, MemoryPlacement.CPU)
+    assert any(item.category is RuntimeWarning for item in caught)
+    print(f"  vitisai resolved to {vitis.ortvalue_device} ({vitis.memory_placement.value})")
+
+    # When direct AMD allocation is rejected and cuda_pinned is accepted,
+    # pinned host memory wins over pageable CPU.
+    calls = []
+    real_from_numpy = io_binding_module.ort.OrtValue.ortvalue_from_numpy
+
+    def _fake_from_numpy(array, device_type="cpu", device_id=0, vendor_id=-1):
+        calls.append(device_type)
+        if device_type in ("cuda_pinned", "cpu"):
+            return real_from_numpy(array, "cpu", device_id)
+        raise Exception(f"Unsupported device type: {device_type}")
+
+    io_binding_module.ort.OrtValue.ortvalue_from_numpy = _fake_from_numpy
+    try:
+        pinned_manager = IOBindingManager(device_type="ryzenai")
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            pinned_value = pinned_manager._create_ort_value(np.ones((2,), dtype=np.float32))
+        assert calls[0] == "ryzenai"
+        assert calls.index("hip_pinned") < calls.index("rocm_pinned") < calls.index("cuda_pinned")
+        assert calls[-1] == "cuda_pinned"
+        assert pinned_manager.ortvalue_device == "cuda_pinned"
+        assert pinned_manager.memory_placement == MemoryPlacement.PINNED_HOST
+        assert pinned_value.numpy().shape == (2,)
+        print(f"  ryzenai pinned fallback order: {calls}")
+    finally:
+        io_binding_module.ort.OrtValue.ortvalue_from_numpy = real_from_numpy
+
+    cpu_value = create_ortvalue_from_numpy(np.arange(3, dtype=np.float32), device_type="cpu")
+    assert cpu_value.numpy().tolist() == [0.0, 1.0, 2.0]
+
     print("io_binding module: OK\n")
     return True
 

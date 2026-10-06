@@ -51,10 +51,13 @@ from .io_binding import (
     IOBindingManager,
     DeviceBuffer,
     MemoryMode,
+    MemoryPlacement,
     get_supported_devices,
     get_onnx_element_type,
     create_ortvalue_from_numpy,
+    ort_memory_candidates,
     NUMPY_TO_ONNX_ELEMENT_TYPE,
+    VALID_ORTVALUE_DEVICES,
 )
 
 from .backend import (
@@ -118,10 +121,13 @@ __all__ = [
     "IOBindingManager",
     "DeviceBuffer",
     "MemoryMode",
+    "MemoryPlacement",
     "get_supported_devices",
     "get_onnx_element_type",
     "create_ortvalue_from_numpy",
+    "ort_memory_candidates",
     "NUMPY_TO_ONNX_ELEMENT_TYPE",
+    "VALID_ORTVALUE_DEVICES",
     # backend exports
     "BackendType",
     "DeviceType",
