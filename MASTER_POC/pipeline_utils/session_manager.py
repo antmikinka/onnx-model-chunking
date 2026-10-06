@@ -89,13 +89,14 @@ NPU_SEQUENTIAL_SPLIT_ERROR = (
 
 
 SEQUENTIAL_LAYER_SPLIT_POLICIES = frozenset({
-    ExecutionPolicy.SPLIT_CPU_MEMORY_OPTIMIZED,
-    ExecutionPolicy.SPLIT_GPU_PERSISTENT,
+    ExecutionPolicy.SEQUENTIAL,
+    ExecutionPolicy.PERSISTENT,
 })
 
 HYBRID_NPU_POLICIES = frozenset({
-    ExecutionPolicy.HYBRID_NPU_IGPU_PHASE_SPLIT,
-    ExecutionPolicy.HYBRID_NPU_MOE_ROUTING,
+    ExecutionPolicy.HYBRID_NPU_IGPU,
+    ExecutionPolicy.PHASE_SPLIT,
+    ExecutionPolicy.MOE_ROUTING,
 })
 
 
@@ -187,8 +188,8 @@ def validate_npu_execution_policy(
     targets_npu = providers_target_npu(provider_list)
     targets_gpu = any(provider_is_gpu(provider) for provider in provider_list)
     layer_split = is_sequential_layer_split(names)
-    # SPLIT_* is the explicit sequential/persistent layer policy. A layer
-    # series under any other non-hybrid policy is the same shape in practice.
+    # SEQUENTIAL and PERSISTENT are explicit layer policies. A layer series
+    # under any other non-hybrid policy is the same shape in practice.
     sequential_split = policy in SEQUENTIAL_LAYER_SPLIT_POLICIES or (
         policy not in HYBRID_NPU_POLICIES and layer_split
     )
@@ -204,21 +205,21 @@ def validate_npu_execution_policy(
             RuntimeWarning,
             stacklevel=2,
         )
-    elif policy == ExecutionPolicy.SPLIT_GPU_PERSISTENT and not targets_gpu:
+    elif policy == ExecutionPolicy.PERSISTENT and not targets_gpu:
         warnings.warn(
-            "Execution policy 'split_gpu_persistent' expects a GPU provider "
+            "Execution policy 'persistent' expects a GPU provider "
             "(CUDA, ROCm, TensorRT, MIGraphX, or DirectML).",
             RuntimeWarning,
             stacklevel=2,
         )
     elif (
-        policy == ExecutionPolicy.SPLIT_CPU_MEMORY_OPTIMIZED
+        policy == ExecutionPolicy.SEQUENTIAL
         and targets_gpu
         and not targets_npu
     ):
         warnings.warn(
-            "Execution policy 'split_cpu_memory_optimized' unloads each "
-            "layer. A GPU target should use 'split_gpu_persistent'.",
+            "Execution policy 'sequential' unloads each "
+            "layer. A GPU target should use 'persistent'.",
             RuntimeWarning,
             stacklevel=2,
         )
@@ -1343,7 +1344,7 @@ class SessionConfig:
         policy = coerce_execution_policy(self.execution_policy)
         self.execution_policy = policy
         if policy is ExecutionPolicy.AUTO:
-            return ExecutionPolicy.MONOLITHIC_ONLY
+            return ExecutionPolicy.MONOLITHIC
         return policy
 
     def resolved_memory_policy(self) -> str:
@@ -1369,7 +1370,8 @@ class SessionConfig:
         Raise if this config would layer-split an NPU.
 
         ``component_names`` comes from the discovered model. With no names,
-        an explicit ``SPLIT_*`` policy is still rejected on an NPU provider.
+        an explicit sequential or persistent policy is still rejected on an
+        NPU provider.
         """
         return validate_npu_execution_policy(
             self.resolved_execution_policy(),
@@ -3237,27 +3239,37 @@ class SessionManager:
         """
         Check the plan shape against the configured execution policy.
 
-        Monolithic NPU runs get one NPU step. Phase-split needs prefill and
-        decode. MoE routing needs a router and an expert.
+        Monolithic NPU runs get one NPU step. Hybrid NPU and iGPU and phase
+        split need prefill and decode. MoE routing needs a router and an
+        expert. Speculative draft and verify needs both of those phases.
         """
         policy = self.config.resolved_execution_policy()
         phases = {step.phase for step in plan.steps}
         npu_steps = [step for step in plan.steps if _step_targets_npu(step)]
-        if policy == ExecutionPolicy.MONOLITHIC_ONLY and len(npu_steps) > 1:
+        if policy == ExecutionPolicy.MONOLITHIC and len(npu_steps) > 1:
             raise RuntimeError(NPU_SEQUENTIAL_SPLIT_ERROR)
         if policy in SEQUENTIAL_LAYER_SPLIT_POLICIES and npu_steps:
             raise RuntimeError(NPU_SEQUENTIAL_SPLIT_ERROR)
-        if policy == ExecutionPolicy.HYBRID_NPU_IGPU_PHASE_SPLIT and (
+        if policy in (
+            ExecutionPolicy.HYBRID_NPU_IGPU,
+            ExecutionPolicy.PHASE_SPLIT,
+        ) and (
             "prefill" not in phases or "decode" not in phases
         ):
             raise ValueError(
-                "hybrid_npu_igpu_phase_split requires a prefill step and a decode step."
+                f"{policy.value} requires a prefill step and a decode step."
             )
-        if policy == ExecutionPolicy.HYBRID_NPU_MOE_ROUTING and (
+        if policy == ExecutionPolicy.MOE_ROUTING and (
             "router" not in phases or "expert" not in phases
         ):
             raise ValueError(
-                "hybrid_npu_moe_routing requires a router step and an expert step."
+                f"{policy.value} requires a router step and an expert step."
+            )
+        if policy == ExecutionPolicy.SPECULATIVE and (
+            "speculative_draft" not in phases or "verification" not in phases
+        ):
+            raise ValueError(
+                "speculative requires a speculative_draft step and a verification step."
             )
 
     def get_io_metadata(self, name: str) -> IOMetadata:

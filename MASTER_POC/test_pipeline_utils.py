@@ -3494,42 +3494,57 @@ def test_session_manager():
 
     _expect_npu_split_rejected(
         ["VitisAIExecutionProvider", "CPUExecutionProvider"],
-        ExecutionPolicy.SPLIT_CPU_MEMORY_OPTIMIZED,
+        ExecutionPolicy.SEQUENTIAL,
         split_layers,
     )
     _expect_npu_split_rejected(
         ["RyzenAIExecutionProvider"],
-        ExecutionPolicy.SPLIT_GPU_PERSISTENT,
+        ExecutionPolicy.PERSISTENT,
         split_layers,
     )
     _expect_npu_split_rejected(
         ["VitisAIExecutionProvider"],
-        ExecutionPolicy.MONOLITHIC_ONLY,
+        ExecutionPolicy.MONOLITHIC,
         split_layers,
     )
     _expect_npu_split_rejected(
         ["RyzenAIExecutionProvider"],
-        "split_cpu_memory_optimized",
+        "sequential",
         monolithic,
     )
     validate_npu_execution_policy(
-        ExecutionPolicy.MONOLITHIC_ONLY,
+        ExecutionPolicy.MONOLITHIC,
         ["VitisAIExecutionProvider", "CPUExecutionProvider"],
         monolithic,
     )
     validate_npu_execution_policy(
-        ExecutionPolicy.HYBRID_NPU_IGPU_PHASE_SPLIT,
+        ExecutionPolicy.HYBRID_NPU_IGPU,
         ["VitisAIExecutionProvider", "DmlExecutionProvider"],
         split_layers,
     )
     validate_npu_execution_policy(
-        ExecutionPolicy.HYBRID_NPU_MOE_ROUTING,
+        ExecutionPolicy.MOE_ROUTING,
         ["RyzenAIExecutionProvider", "ROCmExecutionProvider"],
         split_layers,
     )
     validate_npu_execution_policy(
-        ExecutionPolicy.SPLIT_CPU_MEMORY_OPTIMIZED,
+        ExecutionPolicy.SEQUENTIAL,
         ["CPUExecutionProvider"],
+        split_layers,
+    )
+    _expect_npu_split_rejected(
+        ["VitisAIExecutionProvider"],
+        ExecutionPolicy.SPECULATIVE,
+        split_layers,
+    )
+    validate_npu_execution_policy(
+        ExecutionPolicy.SPECULATIVE,
+        ["VitisAIExecutionProvider"],
+        ["draft", "verify"],
+    )
+    validate_npu_execution_policy(
+        ExecutionPolicy.PHASE_SPLIT,
+        ["VitisAIExecutionProvider", "DmlExecutionProvider"],
         split_layers,
     )
 
@@ -3577,7 +3592,7 @@ def test_session_manager():
         ".",
         SessionConfig(
             providers=["RyzenAIExecutionProvider", "DmlExecutionProvider"],
-            execution_policy=ExecutionPolicy.HYBRID_NPU_IGPU_PHASE_SPLIT,
+            execution_policy=ExecutionPolicy.HYBRID_NPU_IGPU,
         ),
         model_info=split_info,
         available_providers=[
@@ -3593,7 +3608,7 @@ def test_session_manager():
         ".",
         SessionConfig(
             providers=["CPUExecutionProvider"],
-            execution_policy=ExecutionPolicy.SPLIT_CPU_MEMORY_OPTIMIZED,
+            execution_policy=ExecutionPolicy.SEQUENTIAL,
         ),
         model_info=split_info,
     )
@@ -3601,7 +3616,7 @@ def test_session_manager():
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         validate_npu_execution_policy(
-            ExecutionPolicy.HYBRID_NPU_MOE_ROUTING,
+            ExecutionPolicy.MOE_ROUTING,
             ["CPUExecutionProvider"],
             split_layers,
         )
@@ -3647,7 +3662,7 @@ def test_session_manager():
         providers=["ROCmExecutionProvider", "CPUExecutionProvider"],
         device_id=1,
         memory_limit_mb=128,
-        execution_policy=ExecutionPolicy.SPLIT_GPU_PERSISTENT,
+        execution_policy=ExecutionPolicy.PERSISTENT,
     )
     rocm_providers = rocm_config.ort_providers()
     assert rocm_providers[0][1]["device_id"] == "1"
@@ -3695,7 +3710,7 @@ def test_session_manager():
 
     hybrid = SessionConfig(
         providers=["RyzenAIExecutionProvider", "DmlExecutionProvider", "CPUExecutionProvider"],
-        execution_policy=ExecutionPolicy.HYBRID_NPU_IGPU_PHASE_SPLIT,
+        execution_policy=ExecutionPolicy.HYBRID_NPU_IGPU,
         npu_compilation_mode="optimized",
     )
     assert hybrid.active_profile().device_type == "ryzenai"
@@ -3757,7 +3772,7 @@ def test_session_manager():
         ".",
         SessionConfig(
             providers=["CPUExecutionProvider"],
-            execution_policy=ExecutionPolicy.SPLIT_CPU_MEMORY_OPTIMIZED,
+            execution_policy=ExecutionPolicy.SEQUENTIAL,
         ),
         model_info=_plan_info("embedding", "norm", "lm_head", "other"),
     )
@@ -3789,7 +3804,7 @@ def test_session_manager():
         ".",
         SessionConfig(
             providers=["VitisAIExecutionProvider", "DmlExecutionProvider", "CPUExecutionProvider"],
-            execution_policy=ExecutionPolicy.HYBRID_NPU_IGPU_PHASE_SPLIT,
+            execution_policy=ExecutionPolicy.HYBRID_NPU_IGPU,
         ),
         model_info=_plan_info("embedding", "prefill", "decode", "norm", "lm_head"),
         available_providers=installed,
@@ -3824,7 +3839,7 @@ def test_session_manager():
         ".",
         SessionConfig(
             providers=["RyzenAIExecutionProvider", "ROCmExecutionProvider"],
-            execution_policy=ExecutionPolicy.HYBRID_NPU_MOE_ROUTING,
+            execution_policy=ExecutionPolicy.MOE_ROUTING,
         ),
         model_info=_plan_info("router", "expert_0"),
         available_providers=installed,
@@ -3851,7 +3866,7 @@ def test_session_manager():
         ".",
         SessionConfig(
             providers=["VitisAIExecutionProvider", "CPUExecutionProvider"],
-            execution_policy=ExecutionPolicy.MONOLITHIC_ONLY,
+            execution_policy=ExecutionPolicy.MONOLITHIC,
         ),
         model_info=_plan_info("prefill", "decode"),
         available_providers=installed,
@@ -3873,7 +3888,7 @@ def test_session_manager():
         ".",
         SessionConfig(
             providers=["VitisAIExecutionProvider", "CPUExecutionProvider"],
-            execution_policy=ExecutionPolicy.HYBRID_NPU_IGPU_PHASE_SPLIT,
+            execution_policy=ExecutionPolicy.PHASE_SPLIT,
         ),
         model_info=_plan_info("prefill"),
         available_providers=installed,
@@ -3885,6 +3900,39 @@ def test_session_manager():
         raise AssertionError("phase split without decode was accepted")
     except ValueError as exc:
         assert "decode" in str(exc)
+        assert "phase_split" in str(exc)
+
+    speculative = SessionManager(
+        ".",
+        SessionConfig(
+            providers=["VitisAIExecutionProvider", "DmlExecutionProvider"],
+            execution_policy=ExecutionPolicy.SPECULATIVE,
+        ),
+        model_info=_plan_info("draft", "verify"),
+        available_providers=installed,
+    )
+    try:
+        speculative.load_from_plan(ExecutionPlan(steps=[
+            ExecutionStep(
+                "draft", "DmlExecutionProvider", "igpu", "speculative_draft",
+                [], ["hidden"],
+            ),
+        ]))
+        raise AssertionError("speculative plan without verification was accepted")
+    except ValueError as exc:
+        assert "verification" in str(exc)
+    speculative.load_from_plan(ExecutionPlan(steps=[
+        ExecutionStep(
+            "draft", "DmlExecutionProvider", "igpu", "draft",
+            [], ["hidden"],
+        ),
+        ExecutionStep(
+            "verify", "VitisAIExecutionProvider", "npu", "verify",
+            ["draft"], ["logits"],
+        ),
+    ]))
+    assert speculative.get_session_info("draft").phase == "speculative_draft"
+    assert speculative.get_session_info("verify").phase == "verification"
 
     try:
         ExecutionPlan(steps=[
@@ -3963,7 +4011,7 @@ def test_session_manager():
                 "DmlExecutionProvider",
                 "CPUExecutionProvider",
             ],
-            execution_policy=ExecutionPolicy.HYBRID_NPU_IGPU_PHASE_SPLIT,
+            execution_policy=ExecutionPolicy.HYBRID_NPU_IGPU,
         ),
         model_info=sync_info,
         available_providers=[
@@ -4082,7 +4130,7 @@ def test_session_manager():
                 "DmlExecutionProvider",
                 "CPUExecutionProvider",
             ],
-            execution_policy=ExecutionPolicy.HYBRID_NPU_IGPU_PHASE_SPLIT,
+            execution_policy=ExecutionPolicy.HYBRID_NPU_IGPU,
         ),
         model_info=memory_info,
         available_providers=[
@@ -4248,7 +4296,7 @@ def test_session_manager():
         ".",
         SessionConfig(
             providers=list(placed_providers),
-            execution_policy=ExecutionPolicy.HYBRID_NPU_MOE_ROUTING,
+            execution_policy=ExecutionPolicy.MOE_ROUTING,
             npu_compilation_mode="optimized",
         ),
         model_info=placed_info,
@@ -4679,7 +4727,7 @@ def test_session_manager():
                 "DmlExecutionProvider",
                 "CPUExecutionProvider",
             ],
-            execution_policy=ExecutionPolicy.HYBRID_NPU_IGPU_PHASE_SPLIT,
+            execution_policy=ExecutionPolicy.HYBRID_NPU_IGPU,
         ),
         model_info={"components": phase_components},
         available_providers=[
@@ -4748,7 +4796,7 @@ def test_session_manager():
         ".",
         SessionConfig(
             providers=["CPUExecutionProvider"],
-            execution_policy=ExecutionPolicy.SPLIT_CPU_MEMORY_OPTIMIZED,
+            execution_policy=ExecutionPolicy.SEQUENTIAL,
         ),
         model_info={"components": {
             "prefill": {"file": "prefill.onnx"},
@@ -4782,7 +4830,7 @@ def test_session_manager():
     assert defaults.static_shapes is True
     assert defaults.memory_policy == "auto"
     assert defaults.execution_policy == "auto"
-    assert defaults.resolved_execution_policy() == ExecutionPolicy.MONOLITHIC_ONLY
+    assert defaults.resolved_execution_policy() == ExecutionPolicy.MONOLITHIC
     assert defaults.execution_policy == ExecutionPolicy.AUTO
     assert defaults.resolved_memory_policy() == "persistent"
     npu_defaults = SessionConfig(providers=["VitisAIExecutionProvider"])
@@ -4835,7 +4883,7 @@ def test_session_manager():
     assert surface.load_component("embedding") is None
     plan = surface.estimate_memory_plan()
     assert plan["memory_policy"] == "persistent"
-    assert plan["execution_policy"] == "monolithic_only"
+    assert plan["execution_policy"] == "monolithic"
     assert plan["static_shapes"] is True
     assert plan["warmup"] is True
     assert plan["order"] == ["embedding", "layer_0", "lm_head"]
@@ -6349,13 +6397,58 @@ def test_backend():
             model="weights",
             output="out",
             providers=["VitisAIExecutionProvider", "DmlExecutionProvider"],
-            execution_policy="hybrid_npu_igpu_phase_split",
+            execution_policy="hybrid_npu_igpu",
         )
         assert hybrid_plan.resolved_providers() == [
             "VitisAIExecutionProvider",
             "DmlExecutionProvider",
         ]
-        assert hybrid_plan.execution_policy is canonical_policy.HYBRID_NPU_IGPU_PHASE_SPLIT
+        assert hybrid_plan.execution_policy is canonical_policy.HYBRID_NPU_IGPU
+        assert [item.value for item in canonical_policy] == [
+            "auto",
+            "monolithic",
+            "sequential",
+            "persistent",
+            "hybrid_npu_igpu",
+            "phase_split",
+            "moe_routing",
+            "speculative",
+        ]
+        cpu_seq = SplitConfig(
+            model="weights",
+            output="out",
+            target_device="cpu",
+            execution_policy="sequential",
+        )
+        assert cpu_seq.execution_policy is canonical_policy.SEQUENTIAL
+        for safe_policy in ("monolithic", "hybrid_npu_igpu", "phase_split", "moe_routing", "speculative"):
+            accepted = SplitConfig(
+                model="weights",
+                output="out",
+                target_device="npu",
+                execution_policy=safe_policy,
+            )
+            assert accepted.execution_policy.value == safe_policy
+        try:
+            SplitConfig(
+                model="weights",
+                output="out",
+                target_device="npu",
+                execution_policy="sequential",
+            )
+            raise AssertionError("sequential NPU execution was accepted")
+        except ValueError as exc:
+            assert "sequential" in str(exc)
+        try:
+            SplitConfig(
+                model="weights",
+                output="out",
+                providers=["VitisAIExecutionProvider"],
+                execution_policy="persistent",
+            )
+            raise AssertionError("persistent NPU execution was accepted")
+        except ValueError as exc:
+            assert "persistent" in str(exc)
         try:
             SplitConfig(model="weights", output="out", target_device="tpu")
             raise AssertionError("an unknown device was accepted")
@@ -6918,6 +7011,7 @@ def test_backend():
     print("  hybrid: prefill/decode, NPU layer range, MoE router and experts")
     print("  model format: one enum for onnx, safetensors, gguf, pytorch_bin")
     print("  device policy: providers, npu, ipu, hybrid execution")
+    print("  execution policy: monolithic, sequential rejected on NPU, hybrid and moe allowed")
     print("backend module: OK\n")
     return True
 

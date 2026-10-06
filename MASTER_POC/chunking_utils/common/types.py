@@ -6,7 +6,7 @@ splitting operations, providing a unified interface for configuration and result
 """
 
 from enum import Enum
-from typing import Dict, List, Any, Optional
+from typing import Dict, Iterable, List, Any, Optional
 from dataclasses import dataclass, field
 
 
@@ -85,15 +85,29 @@ class ExecutionPolicy(str, Enum):
     """
     How a split model may be executed.
 
-    AUTO behaves as one monolithic graph. A sequential NPU layer split stays
-    rejected. Phase split and MoE routing are the NPU exceptions.
+    AUTO behaves as one monolithic graph. Sequential and persistent layer
+    splits are rejected on the NPU. Hybrid NPU and iGPU, phase split, and
+    MoE routing are the NPU exceptions. Speculative draft and verify is a
+    phase schedule, not a layer series.
     """
     AUTO = "auto"
-    MONOLITHIC_ONLY = "monolithic_only"
-    SPLIT_CPU_MEMORY_OPTIMIZED = "split_cpu_memory_optimized"
-    SPLIT_GPU_PERSISTENT = "split_gpu_persistent"
-    HYBRID_NPU_IGPU_PHASE_SPLIT = "hybrid_npu_igpu_phase_split"
-    HYBRID_NPU_MOE_ROUTING = "hybrid_npu_moe_routing"
+    MONOLITHIC = "monolithic"
+    SEQUENTIAL = "sequential"
+    PERSISTENT = "persistent"
+    HYBRID_NPU_IGPU = "hybrid_npu_igpu"
+    PHASE_SPLIT = "phase_split"
+    MOE_ROUTING = "moe_routing"
+    SPECULATIVE = "speculative"
+
+
+# Ahead-of-time accelerators. A sequential layer series on these providers
+# recompiles or context-switches between graphs.
+_NPU_PROVIDER_MARKERS = (
+    "vitisai",
+    "ryzenai",
+    "openvino",
+    "coreml",
+)
 
 
 # Ordered ONNX Runtime fallback for each device. AUTO is resolved later.
@@ -149,6 +163,15 @@ def _coerce_execution_policy(policy: Any) -> ExecutionPolicy:
         ) from exc
 
 
+def _providers_include_npu(providers: Iterable[str]) -> bool:
+    """True when any provider name is an ahead-of-time NPU."""
+    for name in providers:
+        lowered = str(name).lower()
+        if any(marker in lowered for marker in _NPU_PROVIDER_MARKERS):
+            return True
+    return False
+
+
 def _auto_provider_fallback() -> List[str]:
     """NPU, then AMD iGPU, then discrete GPU, with CPU last."""
     selected: List[str] = []
@@ -180,7 +203,7 @@ class SplitConfig:
         device: Torch or runtime device string, such as cpu or cuda:0.
         providers: ONNX Runtime provider fallback, first choice first.
         target_device: CPU, GPU, NPU, IPU, or AUTO.
-        execution_policy: Monolithic, split, or hybrid NPU placement.
+        execution_policy: Monolithic, sequential, persistent, hybrid, or speculative.
         low_cpu_mem_usage: Use HuggingFace's low-memory loading.
         
         # HuggingFace integration
@@ -235,6 +258,29 @@ class SplitConfig:
                 )
             cleaned.append(item.strip())
         self.providers = cleaned
+        self._reject_npu_sequential_split()
+
+    def _reject_npu_sequential_split(self) -> None:
+        """
+        Refuse sequential and persistent layer splits on an NPU.
+
+        AUTO and monolithic stay valid. Hybrid phase split, MoE routing, and
+        speculative draft and verify are not layer series.
+        """
+        if self.execution_policy not in (
+            ExecutionPolicy.SEQUENTIAL,
+            ExecutionPolicy.PERSISTENT,
+        ):
+            return
+        on_npu = (
+            self.target_device is DeviceType.NPU
+            or _providers_include_npu(self.resolved_providers())
+        )
+        if on_npu:
+            raise ValueError(
+                f"execution_policy {self.execution_policy.value} is rejected "
+                "on an NPU provider. Sequential layer splitting on NPU is unsafe."
+            )
 
     def resolved_providers(self) -> List[str]:
         """

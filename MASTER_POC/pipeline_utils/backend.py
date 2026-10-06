@@ -254,6 +254,9 @@ _EXECUTION_POLICY_ALIASES = {
     "hybrid_npu_igpu": "hybrid",
     "hybrid_npu_igpu_phase_split": "hybrid",
     "hybrid_npu_moe_routing": "hybrid",
+    "phase_split": "hybrid",
+    "moe_routing": "hybrid",
+    "speculative": "hybrid",
 }
 
 
