@@ -15150,6 +15150,155 @@ def test_kv_cache_contract():
     return True
 
 
+def test_execution_plan_type():
+    """An ONNX placement plan names the device, phase, and residency of each component."""
+    print("=" * 50)
+    print("Testing execution plan type...")
+    print("=" * 50)
+
+    import sys
+    import types
+
+    try:
+        from chunking_utils.onnx.types import ExecutionPlan, ExecutionStep, OnnxSplitResult
+        import chunking_utils.onnx as onnx_pkg
+        import chunking_utils
+        from chunking_utils.common.types import ExecutionPlan as CommonPlan
+        from chunking_utils.common.types import ExecutionPolicy
+    except ModuleNotFoundError:
+        for name in list(sys.modules):
+            if name == "chunking_utils.onnx" or name.startswith("chunking_utils.onnx."):
+                del sys.modules[name]
+        onnx_stub = types.ModuleType("onnx")
+        onnx_stub.ModelProto = type("ModelProto", (), {})
+        onnx_stub.numpy_helper = types.SimpleNamespace()
+        onnx_stub.helper = types.SimpleNamespace()
+        onnx_stub.TensorProto = types.SimpleNamespace()
+        onnx_stub.shape_inference = types.SimpleNamespace()
+        sys.modules["onnx"] = onnx_stub
+        from chunking_utils.onnx.types import ExecutionPlan, ExecutionStep, OnnxSplitResult
+        import chunking_utils.onnx as onnx_pkg
+        import chunking_utils
+        from chunking_utils.common.types import ExecutionPlan as CommonPlan
+        from chunking_utils.common.types import ExecutionPolicy
+
+    assert "ExecutionPlan" not in onnx_pkg.__all__
+    assert "ExecutionStep" not in onnx_pkg.__all__
+    assert chunking_utils.ExecutionPlan is CommonPlan
+    assert ExecutionPlan is not CommonPlan
+
+    def expect_value_error(callable_check, text):
+        try:
+            callable_check()
+            raise AssertionError(text)
+        except ValueError:
+            return
+
+    bare = OnnxSplitResult(
+        output_dir="out",
+        num_layers=1,
+        component_files={},
+        model_info={},
+    )
+    assert type(bare.execution_plan) is CommonPlan
+    assert bare.execution_plan.steps == []
+    assert bare.execution_plan.policy is ExecutionPolicy.AUTO
+
+    shared_step = ExecutionStep(
+        component_name=" layer_0 ",
+        provider=" VitisAIExecutionProvider ",
+        device="xdna",
+        phase=" Decode ",
+    )
+    assert shared_step.component_name == "layer_0"
+    assert shared_step.provider == "VitisAIExecutionProvider"
+    assert shared_step.device == "npu"
+    assert shared_step.phase == "decode"
+    assert shared_step.resident is True
+
+    first = ExecutionPlan(
+        steps=[shared_step],
+        policy=ExecutionPolicy.HYBRID_NPU_IGPU,
+        npu_safe=True,
+        prefill_device="xdna",
+        decode_device="rdna",
+    )
+    second = ExecutionPlan(
+        steps=[{
+            "component_name": "expert_0",
+            "device": "igpu",
+            "phase": "moe_router",
+            "resident": False,
+        }],
+        policy="auto",
+        npu_safe=False,
+        prefill_device="npu",
+        decode_device="igpu",
+    )
+    assert first.policy == "hybrid_npu_igpu"
+    assert first.npu_safe is True
+    assert first.prefill_device == "npu"
+    assert first.decode_device == "igpu"
+    assert first.steps[0] is not shared_step
+    assert first.steps[0].phase == "decode"
+    assert second.steps[0].phase == "router"
+    assert second.steps[0].resident is False
+    assert second.policy == "auto"
+    first.steps[0].resident = False
+    assert shared_step.resident is True
+    assert second.steps[0].resident is False
+
+    recorded = first.to_dict()
+    assert recorded["policy"] == "hybrid_npu_igpu"
+    assert recorded["npu_safe"] is True
+    assert recorded["steps"][0]["device"] == "npu"
+    assert recorded["steps"][0]["phase"] == "decode"
+    recorded["steps"][0]["resident"] = True
+    recorded["steps"].append({"component_name": "norm"})
+    assert first.steps[0].resident is False
+    assert len(first.steps) == 1
+
+    expect_value_error(
+        lambda: ExecutionStep(component_name="layer_0", resident=1),
+        "an integer resident flag was accepted",
+    )
+    expect_value_error(
+        lambda: ExecutionStep(component_name=" "),
+        "a blank component name was accepted",
+    )
+    expect_value_error(
+        lambda: ExecutionStep(component_name="layer_0", phase="norm"),
+        "an unknown phase was accepted",
+    )
+    expect_value_error(
+        lambda: ExecutionPlan(steps="layer_0"),
+        "a string step list was accepted",
+    )
+    expect_value_error(
+        lambda: ExecutionPlan(steps=[shared_step, shared_step]),
+        "a repeated component was accepted",
+    )
+    expect_value_error(
+        lambda: ExecutionPlan(steps=[{
+            "component_name": "layer_0",
+            "depends_on": ["embedding"],
+        }]),
+        "a dependency field was accepted",
+    )
+    expect_value_error(
+        lambda: ExecutionPlan(npu_safe=1),
+        "a bool npu flag was accepted",
+    )
+    expect_value_error(
+        lambda: ExecutionPlan(policy="hybrid_phase_split"),
+        "an unknown policy was accepted",
+    )
+
+    print("execution plan type: OK")
+    print("  decode stays the phase, xdna stays the npu, two plans do not share a step, and an integer resident flag raises")
+    return True
+
+
 def test_path_manager():
     """ONNX discovery, external data, split directories, and NPU cache paths."""
     print("=" * 50)
@@ -15580,6 +15729,12 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"kv_cache_contract: FAILED - {e}")
         results.append(("kv_cache_contract", False))
+
+    try:
+        results.append(("execution_plan_type", test_execution_plan_type()))
+    except Exception as e:
+        print(f"execution_plan_type: FAILED - {e}")
+        results.append(("execution_plan_type", False))
 
     try:
         results.append(("path_manager", test_path_manager()))

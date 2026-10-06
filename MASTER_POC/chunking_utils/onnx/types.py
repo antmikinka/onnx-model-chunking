@@ -13,8 +13,11 @@ from ..common.types import (
     SplitResult,
     _boundary_name_is_stateful,
     _coerce_component_device,
+    _coerce_execution_policy,
     _coerce_group_size,
     _coerce_kv_layout,
+    _coerce_optional_provider,
+    _coerce_plan_device,
     _coerce_quant_dtype,
     _coerce_quant_method,
     _copy_dim_list,
@@ -459,3 +462,135 @@ class OnnxMergeResult:
     num_initializers: int = 0
     error: Optional[str] = None
     psnr: Optional[float] = None
+
+
+# Phases an ONNX placement step may name. Router aliases collapse onto router.
+_ONNX_STEP_PHASES = frozenset({"prefill", "decode", "router", "expert"})
+_ONNX_STEP_PHASE_ALIASES = {
+    "prefill": "prefill",
+    "decode": "decode",
+    "router": "router",
+    "moe_router": "router",
+    "moe": "router",
+    "expert": "expert",
+    "expert_execution": "expert",
+    "experts": "expert",
+}
+
+
+def _coerce_onnx_step_phase(value: Any) -> str:
+    """A placement step is prefill, decode, router, or expert."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"phase must be a non-empty string, got {value!r}")
+    text = value.strip().lower().replace("-", "_").replace(" ", "_")
+    text = _ONNX_STEP_PHASE_ALIASES.get(text, text)
+    if text not in _ONNX_STEP_PHASES:
+        allowed = ", ".join(sorted(_ONNX_STEP_PHASES))
+        raise ValueError(f"Unknown phase {value!r}. Expected one of: {allowed}")
+    return text
+
+
+def _copy_execution_step(value: Any) -> "ExecutionStep":
+    """Copy an ExecutionStep, or build one from a dict. Extra keys are an error."""
+    if isinstance(value, ExecutionStep):
+        return ExecutionStep(
+            component_name=value.component_name,
+            provider=value.provider,
+            device=value.device,
+            phase=value.phase,
+            resident=value.resident,
+        )
+    if isinstance(value, dict):
+        try:
+            return ExecutionStep(**value)
+        except TypeError as exc:
+            raise ValueError(
+                f"execution step fields are incomplete, got {value!r}"
+            ) from exc
+    raise ValueError(
+        f"execution step must be an ExecutionStep or a dict, got {value!r}"
+    )
+
+
+@dataclass
+class ExecutionStep:
+    """
+    Where one ONNX component runs.
+
+    ``phase`` is prefill, decode, router, or expert, and defaults to decode.
+    ``device`` uses the AMD names, so xdna is the NPU and rdna is the iGPU.
+    ``resident`` keeps the component loaded.
+    """
+    component_name: str
+    provider: Optional[str] = None
+    device: Optional[str] = None
+    phase: str = "decode"  # prefill, decode, router, expert
+    resident: bool = True
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.component_name, str) or not self.component_name.strip():
+            raise ValueError(
+                f"component_name must be a non-empty string, got {self.component_name!r}"
+            )
+        self.component_name = self.component_name.strip()
+        self.provider = _coerce_optional_provider(self.provider)
+        self.device = _coerce_plan_device(self.device, "device")
+        self.phase = _coerce_onnx_step_phase(self.phase)
+        if not isinstance(self.resident, bool):
+            raise ValueError(f"resident must be a boolean, got {self.resident!r}")
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Copy the step so a caller can serialize it without sharing this object."""
+        return {
+            "component_name": self.component_name,
+            "provider": self.provider,
+            "device": self.device,
+            "phase": self.phase,
+            "resident": self.resident,
+        }
+
+
+@dataclass
+class ExecutionPlan:
+    """
+    How ONNX components run on AMD hardware.
+
+    ``policy`` is a canonical name such as auto or hybrid_npu_igpu.
+    ``npu_safe`` records whether the graph may run on the NPU. Prefill and
+    decode can name different devices.
+    """
+    steps: List[ExecutionStep] = field(default_factory=list)
+    policy: str = "auto"
+    npu_safe: bool = False
+    prefill_device: Optional[str] = None
+    decode_device: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.steps, (str, bytes)) or not isinstance(self.steps, list):
+            raise ValueError(f"steps must be a list, got {self.steps!r}")
+        cleaned: List[ExecutionStep] = []
+        seen = set()
+        for item in self.steps:
+            step = _copy_execution_step(item)
+            if step.component_name in seen:
+                raise ValueError(
+                    f"execution plan repeats component {step.component_name!r}"
+                )
+            seen.add(step.component_name)
+            cleaned.append(step)
+        self.steps = cleaned
+        self.policy = _coerce_execution_policy(self.policy).value
+        if not isinstance(self.npu_safe, bool):
+            raise ValueError(f"npu_safe must be a boolean, got {self.npu_safe!r}")
+        self.prefill_device = _coerce_plan_device(self.prefill_device, "prefill_device")
+        self.decode_device = _coerce_plan_device(self.decode_device, "decode_device")
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Copy the plan. Each step is copied on its own."""
+        return {
+            "steps": [step.to_dict() for step in self.steps],
+            "policy": self.policy,
+            "npu_safe": self.npu_safe,
+            "prefill_device": self.prefill_device,
+            "decode_device": self.decode_device,
+        }
