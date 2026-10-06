@@ -13,6 +13,9 @@ from .architecture import (
     get_prefixes,
     LLAMA_STYLE_ARCHITECTURES,
     architecture_from_string,
+    ArchitectureDescriptor,
+    ARCHITECTURE_DESCRIPTORS,
+    get_architecture_descriptor,
 )
 from .types import (
     ModelFormat,
@@ -71,6 +74,9 @@ __all__ = [
     "get_prefixes",
     "LLAMA_STYLE_ARCHITECTURES",
     "architecture_from_string",
+    "ArchitectureDescriptor",
+    "ARCHITECTURE_DESCRIPTORS",
+    "get_architecture_descriptor",
     # Types
     "ModelFormat",
     "TensorDtype",

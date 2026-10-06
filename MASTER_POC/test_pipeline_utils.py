@@ -8735,15 +8735,18 @@ def test_architecture():
 
     import chunking_utils.common as common
     from chunking_utils.common.architecture import (
+        ARCHITECTURE_DESCRIPTORS,
         LLAMA_STYLE_ARCHITECTURES,
         ONNX_PREFIXES,
         SAFETENSORS_PREFIXES,
+        ArchitectureDescriptor,
         ArchitecturePrefixes,
         ArchitectureType,
         _LLAMA_STYLE,
         _LLAMA_STYLE_ONNX,
         architecture_from_string,
         classify_qwen_family,
+        get_architecture_descriptor,
         get_prefixes,
         get_prefixes_tuple,
     )
@@ -8965,7 +8968,132 @@ def test_architecture():
     except ValueError as exc:
         assert "layer id" in str(exc)
 
+    assert common.ArchitectureDescriptor is ArchitectureDescriptor
+    assert common.get_architecture_descriptor is get_architecture_descriptor
+    assert common.ARCHITECTURE_DESCRIPTORS is ARCHITECTURE_DESCRIPTORS
+    assert set(ARCHITECTURE_DESCRIPTORS) == set(ArchitectureType)
+    unknown = ARCHITECTURE_DESCRIPTORS[ArchitectureType.UNKNOWN]
+    assert unknown.supports_gqa is False
+    assert unknown.supports_mqa is False
+    assert unknown.is_moe is False
+    assert unknown.num_experts == 0
+    assert unknown.experts_per_token == 0
+    assert unknown.has_sliding_window is False
+    assert unknown.has_tied_embeddings is False
+    assert unknown.attention_variants == []
+    assert unknown.max_seq_len == 0
+    assert unknown.has_hybrid_attention is False
+    for record in ARCHITECTURE_DESCRIPTORS.values():
+        assert record.supports_mqa is False
+        assert record.max_seq_len == 0
+
+    qwen3 = get_architecture_descriptor(ArchitectureType.QWEN3)
+    assert qwen3 is ARCHITECTURE_DESCRIPTORS[ArchitectureType.QWEN3]
+    assert qwen3.supports_gqa is True
+    assert qwen3.is_moe is False
+    assert qwen3.has_hybrid_attention is False
+    assert get_architecture_descriptor("qwen3") is qwen3
+    assert ARCHITECTURE_DESCRIPTORS[ArchitectureType.QWEN].supports_gqa is False
+    assert ARCHITECTURE_DESCRIPTORS[ArchitectureType.LLAMA].supports_gqa is True
+
+    moe_desc = get_architecture_descriptor("qwen3_moe")
+    assert moe_desc.is_moe is True
+    assert moe_desc.supports_gqa is True
+    assert moe_desc.num_experts == 0
+    assert moe_desc.experts_per_token == 0
+    assert moe_desc.has_hybrid_attention is False
+
+    hybrid_desc = get_architecture_descriptor("Qwen3.8")
+    assert hybrid_desc.arch_type is ArchitectureType.QWEN3_HYBRID
+    assert hybrid_desc is get_architecture_descriptor(ArchitectureType.QWEN3_HYBRID)
+    assert hybrid_desc.supports_gqa is True
+    assert hybrid_desc.is_moe is True
+    assert hybrid_desc.num_experts == 512
+    assert hybrid_desc.experts_per_token == 10
+    assert hybrid_desc.attention_variants == ["full", "gated_deltanet", "sparse_attention"]
+    assert hybrid_desc.has_hybrid_attention is True
+    assert hybrid_desc.has_sliding_window is False
+    assert hybrid_desc.has_tied_embeddings is False
+
+    mistral = get_architecture_descriptor("mistral")
+    assert mistral.supports_gqa is True
+    assert mistral.has_sliding_window is True
+    assert mistral.attention_variants == ["sliding_window"]
+    assert mistral.has_hybrid_attention is False
+    gemma = ARCHITECTURE_DESCRIPTORS[ArchitectureType.GEMMA]
+    assert gemma.has_tied_embeddings is True
+    assert gemma.supports_gqa is True
+    gpt2_desc = get_architecture_descriptor("gpt2")
+    assert gpt2_desc.has_tied_embeddings is True
+    assert gpt2_desc.supports_gqa is False
+    assert get_architecture_descriptor("bert") is unknown
+
+    supplied = ["Full", "full", " gated_deltanet "]
+    custom = ArchitectureDescriptor(
+        "qwen3_hybrid",
+        is_moe=True,
+        num_experts=512,
+        experts_per_token=10,
+        attention_variants=supplied,
+        max_seq_len=8192,
+    )
+    assert custom.arch_type is ArchitectureType.QWEN3_HYBRID
+    assert custom.attention_variants == ["full", "gated_deltanet"]
+    assert custom.attention_variants is not supplied
+    assert custom.max_seq_len == 8192
+    supplied.append("sparse_attention")
+    assert custom.attention_variants == ["full", "gated_deltanet"]
+    first = ArchitectureDescriptor(ArchitectureType.LLAMA)
+    second = ArchitectureDescriptor(ArchitectureType.LLAMA)
+    assert first.attention_variants is not second.attention_variants
+    try:
+        qwen3.supports_gqa = False
+        raise AssertionError("a descriptor field was changed")
+    except AttributeError:
+        pass
+    try:
+        ArchitectureDescriptor(ArchitectureType.LLAMA, supports_gqa=1)
+        raise AssertionError("an int was accepted as a bool")
+    except ValueError as exc:
+        assert "supports_gqa" in str(exc)
+    try:
+        ArchitectureDescriptor(ArchitectureType.LLAMA, num_experts=8)
+        raise AssertionError("expert counts were accepted without MoE")
+    except ValueError as exc:
+        assert "is_moe" in str(exc)
+    try:
+        ArchitectureDescriptor(ArchitectureType.QWEN3_MOE, is_moe=True, experts_per_token=4)
+        raise AssertionError("a top-k was accepted without an expert count")
+    except ValueError as exc:
+        assert "num_experts" in str(exc)
+    try:
+        ArchitectureDescriptor(
+            ArchitectureType.QWEN3_HYBRID,
+            is_moe=True,
+            num_experts=8,
+            experts_per_token=10,
+        )
+        raise AssertionError("a top-k above the expert count was accepted")
+    except ValueError as exc:
+        assert "exceeds" in str(exc)
+    try:
+        ArchitectureDescriptor(ArchitectureType.LLAMA, max_seq_len=-1)
+        raise AssertionError("a negative context length was accepted")
+    except ValueError as exc:
+        assert "max_seq_len" in str(exc)
+    try:
+        ArchitectureDescriptor(ArchitectureType.LLAMA, attention_variants="full")
+        raise AssertionError("a string was accepted as attention variants")
+    except ValueError as exc:
+        assert "attention_variants" in str(exc)
+    try:
+        get_architecture_descriptor(None)
+        raise AssertionError("a missing architecture was accepted")
+    except ValueError as exc:
+        assert "arch" in str(exc)
+
     print("  architecture prefixes: dense llama record, moe router and expert, hybrid mtp head")
+    print("  architecture descriptor: gqa, moe counts, sliding window, tied embeddings, hybrid attention")
     print("architecture prefixes: OK\n")
     return True
 

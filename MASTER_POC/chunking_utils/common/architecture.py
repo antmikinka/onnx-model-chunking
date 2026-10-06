@@ -8,11 +8,12 @@ To add support for a new architecture:
 1. Add it to ArchitectureType enum
 2. Add it to LLAMA_STYLE_ARCHITECTURES when it uses the shared dense LLaMA prefixes
 3. Otherwise add its own record to SAFETENSORS_PREFIXES and ONNX_PREFIXES
+4. Add an ArchitectureDescriptor to ARCHITECTURE_DESCRIPTORS
 """
 
 from enum import Enum
-from typing import Dict, Iterable, Optional, Tuple
-from dataclasses import dataclass, replace
+from typing import Dict, Iterable, List, Optional, Tuple
+from dataclasses import dataclass, field, replace
 
 
 class ArchitectureType(str, Enum):
@@ -318,3 +319,139 @@ def architecture_from_string(model_type: str) -> ArchitectureType:
         return ArchitectureType.QWEN
     
     return ArchitectureType.UNKNOWN
+
+
+def _copy_attention_variants(value: object) -> List[str]:
+    """Copy attention names. A string is not a list of names."""
+    if isinstance(value, str) or not isinstance(value, Iterable):
+        raise ValueError("attention_variants must be a list of strings")
+    copied: List[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError("attention_variants must be a list of strings")
+        text = item.strip().lower()
+        if text not in copied:
+            copied.append(text)
+    return copied
+
+
+@dataclass(frozen=True)
+class ArchitectureDescriptor:
+    """
+    Family metadata for one ArchitectureType.
+
+    supports_gqa and supports_mqa say the family can use that attention
+    grouping. is_moe with zero expert counts means the checkpoint supplies
+    the count. max_seq_len 0 means the same for context length. More than
+    one attention variant is hybrid attention.
+    """
+    arch_type: ArchitectureType
+    supports_gqa: bool = False
+    supports_mqa: bool = False
+    is_moe: bool = False
+    num_experts: int = 0
+    experts_per_token: int = 0
+    has_sliding_window: bool = False
+    has_tied_embeddings: bool = False
+    attention_variants: List[str] = field(default_factory=list)
+    max_seq_len: int = 0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.arch_type, ArchitectureType):
+            if isinstance(self.arch_type, str):
+                text = self.arch_type.strip().lower()
+                try:
+                    object.__setattr__(self, "arch_type", ArchitectureType(text))
+                except ValueError as exc:
+                    known = ", ".join(item.value for item in ArchitectureType)
+                    raise ValueError(
+                        f"Unknown arch_type {self.arch_type!r}. Expected one of: {known}"
+                    ) from exc
+            else:
+                raise ValueError(
+                    f"arch_type must be an ArchitectureType, got {self.arch_type!r}"
+                )
+        for name in (
+            "supports_gqa",
+            "supports_mqa",
+            "is_moe",
+            "has_sliding_window",
+            "has_tied_embeddings",
+        ):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"{name} must be a bool")
+        for name in ("num_experts", "experts_per_token", "max_seq_len"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{name} must be a non-negative int")
+        if not self.is_moe and (self.num_experts or self.experts_per_token):
+            raise ValueError("expert counts require is_moe")
+        if self.experts_per_token and self.num_experts == 0:
+            raise ValueError("experts_per_token requires num_experts")
+        if self.num_experts and self.experts_per_token > self.num_experts:
+            raise ValueError("experts_per_token exceeds num_experts")
+        object.__setattr__(
+            self, "attention_variants", _copy_attention_variants(self.attention_variants)
+        )
+
+    @property
+    def has_hybrid_attention(self) -> bool:
+        """True when the family names more than one attention variant."""
+        return len(self.attention_variants) > 1
+
+
+def _describe(arch: ArchitectureType, **kwargs: object) -> ArchitectureDescriptor:
+    return ArchitectureDescriptor(arch_type=arch, **kwargs)
+
+
+# Family traits. Expert counts stay 0 when checkpoints disagree.
+# Qwen3.8 is the hybrid member: 512 experts, 10 chosen per token.
+ARCHITECTURE_DESCRIPTORS: Dict[ArchitectureType, ArchitectureDescriptor] = {
+    ArchitectureType.LLAMA: _describe(ArchitectureType.LLAMA, supports_gqa=True),
+    ArchitectureType.MISTRAL: _describe(
+        ArchitectureType.MISTRAL,
+        supports_gqa=True,
+        has_sliding_window=True,
+        attention_variants=["sliding_window"],
+    ),
+    ArchitectureType.PHI: _describe(ArchitectureType.PHI, supports_gqa=True),
+    ArchitectureType.GEMMA: _describe(
+        ArchitectureType.GEMMA,
+        supports_gqa=True,
+        has_tied_embeddings=True,
+    ),
+    ArchitectureType.QWEN: _describe(ArchitectureType.QWEN),
+    ArchitectureType.QWEN2: _describe(ArchitectureType.QWEN2, supports_gqa=True),
+    ArchitectureType.QWEN3: _describe(ArchitectureType.QWEN3, supports_gqa=True),
+    ArchitectureType.QWEN3_MOE: _describe(
+        ArchitectureType.QWEN3_MOE,
+        supports_gqa=True,
+        is_moe=True,
+    ),
+    ArchitectureType.QWEN3_HYBRID: _describe(
+        ArchitectureType.QWEN3_HYBRID,
+        supports_gqa=True,
+        is_moe=True,
+        num_experts=512,
+        experts_per_token=10,
+        attention_variants=["full", "gated_deltanet", "sparse_attention"],
+    ),
+    ArchitectureType.GPT2: _describe(
+        ArchitectureType.GPT2,
+        has_tied_embeddings=True,
+    ),
+    ArchitectureType.UNKNOWN: _describe(ArchitectureType.UNKNOWN),
+}
+
+
+def get_architecture_descriptor(arch: object) -> ArchitectureDescriptor:
+    """
+    Return the family descriptor for an ArchitectureType or a model_type string.
+    """
+    if isinstance(arch, ArchitectureType):
+        key = arch
+    elif isinstance(arch, str):
+        key = architecture_from_string(arch)
+    else:
+        raise ValueError(f"arch must be an ArchitectureType or model_type string, got {arch!r}")
+    return ARCHITECTURE_DESCRIPTORS.get(key, ARCHITECTURE_DESCRIPTORS[ArchitectureType.UNKNOWN])
