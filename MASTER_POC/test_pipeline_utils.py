@@ -15622,6 +15622,227 @@ def test_external_data_fallback():
     return True
 
 
+def test_genai_external_data():
+    """A GenAI model keeps every numbered external data file."""
+    print("=" * 50)
+    print("Testing GenAI external data files...")
+    print("=" * 50)
+
+    import os
+    import sys
+    import tempfile
+    import types
+
+    try:
+        import chunking_utils.onnx as onnx_pkg
+        import chunking_utils.onnx.loader as loader
+    except ModuleNotFoundError:
+        for name in list(sys.modules):
+            if name == "chunking_utils.onnx" or name.startswith("chunking_utils.onnx."):
+                del sys.modules[name]
+        onnx_stub = types.ModuleType("onnx")
+        onnx_stub.ModelProto = type("ModelProto", (), {})
+        onnx_stub.numpy_helper = types.SimpleNamespace()
+        onnx_stub.helper = types.SimpleNamespace()
+        onnx_stub.TensorProto = types.SimpleNamespace()
+        onnx_stub.shape_inference = types.SimpleNamespace()
+        sys.modules["onnx"] = onnx_stub
+        import chunking_utils.onnx as onnx_pkg
+        import chunking_utils.onnx.loader as loader
+
+    assert "find_all_external_data_files" not in onnx_pkg.__all__
+
+    class _Entry:
+        def __init__(self, key, value):
+            self.key = key
+            self.value = value
+
+    class _Tensor:
+        def __init__(self, name, location, offset, length):
+            self.name = name
+            self.external_data = [
+                _Entry("location", location),
+                _Entry("offset", offset),
+                _Entry("length", length),
+            ]
+            self.raw_data = b""
+
+    class _Model:
+        def __init__(self, tensors):
+            self.graph = types.SimpleNamespace(
+                initializer=list(tensors),
+                sparse_initializer=[],
+                node=[],
+            )
+            self.ir_version = 8
+            self.producer_name = "genai"
+
+    calls = []
+
+    def fake_load(path, load_external_data=True):
+        calls.append((path, load_external_data))
+        if load_external_data and not os.path.isfile(path + ".data"):
+            raise FileNotFoundError(path + ".data")
+        return _Model([
+            _Tensor("a", "model.onnx.data", "0", "4"),
+            _Tensor("b", "model.onnx.data_1", "0", "4"),
+            _Tensor("c", "model.onnx.data_2", "1", "3"),
+            _Tensor("d", "model.onnx_1.data", "0", "4"),
+        ])
+
+    def expect(callable_check, error_type, text):
+        try:
+            callable_check()
+            raise AssertionError(text)
+        except error_type:
+            return
+
+    had_load = hasattr(loader.onnx, "load")
+    original_load = getattr(loader.onnx, "load", None)
+    loader.onnx.load = fake_load
+    try:
+        with tempfile.TemporaryDirectory() as root:
+            model = os.path.join(root, "model.onnx")
+            with open(model, "wb") as handle:
+                handle.write(b"graph")
+            payloads = {
+                "model.onnx.data": b"AAAA",
+                "model.onnx.data_2": b"XCCCC",
+                "model.onnx.data_1": b"BBBB",
+                "model.onnx.data_10": b"TEN!",
+                "model.onnx_2.data": b"EEEE",
+                "model.onnx_1.data": b"DDDD",
+                "model.onnx.data_0": b"ZERO",
+                "model.onnx.data_01": b"LEAD",
+                "other.onnx.data": b"OTHER",
+                "model.onnx.data.bak": b"BAK",
+            }
+            for name, payload in payloads.items():
+                with open(os.path.join(root, name), "wb") as handle:
+                    handle.write(payload)
+
+            found = loader.find_all_external_data_files("  " + model + "  ")
+            assert found == [
+                os.path.normpath(os.path.join(root, "model.onnx.data")),
+                os.path.normpath(os.path.join(root, "model.onnx.data_1")),
+                os.path.normpath(os.path.join(root, "model.onnx.data_2")),
+                os.path.normpath(os.path.join(root, "model.onnx.data_10")),
+                os.path.normpath(os.path.join(root, "model.onnx_1.data")),
+                os.path.normpath(os.path.join(root, "model.onnx_2.data")),
+            ]
+            found.append("extra")
+            again = loader.find_all_external_data_files(model)
+            assert again == found[:-1]
+            assert again is not found
+
+            calls.clear()
+            loaded = loader.load_onnx_model(model)
+            assert calls == [(model, False)]
+            raw = [tensor.raw_data for tensor in loaded.graph.initializer]
+            assert raw == [b"AAAA", b"BBBB", b"CCC", b"DDDD"]
+            assert loaded.graph.initializer[1].external_data[0].value == "model.onnx.data_1"
+            loaded.graph.initializer[1].raw_data = b"CHANGED"
+            second = loader.load_onnx_model(model)
+            assert second.graph.initializer[1] is not loaded.graph.initializer[1]
+            assert second.graph.initializer[1].raw_data == b"BBBB"
+
+            os.remove(os.path.join(root, "model.onnx.data"))
+            with open(os.path.join(root, "model.onnx.data"), "wb") as handle:
+                handle.write(b"")
+            calls.clear()
+            lazy = loader.load_onnx_model(model, lazy_load_threshold_mb=0)
+            assert calls == [(model, False)]
+            assert lazy.graph.initializer[1].raw_data == b""
+            assert lazy.graph.initializer[1].external_data[0].value == "model.onnx.data_1"
+
+            for name in (
+                "model.onnx.data",
+                "model.onnx.data_2",
+                "model.onnx.data_10",
+                "model.onnx_1.data",
+                "model.onnx_2.data",
+            ):
+                os.remove(os.path.join(root, name))
+
+            def data_1_only(path, load_external_data=True):
+                calls.append((path, load_external_data))
+                return _Model([_Tensor("b", "model.onnx.data_1", "0", "4")])
+
+            loader.onnx.load = data_1_only
+            calls.clear()
+            lone = loader.load_onnx_model(model)
+            assert calls == [(model, False)]
+            assert lone.graph.initializer[0].raw_data == b"BBBB"
+            assert lone.graph.initializer[0].external_data[0].value == "model.onnx.data_1"
+
+            def missing_shard(path, load_external_data=True):
+                calls.append((path, load_external_data))
+                return _Model([_Tensor("gone", "model.onnx.data_3", "0", "4")])
+
+            loader.onnx.load = missing_shard
+            expect(
+                lambda: loader.load_onnx_model(model),
+                FileNotFoundError,
+                "a missing data_3 shard was accepted",
+            )
+
+            shards = os.path.join(root, "shards")
+            os.makedirs(shards)
+            with open(os.path.join(shards, "model.onnx.data"), "wb") as handle:
+                handle.write(b"AAAA")
+            with open(os.path.join(shards, "model.onnx.data_1"), "wb") as handle:
+                handle.write(b"BBBB")
+            elsewhere = os.path.join(root, "elsewhere")
+            os.makedirs(elsewhere)
+            remote = os.path.join(elsewhere, "model.onnx")
+            with open(remote, "wb") as handle:
+                handle.write(b"graph")
+
+            def remote_model(path, load_external_data=True):
+                calls.append((path, load_external_data))
+                return _Model([
+                    _Tensor("a", "model.onnx.data", "0", "4"),
+                    _Tensor("b", "model.onnx.data_1", "0", "4"),
+                ])
+
+            loader.onnx.load = remote_model
+            calls.clear()
+            moved = loader.load_onnx_model(remote, external_data_dir=shards)
+            assert calls == [(remote, False)]
+            assert [tensor.raw_data for tensor in moved.graph.initializer] == [b"AAAA", b"BBBB"]
+            assert moved.graph.initializer[1].external_data[0].value == "model.onnx.data_1"
+
+            expect(
+                lambda: loader.find_all_external_data_files(" "),
+                ValueError,
+                "a blank path was accepted",
+            )
+            expect(
+                lambda: loader.find_all_external_data_files(True),
+                ValueError,
+                "a bool path was accepted",
+            )
+            expect(
+                lambda: loader.find_all_external_data_files(root),
+                ValueError,
+                "a directory was accepted",
+            )
+            expect(
+                lambda: loader.find_all_external_data_files(os.path.join(root, "missing", "model.onnx")),
+                FileNotFoundError,
+                "a missing directory was accepted",
+            )
+    finally:
+        if had_load:
+            loader.onnx.load = original_load
+        elif hasattr(loader.onnx, "load"):
+            del loader.onnx.load
+
+    print("genai external data: OK")
+    print("  a genai model reads data_1, a numbered file stays in order, and a blank path raises")
+    return True
+
+
 def test_path_manager():
     """ONNX discovery, external data, split directories, and NPU cache paths."""
     print("=" * 50)
@@ -16070,6 +16291,12 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"external_data_fallback: FAILED - {e}")
         results.append(("external_data_fallback", False))
+
+    try:
+        results.append(("genai_external_data", test_genai_external_data()))
+    except Exception as e:
+        print(f"genai_external_data: FAILED - {e}")
+        results.append(("genai_external_data", False))
 
     try:
         results.append(("path_manager", test_path_manager()))

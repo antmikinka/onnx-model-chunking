@@ -6,7 +6,7 @@ with support for external data files and large models.
 """
 
 import os
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 import onnx
 
@@ -47,6 +47,116 @@ def resolve_model_path(model_path: str) -> str:
         raise FileNotFoundError(f"No ONNX model found in directory: {model_path}")
     else:
         raise FileNotFoundError(f"Model path does not exist: {model_path}")
+
+
+def _positive_index(text: str) -> Optional[int]:
+    """Return a shard index. Zero and a leading zero are not GenAI suffixes."""
+    if not text.isdigit() or (len(text) > 1 and text.startswith("0")):
+        return None
+    value = int(text)
+    if value <= 0:
+        return None
+    return value
+
+
+def find_all_external_data_files(model_file: str) -> List[str]:
+    """
+    Find every external-data file for one ONNX graph.
+
+    GenAI splits a model past the protobuf limit into ``model.onnx.data``,
+    ``model.onnx.data_1``, and ``model.onnx_1.data``. Only files that exist
+    are returned, unsuffixed first and then by numeric suffix.
+    """
+    if isinstance(model_file, bool) or not isinstance(model_file, str) or not model_file.strip():
+        raise ValueError(f"model_file must be a non-empty string, got {model_file!r}")
+    model_file = os.path.normpath(model_file.strip())
+    if os.path.isdir(model_file):
+        raise ValueError(f"model_file must be a file, got {model_file}")
+    directory = os.path.dirname(model_file) or "."
+    if not os.path.isdir(directory):
+        raise FileNotFoundError(f"external data directory does not exist: {directory}")
+    name = os.path.basename(model_file)
+    primary = None
+    data_shards = []
+    onnx_shards = []
+    try:
+        entries = os.listdir(directory)
+    except OSError as exc:
+        raise FileNotFoundError(
+            f"external data directory is not readable: {directory}"
+        ) from exc
+    data_prefix = name + ".data_"
+    onnx_prefix = name + "_"
+    for entry in entries:
+        path = os.path.normpath(os.path.join(directory, entry))
+        if not os.path.isfile(path):
+            continue
+        if entry == name + ".data":
+            primary = path
+            continue
+        if entry.startswith(data_prefix):
+            index = _positive_index(entry[len(data_prefix):])
+            if index is not None:
+                data_shards.append((index, path))
+            continue
+        if entry.startswith(onnx_prefix) and entry.endswith(".data"):
+            middle = entry[len(onnx_prefix):-len(".data")]
+            index = _positive_index(middle)
+            if index is not None:
+                onnx_shards.append((index, path))
+    data_shards.sort(key=lambda item: (item[0], item[1]))
+    onnx_shards.sort(key=lambda item: (item[0], item[1]))
+    found: List[str] = []
+    if primary is not None:
+        found.append(primary)
+    found.extend(path for _, path in data_shards)
+    found.extend(path for _, path in onnx_shards)
+    return found
+
+
+def _graph_for_data_file(path: str) -> Optional[str]:
+    """Return the graph path a GenAI data filename belongs to."""
+    directory = os.path.dirname(path)
+    name = os.path.basename(path)
+    marker = ".data_"
+    position = name.rfind(marker)
+    if position > 0 and _positive_index(name[position + len(marker):]) is not None:
+        return os.path.join(directory, name[:position])
+    if not name.endswith(".data"):
+        return None
+    stem = name[:-len(".data")]
+    split = stem.rfind("_")
+    if split > 0 and _positive_index(stem[split + 1:]) is not None:
+        return os.path.join(directory, stem[:split])
+    return os.path.join(directory, stem)
+
+
+def _fallback_external_files(fallback: str, model_file: str) -> tuple:
+    """
+    Return fallback data files and whether missing locations use one master.
+
+    Shards named for this graph are kept distinct. Any other single data
+    file is the shared master from the hardlink fallback.
+    """
+    raw = os.path.normpath(fallback)
+    model_name = os.path.basename(model_file)
+    if os.path.isfile(raw):
+        if not raw.endswith(".data"):
+            raise ValueError(
+                f"external_data_dir must be a directory or a .data file, got {raw}"
+            )
+        graph = _graph_for_data_file(raw)
+        if graph is not None and os.path.basename(graph) == model_name:
+            named = find_all_external_data_files(graph)
+            if named:
+                return named, False
+        return [raw], True
+    if not os.path.isdir(raw):
+        raise FileNotFoundError(f"external data path does not exist: {raw}")
+    named = find_all_external_data_files(os.path.join(raw, model_name))
+    if named:
+        return named, False
+    return [_resolve_master_data(raw)], True
 
 
 def _coerce_optional_path(value: Optional[str], label: str) -> Optional[str]:
@@ -223,6 +333,34 @@ def _store_raw(tensor: Any, payload: bytes) -> None:
         raise ValueError("initializer does not accept raw_data") from exc
 
 
+def _load_known_external_data(
+    model: onnx.ModelProto,
+    model_file: str,
+    data_files: List[str],
+) -> None:
+    """Read each external tensor from the shard named by its location."""
+    known = {}
+    for path in data_files:
+        known[os.path.basename(path)] = path
+        known[os.path.normpath(path)] = path
+        known[os.path.abspath(path)] = path
+    for tensor in _iter_external_tensors(model):
+        location = _location_of(tensor)
+        if location is None:
+            continue
+        resolved = _resolve_external_file(model_file, location)
+        if resolved is None:
+            resolved = known.get(os.path.basename(location))
+            if resolved is None:
+                resolved = known.get(os.path.normpath(location))
+        if resolved is None:
+            raise FileNotFoundError(
+                f"external data location {location!r} is not available for {model_file}"
+            )
+        offset, length = _external_span(tensor)
+        _store_raw(tensor, _read_span(resolved, offset, length))
+
+
 def _map_external_data(model: onnx.ModelProto, model_file: str, data_file: str) -> None:
     """Point missing external locations at the master data file and read them."""
     stored = _location_for_master(model_file, data_file)
@@ -257,6 +395,7 @@ def load_onnx_model(
     Supports:
     - Single ONNX files
     - ONNX files with external data (.onnx.data files)
+    - GenAI shards ``model.onnx.data``, ``model.onnx.data_1``, and ``model.onnx_1.data``
     - A shared master data file when the component sibling is absent
     - Lazy loading for very large models (>10GB by default)
     
@@ -279,27 +418,37 @@ def load_onnx_model(
     model_file = resolve_model_path(model_path)
     print(f"Loading ONNX model from: {model_file}")
     
-    # The component sibling wins. A hardlinked master file is the fallback.
-    sibling = model_file + ".data"
-    data_file = sibling if os.path.isfile(sibling) else None
-    used_fallback = False
-    if data_file is None and fallback is not None:
-        data_file = _resolve_master_data(fallback)
-        used_fallback = True
+    # Numbered GenAI shards count with the unsuffixed file. A hardlinked
+    # master file is the fallback when this graph has no shards of its own.
+    data_files = find_all_external_data_files(model_file)
+    retarget = False
+    if not data_files and fallback is not None:
+        data_files, retarget = _fallback_external_files(fallback, model_file)
     
-    if data_file is not None:
-        size_mb = os.path.getsize(data_file) / (1024 * 1024)
-        print(f"  External data file detected: {os.path.basename(data_file)} ({size_mb:.1f} MB)")
+    if data_files:
+        total_mb = sum(os.path.getsize(path) for path in data_files) / (1024 * 1024)
+        for path in data_files:
+            size_mb = os.path.getsize(path) / (1024 * 1024)
+            print(f"  External data file detected: {os.path.basename(path)} ({size_mb:.1f} MB)")
+        sibling = os.path.normpath(model_file + ".data")
+        single_sibling = (
+            len(data_files) == 1 and os.path.normpath(data_files[0]) == sibling
+        )
         
         # For very large models, use lazy loading to avoid OOM
-        if size_mb > lazy_load_threshold_mb:
+        if total_mb > lazy_load_threshold_mb:
             print(f"  Using LAZY loading (graph structure only) for large model")
             model = onnx.load(model_file, load_external_data=False)
-        elif used_fallback and load_external_data:
+        elif not load_external_data:
             model = onnx.load(model_file, load_external_data=False)
-            _map_external_data(model, model_file, data_file)
-        else:
+        elif retarget:
+            model = onnx.load(model_file, load_external_data=False)
+            _map_external_data(model, model_file, data_files[0])
+        elif single_sibling:
             model = onnx.load(model_file, load_external_data=load_external_data)
+        else:
+            model = onnx.load(model_file, load_external_data=False)
+            _load_known_external_data(model, model_file, data_files)
     else:
         model = onnx.load(model_file, load_external_data=load_external_data)
     
