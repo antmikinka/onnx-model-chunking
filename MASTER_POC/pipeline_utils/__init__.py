@@ -115,6 +115,9 @@ from .backend import (
     get_backend,
     detect_model_format,
     get_backend_for_model,
+    providers_for_device,
+    resolve_onnx_providers,
+    DEVICE_PROVIDER_MAP,
 )
 
 from .dtypes import GGUF_DTYPE_MAP, AWQ_DTYPE_MAP
@@ -225,6 +228,9 @@ __all__ = [
     "get_backend",
     "detect_model_format",
     "get_backend_for_model",
+    "providers_for_device",
+    "resolve_onnx_providers",
+    "DEVICE_PROVIDER_MAP",
     # npu_config exports (P1.4)
     "NPUConfig",
     "NPUOffloadConfig",

@@ -3260,11 +3260,15 @@ def test_backend():
     import onnxruntime as ort
 
     from pipeline_utils.backend import (
+        DEVICE_PROVIDER_MAP,
         BackendConfig,
+        DeviceType,
         OnnxRuntimeBackend,
         _pair_present_to_past,
         _sample_next_token,
         _sequential_pipeline_class,
+        providers_for_device,
+        resolve_onnx_providers,
     )
 
     unloaded = OnnxRuntimeBackend()
@@ -3510,7 +3514,113 @@ def test_backend():
         if inserted_transformers:
             sys.modules.pop("transformers", None)
 
+    assert DEVICE_PROVIDER_MAP[DeviceType.NPU] == [
+        "VitisAIExecutionProvider",
+        "RyzenAIExecutionProvider",
+        "CPUExecutionProvider",
+    ]
+    assert DEVICE_PROVIDER_MAP[DeviceType.GPU] == [
+        "ROCmExecutionProvider",
+        "CUDAExecutionProvider",
+        "DmlExecutionProvider",
+        "CPUExecutionProvider",
+    ]
+    assert DEVICE_PROVIDER_MAP[DeviceType.CPU] == ["CPUExecutionProvider"]
+    assert DEVICE_PROVIDER_MAP[DeviceType.AUTO] is None
+    full = [
+        "VitisAIExecutionProvider",
+        "RyzenAIExecutionProvider",
+        "ROCmExecutionProvider",
+        "CUDAExecutionProvider",
+        "DmlExecutionProvider",
+        "CPUExecutionProvider",
+    ]
+    assert providers_for_device(DeviceType.NPU, full) == [
+        "VitisAIExecutionProvider",
+        "RyzenAIExecutionProvider",
+        "CPUExecutionProvider",
+    ]
+    assert providers_for_device("gpu", full) == [
+        "ROCmExecutionProvider",
+        "CUDAExecutionProvider",
+        "DmlExecutionProvider",
+        "CPUExecutionProvider",
+    ]
+    assert providers_for_device(DeviceType.NPU, ["CPUExecutionProvider"]) == [
+        "CPUExecutionProvider",
+    ]
+    assert providers_for_device(DeviceType.AUTO, [
+        "CUDAExecutionProvider",
+        "VitisAIExecutionProvider",
+        "CPUExecutionProvider",
+    ]) == [
+        "VitisAIExecutionProvider",
+        "CUDAExecutionProvider",
+        "CPUExecutionProvider",
+    ]
+    assert providers_for_device(DeviceType.AUTO, ["CPUExecutionProvider"]) == [
+        "CPUExecutionProvider",
+    ]
+    try:
+        providers_for_device("tpu")
+        raise AssertionError("unknown device was accepted")
+    except ValueError as exc:
+        assert "tpu" in str(exc)
+    explicit = BackendConfig(
+        device=DeviceType.NPU,
+        onnx_providers=["CPUExecutionProvider"],
+    )
+    assert resolve_onnx_providers(explicit, full) == ["CPUExecutionProvider"]
+    try:
+        resolve_onnx_providers(
+            BackendConfig(onnx_providers=["VitisAIExecutionProvider"]),
+            ["CPUExecutionProvider"],
+        )
+        raise AssertionError("a missing explicit provider was accepted")
+    except RuntimeError as exc:
+        assert "VitisAIExecutionProvider" in str(exc)
+
+    real_available = ort.get_available_providers
+    ort.get_available_providers = lambda: [
+        "CPUExecutionProvider",
+        "ROCmExecutionProvider",
+    ]
+    ort.InferenceSession = _PatchedSession
+    try:
+        gpu = OnnxRuntimeBackend(BackendConfig(device=DeviceType.GPU))
+        assert gpu.providers == ["ROCmExecutionProvider", "CPUExecutionProvider"]
+        gpu.load(model_file.name)
+        assert captured["providers"] == ["ROCmExecutionProvider", "CPUExecutionProvider"]
+        gpu.cleanup()
+    finally:
+        ort.get_available_providers = real_available
+        ort.InferenceSession = real_session
+
+    backend_mod._sequential_pipeline_class = _fake_pipeline_class
+    ort.get_available_providers = lambda: [
+        "VitisAIExecutionProvider",
+        "CPUExecutionProvider",
+    ]
+    npu_dir = tempfile.mkdtemp(prefix="onnx-npu-")
+    try:
+        npu = OnnxRuntimeBackend(BackendConfig(device=DeviceType.NPU))
+        npu.load(npu_dir)
+        assert created["pipeline"].providers == [
+            "VitisAIExecutionProvider",
+            "CPUExecutionProvider",
+        ]
+        assert npu.get_memory_usage()["providers"] == [
+            "VitisAIExecutionProvider",
+            "CPUExecutionProvider",
+        ]
+        npu.cleanup()
+    finally:
+        backend_mod._sequential_pipeline_class = original_factory
+        ort.get_available_providers = real_available
+        os.rmdir(npu_dir)
+
     print("  generate: split pipeline and monolithic prefill/decode")
+    print("  providers: NPU, GPU, CPU, and auto-detect")
     print("backend module: OK\n")
     return True
 

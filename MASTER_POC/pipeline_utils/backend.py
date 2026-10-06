@@ -8,8 +8,11 @@ enabling the pipeline to work with ONNX Runtime, llama.cpp, or PyTorch.
 Usage:
     from pipeline_utils.backend import get_backend, BackendType, DeviceType
     
-    backend = get_backend(BackendType.ONNX_RUNTIME)
-    backend.load(model_path, device=DeviceType.GPU)
+    backend = get_backend(
+        BackendType.ONNX_RUNTIME,
+        BackendConfig(device=DeviceType.NPU),
+    )
+    backend.load(model_path)
     output = backend.generate("Hello", max_tokens=50)
 """
 
@@ -54,6 +57,17 @@ class ModelFormat(Enum):
     PYTORCH_BIN = "pytorch_bin"
 
 
+# Preference order for OnnxRuntimeBackend. AUTO is detected from this table.
+DEVICE_PROVIDER_MAP = {
+    DeviceType.NPU: ["VitisAIExecutionProvider", "RyzenAIExecutionProvider", "CPUExecutionProvider"],
+    DeviceType.GPU: ["ROCmExecutionProvider", "CUDAExecutionProvider", "DmlExecutionProvider", "CPUExecutionProvider"],
+    DeviceType.CPU: ["CPUExecutionProvider"],
+    DeviceType.AUTO: None,  # auto-detect
+}
+
+_AUTO_DEVICE_ORDER = (DeviceType.NPU, DeviceType.GPU, DeviceType.CPU)
+
+
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
@@ -76,12 +90,94 @@ class BackendConfig:
     # Quantization (for llama.cpp)
     quantization: Optional[str] = None  # Q4_K_M, Q8_0, etc.
     
-    # ONNX-specific
-    onnx_providers: List[str] = field(default_factory=lambda: ["CPUExecutionProvider"])
+    # ONNX-specific. None uses DEVICE_PROVIDER_MAP for ``device``.
+    onnx_providers: Optional[List[str]] = None
     onnx_optimization_level: str = "DISABLE"
     
     # Memory
     low_memory: bool = False
+
+
+def _coerce_device(device: Union[DeviceType, str]) -> DeviceType:
+    """Accept a DeviceType or its value, such as ``\"npu\"``."""
+    if isinstance(device, DeviceType):
+        return device
+    text = str(device).split(".")[-1].strip().lower()
+    try:
+        return DeviceType(text)
+    except ValueError as exc:
+        known = ", ".join(item.value for item in DeviceType)
+        raise ValueError(f"Unknown device '{device}'. Expected one of: {known}") from exc
+
+
+def _available_execution_providers() -> List[str]:
+    """Providers this ONNX Runtime build can actually run."""
+    import onnxruntime as ort
+    return list(ort.get_available_providers())
+
+
+def providers_for_device(
+    device: Union[DeviceType, str],
+    available: Optional[Sequence[str]] = None,
+) -> List[str]:
+    """
+    Provider list for one device.
+
+    Names follow ``DEVICE_PROVIDER_MAP`` and stay in that order. A provider
+    this process cannot run is left out. ``AUTO`` walks NPU, then GPU, then
+    CPU and keeps the first installed accelerator from each, with CPU last.
+    """
+    kind = _coerce_device(device)
+    if kind not in DEVICE_PROVIDER_MAP:
+        raise ValueError(f"No provider map entry for {kind}")
+    if available is None:
+        available = _available_execution_providers()
+    installed = set(available)
+    mapped = DEVICE_PROVIDER_MAP[kind]
+    if mapped is None:
+        selected: List[str] = []
+        for candidate in _AUTO_DEVICE_ORDER:
+            for provider in DEVICE_PROVIDER_MAP[candidate]:
+                if provider == "CPUExecutionProvider" or provider in selected:
+                    continue
+                if provider in installed:
+                    selected.append(provider)
+        if "CPUExecutionProvider" in installed or not selected:
+            selected.append("CPUExecutionProvider")
+        return selected
+    selected = [provider for provider in mapped if provider in installed]
+    if selected:
+        return selected
+    if "CPUExecutionProvider" in mapped:
+        return ["CPUExecutionProvider"]
+    raise RuntimeError(
+        f"No mapped provider for {kind.value} is available. Available: {list(available)}"
+    )
+
+
+def resolve_onnx_providers(
+    config: "BackendConfig",
+    available: Optional[Sequence[str]] = None,
+) -> List[str]:
+    """
+    Providers a backend should pass to ONNX Runtime.
+
+    An ``onnx_providers`` list is the caller override. Otherwise the device
+    map selects the list. An override whose names are all missing raises.
+    """
+    if available is None:
+        available = _available_execution_providers()
+    explicit = list(config.onnx_providers or [])
+    if explicit:
+        installed = set(available)
+        selected = [provider for provider in explicit if provider in installed]
+        if selected:
+            return selected
+        raise RuntimeError(
+            f"None of the requested providers {explicit} are available. "
+            f"Available: {list(available)}"
+        )
+    return providers_for_device(config.device, available)
 
 
 # =============================================================================
@@ -427,6 +523,7 @@ class OnnxRuntimeBackend(InferenceBackend):
         self._is_split = False
         self._pipeline = None
         self._tokenizer = None
+        self.providers = resolve_onnx_providers(self.config)
 
     @property
     def backend_type(self) -> BackendType:
@@ -441,11 +538,12 @@ class OnnxRuntimeBackend(InferenceBackend):
         self.model_path = model_path
         self._is_split = os.path.isdir(model_path)
         self._pipeline = None
+        self.providers = resolve_onnx_providers(self.config)
         if self._is_split:
             pipeline_cls = _sequential_pipeline_class()
             self._pipeline = pipeline_cls(
                 model_path,
-                providers=list(self.config.onnx_providers),
+                providers=list(self.providers),
                 verbose=False,
                 persist_sessions=not self.config.low_memory,
             )
@@ -466,7 +564,7 @@ class OnnxRuntimeBackend(InferenceBackend):
             self.model = ort.InferenceSession(
                 model_path,
                 sess_options=options,
-                providers=self.config.onnx_providers,
+                providers=list(self.providers),
             )
             self._tokenizer = _load_tokenizer(model_path)
         self.is_loaded = True
@@ -607,11 +705,13 @@ class OnnxRuntimeBackend(InferenceBackend):
         if hasattr(source, "get_memory_usage"):
             usage = dict(source.get_memory_usage())
             usage["split"] = self._is_split
+            usage["providers"] = list(self.providers)
             return usage
         return {
             "backend": "onnx_runtime",
             "loaded": self.is_loaded,
             "split": self._is_split,
+            "providers": list(self.providers),
         }
 
     def cleanup(self) -> None:
@@ -809,4 +909,8 @@ __all__ = [
     "get_backend",
     "detect_model_format",
     "get_backend_for_model",
+    "providers_for_device",
+    "resolve_onnx_providers",
+    # Provider map
+    "DEVICE_PROVIDER_MAP",
 ]
