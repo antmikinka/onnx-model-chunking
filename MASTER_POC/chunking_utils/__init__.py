@@ -93,6 +93,8 @@ from .common.architecture import (
     LLAMA_STYLE_ARCHITECTURES,
 )
 
+from .common.architecture_detector import detect_architecture
+
 from .common.path_utils import (
     is_local_path,
     sanitize_model_name,
@@ -254,6 +256,7 @@ __all__ = [
     "get_architecture_descriptor",
     "QUANTIZED_OP_PATTERNS",
     "quantized_op_scheme",
+    "detect_architecture",
     "SAFETENSORS_PREFIXES",
     "ONNX_PREFIXES",
     "LLAMA_STYLE_ARCHITECTURES",

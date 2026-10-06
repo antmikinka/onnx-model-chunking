@@ -9008,6 +9008,9 @@ def test_architecture():
     assert unknown.attention_variants == []
     assert unknown.max_seq_len == 0
     assert unknown.has_hybrid_attention is False
+    assert unknown.has_mtp_head is False
+    assert unknown.has_ngram_embedding is False
+    assert unknown.quantization_format == ""
     for record in ARCHITECTURE_DESCRIPTORS.values():
         assert record.supports_mqa is False
         assert record.max_seq_len == 0
@@ -9152,10 +9155,182 @@ def test_architecture():
     except ValueError as exc:
         assert "node name" in str(exc)
 
+    import sys
+    import types
+    import chunking_utils
+    from chunking_utils.common.architecture_detector import detect_architecture
+
+    try:
+        from chunking_utils.onnx.splitter import detect_architecture_from_onnx
+    except ModuleNotFoundError:
+        for name in list(sys.modules):
+            if name == "chunking_utils.onnx" or name.startswith("chunking_utils.onnx."):
+                del sys.modules[name]
+        onnx_stub = types.ModuleType("onnx")
+        onnx_stub.ModelProto = type("ModelProto", (), {})
+        onnx_stub.numpy_helper = types.SimpleNamespace()
+        onnx_stub.helper = types.SimpleNamespace()
+        onnx_stub.TensorProto = types.SimpleNamespace()
+        onnx_stub.shape_inference = types.SimpleNamespace()
+        sys.modules["onnx"] = onnx_stub
+        from chunking_utils.onnx.splitter import detect_architecture_from_onnx
+
+    assert common.detect_architecture is detect_architecture
+    assert chunking_utils.detect_architecture is detect_architecture
+
+    class _Node:
+        def __init__(self, name, op_type="MatMul"):
+            self.name = name
+            self.op_type = op_type
+
+    class _Init:
+        def __init__(self, name):
+            self.name = name
+
+    class _Graph:
+        def __init__(self, nodes, inits=()):
+            self.node = nodes
+            self.initializer = list(inits)
+
+    hybrid_graph = _Graph([
+        _Node("/model/layers.0/linear_attn/in_proj"),
+        _Node("/model/layers.1/sparse_attn/q_proj"),
+        _Node("/model/layers.0/mlp/experts/0/gate_proj/MatMulNBits", "MatMulNBits"),
+        _Node("/mtp_head"),
+        _Node("/model/ngram_embedding"),
+    ])
+    hybrid_found = detect_architecture(hybrid_graph)
+    assert hybrid_found.arch_type is ArchitectureType.QWEN3_HYBRID
+    assert hybrid_found.is_moe is True
+    assert hybrid_found.attention_variants == ["gdn", "qsa"]
+    assert hybrid_found.has_mtp_head is True
+    assert hybrid_found.has_ngram_embedding is True
+    assert hybrid_found.quantization_format == "matmulnbits"
+    assert detect_architecture_from_onnx(hybrid_graph) is ArchitectureType.QWEN3_HYBRID
+
+    dense_qwen = detect_architecture(_Graph([
+        _Node("/model/layers.0/self_attn/q_norm"),
+        _Node("/model/layers.0/mlp/gate_proj/MatMul"),
+    ]))
+    assert dense_qwen.arch_type is ArchitectureType.QWEN3
+    assert dense_qwen.is_moe is False
+    assert dense_qwen.attention_variants == []
+    assert dense_qwen.quantization_format == ""
+
+    moe_found = detect_architecture(_Graph([
+        _Node("/model/layers.0/self_attn/q_norm"),
+        _Node("/model/layers.0/mlp/experts/0/up_proj"),
+        _Node("/model/layers.0/mlp/gate/MatMul"),
+    ]))
+    assert moe_found.arch_type is ArchitectureType.QWEN3_MOE
+    assert moe_found.is_moe is True
+    assert moe_found.has_mtp_head is False
+
+    ryzen = detect_architecture(_Graph([
+        _Node("gqo_8_1_0"),
+        _Node("ssmlp_3_0_0"),
+        _Node("MatMulNBits_k_6_0", "MatMulNBits"),
+    ]))
+    assert ryzen.arch_type is ArchitectureType.LLAMA
+    assert ryzen.is_moe is False
+    assert ryzen.attention_variants == []
+    assert ryzen.quantization_format == "matmulnbits"
+
+    configured = detect_architecture(
+        _Graph([
+            _Node("gqo_8_1_0"),
+            _Node("ssmlp_3_0_0"),
+            _Node("MatMulNBits_k_6_0", "MatMulNBits"),
+        ]),
+        config_json={
+            "model_type": "qwen3.8",
+            "layer_types": ["linear_attention", "sparse_attention"],
+            "num_experts": 512,
+            "num_experts_per_tok": 10,
+        },
+    )
+    assert configured.arch_type is ArchitectureType.QWEN3_HYBRID
+    assert configured.is_moe is True
+    assert configured.num_experts == 512
+    assert configured.experts_per_token == 10
+    assert configured.attention_variants == ["gdn", "qsa"]
+    assert configured.quantization_format == "matmulnbits"
+    assert configured.supports_gqa is True
+
+    from_info = detect_architecture(
+        _Graph([_Node("/model/layers.0/self_attn/q_proj")]),
+        config_json={"model_type": "llama"},
+        model_info={
+            "model_type": "qwen3_moe",
+            "num_experts": 64,
+            "num_experts_per_token": 4,
+        },
+    )
+    assert from_info.arch_type is ArchitectureType.QWEN3_MOE
+    assert from_info.num_experts == 64
+    assert from_info.experts_per_token == 4
+
+    from_genai = detect_architecture(
+        _Graph([_Node("/model/layers.0/self_attn/q_norm/MatMulNBits", "MatMulNBits")]),
+        config_json='{"quantization_config": {"quant_method": "awq"}}',
+        genai_config={"model": {"decoder": {"model_type": "llama"}}},
+    )
+    assert from_genai.arch_type is ArchitectureType.QWEN3
+    assert from_genai.quantization_format == "awq"
+
+    ngram_only = detect_architecture(_Graph([], [_Init("model.ngram_embedding.weight")]))
+    assert ngram_only.arch_type is ArchitectureType.QWEN3_HYBRID
+    assert ngram_only.has_ngram_embedding is True
+
+    flagged = detect_architecture(
+        None,
+        config_json={
+            "model_type": "qwen3_hybrid",
+            "has_mtp_head": True,
+            "has_ngram_embedding": True,
+        },
+    )
+    assert flagged.arch_type is ArchitectureType.QWEN3_HYBRID
+    assert flagged.is_moe is True
+    assert flagged.has_mtp_head is True
+    assert flagged.has_ngram_embedding is True
+
+    assert detect_architecture(None).arch_type is ArchitectureType.UNKNOWN
+    assert detect_architecture(_Graph([])).arch_type is ArchitectureType.LLAMA
+    assert detect_architecture(_Graph([_Node("/transformer/h.0/attn")])).arch_type is ArchitectureType.GPT2
+    assert detect_architecture_from_onnx(_Graph([])) is ArchitectureType.LLAMA
+
+    try:
+        detect_architecture(_Graph([]), config_json="{")
+        raise AssertionError("broken config json was accepted")
+    except ValueError as exc:
+        assert "config_json" in str(exc)
+    try:
+        detect_architecture(1)
+        raise AssertionError("a non-graph was accepted")
+    except ValueError as exc:
+        assert "graph" in str(exc)
+    try:
+        detect_architecture(
+            None,
+            model_info={"model_type": "qwen3_moe", "num_experts": 4, "num_experts_per_tok": 8},
+        )
+        raise AssertionError("a top-k above the expert count was accepted")
+    except ValueError as exc:
+        assert "exceeds" in str(exc)
+    try:
+        ArchitectureDescriptor(ArchitectureType.LLAMA, quantization_format="int4/weight")
+        raise AssertionError("a quantization path was accepted")
+    except ValueError as exc:
+        assert "quantization_format" in str(exc)
+    stored = ArchitectureDescriptor(ArchitectureType.LLAMA, quantization_format="matmul_nbits")
+    assert stored.quantization_format == "matmulnbits"
+
     print("  architecture prefixes: dense llama record, moe router and expert, hybrid mtp head")
     print("  architecture names: longest qwen3_moe, dense qwen3, qwen2.5")
     print("  quantized onnx nodes: MatMulNBits int4, QLinearMatMul int8, AWQMatMul awq")
     print("  architecture descriptor: gqa, moe counts, sliding window, tied embeddings, hybrid attention")
+    print("  architecture detector: hybrid gdn qsa, mtp, ngram, matmulnbits, ryzenai config")
     print("architecture prefixes: OK\n")
     return True
 

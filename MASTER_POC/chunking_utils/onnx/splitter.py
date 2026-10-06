@@ -18,9 +18,9 @@ from ..common.path_utils import sanitize_model_name
 from ..common.architecture import (
     ArchitectureType,
     ONNX_PREFIXES,
-    classify_qwen_family,
     get_prefixes,
 )
+from ..common.architecture_detector import detect_architecture
 from ..common.types import SplitConfig, ModelFormat
 
 from .types import ComponentInfo, OnnxSplitResult
@@ -29,32 +29,18 @@ from .loader import load_onnx_model
 
 def detect_architecture_from_onnx(graph) -> ArchitectureType:
     """
-    Detect model architecture from ONNX node name patterns.
-    
+    Detect model architecture from an ONNX graph.
+
+    The descriptor lives in ``architecture_detector``. This wrapper returns
+    the architecture type used to choose ONNX prefixes.
+
     Args:
         graph: ONNX graph.
-    
+
     Returns:
         Detected ArchitectureType.
     """
-    sample_names = []
-    for node in graph.node:
-        if node.name:
-            sample_names.append(node.name)
-
-    for init in graph.initializer:
-        if init.name:
-            sample_names.append(init.name)
-
-    if any("/model/layers." in n or "model.layers." in n for n in sample_names):
-        variant = classify_qwen_family(sample_names)
-        if variant is not None:
-            return variant
-        return ArchitectureType.LLAMA
-    elif any("/transformer/h." in n or "transformer.h." in n for n in sample_names):
-        return ArchitectureType.GPT2
-    
-    return ArchitectureType.LLAMA  # Default
+    return detect_architecture(graph).arch_type
 
 
 def get_onnx_prefixes(model_type: Optional[str] = None) -> Tuple[str, str, str, str]:

@@ -381,6 +381,29 @@ def architecture_from_string(model_type: str) -> ArchitectureType:
     return ArchitectureType.UNKNOWN
 
 
+_QUANT_FORMAT_ALIASES = {
+    "matmulnbits": "matmulnbits",
+    "int4weight": "matmulnbits",
+    "awq": "awq",
+    "awqint4": "awq",
+    "gptq": "gptq",
+    "qlinear": "qlinear",
+    "qlinearmatmul": "qlinear",
+    "int8quantized": "qlinear",
+}
+
+
+def _canonical_quantization_format(value: str) -> str:
+    """Store a quantization format as a short lowercase name."""
+    text = value.strip().lower()
+    if not text:
+        return ""
+    compact = text.replace("-", "").replace("_", "").replace(" ", "")
+    if not compact.isalnum():
+        raise ValueError("quantization_format must be a format name")
+    return _QUANT_FORMAT_ALIASES.get(compact, compact)
+
+
 def _copy_attention_variants(value: object) -> List[str]:
     """Copy attention names. A string is not a list of names."""
     if isinstance(value, str) or not isinstance(value, Iterable):
@@ -403,7 +426,10 @@ class ArchitectureDescriptor:
     supports_gqa and supports_mqa say the family can use that attention
     grouping. is_moe with zero expert counts means the checkpoint supplies
     the count. max_seq_len 0 means the same for context length. More than
-    one attention variant is hybrid attention.
+    one attention variant is hybrid attention. ``has_mtp_head`` and
+    ``has_ngram_embedding`` record a multi-token prediction head and
+    n-gram embeddings. ``quantization_format`` is empty until a graph
+    or config names one, and ``matmul_nbits`` is stored as ``matmulnbits``.
     """
     arch_type: ArchitectureType
     supports_gqa: bool = False
@@ -415,6 +441,9 @@ class ArchitectureDescriptor:
     has_tied_embeddings: bool = False
     attention_variants: List[str] = field(default_factory=list)
     max_seq_len: int = 0
+    has_mtp_head: bool = False
+    has_ngram_embedding: bool = False
+    quantization_format: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.arch_type, ArchitectureType):
@@ -437,9 +466,18 @@ class ArchitectureDescriptor:
             "is_moe",
             "has_sliding_window",
             "has_tied_embeddings",
+            "has_mtp_head",
+            "has_ngram_embedding",
         ):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be a bool")
+        if not isinstance(self.quantization_format, str):
+            raise ValueError("quantization_format must be a string")
+        object.__setattr__(
+            self,
+            "quantization_format",
+            _canonical_quantization_format(self.quantization_format),
+        )
         for name in ("num_experts", "experts_per_token", "max_seq_len"):
             value = getattr(self, name)
             if type(value) is not int or value < 0:

@@ -30,6 +30,7 @@ from .architecture import (
     QUANTIZED_OP_PATTERNS,
     quantized_op_scheme,
 )
+from .architecture_detector import detect_architecture
 from .types import (
     ModelFormat,
     TensorDtype,
@@ -101,6 +102,7 @@ __all__ = [
     "get_architecture_descriptor",
     "QUANTIZED_OP_PATTERNS",
     "quantized_op_scheme",
+    "detect_architecture",
     # Types
     "ModelFormat",
     "TensorDtype",
