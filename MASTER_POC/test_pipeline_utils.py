@@ -3293,6 +3293,21 @@ def test_backend():
         raise AssertionError("generate before load was accepted")
     except RuntimeError as exc:
         assert "load()" in str(exc)
+    try:
+        unloaded.warmup()
+        raise AssertionError("warmup before load was accepted")
+    except RuntimeError as exc:
+        assert "load()" in str(exc)
+    try:
+        unloaded.warmup(-1)
+        raise AssertionError("a negative warmup count was accepted")
+    except ValueError as exc:
+        assert "iterations" in str(exc)
+    try:
+        unloaded.warmup(True)
+        raise AssertionError("a boolean warmup count was accepted")
+    except TypeError as exc:
+        assert "int" in str(exc)
 
     assert _sample_next_token(np.array([1.0, 3.0, 2.0]), temperature=0, top_p=0.9) == 1
     assert _sample_next_token(np.array([0.0, 0.0, 5.0]), temperature=1.0, top_p=0.1) == 2
@@ -3453,6 +3468,57 @@ def test_backend():
     assert kv_backend.kv_cache is not None
     assert kv_backend.get_cache_stats()["attached"] is True
     assert kv_backend.get_cache_stats()["sequence_length"] == 4
+    assert kv_backend.warmed_up is False
+
+    warm_session = _GreedySession()
+    warm_backend = OnnxRuntimeBackend()
+    warm_backend.is_loaded = True
+    warm_backend._is_split = False
+    warm_backend.model = warm_session
+    warm_backend._tokenizer = _Tokenizer()
+    assert warm_backend.warmup(0) == {"iterations": 0, "warmed": False}
+    assert warm_session.lengths == []
+    assert warm_backend.warmup() == {"iterations": 2, "warmed": True}
+    assert warm_backend.warmed_up is True
+    assert warm_session.lengths == [3, 4, 3, 4]
+    assert warm_backend.get_memory_usage()["warmed_up"] is True
+    warm_backend.cleanup()
+    assert warm_backend.warmed_up is False
+
+    warm_kv_session = _KvSession()
+    warm_kv = OnnxRuntimeBackend()
+    warm_kv.is_loaded = True
+    warm_kv.model = warm_kv_session
+    warm_kv._tokenizer = _Tokenizer()
+    assert warm_kv.warmup(1) == {"iterations": 1, "warmed": True}
+    assert warm_kv_session.past_lengths == [0, 3]
+    assert warm_kv.kv_cache.get_sequence_length() == 0
+    warm_kv_session.past_lengths.clear()
+    assert warm_kv.generate("Hello", max_tokens=1, temperature=0) == "1,2,3,3"
+    assert warm_kv_session.past_lengths == [0]
+
+    class _AnonSession:
+        def __init__(self):
+            self.feeds = []
+
+        def get_inputs(self):
+            return [
+                _Node("input_ids", [1, "seq"], "tensor(int64)"),
+                _Node("past_key_values.0.key", [1, 1, "past", 2]),
+                _Node("past_key_values.0.value", [1, 1, "past", 2]),
+            ]
+
+        def run(self, names, feeds):
+            self.feeds.append(int(feeds["past_key_values.0.key"].shape[2]))
+            return [np.zeros((1, 1, 2), dtype=np.float32)]
+
+    anon = OnnxRuntimeBackend()
+    anon.is_loaded = True
+    anon._is_split = False
+    anon.model = _AnonSession()
+    assert anon.warmup(1)["warmed"] is True
+    assert anon.model.feeds == [0, 1]
+    assert anon.kv_cache is None
 
     class _OddSession(_GreedySession):
         def get_inputs(self):
@@ -3538,6 +3604,39 @@ def test_backend():
     ) == "done"
     assert plain_pieces == [("done", 0)]
 
+    class _WarmLlama:
+        def __init__(self):
+            self.calls = []
+            self.resets = 0
+
+        def __call__(
+            self,
+            prompt,
+            max_tokens=50,
+            temperature=0.7,
+            top_p=0.9,
+            echo=False,
+            stream=False,
+        ):
+            self.calls.append((prompt, max_tokens, temperature, stream))
+            return {"choices": [{"text": "ok"}]}
+
+        def reset(self):
+            self.resets += 1
+
+    warm_llama = LlamaCppBackend()
+    warm_llama.is_loaded = True
+    warm_llama.model = _WarmLlama()
+    assert warm_llama.warmup(2) == {"iterations": 2, "warmed": True}
+    assert warm_llama.model.calls == [
+        ("Hello", 2, 0.0, False),
+        ("Hello", 2, 0.0, False),
+    ]
+    assert warm_llama.model.resets == 3
+    assert warm_llama.get_memory_usage()["warmed_up"] is True
+    warm_llama.cleanup()
+    assert warm_llama.warmed_up is False
+
     odd = OnnxRuntimeBackend()
     odd.is_loaded = True
     odd.model = _OddSession()
@@ -3617,6 +3716,9 @@ def test_backend():
         ) == "split:Hello:7"
         assert fallback_tokens == [("split:Hello:7", 0)]
         assert pipeline.calls == [("Hello", 7), ("Hello", 7)]
+        assert split.warmup(2) == {"iterations": 2, "warmed": True}
+        assert pipeline.calls == [("Hello", 7), ("Hello", 7), ("Hello", 2), ("Hello", 2)]
+        assert split.get_memory_usage()["warmed_up"] is True
 
         class _StreamingPipeline(_FakePipeline):
             def generate(self, prompt, max_new_tokens=20, stream_callback=None):
@@ -3654,6 +3756,7 @@ def test_backend():
         split.cleanup()
         assert pipeline.cleaned is True
         assert split.is_loaded is False
+        assert split.warmed_up is False
 
         preset = KVCacheManager(
             num_layers=1,

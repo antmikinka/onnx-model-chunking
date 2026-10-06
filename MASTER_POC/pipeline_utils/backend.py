@@ -354,6 +354,7 @@ class InferenceBackend(ABC):
         self.is_loaded = False
         self.model_path: Optional[str] = None
         self.kv_cache: Optional[KVCacheManager] = None
+        self.warmed_up = False
     
     @property
     @abstractmethod
@@ -412,6 +413,37 @@ class InferenceBackend(ABC):
         """Release the model. The KV cache object stays attached."""
         self.model = None
         self.is_loaded = False
+        self.warmed_up = False
+
+    def warmup(self, iterations: int = 2) -> Dict[str, Any]:
+        """
+        Pay the first-run compilation cost before timing.
+
+        On an NPU that cost is graph compilation, XCLBIN generation, memory
+        planning, operator fallback, and cache initialization. Each iteration
+        resets the cache and generates two tokens from a fixed prompt, so
+        prefill and one decode both run. The runs are not a latency result.
+        The cache is cleared again afterward. Zero iterations leave the
+        warmed flag unchanged and do not run the model.
+        """
+        if isinstance(iterations, bool) or not isinstance(iterations, int):
+            raise TypeError(f"warmup iterations must be an int, got {iterations!r}")
+        if iterations < 0:
+            raise ValueError(f"warmup iterations must be >= 0, got {iterations}")
+        if not self.is_loaded:
+            raise RuntimeError("Model not loaded. Call load() first.")
+        if iterations == 0:
+            return {"iterations": 0, "warmed": bool(self.warmed_up)}
+        for _ in range(iterations):
+            self.reset_cache()
+            self._warmup_once()
+        self.reset_cache()
+        self.warmed_up = True
+        return {"iterations": iterations, "warmed": True}
+
+    def _warmup_once(self) -> None:
+        """One prefill plus one decode token. Subclasses may compile directly."""
+        self.generate(_WARMUP_PROMPT, max_tokens=_WARMUP_NEW_TOKENS, temperature=0.0)
 
     def reset_cache(self) -> None:
         """Clear the attached KV cache. An unset cache is left unset."""
@@ -545,6 +577,46 @@ def _prompt_token_ids(tokenizer: Any, prompt: str) -> np.ndarray:
     if ids.ndim != 2:
         raise RuntimeError(f"Tokenizer input_ids must be 2D, got shape {ids.shape}")
     return np.ascontiguousarray(ids, dtype=np.int64)
+
+
+_WARMUP_PROMPT = "Hello"
+_WARMUP_NEW_TOKENS = 2
+
+
+def _synthetic_onnx_feeds(
+    inputs: Sequence[Any],
+    seq: int,
+    past_len: int,
+    batch: int = 1,
+) -> Dict[str, np.ndarray]:
+    """Concrete feeds for one warmup run when no tokenizer is available."""
+    past_names = [node.name for node in inputs if "past" in node.name.lower()]
+    token_ids = np.ones((batch, seq), dtype=np.int64)
+    position = np.arange(past_len, past_len + seq, dtype=np.int64).reshape(1, -1)
+    attention_length = past_len + seq if past_names else seq
+    feeds: Dict[str, np.ndarray] = {}
+    for node in inputs:
+        name = node.name
+        lower = name.lower()
+        if "input_ids" in lower or lower in ("input", "tokens", "ids"):
+            feeds[name] = token_ids
+        elif "attention" in lower and "mask" in lower:
+            feeds[name] = np.ones((batch, attention_length), dtype=np.int64)
+        elif "position" in lower:
+            feeds[name] = position
+        elif name in past_names:
+            array = _empty_kv(node, batch)
+            if past_len > 0 and array.ndim >= 3:
+                shape = list(array.shape)
+                shape[2] = past_len
+                array = np.zeros(shape, dtype=array.dtype)
+            feeds[name] = array
+        else:
+            raise RuntimeError(
+                f"Monolithic ONNX input '{name}' is not input_ids, "
+                "an attention mask, position ids, or past KV"
+            )
+    return feeds
 
 
 def _emit_stream_token(
@@ -855,6 +927,7 @@ class OnnxRuntimeBackend(InferenceBackend):
 
     def load(self, model_path: str) -> None:
         """Load a split model directory or one ONNX file."""
+        self.warmed_up = False
         self.model_path = model_path
         self._is_split = os.path.isdir(model_path)
         self._pipeline = None
@@ -1070,6 +1143,7 @@ class OnnxRuntimeBackend(InferenceBackend):
             usage["providers"] = list(self.providers)
             usage["execution_policy"] = self.execution_plan.policy
             usage.update(self._kv_usage_fields())
+            usage["warmed_up"] = self.warmed_up
             return usage
         return {
             "backend": "onnx_runtime",
@@ -1077,8 +1151,34 @@ class OnnxRuntimeBackend(InferenceBackend):
             "split": self._is_split,
             "providers": list(self.providers),
             "execution_policy": self.execution_plan.policy,
+            "warmed_up": self.warmed_up,
             **self._kv_usage_fields(),
         }
+
+    def _warmup_once(self) -> None:
+        """Compile prefill and decode. A session with no tokenizer uses synthetic feeds."""
+        if not self._is_split and self._tokenizer is None:
+            loaded = _load_tokenizer(self.model_path)
+            if loaded is not None:
+                self._tokenizer = loaded
+        if self._is_split or self._tokenizer is not None:
+            self.generate(_WARMUP_PROMPT, max_tokens=_WARMUP_NEW_TOKENS, temperature=0.0)
+            return
+        self._warmup_anonymous_session()
+
+    def _warmup_anonymous_session(self) -> None:
+        """Run two concrete shapes so an NPU compiles prefill and the next step."""
+        session = self.model
+        if session is None or not hasattr(session, "run"):
+            raise RuntimeError("Monolithic ONNX warmup needs a loaded InferenceSession.")
+        inputs = list(session.get_inputs()) if hasattr(session, "get_inputs") else []
+        if not inputs:
+            session.run(None, {})
+            return
+        past_names = [node.name for node in inputs if "past" in node.name.lower()]
+        shapes = [(1, 0), (1, 1)] if past_names else [(1, 0), (2, 0)]
+        for seq, past_len in shapes:
+            session.run(None, _synthetic_onnx_feeds(inputs, seq, past_len))
 
     def _share_pipeline_cache(self, pipeline: Any) -> None:
         """
@@ -1173,6 +1273,7 @@ class LlamaCppBackend(InferenceBackend):
         elif self.config.device == DeviceType.AUTO:
             n_gpu_layers = self.config.n_gpu_layers if self.config.n_gpu_layers >= 0 else -1
         
+        self.warmed_up = False
         self.model = Llama(
             model_path=model_path,
             n_gpu_layers=n_gpu_layers,
@@ -1253,6 +1354,7 @@ class LlamaCppBackend(InferenceBackend):
             "backend": "llama_cpp",
             "n_gpu_layers": self.config.n_gpu_layers,
             "n_ctx": self.config.n_ctx,
+            "warmed_up": self.warmed_up,
             **self._kv_usage_fields(),
         }
 
