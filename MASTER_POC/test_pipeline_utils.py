@@ -1154,6 +1154,189 @@ def test_kv_cache():
     assert int(device_cursor.attention_mask()[0, 1]) == 0
     print("  cursor: reserve, advance_sequence_length, truncate_to_length")
 
+    phase = KVCacheManager(
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=2,
+        dtype=np.float32,
+        max_seq_len=8,
+    )
+    phase_buffer = phase.get_past_tensors(0)[0]
+    prefill = np.arange(4, dtype=np.float32).reshape(1, 1, 2, 2)
+    assert phase.update_prefill(0, prefill, prefill) == 2
+    assert phase.phase == "prefill"
+    assert phase.execution_phase == "prefill"
+    assert phase.role == "target"
+    assert phase.get_past_tensors(0)[0] is phase_buffer
+    assert np.array_equal(phase_buffer[:, :, :2, :], prefill)
+    usage = phase.get_memory_usage()
+    assert usage["phase"] == "prefill"
+    assert usage["execution_phase"] == "prefill"
+    assert usage["role"] == "target"
+    decode_token = np.full((1, 1, 1, 2), 7, dtype=np.float32)
+    assert phase.update_decode(0, decode_token, decode_token) == 3
+    assert phase.phase == "decode"
+    assert phase.execution_phase == "decode"
+    assert np.array_equal(phase_buffer[:, :, :2, :], prefill)
+    assert np.array_equal(phase_buffer[:, :, 2, :], decode_token[:, :, 0, :])
+    try:
+        phase.update_decode(0, prefill, prefill)
+        raise AssertionError("decode of more than one token was accepted")
+    except ValueError as exc:
+        assert "decode" in str(exc)
+        assert "one token" in str(exc)
+    assert phase.layer_length(0) == 3
+    assert phase.phase == "decode"
+    draft = np.arange(10, 16, dtype=np.float32).reshape(1, 1, 3, 2)
+    assert phase.update_verify(0, draft, draft, 2) == 5
+    assert phase.phase == "verify"
+    assert phase.execution_phase == "verify"
+    assert np.array_equal(phase_buffer[:, :, :2, :], prefill)
+    assert np.array_equal(phase_buffer[:, :, 2, :], decode_token[:, :, 0, :])
+    assert np.array_equal(phase_buffer[:, :, 3:5, :], draft[:, :, :2, :])
+    assert np.all(phase_buffer[:, :, 5, :] == 0)
+    assert phase.update_verify(0, draft, draft, 0) == 5
+    assert phase.phase == "verify"
+    try:
+        phase.update_verify(0, draft, draft, 4)
+        raise AssertionError("accepted_length past the draft span was accepted")
+    except ValueError as exc:
+        assert "accepted_length" in str(exc)
+        assert "draft span" in str(exc)
+    assert phase.layer_length(0) == 5
+    phase.reset()
+    assert phase.phase is None
+    assert phase.execution_phase is None
+    assert phase.role == "target"
+    assert phase.layer_length(0) == 0
+    empty = np.zeros((1, 1, 0, 2), dtype=np.float32)
+    try:
+        phase.update_prefill(0, empty, empty)
+        raise AssertionError("empty prefill was accepted")
+    except ValueError as exc:
+        assert "prefill" in str(exc)
+    assert phase.phase is None
+
+    chunked = KVCacheManager(
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=2,
+        dtype=np.float32,
+        max_seq_len=8,
+    )
+    first_chunk = np.arange(4, dtype=np.float32).reshape(1, 1, 2, 2)
+    second_chunk = np.arange(4, 10, dtype=np.float32).reshape(1, 1, 3, 2)
+    assert chunked.update_prefill(0, first_chunk, first_chunk) == 2
+    assert chunked.update_prefill(0, second_chunk, second_chunk) == 5
+    assert chunked.phase == "prefill"
+    written = chunked.get_past_tensors(0)[0][:, :, :5, :].reshape(-1)
+    assert np.array_equal(written[:10], np.arange(10, dtype=np.float32))
+
+    sliding = KVCacheManager(
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=1,
+        dtype=np.float32,
+        max_seq_len=8,
+        policy=KVCachePolicy.SLIDING_WINDOW,
+        window_size=4,
+    )
+    slide_prompt = np.arange(6, dtype=np.float32).reshape(1, 1, 6, 1)
+    assert sliding.update_prefill(0, slide_prompt, slide_prompt) == 4
+    assert sliding.phase == "sliding"
+    assert sliding.execution_phase == "prefill"
+    assert sliding.layer_seen_tokens(0) == 6
+    assert np.array_equal(
+        sliding.get_past_tensors(0)[0][:, :, :4, 0].reshape(-1),
+        np.array([2, 3, 4, 5], dtype=np.float32),
+    )
+    slide_token = np.array([[[[9.0]]]], dtype=np.float32)
+    assert sliding.update_decode(0, slide_token, slide_token) == 4
+    assert sliding.phase == "sliding"
+    assert sliding.execution_phase == "decode"
+    assert np.array_equal(
+        sliding.get_past_tensors(0)[0][:, :, :4, 0].reshape(-1),
+        np.array([3, 4, 5, 9], dtype=np.float32),
+    )
+    slide_draft = np.array([[[[11.0]]]], dtype=np.float32)
+    assert sliding.update_verify(0, slide_draft, slide_draft, 1) == 4
+    assert sliding.phase == "verify"
+    assert sliding.execution_phase == "verify"
+    assert np.array_equal(
+        sliding.get_past_tensors(0)[0][:, :, :4, 0].reshape(-1),
+        np.array([4, 5, 9, 11], dtype=np.float32),
+    )
+
+    dynamic_phase = KVCacheManager(
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=2,
+        dtype=np.float32,
+    )
+    assert dynamic_phase.update_prefill(0, first_chunk, first_chunk) == 2
+    dynamic_token = np.array([[[[8.0, 9.0]]]], dtype=np.float32)
+    assert dynamic_phase.update_decode(0, dynamic_token, dynamic_token) == 3
+    assert dynamic_phase.get_past_tensors(0)[0].shape[2] == 3
+    assert np.array_equal(
+        dynamic_phase.get_past_tensors(0)[0].reshape(-1),
+        np.array([0, 1, 2, 3, 8, 9], dtype=np.float32),
+    )
+    assert dynamic_phase.phase == "decode"
+
+    locked = KVCacheManager(
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=2,
+        dtype=np.float32,
+        max_seq_len=4,
+    )
+    with locked._lock:
+        assert locked.update_decode(0, dynamic_token, dynamic_token) == 1
+    assert locked.phase == "decode"
+
+    device_phase = KVCacheManager(
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=2,
+        dtype=np.float16,
+        backend=KVCacheBackend.VITISAI,
+        max_seq_len=8,
+    )
+    device_ptr = int(device_phase.get_device_tensors(0)[0].data_ptr())
+    device_prefill = np.arange(4, dtype=np.float16).reshape(1, 1, 2, 2)
+    device_token = np.ones((1, 1, 1, 2), dtype=np.float16)
+    device_draft = np.arange(6, dtype=np.float16).reshape(1, 1, 3, 2)
+    assert device_phase.update_prefill(0, device_prefill, device_prefill) == 2
+    assert device_phase.update_decode(0, device_token, device_token) == 3
+    assert device_phase.update_verify(0, device_draft, device_draft, 2) == 5
+    assert int(device_phase.get_device_tensors(0)[0].data_ptr()) == device_ptr
+    assert device_phase.phase == "verify"
+    assert np.array_equal(
+        device_phase.get_device_tensors(0)[0].numpy()[:, :, :2, :],
+        device_prefill,
+    )
+
+    hybrid_phase = HybridKVCacheManager(
+        layer_types=["dense"],
+        num_kv_heads=1,
+        head_dim=2,
+        dtype=np.float32,
+        max_seq_len=4,
+        draft=1,
+        verify=1,
+    )
+    assert hybrid_phase.role == "target"
+    assert hybrid_phase.draft_cache.role == "draft"
+    assert hybrid_phase.verify_cache.role == "verify"
+    assert hybrid_phase.draft_cache.update_decode(0, dynamic_token, dynamic_token) == 1
+    assert hybrid_phase.draft_cache.phase == "speculative_draft"
+    assert hybrid_phase.draft_cache.execution_phase == "decode"
+    hybrid_phase.draft_cache.reset()
+    assert hybrid_phase.draft_cache.phase is None
+    assert hybrid_phase.draft_cache.execution_phase is None
+    assert hybrid_phase.draft_cache.role == "draft"
+    print("  phases: update_prefill, update_decode, update_verify")
+
     print("kv_cache module: OK\n")
     return True
 

@@ -507,6 +507,9 @@ class KVCacheManager:
         self._binder: Optional[IOBindingManager] = None
         self._bridge: Optional[HeterogeneousIOBindingManager] = None
         self._shared: List[SharedBuffer] = []
+        self.phase: Optional[str] = None
+        self.execution_phase: Optional[str] = None
+        self.role = "target"
         # Reentrant so extract_from_registry can call update_from_present.
         # Acquire this before an IOBindingManager lock. The binder methods
         # used here take the IO lock and do not call back into the cache.
@@ -546,6 +549,8 @@ class KVCacheManager:
             self._seq_len = 0
             self._layer_len = [0] * self.num_layers
             self._mask_layer = 0
+            self.phase = None
+            self.execution_phase = None
             self._reset_policy_state()
             self._reset_quant_state()
             if self.device_resident:
@@ -1483,6 +1488,161 @@ class KVCacheManager:
             self._seen[layer_idx] = int(new_len)
             self._seen_published = int(new_len)
 
+    def update_prefill(self, layer_idx: int, keys: Any, values: Any) -> int:
+        """
+        Write a prefill span for one layer.
+
+        The first call fills an empty layer. A later call appends the next
+        prefill chunk at the write cursor. A sliding-window layer records
+        ``phase`` ``sliding`` and keeps ``execution_phase`` ``prefill``.
+        A draft cache records ``speculative_draft``. Returns the resident
+        length.
+        """
+        with self._lock:
+            seq = self._phase_span(layer_idx, keys, values)
+            if seq < 1:
+                raise ValueError(
+                    f"Layer {layer_idx}: prefill writes one or more tokens, got {seq}"
+                )
+            if self.layer_length(layer_idx) == 0:
+                self.update_from_present(layer_idx, keys, values)
+            else:
+                self._append_new_tokens(layer_idx, keys, values)
+            self._note_phase(layer_idx, "prefill")
+            return self.layer_length(layer_idx)
+
+    def update_decode(self, layer_idx: int, key: Any, value: Any) -> int:
+        """
+        Append one decode token at the write cursor.
+
+        The sequence axis must be 1. A sliding-window layer records
+        ``phase`` ``sliding``. A draft cache records ``speculative_draft``.
+        Returns the resident length.
+        """
+        with self._lock:
+            seq = self._phase_span(layer_idx, key, value)
+            if seq != 1:
+                raise ValueError(
+                    f"Layer {layer_idx}: decode writes one token, got sequence length {seq}"
+                )
+            self._append_new_tokens(layer_idx, key, value)
+            self._note_phase(layer_idx, "decode")
+            return self.layer_length(layer_idx)
+
+    def update_verify(
+        self,
+        layer_idx: int,
+        draft_keys: Any,
+        draft_values: Any,
+        accepted_length: int,
+    ) -> int:
+        """
+        Keep the accepted prefix of a draft span.
+
+        ``accepted_length`` counts accepted draft tokens, from 0 through
+        the draft sequence. Rejected tokens stay outside the cursor.
+        ``phase`` becomes ``verify``. Returns the resident length.
+        """
+        with self._lock:
+            seq = self._phase_span(layer_idx, draft_keys, draft_values)
+            accepted = int(accepted_length)
+            if accepted < 0 or accepted > seq:
+                raise ValueError(
+                    f"Layer {layer_idx}: accepted_length {accepted} is outside "
+                    f"the draft span of {seq}"
+                )
+            if accepted:
+                keys = _as_numpy(draft_keys)
+                values = _as_numpy(draft_values)
+                self._append_new_tokens(
+                    layer_idx,
+                    keys[:, :, :accepted, :],
+                    values[:, :, :accepted, :],
+                )
+            self._note_phase(layer_idx, "verify")
+            return self.layer_length(layer_idx)
+
+    def _phase_span(self, layer_idx: int, key: Any, value: Any) -> int:
+        if layer_idx not in self._cache:
+            raise KeyError(
+                f"Layer {layer_idx} not in cache (have {self.num_layers} layers)"
+            )
+        key_shape = _tensor_shape(key)
+        value_shape = _tensor_shape(value)
+        if key_shape != value_shape:
+            raise ValueError(
+                f"Layer {layer_idx}: key shape {key_shape} != value shape {value_shape}"
+            )
+        if len(key_shape) != 4:
+            raise ValueError(
+                f"Layer {layer_idx}: expected 4D tensor [batch, heads, seq, head_dim], "
+                f"got shape {key_shape}"
+            )
+        if key_shape[1] != self.num_kv_heads or key_shape[3] != self.head_dim:
+            raise ValueError(
+                f"Layer {layer_idx}: expected heads {self.num_kv_heads} and "
+                f"head_dim {self.head_dim}, got {key_shape}"
+            )
+        return int(key_shape[_SEQ_AXIS])
+
+    def _note_phase(self, layer_idx: int, execution: str) -> None:
+        self.execution_phase = execution
+        if self.role == "draft":
+            self.phase = "speculative_draft"
+        elif execution == "verify":
+            self.phase = "verify"
+        elif self.policy_for(layer_idx) is KVCachePolicy.SLIDING_WINDOW:
+            self.phase = "sliding"
+        else:
+            self.phase = execution
+
+    def _append_new_tokens(self, layer_idx: int, key: Any, value: Any) -> None:
+        """Append tokens at the layer cursor. The tensor is new tokens only."""
+        self._invalidate_quant(layer_idx)
+        key_np = np.ascontiguousarray(_as_numpy(key), dtype=self.dtype)
+        value_np = np.ascontiguousarray(_as_numpy(value), dtype=self.dtype)
+        added = int(key_np.shape[_SEQ_AXIS])
+        if added < 1:
+            return
+        if not self._static:
+            stored_key = self._cache[layer_idx]["key"]
+            stored_value = self._cache[layer_idx]["value"]
+            if int(_tensor_shape(stored_key)[_SEQ_AXIS]) == 0:
+                self._cache[layer_idx]["key"] = key_np
+                self._cache[layer_idx]["value"] = value_np
+            else:
+                self._cache[layer_idx]["key"] = np.concatenate(
+                    [_as_numpy(stored_key), key_np], axis=_SEQ_AXIS
+                )
+                self._cache[layer_idx]["value"] = np.concatenate(
+                    [_as_numpy(stored_value), value_np], axis=_SEQ_AXIS
+                )
+            self._seen[layer_idx] = int(self._cache[layer_idx]["key"].shape[_SEQ_AXIS])
+            self._seen_published = int(self._seen[layer_idx])
+            return
+        stored_key = self._cache[layer_idx]["key"]
+        stored_value = self._cache[layer_idx]["value"]
+        if self.policy_for(layer_idx) is KVCachePolicy.DENSE_CONTIGUOUS:
+            position = int(self._layer_len[layer_idx])
+            new_len = position + added
+            if self.max_seq_len is not None and new_len > int(self.max_seq_len):
+                raise ValueError(
+                    f"Layer {layer_idx}: sequence length {new_len} exceeds "
+                    f"max_seq_len {self.max_seq_len}"
+                )
+            _write_window(stored_key, key_np, position)
+            _write_window(stored_value, value_np, position)
+            self._commit_length(layer_idx, new_len)
+            self._seen[layer_idx] = int(new_len)
+            self._seen_published = int(new_len)
+            return
+        if self.policy_for(layer_idx) is KVCachePolicy.PAGED_BLOCKS:
+            self._paged_append(layer_idx, stored_key, stored_value, key_np, value_np)
+        else:
+            self._compact_append(layer_idx, stored_key, stored_value, key_np, value_np)
+        self._seen[layer_idx] += added
+        self._seen_published = int(self._seen[layer_idx])
+
     def _append_position(self, layer_idx: int) -> int:
         if self.policy_for(layer_idx) is KVCachePolicy.PAGED_BLOCKS:
             return int(self._pages[layer_idx].write_pos)
@@ -1892,6 +2052,9 @@ class KVCacheManager:
             "sink_size": self.sink_size,
             "seen_tokens": self.seen_tokens,
             "storage": "device_buffer" if self.device_resident else "numpy",
+            "phase": self.phase,
+            "execution_phase": self.execution_phase,
+            "role": self.role,
         }
 
     def __repr__(self) -> str:
@@ -3210,8 +3373,11 @@ class HybridKVCacheManager:
         self._layers = [
             self._build_layer(*_layer_spec(item)) for item in layer_types
         ]
-        self.draft_cache = self._build_role(draft, "draft")
-        self.verify_cache = self._build_role(verify, "verify")
+        self.draft_cache = self._assign_role(self._build_role(draft, "draft"), "draft")
+        self.verify_cache = self._assign_role(self._build_role(verify, "verify"), "verify")
+        self.role = "target"
+        self.phase = None
+        self.execution_phase = None
 
     @property
     def num_layers(self) -> int:
@@ -3324,6 +3490,12 @@ class HybridKVCacheManager:
         raise TypeError(
             f"{role} cache must be a layer count, a layer-type list, or a cache object"
         )
+
+    @staticmethod
+    def _assign_role(cache: Any, role: str) -> Any:
+        if cache is not None and hasattr(cache, "role"):
+            cache.role = role
+        return cache
 
     def _child(self, layer_idx: int) -> Any:
         if layer_idx < 0 or layer_idx >= self.num_layers:
