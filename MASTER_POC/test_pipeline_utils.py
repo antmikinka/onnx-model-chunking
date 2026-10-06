@@ -13118,6 +13118,239 @@ def test_merge_order():
     return True
 
 
+def test_other_dependencies():
+    """other is inserted where its inputs are produced."""
+    print("=" * 50)
+    print("Testing other dependencies...")
+    print("=" * 50)
+
+    import json
+    import os
+    import sys
+    import tempfile
+    import types
+
+    try:
+        import chunking_utils.onnx.merger as merger
+    except ModuleNotFoundError:
+        for name in list(sys.modules):
+            if name == "chunking_utils.onnx" or name.startswith("chunking_utils.onnx."):
+                del sys.modules[name]
+        onnx_stub = types.ModuleType("onnx")
+        onnx_stub.ModelProto = type("ModelProto", (), {})
+        onnx_stub.numpy_helper = types.SimpleNamespace()
+        onnx_stub.helper = types.SimpleNamespace()
+        onnx_stub.TensorProto = types.SimpleNamespace()
+        onnx_stub.shape_inference = types.SimpleNamespace()
+        sys.modules["onnx"] = onnx_stub
+        import chunking_utils.onnx.merger as merger
+
+    loaded = []
+
+    def fake_load(filepath, load_external_data=True):
+        name = os.path.splitext(os.path.basename(filepath))[0]
+        loaded.append(name)
+        return types.SimpleNamespace(
+            graph=types.SimpleNamespace(
+                node=[types.SimpleNamespace(name=name)],
+                initializer=[],
+                input=[],
+                output=[types.SimpleNamespace(name=name + "_out")],
+            ),
+            opset_import=[],
+            ir_version=8,
+        )
+
+    def make_graph(nodes, name, inputs, outputs, initializer):
+        captured["outputs"] = [item.name for item in outputs]
+        return types.SimpleNamespace(node=list(nodes), output=list(outputs), initializer=list(initializer), input=list(inputs))
+
+    def make_model(graph, producer_name, opset_imports):
+        return types.SimpleNamespace(graph=graph, producer_name=producer_name, ir_version=None)
+
+    if not hasattr(merger.onnx, "load"):
+        merger.onnx.load = None
+    original_load = merger.onnx.load
+    original_helper = merger.helper
+    captured = {}
+    merger.onnx.load = fake_load
+    merger.helper = types.SimpleNamespace(make_graph=make_graph, make_model=make_model)
+
+    def component(filename, **fields):
+        record = {"file": filename}
+        record.update(fields)
+        return record
+
+    def write_info(directory, components, boundary=None):
+        payload = {"num_layers": 1, "components": components}
+        if boundary is not None:
+            payload["boundary_tensors"] = boundary
+        with open(os.path.join(directory, "model_info.json"), "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+        for info in components.values():
+            with open(os.path.join(directory, info["file"]), "w", encoding="utf-8") as handle:
+                handle.write("onnx")
+
+    chain = ["embedding", "layer_0", "norm", "lm_head", "other"]
+
+    try:
+        unknown = {"components": {"other": {"file": "other.onnx"}}}
+        assert merger.analyze_component_dependencies("other", unknown) is None
+        assert merger.find_correct_insert_position(None, ["embedding", "lm_head"]) == 2
+
+        external = {
+            "components": {
+                "embedding": component("embedding.onnx", output_names=["hidden"]),
+                "other": component("other.onnx", input_names=["input_ids"]),
+            }
+        }
+        placement = merger.analyze_component_dependencies("other", external)
+        assert placement["depends_on"] == []
+        assert merger.find_correct_insert_position(placement, ["embedding", "layer_0", "norm", "lm_head"]) == 0
+
+        with tempfile.TemporaryDirectory() as directory:
+            write_info(directory, {
+                "embedding": component("embedding.onnx", output_names=["hidden"]),
+                "layer_0": component("layer_0.onnx", input_names=["hidden"], output_names=["h0"]),
+                "norm": component("norm.onnx", input_names=["h0"]),
+                "lm_head": component("lm_head.onnx"),
+                "other": component("other.onnx", input_names=["input_ids", "position_ids"]),
+            })
+            loaded.clear()
+            merger.merge_onnx(directory)
+            assert loaded == ["other", "embedding", "layer_0", "norm", "lm_head"]
+            assert captured["outputs"] == ["lm_head_out"]
+
+            write_info(directory, {
+                "embedding": component("embedding.onnx", output_names=["hidden"]),
+                "layer_0": component("layer_0.onnx"),
+                "norm": component("norm.onnx"),
+                "lm_head": component("lm_head.onnx"),
+                "other": component("other.onnx", input_names=["hidden"]),
+            })
+            loaded.clear()
+            merger.merge_onnx(directory)
+            assert loaded == ["embedding", "other", "layer_0", "norm", "lm_head"]
+
+            write_info(directory, {
+                "embedding": component("embedding.onnx"),
+                "layer_0": component("layer_0.onnx", output_names=["h0"]),
+                "norm": component("norm.onnx"),
+                "lm_head": component("lm_head.onnx"),
+                "other": component("other.onnx", input_names=["h0"]),
+            })
+            loaded.clear()
+            merger.merge_onnx(directory)
+            assert loaded == ["embedding", "layer_0", "other", "norm", "lm_head"]
+
+            write_info(directory, {
+                "embedding": component("embedding.onnx", output_names=["token"]),
+                "layer_0": component("layer_0.onnx"),
+                "norm": component("norm.onnx"),
+                "lm_head": component("lm_head.onnx"),
+                "other": component("other.onnx", depends_on=["embedding"]),
+            })
+            loaded.clear()
+            merger.merge_onnx(directory)
+            assert loaded == ["embedding", "other", "layer_0", "norm", "lm_head"]
+
+            write_info(
+                directory,
+                {
+                    "embedding": component("embedding.onnx"),
+                    "layer_0": component("layer_0.onnx"),
+                    "norm": component("norm.onnx"),
+                    "lm_head": component("lm_head.onnx"),
+                    "other": component("other.onnx"),
+                },
+                boundary=[{
+                    "producer": "embedding",
+                    "producer_component": "embedding",
+                    "consumers": ["other"],
+                    "consumer_components": ["other"],
+                }],
+            )
+            loaded.clear()
+            merger.merge_onnx(directory)
+            assert loaded == ["embedding", "other", "layer_0", "norm", "lm_head"]
+
+            write_info(directory, {
+                "embedding": component("embedding.onnx"),
+                "layer_0": component("layer_0.onnx", input_names=["ngram"]),
+                "norm": component("norm.onnx"),
+                "lm_head": component("lm_head.onnx"),
+                "other": component("other.onnx", output_names=["ngram"], input_names=["input_ids"]),
+            })
+            loaded.clear()
+            merger.merge_onnx(directory)
+            assert loaded == ["other", "embedding", "layer_0", "norm", "lm_head"]
+
+            cycle = {
+                "num_layers": 1,
+                "components": {
+                    "embedding": component("embedding.onnx"),
+                    "layer_0": component("layer_0.onnx", output_names=["h0"], input_names=["side"]),
+                    "norm": component("norm.onnx"),
+                    "lm_head": component("lm_head.onnx"),
+                    "other": component("other.onnx", input_names=["h0"], output_names=["side"]),
+                },
+            }
+            try:
+                merger.analyze_component_dependencies("other", cycle)
+                merger.find_correct_insert_position(
+                    merger.analyze_component_dependencies("other", cycle),
+                    ["embedding", "layer_0", "norm", "lm_head"],
+                )
+                raise AssertionError("a dependency cycle was accepted")
+            except ValueError as exc:
+                assert "reads" in str(exc)
+
+            missing = {
+                "num_layers": 1,
+                "components": {
+                    "other": component("other.onnx", depends_on=["moe_router"]),
+                },
+            }
+            try:
+                merger.find_correct_insert_position(
+                    merger.analyze_component_dependencies("other", missing),
+                    ["embedding", "layer_0", "norm", "lm_head"],
+                )
+                raise AssertionError("a dependency outside the chain was accepted")
+            except ValueError as exc:
+                assert "not in the merge order" in str(exc)
+
+            try:
+                merger.analyze_component_dependencies("other", {
+                    "components": {"other": {"depends_on": "embedding"}},
+                })
+                raise AssertionError("a string depends_on was accepted")
+            except ValueError as exc:
+                assert "list" in str(exc)
+
+            write_info(directory, {
+                "embedding": component("embedding.onnx"),
+                "other": component("other.onnx", input_names=["input_ids"]),
+            })
+            loaded.clear()
+            merger.merge_onnx(directory, execution_plan={
+                "steps": [
+                    {"component_name": "embedding"},
+                    {"component_name": "other", "depends_on": ["embedding"]},
+                ],
+            })
+            assert loaded == ["embedding", "other"]
+    finally:
+        merger.onnx.load = original_load
+        merger.helper = original_helper
+
+    assert chain[0] == "embedding"
+    print("other dependencies: OK")
+    print("  external inputs run before the layers")
+    print("  an embedding input runs before layer_0")
+    return True
+
+
 def test_path_manager():
     """ONNX discovery, external data, split directories, and NPU cache paths."""
     print("=" * 50)
@@ -13500,6 +13733,12 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"merge_order: FAILED - {e}")
         results.append(("merge_order", False))
+
+    try:
+        results.append(("other_dependencies", test_other_dependencies()))
+    except Exception as e:
+        print(f"other_dependencies: FAILED - {e}")
+        results.append(("other_dependencies", False))
 
     try:
         results.append(("path_manager", test_path_manager()))

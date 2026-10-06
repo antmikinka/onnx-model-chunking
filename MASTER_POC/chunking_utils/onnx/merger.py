@@ -63,8 +63,225 @@ def _component_map(model_info: dict) -> dict:
     return components
 
 
+def _name_list(value, label: str) -> List[str]:
+    """Copy a list of tensor or component names. A string or a blank entry raises."""
+    if isinstance(value, (str, bytes)) or not isinstance(value, list):
+        raise ValueError(f"{label} must be a list, got {value!r}")
+    names: List[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(f"{label} entries must be non-empty strings, got {item!r}")
+        text = item.strip()
+        if text not in names:
+            names.append(text)
+    return names
+
+
+def _output_owners(components: dict, skip_name: str) -> Dict[str, str]:
+    """Map each recorded output tensor to the component that writes it."""
+    owners: Dict[str, str] = {}
+    for name, comp in components.items():
+        if name == skip_name:
+            continue
+        if not isinstance(comp, dict):
+            raise ValueError(f"component {name} must be a dict, got {comp!r}")
+        if "output_names" not in comp:
+            continue
+        for tensor in _name_list(comp.get("output_names"), f"{name} output_names"):
+            previous = owners.get(tensor)
+            if previous is not None and previous != name:
+                raise ValueError(
+                    f"tensor {tensor!r} is produced by {previous!r} and {name!r}"
+                )
+            owners[tensor] = name
+    return owners
+
+
+def _boundary_predecessors(model_info: dict, component_name: str):
+    """Components that write a boundary tensor this component reads. None if unrecorded."""
+    boundaries = model_info.get("boundary_tensors")
+    if boundaries is None:
+        return None
+    if isinstance(boundaries, (str, bytes)) or not isinstance(boundaries, list):
+        raise ValueError(f"boundary_tensors must be a list, got {boundaries!r}")
+    found = False
+    predecessors: List[str] = []
+    for item in boundaries:
+        if not isinstance(item, dict):
+            raise ValueError(f"boundary tensor must be a dict, got {item!r}")
+        consumers = item.get("consumer_components", item.get("consumers"))
+        if consumers is None:
+            continue
+        consumer_names = _name_list(consumers, "consumer_components")
+        if component_name not in consumer_names:
+            continue
+        found = True
+        producer = item.get("producer_component", item.get("producer"))
+        if not isinstance(producer, str) or not producer.strip():
+            raise ValueError(
+                f"producer_component must be a non-empty string, got {producer!r}"
+            )
+        producer = producer.strip()
+        if producer in ("external", component_name) or producer in predecessors:
+            continue
+        predecessors.append(producer)
+    if not found:
+        return None
+    return predecessors
+
+
+def _required_by(components: dict, component_name: str, info: dict, model_info: dict) -> List[str]:
+    """Components that read a tensor this component writes."""
+    readers: List[str] = []
+    outputs: List[str] = []
+    if "output_names" in info:
+        outputs = _name_list(info.get("output_names"), "output_names")
+    if outputs:
+        produced = set(outputs)
+        for name, comp in components.items():
+            if name == component_name:
+                continue
+            if not isinstance(comp, dict) or "input_names" not in comp:
+                continue
+            for tensor in _name_list(comp.get("input_names"), f"{name} input_names"):
+                if tensor in produced and name not in readers:
+                    readers.append(name)
+    boundaries = model_info.get("boundary_tensors")
+    if boundaries is None:
+        return readers
+    if isinstance(boundaries, (str, bytes)) or not isinstance(boundaries, list):
+        raise ValueError(f"boundary_tensors must be a list, got {boundaries!r}")
+    for item in boundaries:
+        if not isinstance(item, dict):
+            raise ValueError(f"boundary tensor must be a dict, got {item!r}")
+        producer = item.get("producer_component", item.get("producer"))
+        if not isinstance(producer, str) or producer.strip() != component_name:
+            continue
+        consumers = item.get("consumer_components", item.get("consumers", []))
+        for name in _name_list(consumers, "consumer_components"):
+            if name not in ("external", component_name) and name not in readers:
+                readers.append(name)
+    return readers
+
+
+def analyze_component_dependencies(component_name: str, model_info: dict):
+    """
+    Find what must run before one component, and what reads it.
+
+    None means model_info does not record a dependency, so the linear chain
+    keeps that component at the end. A dict carries depends_on and required_by.
+    Graph inputs that no component writes are external and do not create a
+    predecessor. An n-gram lookup, a mask preprocess, or a position encode
+    that only reads those inputs therefore has an empty depends_on.
+    """
+    if not isinstance(component_name, str) or not component_name.strip():
+        raise ValueError(
+            f"component name must be a non-empty string, got {component_name!r}"
+        )
+    component_name = component_name.strip()
+    if not isinstance(model_info, dict):
+        raise ValueError(f"model_info must be a dict, got {model_info!r}")
+    components = model_info.get("components")
+    if components is None:
+        return None
+    if not isinstance(components, dict):
+        raise ValueError(f"model_info components must be a dict, got {components!r}")
+    info = components.get(component_name)
+    if info is None:
+        return None
+    if not isinstance(info, dict):
+        raise ValueError(f"component {component_name} must be a dict, got {info!r}")
+
+    known = False
+    depends_on: List[str] = []
+    if "depends_on" in info:
+        known = True
+        depends_on = _name_list(info.get("depends_on"), "depends_on")
+        if component_name in depends_on:
+            raise ValueError(f"component {component_name!r} depends on itself")
+
+    if "input_names" in info and "depends_on" not in info:
+        known = True
+        owners = _output_owners(components, component_name)
+        for tensor in _name_list(info.get("input_names"), "input_names"):
+            owner = owners.get(tensor)
+            if owner and owner not in depends_on:
+                depends_on.append(owner)
+    elif "depends_on" not in info:
+        predecessors = _boundary_predecessors(model_info, component_name)
+        if predecessors is not None:
+            known = True
+            depends_on = predecessors
+
+    required_by = _required_by(components, component_name, info, model_info)
+    if required_by:
+        known = True
+    if not known:
+        return None
+    return {"depends_on": depends_on, "required_by": required_by}
+
+
+def find_correct_insert_position(other_dependencies, component_order) -> int:
+    """
+    Index where the dependent component belongs in the linear chain.
+
+    None keeps the historical end position. An empty depends_on inserts at
+    the front. Named predecessors insert immediately after the latest one.
+    A consumer that would then be merged first is a cycle.
+    """
+    if isinstance(component_order, (str, bytes)) or not isinstance(component_order, list):
+        raise ValueError(f"component order must be a list, got {component_order!r}")
+    if other_dependencies is None:
+        return len(component_order)
+    if isinstance(other_dependencies, list):
+        depends_on = _name_list(other_dependencies, "dependencies")
+        required_by: List[str] = []
+    elif isinstance(other_dependencies, dict):
+        if "depends_on" not in other_dependencies:
+            raise ValueError(
+                f"dependencies must name depends_on, got {other_dependencies!r}"
+            )
+        depends_on = _name_list(other_dependencies.get("depends_on"), "depends_on")
+        required_by = _name_list(
+            other_dependencies.get("required_by", []), "required_by"
+        )
+    else:
+        raise ValueError(
+            f"dependencies must be a list or a dict, got {other_dependencies!r}"
+        )
+
+    index: Dict[str, int] = {}
+    for position, name in enumerate(component_order):
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"component order entries must be non-empty strings, got {name!r}")
+        if name in index:
+            raise ValueError(f"component order repeats {name!r}")
+        index[name] = position
+
+    latest = -1
+    for name in depends_on:
+        if name not in index:
+            raise ValueError(
+                f"component 'other' depends on {name!r}, which is not in the merge order"
+            )
+        latest = max(latest, index[name])
+    earliest = len(component_order)
+    for name in required_by:
+        if name not in index:
+            raise ValueError(
+                f"component 'other' is required by {name!r}, which is not in the merge order"
+            )
+        earliest = min(earliest, index[name])
+    position = latest + 1
+    if position > earliest:
+        raise ValueError(
+            "component 'other' depends on a component that also reads 'other'"
+        )
+    return position
+
+
 def _linear_component_order(model_info: dict) -> List[str]:
-    """Dense transformer order: embedding, layers, norm, lm_head, other."""
+    """Dense transformer order, with other inserted from its input dependencies."""
     if "num_layers" not in model_info:
         raise ValueError("model_info num_layers is required")
     num_layers = model_info["num_layers"]
@@ -75,7 +292,12 @@ def _linear_component_order(model_info: dict) -> List[str]:
     order = ["embedding"]
     for index in range(num_layers):
         order.append(f"layer_{index}")
-    order.extend(["norm", "lm_head", "other"])
+    order.extend(["norm", "lm_head"])
+    # Instead of blindly appending "other" at the end,
+    # analyze its input dependencies and insert at the correct position.
+    other_dependencies = analyze_component_dependencies("other", model_info)
+    insert_position = find_correct_insert_position(other_dependencies, order)
+    order.insert(insert_position, "other")
     return order
 
 
@@ -131,7 +353,7 @@ def merge_onnx(
         save_path: Optional path to save the merged model.
         execution_plan: Optional plan whose step list is the merge order.
             When omitted, components merge as embedding, layers, norm,
-            lm_head, then other.
+            and lm_head. other is inserted where its inputs are produced.
 
     Returns:
         Merged ONNX ModelProto.
