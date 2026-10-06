@@ -9196,6 +9196,23 @@ def test_path_manager():
     assert chunking_utils.resolve_npu_artifact_cache is resolve_npu_artifact_cache
     assert sanitize_model_name("meta-llama/Llama-2-7b") == "meta-llama--Llama-2-7b"
     assert is_local_path("/home/user/model") is True
+    assert is_local_path("C:\\Users\\model") is True
+    assert is_local_path("./weights") is True
+    assert is_local_path("../weights") is True
+    assert is_local_path("meta-llama/Llama-2-7b") is False
+    previous = os.getcwd()
+    with tempfile.TemporaryDirectory() as local_root:
+        try:
+            os.chdir(local_root)
+            with open("llama", "w", encoding="utf-8") as handle:
+                handle.write("file")
+            os.makedirs("models")
+            assert is_local_path("llama") is False
+            assert is_local_path("meta-llama/llama") is False
+            assert is_local_path("models") is True
+            assert sanitize_model_name("meta-llama/Llama-2-7b") == "meta-llama--Llama-2-7b"
+        finally:
+            os.chdir(previous)
 
     def _location(text):
         encoded = text.encode("utf-8")

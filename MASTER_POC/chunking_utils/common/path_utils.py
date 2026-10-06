@@ -19,14 +19,19 @@ from typing import Any, Dict, List
 def is_local_path(model_id: str) -> bool:
     """
     Check if the model_id is a local filesystem path.
-    
+
+    Absolute paths and Windows drive paths are local. A relative
+    directory that exists is local. An explicit ``./`` or ``../``
+    prefix is local. A Hub ID is not local, even when a file of a
+    similar name exists in the working directory.
+
     Args:
         model_id: Either a HuggingFace model ID (e.g., "meta-llama/Llama-2-7b")
                   or a local filesystem path.
-    
+
     Returns:
         True if model_id appears to be a local path, False otherwise.
-    
+
     Examples:
         >>> is_local_path("meta-llama/Llama-2-7b")
         False
@@ -35,7 +40,20 @@ def is_local_path(model_id: str) -> bool:
         >>> is_local_path("/home/user/model")
         True
     """
-    return os.path.isdir(model_id) or os.path.isabs(model_id) or os.path.exists(model_id)
+    # Absolute paths are always local.
+    if os.path.isabs(model_id):
+        return True
+    # Relative paths with directory separators that exist.
+    if os.path.isdir(model_id):
+        return True
+    # Paths with explicit ./ or ../ prefixes.
+    if model_id.startswith(("./", "../", ".\\", "..\\")):
+        return True
+    # Windows drive letters.
+    if re.match(r"^[A-Za-z]:\\", model_id):
+        return True
+    # Everything else is a Hub ID.
+    return False
 
 
 def sanitize_model_name(model_id: str) -> str:
