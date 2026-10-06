@@ -27,10 +27,11 @@ import threading
 import time
 import warnings
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Dict, Iterable, List, Optional, Sequence, Any, Tuple, Union
 import numpy as np
 import onnxruntime as ort
+
+from chunking_utils.common.types import ExecutionPolicy
 
 
 # =============================================================================
@@ -85,23 +86,6 @@ NPU_SEQUENTIAL_SPLIT_ERROR = (
     "Sequential layer splitting on NPU causes AOT/context-switch penalties. "
     "Use monolithic, phase-split, or MoE expert-routing mode."
 )
-
-
-class ExecutionPolicy(Enum):
-    """
-    How a model is allowed to be divided across sessions.
-
-    MONOLITHIC_ONLY is the only general NPU policy. The two hybrid values
-    are the specialized exceptions: prefill on the NPU and decode on the
-    iGPU, or MoE expert routing. The split values are for CPU and GPU.
-    """
-
-    AUTO = "auto"
-    MONOLITHIC_ONLY = "monolithic_only"
-    SPLIT_CPU_MEMORY_OPTIMIZED = "split_cpu_memory_optimized"
-    SPLIT_GPU_PERSISTENT = "split_gpu_persistent"
-    HYBRID_NPU_IGPU_PHASE_SPLIT = "hybrid_npu_igpu_phase_split"
-    HYBRID_NPU_MOE_ROUTING = "hybrid_npu_moe_routing"
 
 
 SEQUENTIAL_LAYER_SPLIT_POLICIES = frozenset({

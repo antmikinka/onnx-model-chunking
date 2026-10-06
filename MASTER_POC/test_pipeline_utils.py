@@ -6300,6 +6300,81 @@ def test_backend():
             raise AssertionError("a gguf file was sent to a splitter")
         except ValueError as exc:
             assert "gguf" in str(exc)
+        from chunking_utils.common.types import (
+            DeviceType as canonical_device,
+            ExecutionPolicy as canonical_policy,
+            PROVIDER_FALLBACK,
+            SplitConfig,
+        )
+        from pipeline_utils.session_manager import ExecutionPolicy as session_policy
+        assert DeviceType is canonical_device
+        assert session_policy is canonical_policy
+        assert [item.value for item in DeviceType] == ["cpu", "gpu", "npu", "ipu", "auto"]
+        assert DeviceType.IPU == "ipu"
+        assert PROVIDER_FALLBACK[DeviceType.NPU] == [
+            "VitisAIExecutionProvider",
+            "RyzenAIExecutionProvider",
+            "CPUExecutionProvider",
+        ]
+        assert PROVIDER_FALLBACK[DeviceType.IPU] == [
+            "DmlExecutionProvider",
+            "ROCmExecutionProvider",
+            "MIGraphXExecutionProvider",
+            "CPUExecutionProvider",
+        ]
+        assert DEVICE_PROVIDER_MAP[DeviceType.IPU] == PROVIDER_FALLBACK[DeviceType.IPU]
+        plain = SplitConfig(model="weights", output="out")
+        other = SplitConfig(model="weights", output="out")
+        assert plain.device == "cpu"
+        assert plain.providers == []
+        assert plain.target_device is DeviceType.AUTO
+        assert plain.execution_policy is canonical_policy.AUTO
+        assert plain.resolved_providers() == [
+            "VitisAIExecutionProvider",
+            "RyzenAIExecutionProvider",
+            "DmlExecutionProvider",
+            "ROCmExecutionProvider",
+            "MIGraphXExecutionProvider",
+            "CUDAExecutionProvider",
+            "CPUExecutionProvider",
+        ]
+        plain.providers.append("CPUExecutionProvider")
+        assert other.providers == []
+        npu_plan = SplitConfig(model="weights", output="out", target_device="npu")
+        assert npu_plan.target_device is DeviceType.NPU
+        assert npu_plan.resolved_providers() == PROVIDER_FALLBACK[DeviceType.NPU]
+        ipu_plan = SplitConfig(model="weights", output="out", target_device=DeviceType.IPU)
+        assert ipu_plan.resolved_providers() == PROVIDER_FALLBACK[DeviceType.IPU]
+        hybrid_plan = SplitConfig(
+            model="weights",
+            output="out",
+            providers=["VitisAIExecutionProvider", "DmlExecutionProvider"],
+            execution_policy="hybrid_npu_igpu_phase_split",
+        )
+        assert hybrid_plan.resolved_providers() == [
+            "VitisAIExecutionProvider",
+            "DmlExecutionProvider",
+        ]
+        assert hybrid_plan.execution_policy is canonical_policy.HYBRID_NPU_IGPU_PHASE_SPLIT
+        try:
+            SplitConfig(model="weights", output="out", target_device="tpu")
+            raise AssertionError("an unknown device was accepted")
+        except ValueError as exc:
+            assert "tpu" in str(exc)
+        try:
+            SplitConfig(model="weights", output="out", providers="CPUExecutionProvider")
+            raise AssertionError("a provider string was accepted")
+        except ValueError as exc:
+            assert "providers" in str(exc)
+        assert providers_for_device(DeviceType.IPU, [
+            "DmlExecutionProvider",
+            "ROCmExecutionProvider",
+            "CPUExecutionProvider",
+        ]) == [
+            "DmlExecutionProvider",
+            "ROCmExecutionProvider",
+            "CPUExecutionProvider",
+        ]
         empty_dir = tempfile.mkdtemp(prefix="empty-model-")
         try:
             detect_model_format(empty_dir)
@@ -6842,6 +6917,7 @@ def test_backend():
     print("  providers: NPU, GPU, CPU, and auto-detect")
     print("  hybrid: prefill/decode, NPU layer range, MoE router and experts")
     print("  model format: one enum for onnx, safetensors, gguf, pytorch_bin")
+    print("  device policy: providers, npu, ipu, hybrid execution")
     print("backend module: OK\n")
     return True
 

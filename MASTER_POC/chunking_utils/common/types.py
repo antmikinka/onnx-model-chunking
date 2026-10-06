@@ -68,6 +68,99 @@ class ComponentType(str, Enum):
     OTHER = "other"
 
 
+class DeviceType(str, Enum):
+    """
+    Inference device for a split model.
+
+    IPU is the AMD iGPU target. AUTO picks NPU, then iGPU, then GPU, then CPU.
+    """
+    CPU = "cpu"
+    GPU = "gpu"
+    NPU = "npu"
+    IPU = "ipu"
+    AUTO = "auto"
+
+
+class ExecutionPolicy(str, Enum):
+    """
+    How a split model may be executed.
+
+    AUTO behaves as one monolithic graph. A sequential NPU layer split stays
+    rejected. Phase split and MoE routing are the NPU exceptions.
+    """
+    AUTO = "auto"
+    MONOLITHIC_ONLY = "monolithic_only"
+    SPLIT_CPU_MEMORY_OPTIMIZED = "split_cpu_memory_optimized"
+    SPLIT_GPU_PERSISTENT = "split_gpu_persistent"
+    HYBRID_NPU_IGPU_PHASE_SPLIT = "hybrid_npu_igpu_phase_split"
+    HYBRID_NPU_MOE_ROUTING = "hybrid_npu_moe_routing"
+
+
+# Ordered ONNX Runtime fallback for each device. AUTO is resolved later.
+# NPU prefers VitisAI, then RyzenAI. IPU is the AMD iGPU order.
+PROVIDER_FALLBACK = {
+    DeviceType.CPU: ["CPUExecutionProvider"],
+    DeviceType.GPU: [
+        "ROCmExecutionProvider",
+        "CUDAExecutionProvider",
+        "DmlExecutionProvider",
+        "CPUExecutionProvider",
+    ],
+    DeviceType.NPU: [
+        "VitisAIExecutionProvider",
+        "RyzenAIExecutionProvider",
+        "CPUExecutionProvider",
+    ],
+    DeviceType.IPU: [
+        "DmlExecutionProvider",
+        "ROCmExecutionProvider",
+        "MIGraphXExecutionProvider",
+        "CPUExecutionProvider",
+    ],
+    DeviceType.AUTO: None,
+}
+
+
+def _coerce_device_type(device: Any) -> DeviceType:
+    """Accept a DeviceType or its value, such as npu or ipu."""
+    if isinstance(device, DeviceType):
+        return device
+    text = str(device).split(".")[-1].strip().lower()
+    try:
+        return DeviceType(text)
+    except ValueError as exc:
+        known = ", ".join(item.value for item in DeviceType)
+        raise ValueError(
+            f"Unknown target_device {device!r}. Expected one of: {known}"
+        ) from exc
+
+
+def _coerce_execution_policy(policy: Any) -> ExecutionPolicy:
+    """Accept an ExecutionPolicy or its value."""
+    if isinstance(policy, ExecutionPolicy):
+        return policy
+    text = str(policy).split(".")[-1].strip().lower()
+    try:
+        return ExecutionPolicy(text)
+    except ValueError as exc:
+        known = ", ".join(item.value for item in ExecutionPolicy)
+        raise ValueError(
+            f"Unknown execution_policy {policy!r}. Expected one of: {known}"
+        ) from exc
+
+
+def _auto_provider_fallback() -> List[str]:
+    """NPU, then AMD iGPU, then discrete GPU, with CPU last."""
+    selected: List[str] = []
+    for kind in (DeviceType.NPU, DeviceType.IPU, DeviceType.GPU):
+        for name in PROVIDER_FALLBACK[kind]:
+            if name == "CPUExecutionProvider" or name in selected:
+                continue
+            selected.append(name)
+    selected.append("CPUExecutionProvider")
+    return selected
+
+
 @dataclass
 class SplitConfig:
     """
@@ -84,7 +177,10 @@ class SplitConfig:
         # Memory efficiency options
         dtype: Target tensor dtype (AUTO preserves original).
         memory_mode: Loading strategy (STREAMING for low-memory environments).
-        device: Target device ('cpu', 'cuda', 'cuda:0', etc.).
+        device: Torch or runtime device string, such as cpu or cuda:0.
+        providers: ONNX Runtime provider fallback, first choice first.
+        target_device: CPU, GPU, NPU, IPU, or AUTO.
+        execution_policy: Monolithic, split, or hybrid NPU placement.
         low_cpu_mem_usage: Use HuggingFace's low-memory loading.
         
         # HuggingFace integration
@@ -106,6 +202,9 @@ class SplitConfig:
     dtype: TensorDtype = TensorDtype.AUTO
     memory_mode: MemoryMode = MemoryMode.STREAMING  # Default to memory-efficient
     device: str = "cpu"
+    providers: List[str] = field(default_factory=list)
+    target_device: DeviceType = DeviceType.AUTO
+    execution_policy: ExecutionPolicy = ExecutionPolicy.AUTO
     low_cpu_mem_usage: bool = True
     
     # HuggingFace integration
@@ -118,6 +217,39 @@ class SplitConfig:
     prompt: str = "Test prompt."
     max_new_tokens: int = 50
     verbose: bool = False
+
+    def __post_init__(self) -> None:
+        self.target_device = _coerce_device_type(self.target_device)
+        self.execution_policy = _coerce_execution_policy(self.execution_policy)
+        if self.providers is None:
+            self.providers = []
+        if isinstance(self.providers, (str, bytes)) or not isinstance(self.providers, list):
+            raise ValueError(
+                f"providers must be a list of provider names, got {self.providers!r}"
+            )
+        cleaned: List[str] = []
+        for item in self.providers:
+            if not isinstance(item, str) or not item.strip():
+                raise ValueError(
+                    f"provider name must be a non-empty string, got {item!r}"
+                )
+            cleaned.append(item.strip())
+        self.providers = cleaned
+
+    def resolved_providers(self) -> List[str]:
+        """
+        Provider fallback order.
+
+        An explicit ``providers`` list is kept. An empty list uses the order
+        for ``target_device``. AUTO tries the NPU, then the AMD iGPU, then
+        a discrete GPU, and CPU last.
+        """
+        if self.providers:
+            return list(self.providers)
+        mapped = PROVIDER_FALLBACK[self.target_device]
+        if mapped is None:
+            return _auto_provider_fallback()
+        return list(mapped)
 
 
 from .architecture import ArchitectureType  # Re-export for convenience

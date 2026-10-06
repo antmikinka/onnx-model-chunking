@@ -32,7 +32,7 @@ import warnings
 import numpy as np
 
 from .kv_cache import KVCacheManager
-from chunking_utils.common.types import ModelFormat
+from chunking_utils.common.types import DeviceType, ModelFormat, PROVIDER_FALLBACK
 
 
 # =============================================================================
@@ -47,20 +47,11 @@ class BackendType(Enum):
     VLLM = "vllm"                   # High-throughput server mode
 
 
-class DeviceType(Enum):
-    """Target device for inference."""
-    CPU = "cpu"
-    GPU = "gpu"       # CUDA/ROCm/MPS
-    NPU = "npu"       # VitisAI/OpenVINO/CoreML
-    AUTO = "auto"     # Best available
-
-
 # Preference order for OnnxRuntimeBackend. AUTO is detected from this table.
+# IPU is the AMD iGPU list. AUTO stays unset so detection uses NPU, GPU, then CPU.
 DEVICE_PROVIDER_MAP = {
-    DeviceType.NPU: ["VitisAIExecutionProvider", "RyzenAIExecutionProvider", "CPUExecutionProvider"],
-    DeviceType.GPU: ["ROCmExecutionProvider", "CUDAExecutionProvider", "DmlExecutionProvider", "CPUExecutionProvider"],
-    DeviceType.CPU: ["CPUExecutionProvider"],
-    DeviceType.AUTO: None,  # auto-detect
+    device: None if names is None else list(names)
+    for device, names in PROVIDER_FALLBACK.items()
 }
 
 _AUTO_DEVICE_ORDER = (DeviceType.NPU, DeviceType.GPU, DeviceType.CPU)
