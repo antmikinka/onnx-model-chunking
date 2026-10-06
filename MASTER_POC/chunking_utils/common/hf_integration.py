@@ -6,7 +6,8 @@ including AutoConfig for architecture detection and accelerate for memory-effici
 """
 
 import os
-from typing import Optional, Dict, Any
+import warnings
+from typing import Optional, Dict, Any, Iterable, Tuple
 
 from .types import TensorDtype, MemoryMode
 from .architecture import architecture_from_string, ArchitectureType
@@ -124,30 +125,220 @@ def detect_architecture_hf(model_path: str, trust_remote_code: bool = True) -> A
     return ArchitectureType.UNKNOWN
 
 
+# First positive value wins. max_position_embeddings is the Hugging Face name.
+_CONTEXT_LENGTH_KEYS = (
+    "max_seq_len",
+    "max_position_embeddings",
+    "max_sequence_length",
+    "seq_length",
+    "n_positions",
+)
+_NESTED_CONFIG_ATTRS = ("text_config", "llm_config", "decoder")
+
+
+def _config_sources(config: Any) -> Tuple[Any, ...]:
+    """Top config, then a nested text or decoder config when the top omits a field."""
+    sources = [config]
+    seen = {id(config)}
+    for name in _NESTED_CONFIG_ATTRS:
+        nested = _lookup(config, name)
+        if nested is None or id(nested) in seen:
+            continue
+        if isinstance(nested, (str, int, float, bool, list, tuple)):
+            continue
+        sources.append(nested)
+        seen.add(id(nested))
+    return tuple(sources)
+
+
+def _lookup(source: Any, name: str) -> Any:
+    """Return an attribute or dict entry. Missing and null stay None."""
+    if isinstance(source, dict):
+        return source.get(name)
+    return getattr(source, name, None)
+
+
+def _as_config_int(value: Any, name: str) -> int:
+    """Accept an integer dimension. Bools and fractional floats are rejected."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be an integer, got {value!r}")
+    if isinstance(value, float):
+        if not value.is_integer():
+            raise ValueError(f"{name} must be an integer, got {value!r}")
+        value = int(value)
+    return int(value)
+
+
+def _first_positive_int(config: Any, names: Iterable[str]) -> Optional[int]:
+    """First positive integer among names. Zero falls through. Negatives raise."""
+    for name in names:
+        for source in _config_sources(config):
+            value = _lookup(source, name)
+            if value is None:
+                continue
+            parsed = _as_config_int(value, name)
+            if parsed == 0:
+                continue
+            if parsed < 0:
+                raise ValueError(f"{name} must be non-negative, got {parsed}")
+            return parsed
+    return None
+
+
+def _first_bool(config: Any, name: str) -> Optional[bool]:
+    """First real boolean. A missing flag stays unset."""
+    for source in _config_sources(config):
+        if isinstance(source, dict):
+            if name not in source or source[name] is None:
+                continue
+            value = source[name]
+        elif not hasattr(source, name):
+            continue
+        else:
+            value = getattr(source, name)
+            if value is None:
+                continue
+        if not isinstance(value, bool):
+            raise ValueError(f"{name} must be a boolean, got {value!r}")
+        return value
+    return None
+
+
+def _first_number(config: Any, name: str, allow_zero: bool = False) -> Optional[float]:
+    """First finite number. Zero is unset unless allow_zero is set."""
+    for source in _config_sources(config):
+        value = _lookup(source, name)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{name} must be a number, got {value!r}")
+        number = float(value)
+        if number == 0 and not allow_zero:
+            continue
+        if number < 0:
+            raise ValueError(f"{name} must be non-negative, got {value!r}")
+        return number
+    return None
+
+
+def _first_mapping(config: Any, name: str) -> Optional[Dict[str, Any]]:
+    """Copy a nested dict such as rope_scaling. A non-dict raises."""
+    for source in _config_sources(config):
+        if isinstance(source, dict):
+            if name not in source or source[name] is None:
+                continue
+            value = source[name]
+        elif not hasattr(source, name):
+            continue
+        else:
+            value = getattr(source, name)
+            if value is None:
+                continue
+        if not isinstance(value, dict):
+            raise ValueError(f"{name} must be a dict, got {value!r}")
+        return dict(value)
+    return None
+
+
+def _architecture_value(config: Any, name: str, default: Any = None) -> Any:
+    """Top-level value, then a nested config, then the default."""
+    if isinstance(config, dict):
+        if name in config and config[name] is not None:
+            return config[name]
+    elif hasattr(config, name):
+        value = getattr(config, name)
+        if value is not None:
+            return value
+    for source in _config_sources(config)[1:]:
+        value = _lookup(source, name)
+        if value is not None:
+            return value
+    return default
+
+
+def _fields_from_hf_config(config: Any) -> Dict[str, Any]:
+    """
+    Read architecture, context, KV, RoPE, and MoE fields from a config object.
+
+    A missing top-level field is read from text_config, llm_config, or decoder.
+    Zero context lengths fall through to the next alias.
+    """
+    context = _first_positive_int(config, _CONTEXT_LENGTH_KEYS)
+    sliding = _first_positive_int(config, ("sliding_window", "sliding_window_size"))
+    sliding_flag = _first_bool(config, "use_sliding_window")
+    if sliding_flag is None:
+        sliding_flag = sliding is not None
+    attention_heads = _first_positive_int(config, ("num_attention_heads",))
+    kv_heads = _first_positive_int(
+        config, ("num_key_value_heads", "num_kv_heads")
+    )
+    if kv_heads is None:
+        kv_heads = attention_heads
+    hidden = _first_positive_int(config, ("hidden_size",))
+    head_dim = _first_positive_int(config, ("head_dim", "head_size"))
+    if head_dim is None and hidden is not None and attention_heads is not None:
+        if hidden % attention_heads != 0:
+            warnings.warn(
+                f"hidden_size ({hidden}) not divisible by num_attention_heads "
+                f"({attention_heads}). Config may be malformed.",
+                UserWarning,
+            )
+        head_dim = hidden // attention_heads
+    experts = _first_positive_int(config, ("num_experts", "num_local_experts")) or 0
+    per_token = _first_positive_int(
+        config, ("num_experts_per_token", "num_experts_per_tok")
+    ) or 0
+    if experts > 0 and per_token > experts:
+        raise ValueError(
+            "num_experts_per_token must not exceed num_experts, "
+            f"got {per_token} and {experts}"
+        )
+    moe_flag = _first_bool(config, "is_moe")
+    torch_dtype = _architecture_value(config, "torch_dtype", "unknown")
+    return {
+        "model_type": _architecture_value(config, "model_type", "unknown"),
+        "num_hidden_layers": _architecture_value(config, "num_hidden_layers"),
+        "hidden_size": _architecture_value(config, "hidden_size"),
+        "vocab_size": _architecture_value(config, "vocab_size"),
+        "num_attention_heads": _architecture_value(config, "num_attention_heads"),
+        "torch_dtype": str(torch_dtype),
+        "max_position_embeddings": _first_positive_int(config, ("max_position_embeddings",)),
+        "max_sequence_length": _first_positive_int(config, ("max_sequence_length",)),
+        "max_seq_len": 0 if context is None else context,
+        "sliding_window": sliding,
+        "use_sliding_window": sliding_flag,
+        "num_key_value_heads": kv_heads,
+        "head_dim": head_dim,
+        "rope_theta": _first_number(config, "rope_theta"),
+        "rope_scaling": _first_mapping(config, "rope_scaling"),
+        "is_moe": experts > 0 if moe_flag is None else moe_flag,
+        "num_experts": experts,
+        "num_experts_per_token": per_token,
+        "moe_intermediate_size": _first_positive_int(config, ("moe_intermediate_size",)),
+        "router_aux_loss_coef": _first_number(config, "router_aux_loss_coef", allow_zero=True),
+    }
+
+
 def get_model_config(model_path: str, trust_remote_code: bool = True) -> Dict[str, Any]:
     """
     Get model configuration from HuggingFace config.
-    
+
+    The result includes the context length, sliding window, KV heads, head
+    dim, RoPE theta, and MoE counts used to preallocate a cache and plan a
+    static NPU graph.
+
     Args:
         model_path: Path to model or HuggingFace model ID.
         trust_remote_code: Allow custom code from model repos.
-    
+
     Returns:
         Dictionary with model configuration.
     """
     if not HAS_TRANSFORMERS:
         return {"error": "transformers not installed"}
-    
+
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=trust_remote_code)
-    
-    return {
-        "model_type": getattr(config, 'model_type', 'unknown'),
-        "num_hidden_layers": getattr(config, 'num_hidden_layers', None),
-        "hidden_size": getattr(config, 'hidden_size', None),
-        "vocab_size": getattr(config, 'vocab_size', None),
-        "num_attention_heads": getattr(config, 'num_attention_heads', None),
-        "torch_dtype": str(getattr(config, 'torch_dtype', 'unknown')),
-    }
+    return _fields_from_hf_config(config)
 
 
 # Weight width in bits. INT4 is two values per byte.

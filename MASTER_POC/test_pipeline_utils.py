@@ -7875,15 +7875,21 @@ def test_hf_integration():
     print("Testing HuggingFace dtype mapping...")
     print("=" * 50)
 
+    import types
+    import warnings
+
     import numpy as np
 
     import chunking_utils.common as common
     from chunking_utils.common.hf_integration import (
         HAS_TORCH,
+        HAS_TRANSFORMERS,
         ONNX_DTYPE_MAP as direct_map,
         TORCH_DTYPE_MAP,
         check_dependencies,
+        _fields_from_hf_config,
         estimate_model_memory,
+        get_model_config,
         get_onnx_dtype as direct_get,
         get_torch_dtype,
     )
@@ -8014,6 +8020,128 @@ def test_hf_integration():
     except ValueError as exc:
         assert "group_size" in str(exc)
     print("  quantized memory: int4 packing, awq and gptq groups, matmul nbits blocks")
+
+    if not HAS_TRANSFORMERS:
+        assert get_model_config("unused") == {"error": "transformers not installed"}
+    llama = types.SimpleNamespace(
+        model_type="llama",
+        num_hidden_layers=2,
+        hidden_size=32,
+        vocab_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=4096,
+        rope_theta=10000,
+        torch_dtype="float16",
+    )
+    planned = _fields_from_hf_config(llama)
+    assert planned["model_type"] == "llama"
+    assert planned["num_hidden_layers"] == 2
+    assert planned["hidden_size"] == 32
+    assert planned["vocab_size"] == 128
+    assert planned["num_attention_heads"] == 4
+    assert planned["torch_dtype"] == "float16"
+    assert planned["max_position_embeddings"] == 4096
+    assert planned["max_sequence_length"] is None
+    assert planned["max_seq_len"] == 4096
+    assert planned["num_key_value_heads"] == 2
+    assert planned["head_dim"] == 8
+    assert planned["rope_theta"] == 10000.0
+    assert planned["sliding_window"] is None
+    assert planned["use_sliding_window"] is False
+    assert planned["is_moe"] is False
+    assert planned["num_experts"] == 0
+    assert planned["num_experts_per_token"] == 0
+    fallen = _fields_from_hf_config(types.SimpleNamespace(
+        max_position_embeddings=0,
+        max_sequence_length=8192,
+        num_attention_heads=4,
+        hidden_size=32,
+    ))
+    assert fallen["max_position_embeddings"] is None
+    assert fallen["max_sequence_length"] == 8192
+    assert fallen["max_seq_len"] == 8192
+    sliding = _fields_from_hf_config(types.SimpleNamespace(
+        sliding_window=4096,
+        num_attention_heads=4,
+        hidden_size=32,
+        head_dim=96,
+    ))
+    assert sliding["sliding_window"] == 4096
+    assert sliding["use_sliding_window"] is True
+    assert sliding["head_dim"] == 96
+    held = _fields_from_hf_config(types.SimpleNamespace(
+        sliding_window=4096,
+        use_sliding_window=False,
+        num_attention_heads=8,
+        hidden_size=64,
+    ))
+    assert held["use_sliding_window"] is False
+    assert held["num_key_value_heads"] == 8
+    assert held["head_dim"] == 8
+    rope_scaling = {"type": "linear", "factor": 2}
+    mixtral = _fields_from_hf_config(types.SimpleNamespace(
+        num_local_experts=8,
+        num_experts_per_tok=2,
+        moe_intermediate_size=64,
+        router_aux_loss_coef=0,
+        rope_scaling=rope_scaling,
+        num_attention_heads=4,
+        hidden_size=32,
+    ))
+    assert mixtral["is_moe"] is True
+    assert mixtral["num_experts"] == 8
+    assert mixtral["num_experts_per_token"] == 2
+    assert mixtral["moe_intermediate_size"] == 64
+    assert mixtral["router_aux_loss_coef"] == 0.0
+    assert mixtral["rope_scaling"] == {"type": "linear", "factor": 2}
+    mixtral["rope_scaling"]["factor"] = 1
+    assert rope_scaling["factor"] == 2
+    nested = _fields_from_hf_config(types.SimpleNamespace(
+        model_type="qwen2_vl",
+        text_config=types.SimpleNamespace(
+            num_hidden_layers=4,
+            hidden_size=16,
+            num_attention_heads=2,
+            max_position_embeddings=2048,
+            rope_theta=1000000,
+        ),
+    ))
+    assert nested["model_type"] == "qwen2_vl"
+    assert nested["num_hidden_layers"] == 4
+    assert nested["max_seq_len"] == 2048
+    assert nested["head_dim"] == 8
+    assert nested["rope_theta"] == 1000000.0
+    flagged = _fields_from_hf_config(types.SimpleNamespace(is_moe=True))
+    assert flagged["is_moe"] is True
+    assert flagged["num_experts"] == 0
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        odd_dim = _fields_from_hf_config(types.SimpleNamespace(
+            hidden_size=30,
+            num_attention_heads=4,
+        ))
+    assert odd_dim["head_dim"] == 7
+    assert any("not divisible" in str(item.message) for item in caught)
+    try:
+        _fields_from_hf_config(types.SimpleNamespace(
+            num_experts=2,
+            num_experts_per_token=3,
+        ))
+        raise AssertionError("more experts per token than experts was accepted")
+    except ValueError as exc:
+        assert "num_experts_per_token" in str(exc)
+    try:
+        _fields_from_hf_config(types.SimpleNamespace(max_position_embeddings=True))
+        raise AssertionError("a boolean context length was accepted")
+    except ValueError as exc:
+        assert "max_position_embeddings" in str(exc)
+    try:
+        _fields_from_hf_config(types.SimpleNamespace(rope_theta=-1))
+        raise AssertionError("a negative rope theta was accepted")
+    except ValueError as exc:
+        assert "rope_theta" in str(exc)
+    print("  hf config: context, sliding window, kv heads, head dim, rope, moe")
     print("hf integration: OK\n")
     return True
 
