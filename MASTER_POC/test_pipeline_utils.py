@@ -10853,6 +10853,434 @@ def test_quantization_metadata():
     return True
 
 
+def test_kv_cache_metadata():
+    """KV cache metadata is read from past and present tensors and saved."""
+    print("=" * 50)
+    print("Testing KV cache metadata...")
+    print("=" * 50)
+
+    import json
+    import os
+    import sys
+    import tempfile
+    import types
+    import warnings
+    import chunking_utils
+
+    try:
+        from chunking_utils.onnx.splitter import extract_kv_cache_info
+        import chunking_utils.onnx.splitter as splitter
+    except ModuleNotFoundError:
+        for name in list(sys.modules):
+            if name == "chunking_utils.onnx" or name.startswith("chunking_utils.onnx."):
+                del sys.modules[name]
+        onnx_stub = types.ModuleType("onnx")
+        onnx_stub.ModelProto = type("ModelProto", (), {})
+        onnx_stub.numpy_helper = types.SimpleNamespace()
+        onnx_stub.helper = types.SimpleNamespace()
+        onnx_stub.TensorProto = types.SimpleNamespace()
+        onnx_stub.shape_inference = types.SimpleNamespace()
+        sys.modules["onnx"] = onnx_stub
+        from chunking_utils.onnx.splitter import extract_kv_cache_info
+        import chunking_utils.onnx.splitter as splitter
+
+    from chunking_utils.onnx.types import ComponentInfo
+
+    assert chunking_utils.extract_kv_cache_info is extract_kv_cache_info
+
+    class _Dim:
+        def __init__(self, value=0, name=""):
+            self.dim_value = value
+            self.dim_param = name
+
+    class _Value:
+        def __init__(self, name, elem, dims):
+            shape = None if dims is None else types.SimpleNamespace(
+                dim=[dim if isinstance(dim, _Dim) else _Dim(dim) for dim in dims]
+            )
+            self.name = name
+            self.type = types.SimpleNamespace(
+                tensor_type=types.SimpleNamespace(elem_type=elem, shape=shape)
+            )
+
+    class _Init:
+        def __init__(self, name, data_type, dims):
+            self.name = name
+            self.data_type = data_type
+            self.dims = dims
+
+    class _Node:
+        def __init__(self, name, op_type, inputs, outputs=()):
+            self.name = name
+            self.op_type = op_type
+            self.input = list(inputs)
+            self.output = list(outputs)
+
+    class _Graph:
+        def __init__(self, nodes, inputs=(), outputs=(), initializers=(), value_info=()):
+            self.node = list(nodes)
+            self.input = list(inputs)
+            self.initializer = list(initializers)
+            self.output = list(outputs)
+            self.value_info = list(value_info)
+
+    def _quiet(graph):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            info = extract_kv_cache_info(graph)
+        return info, caught
+
+    def _named(name, elem=10, dims=None):
+        if dims is None:
+            dims = [
+                _Dim(1, "batch"),
+                _Dim(8, "num_kv_heads"),
+                _Dim(128, "past_sequence_length"),
+                _Dim(64, "head_dim"),
+            ]
+        return _Value(name, elem, dims)
+
+    past_names = []
+    present_names = []
+    values = []
+    for layer in (0, 1):
+        for kind in ("key", "value"):
+            past = f"past_key_values.{layer}.{kind}"
+            present = f"present.{layer}.{kind}"
+            past_names.append(past)
+            present_names.append(present)
+            values.append(_named(past))
+            values.append(_named(present))
+    info, caught = _quiet(_Graph(
+        [_Node("/model/layers.0/self_attn/MatMul", "MatMul", ["hidden"], ["hidden_out"])],
+        inputs=[_named(name) for name in past_names],
+        outputs=[_named(name) for name in present_names],
+        value_info=values,
+    ))
+    assert caught == []
+    assert info == {
+        "num_layers": 2,
+        "num_kv_heads": 8,
+        "head_dim": 64,
+        "layout": "BNSD",
+        "dtype": "float16",
+        "past_key_pattern": "past_key_values.{layer}.key",
+        "past_value_pattern": "past_key_values.{layer}.value",
+        "present_key_pattern": "present.{layer}.key",
+        "present_value_pattern": "present.{layer}.value",
+        "max_seq_len": 128,
+        "stateful": True,
+        "stateful_contract": {
+            "roles": ["past_key", "past_value", "present_key", "present_value"],
+            "zero_copy": True,
+        },
+    }
+    info["num_kv_heads"] = 1
+    info["stateful_contract"]["roles"].append("other")
+    again, _ = _quiet(_Graph(
+        [_Node("attn", "MatMul", past_names, present_names)],
+        inputs=[_named(name) for name in past_names],
+        outputs=[_named(name) for name in present_names],
+    ))
+    assert again["num_kv_heads"] == 8
+    assert again["stateful_contract"]["roles"] == [
+        "past_key", "past_value", "present_key", "present_value",
+    ]
+    assert again is not info
+    json.dumps(again)
+
+    dense, caught = _quiet(_Graph([_Node("proj", "MatMul", ["hidden"], ["out"])]))
+    assert dense["num_layers"] == 0
+    assert dense["num_kv_heads"] is None
+    assert dense["head_dim"] is None
+    assert dense["layout"] is None
+    assert dense["dtype"] is None
+    assert dense["past_key_pattern"] is None
+    assert dense["past_value_pattern"] is None
+    assert dense["present_key_pattern"] is None
+    assert dense["present_value_pattern"] is None
+    assert dense["max_seq_len"] is None
+    assert dense["stateful"] is False
+    assert dense["stateful_contract"] is None
+    assert caught == []
+    other_dense, _ = _quiet(types.SimpleNamespace(
+        node=[_Node("proj", "MatMul", ["hidden"], ["out"])],
+        input=[],
+        output=[],
+    ))
+    assert other_dense is not dense
+    dense["dtype"] = "float16"
+    assert other_dense["dtype"] is None
+
+    bare_name = "past_key_values.0.key"
+    bare_value = _Value(bare_name, 10, [1, 8, 32, 64])
+    assumed, caught = _quiet(_Graph(
+        [_Node("attn", "MatMul", [bare_name], ["present.0.key"])],
+        inputs=[bare_value],
+        outputs=[_Value("present.0.key", 10, [1, 8, 32, 64])],
+    ))
+    assert assumed["layout"] == "BNSD"
+    assert assumed["num_kv_heads"] == 8
+    assert assumed["head_dim"] == 64
+    assert assumed["max_seq_len"] == 32
+    assert assumed["dtype"] == "float16"
+    assert assumed["num_layers"] == 1
+    messages = [str(item.message) for item in caught]
+    assert any("default layout BNSD" in message for message in messages)
+    assert all(issubclass(item.category, UserWarning) for item in caught)
+
+    bsnd_dims = [
+        _Dim(1, "batch"),
+        _Dim(128, "sequence"),
+        _Dim(8, "num_kv_heads"),
+        _Dim(64, "head_dim"),
+    ]
+    bsnd, caught = _quiet(_Graph(
+        [_Node("attn", "MatMul", ["past_key_values.0.key"])],
+        inputs=[_Value("past_key_values.0.key", 10, bsnd_dims)],
+        outputs=[_Value("present.0.key", 10, bsnd_dims)],
+    ))
+    assert caught == []
+    assert bsnd["layout"] == "BSND"
+    assert bsnd["num_kv_heads"] == 8
+    assert bsnd["head_dim"] == 64
+    assert bsnd["max_seq_len"] == 128
+    assert bsnd["past_value_pattern"] is None
+    assert bsnd["present_value_pattern"] is None
+    assert bsnd["stateful_contract"]["roles"] == ["past_key", "present_key"]
+
+    symbolic_dims = [
+        _Dim(1, "batch"),
+        _Dim(8, "num_kv_heads"),
+        _Dim(0, "past_sequence_length"),
+        _Dim(64, "head_dim"),
+    ]
+    symbolic, caught = _quiet(_Graph(
+        [_Node("attn", "MatMul", ["past_key_values.0.key"])],
+        inputs=[_Value("past_key_values.0.key", 10, symbolic_dims)],
+    ))
+    assert symbolic["layout"] == "BNSD"
+    assert symbolic["num_kv_heads"] == 8
+    assert symbolic["head_dim"] == 64
+    assert symbolic["max_seq_len"] is None
+    assert symbolic["dtype"] == "float16"
+    assert any("does not record max_seq_len" in str(item.message) for item in caught)
+    assert all("default layout" not in str(item.message) for item in caught)
+
+    masked = "past_key_values.0.attention_mask.key"
+    masked_info, caught = _quiet(_Graph(
+        [_Node("attn", "MatMul", [masked])],
+        inputs=[_Value(masked, 0, [1, 4, 16, 32])],
+    ))
+    assert masked_info["dtype"] == "float16"
+    assert masked_info["dtype"] != "int64"
+    assert masked_info["past_key_pattern"] == "past_key_values.{layer}.attention_mask.key"
+    masked_messages = [str(item.message) for item in caught]
+    assert any("default dtype float16" in message for message in masked_messages)
+    assert any("default layout BNSD" in message for message in masked_messages)
+    assert all("heuristic" not in message for message in masked_messages)
+
+    typed = _Value("past_key_values.0.key", 1, None)
+    stored, caught = _quiet(_Graph(
+        [_Node("attn", "MatMul", ["past_key_values.0.key"])],
+        inputs=[typed],
+        initializers=[_Init("past_key_values.0.key", 10, [1, 8, 32, 64])],
+    ))
+    assert stored["dtype"] == "float32"
+    assert stored["num_kv_heads"] == 8
+    assert stored["head_dim"] == 64
+    assert stored["max_seq_len"] == 32
+    assert any("default layout BNSD" in str(item.message) for item in caught)
+    assert all("dtype" not in str(item.message) for item in caught)
+
+    rank3, caught = _quiet(_Graph(
+        [_Node("attn", "MatMul", ["past_key_values.0.key"])],
+        inputs=[_Value("past_key_values.0.key", 10, [1, 8, 64])],
+    ))
+    assert rank3["layout"] is None
+    assert rank3["num_kv_heads"] is None
+    assert rank3["head_dim"] is None
+    assert rank3["max_seq_len"] is None
+    assert rank3["num_layers"] == 1
+    assert rank3["stateful"] is True
+    assert any("rank 3" in str(item.message) for item in caught)
+
+    plain = _Graph(
+        [_Node("attn", "MatMul", ["past_key"])],
+        inputs=[_Value("past_key", 10, [
+            _Dim(1, "batch"),
+            _Dim(2, "num_kv_heads"),
+            _Dim(4, "seq"),
+            _Dim(8, "head_dim"),
+        ])],
+    )
+    plain_info, caught = _quiet(plain)
+    assert plain_info["num_layers"] == 1
+    assert plain_info["past_key_pattern"] == "past_key"
+    assert plain_info["num_kv_heads"] == 2
+    assert any("default layer index 0" in str(item.message) for item in caught)
+
+    try:
+        extract_kv_cache_info(_Graph(
+            [_Node("attn", "MatMul", ["past_key_values.0.key", "past_key_values.1.key"])],
+            inputs=[
+                _Value("past_key_values.0.key", 10, [1, 8, 4, 64]),
+                _Value("past_key_values.1.key", 10, [1, 4, 4, 64]),
+            ],
+        ))
+        raise AssertionError("disagreeing kv heads were accepted")
+    except ValueError as exc:
+        assert "num_kv_heads" in str(exc)
+        assert "8" in str(exc) and "4" in str(exc)
+    try:
+        extract_kv_cache_info(_Graph(
+            [_Node("attn", "MatMul", ["past_key_values.0.key", "past_key_1"])],
+            inputs=[
+                _named("past_key_values.0.key"),
+                _named("past_key_1"),
+            ],
+        ))
+        raise AssertionError("an ambiguous layer index was accepted")
+    except ValueError as exc:
+        assert "ambiguous" in str(exc)
+    try:
+        extract_kv_cache_info(_Graph(
+            [_Node("attn", "MatMul", ["past_key_values.0.key", "past_key_values.2.key"])],
+            inputs=[_named("past_key_values.0.key"), _named("past_key_values.2.key")],
+        ))
+        raise AssertionError("a gap in kv layers was accepted")
+    except ValueError as exc:
+        assert "not contiguous" in str(exc)
+    try:
+        extract_kv_cache_info(_Graph(
+            [_Node("attn", "MatMul", ["past_key_values.0.key", "past_key_values.1.key"], ["present.0.key"])],
+            inputs=[_named("past_key_values.0.key"), _named("past_key_values.1.key")],
+            outputs=[_named("present.0.key")],
+        ))
+        raise AssertionError("a partial present layer set was accepted")
+    except ValueError as exc:
+        assert "layers disagree" in str(exc)
+    try:
+        extract_kv_cache_info(None)
+        raise AssertionError("a missing graph was accepted")
+    except ValueError as exc:
+        assert "graph" in str(exc)
+    try:
+        extract_kv_cache_info(_Graph(
+            [_Node("attn", "MatMul", ["past_key_values.0.key"])],
+            inputs=[_Value("past_key_values.0.key", 10, [_Dim(True)])],
+        ))
+        raise AssertionError("a bool cache dimension was accepted")
+    except ValueError as exc:
+        assert "dimension" in str(exc)
+
+    class _SplitModel:
+        def __init__(self, graph):
+            self.graph = graph
+            self.ir_version = 8
+            self.producer_name = "test"
+
+    split_values = [
+        _named("past_key_values.0.key"),
+        _named("past_key_values.0.value"),
+        _named("present.0.key"),
+        _named("present.0.value"),
+    ]
+    split_graph = _Graph(
+        [_Node("/model/layers.0/self_attn/MatMul", "MatMul", ["past_key_values.0.key"], ["present.0.key"])],
+        inputs=split_values[:2],
+        outputs=split_values[2:],
+    )
+    original_load = splitter.load_onnx_model
+    original_extract = splitter.extract_components
+    original_create = splitter.create_component_onnx
+    original_boundaries = splitter.collect_boundary_tensors
+    original_save = getattr(splitter.onnx, "save", None)
+    original_infer = getattr(splitter.shape_inference, "infer_shapes", None)
+
+    def fake_load(path):
+        return _SplitModel(split_graph)
+
+    def fake_infer(model):
+        return model
+
+    def fake_extract(model, **kwargs):
+        return {
+            "layer_0": ComponentInfo(
+                component_type="layer",
+                layer_id=0,
+                node_indices=[0],
+            )
+        }
+
+    def fake_create(model, component, name):
+        return types.SimpleNamespace(
+            graph=types.SimpleNamespace(
+                input=[types.SimpleNamespace(name="past_key_values.0.key")],
+                output=[types.SimpleNamespace(name="present.0.key")],
+            )
+        )
+
+    def fake_boundaries(model, components):
+        return []
+
+    def fake_save(*args, **kwargs):
+        return None
+
+    splitter.load_onnx_model = fake_load
+    splitter.extract_components = fake_extract
+    splitter.create_component_onnx = fake_create
+    splitter.collect_boundary_tensors = fake_boundaries
+    splitter.onnx.save = fake_save
+    splitter.shape_inference.infer_shapes = fake_infer
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            model_path = os.path.join(directory, "model.onnx")
+            output_path = os.path.join(directory, "out")
+            os.makedirs(output_path)
+            with open(model_path, "w", encoding="utf-8") as handle:
+                handle.write("onnx")
+            result = splitter.split_onnx(
+                model=model_path,
+                output=output_path,
+                split_only=True,
+            )
+            info_path = os.path.join(result.output_dir, "model_info.json")
+            saved = json.load(open(info_path, encoding="utf-8"))
+            assert saved["kv_cache_info"]["num_layers"] == 1
+            assert saved["kv_cache_info"]["num_kv_heads"] == 8
+            assert saved["kv_cache_info"]["head_dim"] == 64
+            assert saved["kv_cache_info"]["layout"] == "BNSD"
+            assert saved["kv_cache_info"]["dtype"] == "float16"
+            assert saved["kv_cache_info"]["past_key_pattern"] == "past_key_values.{layer}.key"
+            assert saved["kv_cache_info"]["past_value_pattern"] == "past_key_values.{layer}.value"
+            assert saved["kv_cache_info"]["present_key_pattern"] == "present.{layer}.key"
+            assert saved["kv_cache_info"]["present_value_pattern"] == "present.{layer}.value"
+            assert saved["kv_cache_info"]["max_seq_len"] == 128
+            assert saved["kv_cache_info"]["stateful"] is True
+            assert result.model_info["kv_cache_info"] == saved["kv_cache_info"]
+    finally:
+        splitter.load_onnx_model = original_load
+        splitter.extract_components = original_extract
+        splitter.create_component_onnx = original_create
+        splitter.collect_boundary_tensors = original_boundaries
+        if original_save is None:
+            del splitter.onnx.save
+        else:
+            splitter.onnx.save = original_save
+        if original_infer is None:
+            if hasattr(splitter.shape_inference, "infer_shapes"):
+                del splitter.shape_inference.infer_shapes
+        else:
+            splitter.shape_inference.infer_shapes = original_infer
+
+    print("kv cache metadata: OK")
+    print("  past_key_values and present: 8 heads, head dim 64, BNSD")
+    print("  max sequence length, dtype, and stateful contract")
+    print("  model_info: kv_cache_info saved")
+    return True
+
+
 def test_path_manager():
     """ONNX discovery, external data, split directories, and NPU cache paths."""
     print("=" * 50)
@@ -11199,6 +11627,12 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"quantization_metadata: FAILED - {e}")
         results.append(("quantization_metadata", False))
+
+    try:
+        results.append(("kv_cache_metadata", test_kv_cache_metadata()))
+    except Exception as e:
+        print(f"kv_cache_metadata: FAILED - {e}")
+        results.append(("kv_cache_metadata", False))
 
     try:
         results.append(("path_manager", test_path_manager()))
