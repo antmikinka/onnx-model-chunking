@@ -10,6 +10,8 @@ Usage:
     
     config = load_model_config("/path/to/model")
     print(config.num_layers, config.head_dim)
+    metadata = load_generation_metadata("/path/to/model")
+    print(metadata["eos_token_id"], metadata["chat_template"])
 """
 
 import json
@@ -1755,6 +1757,303 @@ def get_dtype_from_config(config: Dict[str, Any]) -> np.dtype:
     return np.dtype(np.float16)
 
 
+def _generation_directory(model_dir: str) -> str:
+    """Return the directory that holds tokenizer and generation JSON."""
+    if isinstance(model_dir, str) and model_dir and os.path.isdir(model_dir):
+        return model_dir
+    if isinstance(model_dir, str) and model_dir and os.path.isfile(model_dir):
+        parent = os.path.dirname(os.path.abspath(model_dir))
+        if os.path.isdir(parent):
+            return parent
+    raise FileNotFoundError(
+        f"No model directory for generation metadata: {model_dir}"
+    )
+
+
+def _read_object_file(path: str) -> Optional[Dict[str, Any]]:
+    """Load one JSON object. A missing file is absent. A broken file is skipped."""
+    if not os.path.isfile(path):
+        return None
+    name = os.path.basename(path)
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        warnings.warn(f"Could not read {name}: {exc}", UserWarning)
+        return None
+    if not isinstance(payload, dict):
+        raise ValueError(f"{name} must be a JSON object, got {type(payload).__name__}")
+    return payload
+
+
+def _one_token_id(value: Any, key: str) -> int:
+    """Return one non-negative token id."""
+    if isinstance(value, bool) or value is None:
+        raise ValueError(f"{key} must be a non-negative token id, got {value!r}")
+    if isinstance(value, int):
+        number = value
+    elif isinstance(value, float):
+        if not value.is_integer():
+            raise ValueError(f"{key} must be a non-negative token id, got {value!r}")
+        number = int(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text.isdigit():
+            raise ValueError(f"{key} must be a non-negative token id, got {value!r}")
+        number = int(text)
+    else:
+        raise ValueError(f"{key} must be a non-negative token id, got {value!r}")
+    if number < 0:
+        raise ValueError(f"{key} must be a non-negative token id, got {value!r}")
+    return number
+
+
+def _token_id_value(value: Any, key: str) -> Any:
+    """Return an int, a list of ints, or None when the field names nothing."""
+    if value is None:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    if isinstance(value, (list, tuple)):
+        if len(value) == 0:
+            return None
+        return [_one_token_id(item, key) for item in value]
+    return _one_token_id(value, key)
+
+
+def _token_content(value: Any) -> Optional[str]:
+    """Return the text of a tokenizer token, including an AddedToken object."""
+    if isinstance(value, str):
+        text = value.strip()
+        return text or None
+    if isinstance(value, dict):
+        content = value.get("content")
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+    return None
+
+
+def _added_token_ids(tokenizer: Optional[Dict[str, Any]]) -> Dict[str, int]:
+    """Map added-token text to the id stored on tokenizer_config."""
+    if not isinstance(tokenizer, dict):
+        return {}
+    decoder = tokenizer.get("added_tokens_decoder")
+    if not isinstance(decoder, dict):
+        return {}
+    mapping: Dict[str, int] = {}
+    for key, spec in decoder.items():
+        content = _token_content(spec)
+        if content is None:
+            continue
+        try:
+            mapping[content] = _one_token_id(key, "added_tokens_decoder")
+        except ValueError:
+            continue
+    return mapping
+
+
+def _parse_chat_template(value: Any) -> tuple:
+    """Return the primary template string and every named template."""
+    if value is None:
+        return None, {}
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None, {}
+        return text, {"default": text}
+    if isinstance(value, list):
+        mapping: Dict[str, str] = {}
+        for index, item in enumerate(value):
+            if isinstance(item, str):
+                text = item.strip()
+                if not text:
+                    continue
+                name = "default" if "default" not in mapping else f"template_{index}"
+                mapping[name] = text
+                continue
+            if not isinstance(item, dict):
+                raise ValueError(
+                    f"chat_template entry must be a string or object, got {item!r}"
+                )
+            template = item.get("template", item.get("chat_template"))
+            if not isinstance(template, str) or not template.strip():
+                raise ValueError(
+                    f"chat_template entry needs a template string, got {item!r}"
+                )
+            name = item.get("name")
+            if name is None:
+                name = "default" if "default" not in mapping else f"template_{index}"
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError(f"chat_template name must be a string, got {name!r}")
+            mapping[name.strip()] = template.strip()
+        if not mapping:
+            return None, {}
+        primary = mapping.get("default", next(iter(mapping.values())))
+        return primary, mapping
+    raise ValueError(f"chat_template must be a string, got {value!r}")
+
+
+def _named_token_id(
+    payloads: list,
+    key: str,
+    token_key: str,
+    tokenizer: Optional[Dict[str, Any]],
+    added: Dict[str, int],
+) -> Any:
+    """Prefer an explicit id. Otherwise match the token string to added tokens."""
+    for payload in payloads:
+        if key not in payload:
+            continue
+        parsed = _token_id_value(payload[key], key)
+        if parsed is not None:
+            return parsed
+    if isinstance(tokenizer, dict) and token_key in tokenizer:
+        content = _token_content(tokenizer.get(token_key))
+        if content is not None and content in added:
+            return added[content]
+    return None
+
+
+def _sampling_number(value: Any, key: str, kind: str) -> Any:
+    """Return one generation_config sampling field, or None when it is null."""
+    if value is None:
+        return None
+    if kind == "bool":
+        if not isinstance(value, bool):
+            raise ValueError(f"{key} must be a boolean, got {value!r}")
+        return value
+    if isinstance(value, bool):
+        raise ValueError(f"{key} must be a number, got {value!r}")
+    if kind == "int":
+        if isinstance(value, int):
+            number = value
+        elif isinstance(value, float) and value.is_integer():
+            number = int(value)
+        elif isinstance(value, str) and value.strip().isdigit():
+            number = int(value.strip())
+        else:
+            raise ValueError(f"{key} must be an integer, got {value!r}")
+        if number <= 0:
+            raise ValueError(f"{key} must be positive, got {value!r}")
+        return number
+    if isinstance(value, (int, float)):
+        number = float(value)
+    elif isinstance(value, str):
+        try:
+            number = float(value.strip())
+        except ValueError as exc:
+            raise ValueError(f"{key} must be a number, got {value!r}") from exc
+    else:
+        raise ValueError(f"{key} must be a number, got {value!r}")
+    if number != number or number == float("inf") or number == float("-inf"):
+        raise ValueError(f"{key} must be finite, got {value!r}")
+    if kind == "unit" and (number <= 0.0 or number > 1.0):
+        raise ValueError(f"{key} must be in (0, 1], got {value!r}")
+    if kind == "positive_float" and number <= 0.0:
+        raise ValueError(f"{key} must be positive, got {value!r}")
+    if kind == "float" and number < 0.0:
+        raise ValueError(f"{key} must be non-negative, got {value!r}")
+    return number
+
+
+_SAMPLING_FIELDS = (
+    ("max_new_tokens", "int"),
+    ("temperature", "float"),
+    ("top_p", "unit"),
+    ("top_k", "int"),
+    ("do_sample", "bool"),
+    ("repetition_penalty", "positive_float"),
+)
+
+
+def _sampling_from(payloads: list) -> Dict[str, Any]:
+    """Read sampling fields. The first file that names a key wins, including 0."""
+    found: Dict[str, Any] = {}
+    for key, kind in _SAMPLING_FIELDS:
+        found[key] = None
+        for payload in payloads:
+            if key not in payload:
+                continue
+            parsed = _sampling_number(payload[key], key, kind)
+            if parsed is None:
+                continue
+            found[key] = parsed
+            break
+    return found
+
+
+def load_generation_metadata(model_dir: str) -> Dict[str, Any]:
+    """
+    Load tokenizer and generation metadata for a model directory.
+
+    Reads ``generation_config.json`` and ``tokenizer_config.json`` when they
+    are present. Token ids in the generation file win. A null id falls through
+    to the tokenizer file, then to ``added_tokens_decoder`` when the tokenizer
+    names ``eos_token``, ``bos_token``, or ``pad_token`` without an id.
+    ``chat_template`` is the default template string. Every named template is
+    kept in ``chat_templates``. Sampling fields stay unset until a file names
+    them. ``temperature`` 0 is greedy and is kept.
+
+    This does not change ``load_model_config``. A directory with neither file
+    still returns the token fields as None.
+
+    Args:
+        model_dir: Model directory, or a file inside that directory.
+
+    Returns:
+        eos_token_id, bos_token_id, pad_token_id, chat_template, and the
+        sampling fields stored beside the model.
+
+    Raises:
+        FileNotFoundError: If ``model_dir`` is not a directory or a file in one.
+        ValueError: If a present id, template, or sampling field is invalid.
+    """
+    directory = _generation_directory(model_dir)
+    files = (
+        ("generation_config.json", os.path.join(directory, "generation_config.json")),
+        ("tokenizer_config.json", os.path.join(directory, "tokenizer_config.json")),
+    )
+    loaded: Dict[str, Dict[str, Any]] = {}
+    source_files = []
+    for name, path in files:
+        payload = _read_object_file(path)
+        if payload is None:
+            continue
+        loaded[name] = payload
+        source_files.append(name)
+    generation = loaded.get("generation_config.json")
+    tokenizer = loaded.get("tokenizer_config.json")
+    id_payloads = [payload for payload in (generation, tokenizer) if payload is not None]
+    added = _added_token_ids(tokenizer)
+    chat_template = None
+    chat_templates: Dict[str, str] = {}
+    for payload in (tokenizer, generation):
+        if payload is None or "chat_template" not in payload:
+            continue
+        primary, mapping = _parse_chat_template(payload["chat_template"])
+        if primary is None:
+            continue
+        chat_template = primary
+        chat_templates = mapping
+        break
+    metadata = {
+        "eos_token_id": _named_token_id(
+            id_payloads, "eos_token_id", "eos_token", tokenizer, added
+        ),
+        "bos_token_id": _named_token_id(
+            id_payloads, "bos_token_id", "bos_token", tokenizer, added
+        ),
+        "pad_token_id": _named_token_id(
+            id_payloads, "pad_token_id", "pad_token", tokenizer, added
+        ),
+        "chat_template": chat_template,
+        "chat_templates": chat_templates,
+        "source_files": source_files,
+    }
+    metadata.update(_sampling_from(id_payloads))
+    return metadata
+
+
 # =============================================================================
 # CONVENIENCE EXPORTS
 # =============================================================================
@@ -1764,4 +2063,5 @@ __all__ = [
     "load_model_config",
     "validate_config_against_onnx",
     "get_dtype_from_config",
+    "load_generation_metadata",
 ]

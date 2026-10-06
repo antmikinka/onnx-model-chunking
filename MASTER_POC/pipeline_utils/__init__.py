@@ -87,6 +87,7 @@ from .config_loader import (
     load_model_config,
     validate_config_against_onnx,
     get_dtype_from_config,
+    load_generation_metadata,
 )
 
 from .session_manager import (
@@ -251,6 +252,7 @@ __all__ = [
     "load_model_config",
     "validate_config_against_onnx",
     "get_dtype_from_config",
+    "load_generation_metadata",
     # session_manager exports
     "SessionManager",
     "SessionConfig",

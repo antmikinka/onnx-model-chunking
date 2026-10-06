@@ -1956,6 +1956,7 @@ def test_config_loader():
         ModelConfig,
         load_model_config,
         validate_config_against_onnx,
+        load_generation_metadata,
     )
     
     # Test ModelConfig dataclass
@@ -2061,8 +2062,10 @@ def test_config_loader():
 
     from pipeline_utils import load_model_config as exported_loader
     from pipeline_utils import validate_config_against_onnx as exported_validate
+    from pipeline_utils import load_generation_metadata as exported_generation
     assert exported_loader is load_model_config
     assert exported_validate is validate_config_against_onnx
+    assert exported_generation is load_generation_metadata
 
     def _write_json(directory, name, payload):
         path = os.path.join(directory, name)
@@ -3073,12 +3076,135 @@ def test_config_loader():
         assert info_kv.kv_cache_page_size == 8
         assert info_kv.use_sliding_window is False
 
+    try:
+        load_generation_metadata(os.path.join(tempfile.gettempdir(), "missing-generation-dir"))
+        raise AssertionError("a missing model directory must be rejected")
+    except FileNotFoundError as exc:
+        assert "generation metadata" in str(exc)
+    with tempfile.TemporaryDirectory() as directory:
+        empty = load_generation_metadata(directory)
+        assert empty["eos_token_id"] is None
+        assert empty["bos_token_id"] is None
+        assert empty["pad_token_id"] is None
+        assert empty["chat_template"] is None
+        assert empty["chat_templates"] == {}
+        assert empty["source_files"] == []
+        assert empty["max_new_tokens"] is None
+        assert empty["temperature"] is None
+        assert empty["do_sample"] is None
+        _write_json(directory, "config.json", dict(hf_base))
+        assert load_generation_metadata(directory)["source_files"] == []
+    with tempfile.TemporaryDirectory() as directory:
+        _write_json(directory, "generation_config.json", {
+            "eos_token_id": [2, 128001],
+            "bos_token_id": 1,
+            "pad_token_id": 0,
+            "temperature": 0,
+            "top_p": 0.5,
+            "top_k": 20,
+            "do_sample": True,
+            "max_new_tokens": 32,
+            "repetition_penalty": 1.0,
+        })
+        _write_json(directory, "tokenizer_config.json", {
+            "eos_token_id": 99,
+            "chat_template": "CHAT",
+        })
+        merged = load_generation_metadata(directory)
+        assert merged["eos_token_id"] == [2, 128001]
+        assert merged["bos_token_id"] == 1
+        assert merged["pad_token_id"] == 0
+        assert merged["chat_template"] == "CHAT"
+        assert merged["chat_templates"] == {"default": "CHAT"}
+        assert merged["temperature"] == 0.0
+        assert merged["top_p"] == 0.5
+        assert merged["top_k"] == 20
+        assert merged["do_sample"] is True
+        assert merged["max_new_tokens"] == 32
+        assert merged["repetition_penalty"] == 1.0
+        assert merged["source_files"] == ["generation_config.json", "tokenizer_config.json"]
+        with open(os.path.join(directory, "model.onnx"), "wb") as handle:
+            handle.write(b"onnx")
+        from_file = load_generation_metadata(os.path.join(directory, "model.onnx"))
+        assert from_file["eos_token_id"] == [2, 128001]
+    with tempfile.TemporaryDirectory() as directory:
+        _write_json(directory, "generation_config.json", {
+            "eos_token_id": None,
+            "bos_token_id": 7,
+        })
+        _write_json(directory, "tokenizer_config.json", {
+            "eos_token": "<|endoftext|>",
+            "bos_token": {"content": "<|begin|>", "lstrip": False},
+            "pad_token": "<|endoftext|>",
+            "added_tokens_decoder": {
+                "128001": {"content": "<|endoftext|>", "special": True},
+                "128000": {"content": "<|begin|>", "special": True},
+            },
+            "chat_template": [
+                {"name": "default", "template": "DEFAULT"},
+                {"name": "tool", "template": "TOOL"},
+            ],
+        })
+        resolved = load_generation_metadata(directory)
+        assert resolved["eos_token_id"] == 128001
+        assert resolved["bos_token_id"] == 7
+        assert resolved["pad_token_id"] == 128001
+        assert resolved["chat_template"] == "DEFAULT"
+        assert resolved["chat_templates"]["tool"] == "TOOL"
+    with tempfile.TemporaryDirectory() as directory:
+        _write_json(directory, "tokenizer_config.json", {"chat_template": "  "})
+        assert load_generation_metadata(directory)["chat_template"] is None
+    with tempfile.TemporaryDirectory() as directory:
+        _write_json(directory, "generation_config.json", {"eos_token_id": "nope"})
+        try:
+            load_generation_metadata(directory)
+            raise AssertionError("a non-integer eos id must be rejected")
+        except ValueError as exc:
+            assert "eos_token_id" in str(exc)
+    with tempfile.TemporaryDirectory() as directory:
+        _write_json(directory, "generation_config.json", {"pad_token_id": -1})
+        try:
+            load_generation_metadata(directory)
+            raise AssertionError("a negative pad id must be rejected")
+        except ValueError as exc:
+            assert "pad_token_id" in str(exc)
+    with tempfile.TemporaryDirectory() as directory:
+        _write_json(directory, "tokenizer_config.json", {"bos_token_id": True})
+        try:
+            load_generation_metadata(directory)
+            raise AssertionError("a boolean bos id must be rejected")
+        except ValueError as exc:
+            assert "bos_token_id" in str(exc)
+    with tempfile.TemporaryDirectory() as directory:
+        _write_json(directory, "generation_config.json", {"do_sample": "yes"})
+        try:
+            load_generation_metadata(directory)
+            raise AssertionError("a non-boolean do_sample must be rejected")
+        except ValueError as exc:
+            assert "do_sample" in str(exc)
+    with tempfile.TemporaryDirectory() as directory:
+        _write_json(directory, "generation_config.json", {"top_p": 1.5})
+        try:
+            load_generation_metadata(directory)
+            raise AssertionError("top_p above 1 must be rejected")
+        except ValueError as exc:
+            assert "top_p" in str(exc)
+    with tempfile.TemporaryDirectory() as directory:
+        with open(os.path.join(directory, "tokenizer_config.json"), "w", encoding="utf-8") as handle:
+            handle.write("{")
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            skipped = load_generation_metadata(directory)
+        assert skipped["source_files"] == []
+        assert any("tokenizer_config.json" in str(item.message) for item in caught)
+
     print("  kv shape: refuse silent 8/128, infer 4 x 96 from ONNX")
     print("  max_seq_len: max_position_embeddings, sequence aliases, unset stays 0")
     print("  quantization: AWQ, GPTQ, Quark, MatMulNBits, unset stays empty")
     print("  dtype: torch_dtype, dtype, decoder dtype, missing stays float16")
     print("  architecture: moe experts, hybrid attention, dense stays empty")
     print("  kv cache: dtype, BNSD layout, max len, page size, sliding window")
+    print("  generation metadata: eos, bos, pad, chat template")
     print("  onnx graph: layers, KV axes, dtype, present outputs, external data")
     print("config_loader module: OK\n")
     return True
@@ -4971,6 +5097,7 @@ def test_backend():
     print("Testing backend module...")
     print("=" * 50)
 
+    import json
     import os
     import tempfile
     import warnings
@@ -5101,6 +5228,20 @@ def test_backend():
 
     monolithic._tokenizer = _EosTokenizer()
     assert monolithic.generate("Hello", max_tokens=5, temperature=0) == "1,2,3,4"
+
+    class _ListEosTokenizer(_Tokenizer):
+        eos_token_id = [4, 9]
+
+    monolithic._tokenizer = _ListEosTokenizer()
+    assert monolithic.generate("Hello", max_tokens=5, temperature=0) == "1,2,3,4"
+    with tempfile.TemporaryDirectory() as directory:
+        with open(os.path.join(directory, "generation_config.json"), "w", encoding="utf-8") as handle:
+            json.dump({"eos_token_id": 4}, handle)
+        monolithic.model_path = directory
+        monolithic._tokenizer = _Tokenizer()
+        assert monolithic.generate("Hello", max_tokens=5, temperature=0) == "1,2,3,4"
+        monolithic.model_path = None
+        monolithic._tokenizer = _EosTokenizer()
 
     stream_session = _GreedySession()
     stream_backend = OnnxRuntimeBackend()

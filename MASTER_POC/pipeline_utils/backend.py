@@ -644,6 +644,57 @@ def _load_tokenizer(model_path: Optional[str]):
     return None
 
 
+def _metadata_directory(model_path: Optional[str]) -> Optional[str]:
+    """Return a directory that can hold generation_config.json."""
+    if not isinstance(model_path, str) or not model_path:
+        return None
+    if os.path.isdir(model_path):
+        return model_path
+    if os.path.isfile(model_path):
+        parent = os.path.dirname(os.path.abspath(model_path))
+        if os.path.isdir(parent):
+            return parent
+    return None
+
+
+def _stop_token_ids(value: Any) -> set:
+    """Collect integer stop ids. Other values contribute nothing."""
+    if isinstance(value, bool) or value is None:
+        return set()
+    if isinstance(value, int):
+        return {int(value)}
+    if isinstance(value, (list, tuple)):
+        found = set()
+        for item in value:
+            found.update(_stop_token_ids(item))
+        return found
+    return set()
+
+
+def _generation_stop_ids(tokenizer: Any, model_path: Optional[str]) -> set:
+    """
+    Stop ids for one generation loop.
+
+    A tokenizer ``eos_token_id`` wins, including a list of ids. When that
+    attribute is missing, ``generation_config.json`` and ``tokenizer_config.json``
+    beside the model supply it.
+    """
+    if tokenizer is not None:
+        eos = getattr(tokenizer, "eos_token_id", None)
+        if eos is not None:
+            return _stop_token_ids(eos)
+    directory = _metadata_directory(model_path)
+    if directory is None:
+        return set()
+    from .config_loader import load_generation_metadata
+
+    try:
+        metadata = load_generation_metadata(directory)
+    except FileNotFoundError:
+        return set()
+    return _stop_token_ids(metadata.get("eos_token_id"))
+
+
 def _prompt_token_ids(tokenizer: Any, prompt: str) -> np.ndarray:
     """Tokenize a prompt to int64 input ids of shape [batch, seq]."""
     encoded = tokenizer(prompt, return_tensors="np")
@@ -1188,7 +1239,7 @@ class OnnxRuntimeBackend(InferenceBackend):
             if node.name in past_names and self.kv_cache is None
         }
         generated: List[int] = []
-        eos = getattr(self._tokenizer, "eos_token_id", None)
+        stop_ids = _generation_stop_ids(self._tokenizer, self.model_path)
         history = prompt_ids
         for step in range(steps):
             if self.kv_cache is not None and past_names:
@@ -1259,7 +1310,7 @@ class OnnxRuntimeBackend(InferenceBackend):
                 )
             elif past_names:
                 _store_presents(output_names, values, past_names, past_state)
-            if eos is not None and next_id == int(eos):
+            if next_id in stop_ids:
                 break
         if generated:
             full_ids = np.concatenate(
@@ -1892,7 +1943,7 @@ class TorchBackend(InferenceBackend):
         all_ids = _tensor_to_id_list(encoded["input_ids"])
         if not all_ids:
             raise ValueError("Prompt tokenized to zero tokens")
-        eos = getattr(self._tokenizer, "eos_token_id", None)
+        stop_ids = _generation_stop_ids(self._tokenizer, self.model_path)
         past = None
         model = self.model
         with _torch_inference(torch_mod):
@@ -1916,7 +1967,7 @@ class TorchBackend(InferenceBackend):
                     _decode_ids(self._tokenizer, [next_id]),
                     index,
                 )
-                if eos is not None and next_id == int(eos):
+                if next_id in stop_ids:
                     break
         return _decode_ids(self._tokenizer, all_ids)
 
