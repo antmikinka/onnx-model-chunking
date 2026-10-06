@@ -548,6 +548,34 @@ def primary_provider_name(providers: Optional[Sequence[Any]]) -> str:
     return "CPUExecutionProvider"
 
 
+def filter_session_providers(
+    providers: Optional[Sequence[Any]],
+    available: Optional[Sequence[Any]] = None,
+) -> Tuple[List[Any], List[str]]:
+    """
+    Keep requested providers that this ONNX Runtime build can load.
+
+    ``available`` defaults to ``ort.get_available_providers()``. Order is
+    preserved, and a ``(name, options)`` tuple stays intact. An empty
+    intersection becomes ``CPUExecutionProvider``. The second list is the
+    provider names that were removed.
+    """
+    if available is None:
+        available = ort.get_available_providers()
+    available_names = {_provider_name(provider) for provider in available}
+    kept: List[Any] = []
+    dropped: List[str] = []
+    for provider in providers or []:
+        name = _provider_name(provider)
+        if name in available_names:
+            kept.append(provider)
+        else:
+            dropped.append(name)
+    if not kept:
+        kept = ["CPUExecutionProvider"]
+    return kept, dropped
+
+
 def provider_profile_for(provider: Any, **overrides: Any) -> ProviderProfile:
     """
     Build the profile for one provider name.
@@ -916,14 +944,16 @@ class SessionManager:
     - Provider fallback handling
     - Reject layer-by-layer loads on VitisAI, RyzenAI, OpenVINO, and CoreML
       unless the policy is phase-split or MoE expert routing
-    - Select a ProviderProfile from the first execution provider
+    - Select a ProviderProfile from the first execution provider that is
+      installed in this ONNX Runtime build
     """
     
     def __init__(
         self,
         model_dir: str,
         config: Optional[SessionConfig] = None,
-        model_info: Optional[Dict[str, Any]] = None
+        model_info: Optional[Dict[str, Any]] = None,
+        available_providers: Optional[Sequence[str]] = None,
     ):
         """
         Initialize the session manager.
@@ -932,11 +962,13 @@ class SessionManager:
             model_dir: Directory containing split ONNX components
             config: Session configuration (uses defaults if None)
             model_info: Pre-loaded model_info.json dict (loads from file if None)
+            available_providers: Provider names this process can run. The
+                default is ``ort.get_available_providers()``.
         """
         self.model_dir = model_dir
         self.config = config or SessionConfig()
-        self.provider_profile = self.config.active_profile(
-            cache_dir=os.path.join(self.model_dir, ".ort_cache")
+        self._available_providers = (
+            list(available_providers) if available_providers is not None else None
         )
         
         # Load model info if not provided
@@ -957,7 +989,39 @@ class SessionManager:
         
         # Pre-populate session info (without loading)
         self._discover_sessions()
+        self._install_available_providers()
         self._enforce_execution_policy()
+
+    def _install_available_providers(self) -> None:
+        """
+        Drop providers this ONNX Runtime build cannot load.
+
+        The profile and the NPU policy then see the providers that can
+        actually run. A later edit to ``config.providers`` is filtered again
+        on the next load.
+        """
+        available = self._available_providers
+        if available is None:
+            available = ort.get_available_providers()
+        previous = [_provider_name(provider) for provider in self.config.providers]
+        kept, dropped = filter_session_providers(self.config.providers, available)
+        kept_names = [_provider_name(provider) for provider in kept]
+        if dropped:
+            warnings.warn(
+                "Dropped unavailable execution providers: "
+                + ", ".join(dropped)
+                + ". Using "
+                + ", ".join(kept_names)
+                + ".",
+                RuntimeWarning,
+                stacklevel=4,
+            )
+        self.config.providers = kept
+        self.provider_profile = self.config.active_profile(
+            cache_dir=os.path.join(self.model_dir, ".ort_cache")
+        )
+        if previous != kept_names:
+            self._policy_signature = None
     
     def _discover_sessions(self) -> None:
         """Discover all available sessions from model_info without loading them."""
@@ -999,6 +1063,7 @@ class SessionManager:
             return None
         
         try:
+            self._install_available_providers()
             self._enforce_execution_policy()
             self._prepare_profile_cache()
             opts = self.config.create_session_options(
@@ -1043,6 +1108,7 @@ class SessionManager:
             Dict of component name to SessionInfo
         """
         with self._lock:
+            self._install_available_providers()
             self._enforce_execution_policy()
             loaded_count = 0
             failed_count = 0
@@ -1080,6 +1146,7 @@ class SessionManager:
             if name in self._sessions:
                 return self._sessions[name]
 
+            self._install_available_providers()
             self._enforce_execution_policy()
             # Lazy load if not found
             session = self._load_single_session(name)
@@ -1288,6 +1355,7 @@ __all__ = [
     "validate_npu_execution_policy",
     "provider_profile_for",
     "primary_provider_name",
+    "filter_session_providers",
     "ep_provider_options",
     # Constants
     "SUPPORTED_PROVIDERS",

@@ -163,6 +163,7 @@ def test_session_manager():
         SessionInfo,
         ExecutionPolicy,
         provider_profile_for,
+        filter_session_providers,
         get_available_providers,
         get_provider_for_device,
         provider_is_npu,
@@ -268,11 +269,36 @@ def test_session_manager():
             "layer_1": {"file": "layer_1.onnx", "input_names": [], "output_names": []},
         }
     }
+    if "VitisAIExecutionProvider" in get_available_providers():
+        try:
+            SessionManager(
+                ".",
+                SessionConfig(providers=["VitisAIExecutionProvider"]),
+                model_info=split_info,
+            )
+            raise AssertionError("installed VitisAI loaded a layer split")
+        except RuntimeError as exc:
+            assert NPU_SEQUENTIAL_SPLIT_ERROR in str(exc)
+    else:
+        with warnings.catch_warnings(record=True) as dropped_warnings:
+            warnings.simplefilter("always")
+            portable = SessionManager(
+                ".",
+                SessionConfig(providers=["VitisAIExecutionProvider"]),
+                model_info=split_info,
+            )
+        assert portable.config.providers == ["CPUExecutionProvider"]
+        assert portable.provider_profile.device_type == "cpu"
+        assert any(
+            "VitisAIExecutionProvider" in str(item.message)
+            for item in dropped_warnings
+        )
     try:
         SessionManager(
             ".",
             SessionConfig(providers=["VitisAIExecutionProvider"]),
             model_info=split_info,
+            available_providers=["VitisAIExecutionProvider", "CPUExecutionProvider"],
         )
         raise AssertionError("VitisAI SessionManager loaded a layer split")
     except RuntimeError as exc:
@@ -284,8 +310,15 @@ def test_session_manager():
             execution_policy=ExecutionPolicy.HYBRID_NPU_IGPU_PHASE_SPLIT,
         ),
         model_info=split_info,
+        available_providers=[
+            "RyzenAIExecutionProvider",
+            "DmlExecutionProvider",
+            "CPUExecutionProvider",
+        ],
     )
     assert len(phase_manager) == 2
+    assert phase_manager.config.providers[0] == "RyzenAIExecutionProvider"
+    assert phase_manager.provider_profile.device_type == "ryzenai"
     cpu_manager = SessionManager(
         ".",
         SessionConfig(
@@ -376,6 +409,7 @@ def test_session_manager():
         ".",
         SessionConfig(providers=["VitisAIExecutionProvider", "CPUExecutionProvider"]),
         model_info=mono_info,
+        available_providers=["VitisAIExecutionProvider", "CPUExecutionProvider"],
     )
     assert npu_manager.provider_profile.device_type == "vitisai"
     assert npu_manager.provider_profile.cache_dir.endswith(".ort_cache")
@@ -407,7 +441,39 @@ def test_session_manager():
     forced = SessionConfig(providers=["CPUExecutionProvider"], profile=custom)
     assert forced.active_profile().device_type == "cuda"
     assert forced.active_profile().device_id == 3
+
+    installed = get_available_providers()
+    requested = [
+        "CUDAExecutionProvider",
+        "CPUExecutionProvider",
+        "VitisAIExecutionProvider",
+    ]
+    kept, dropped = filter_session_providers(requested, installed)
+    expected = [provider for provider in requested if provider in installed]
+    assert kept == (expected or ["CPUExecutionProvider"])
+    assert all(provider not in installed for provider in dropped)
+    assert "CPUExecutionProvider" in kept
+    tuple_kept, tuple_dropped = filter_session_providers(
+        [("CUDAExecutionProvider", {"device_id": "1"}), "VitisAIExecutionProvider"],
+        ["CPUExecutionProvider", "CUDAExecutionProvider"],
+    )
+    assert tuple_kept == [("CUDAExecutionProvider", {"device_id": "1"})]
+    assert tuple_dropped == ["VitisAIExecutionProvider"]
+    empty_kept, empty_dropped = filter_session_providers(
+        ["VitisAIExecutionProvider"],
+        ["AzureExecutionProvider"],
+    )
+    assert empty_kept == ["CPUExecutionProvider"]
+    assert empty_dropped == ["VitisAIExecutionProvider"]
+    azure_kept, azure_dropped = filter_session_providers(
+        ["AzureExecutionProvider", "VitisAIExecutionProvider"],
+        ["AzureExecutionProvider", "CPUExecutionProvider"],
+    )
+    assert azure_kept == ["AzureExecutionProvider"]
+    assert "AzureExecutionProvider" not in SUPPORTED_PROVIDERS
+    assert azure_dropped == ["VitisAIExecutionProvider"]
     print("  provider profiles: cpu arena, rocm hip, vitisai cache, directml, cuda stream")
+    print(f"  available providers kept: {kept}")
 
     print("session_manager module: OK\n")
     return True
