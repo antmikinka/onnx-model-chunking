@@ -1975,6 +1975,13 @@ def test_config_loader():
     # Test to_dict
     d = config.to_dict()
     print(f"  to_dict keys: {list(d.keys())}")
+    assert config.max_seq_len == 0
+    assert d["max_seq_len"] == 0
+    try:
+        ModelConfig(num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=-1).validate()
+        raise AssertionError("a negative max_seq_len must be rejected")
+    except ValueError as exc:
+        assert "max_seq_len must be non-negative" in str(exc)
 
     import json
     import os
@@ -2069,6 +2076,7 @@ def test_config_loader():
         assert genai.num_layers == 3
         assert genai.num_kv_heads == 4
         assert genai.head_dim == 96
+        assert genai.max_seq_len == 0
 
     with tempfile.TemporaryDirectory() as directory:
         _write_json(directory, "config.json", {
@@ -2081,6 +2089,7 @@ def test_config_loader():
         hf = load_model_config(directory)
         assert hf.num_kv_heads == 2
         assert hf.head_dim == 96
+        assert hf.max_seq_len == 0
 
     with tempfile.TemporaryDirectory() as directory:
         _write_json(directory, "model_info.json", {
@@ -2371,7 +2380,76 @@ def test_config_loader():
     except TypeError as exc:
         assert "ModelConfig" in str(exc)
 
+    hf_base = {
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "hidden_size": 384,
+        "model_type": "llama",
+    }
+    with tempfile.TemporaryDirectory() as directory:
+        payload = dict(hf_base)
+        payload["max_position_embeddings"] = 4096
+        payload["seq_length"] = 128
+        _write_json(directory, "config.json", payload)
+        hf_limit = load_model_config(directory)
+        assert hf_limit.max_seq_len == 4096
+        assert hf_limit.to_dict()["max_seq_len"] == 4096
+    with tempfile.TemporaryDirectory() as directory:
+        payload = dict(hf_base)
+        payload["max_position_embeddings"] = 0
+        payload["max_sequence_length"] = 8192
+        _write_json(directory, "config.json", payload)
+        assert load_model_config(directory).max_seq_len == 8192
+    with tempfile.TemporaryDirectory() as directory:
+        payload = dict(hf_base)
+        payload["seq_length"] = 1024
+        _write_json(directory, "config.json", payload)
+        assert load_model_config(directory).max_seq_len == 1024
+    with tempfile.TemporaryDirectory() as directory:
+        payload = dict(hf_base)
+        payload["n_positions"] = 512
+        _write_json(directory, "config.json", payload)
+        assert load_model_config(directory).max_seq_len == 512
+    with tempfile.TemporaryDirectory() as directory:
+        _write_json(directory, "genai_config.json", {
+            "model": {
+                "type": "llama",
+                "vocab_size": 10,
+                "decoder": {
+                    "num_hidden_layers": 3,
+                    "num_key_value_heads": 4,
+                    "head_size": 96,
+                    "hidden_size": 384,
+                    "num_attention_heads": 4,
+                    "max_position_embeddings": 4096,
+                },
+            },
+        })
+        assert load_model_config(directory).max_seq_len == 4096
+    with tempfile.TemporaryDirectory() as directory:
+        _write_json(directory, "model_info.json", {
+            "num_layers": 4,
+            "architecture": "llama",
+            "num_kv_heads": 4,
+            "head_dim": 96,
+            "max_position_embeddings": 2048,
+        })
+        info_limit = load_model_config(directory, require_all_fields=True)
+        assert info_limit.num_kv_heads == 4
+        assert info_limit.max_seq_len == 2048
+    with tempfile.TemporaryDirectory() as directory:
+        payload = dict(hf_base)
+        payload["max_position_embeddings"] = "nope"
+        _write_json(directory, "config.json", payload)
+        try:
+            load_model_config(directory)
+            raise AssertionError("a non-integer context length must be rejected")
+        except ValueError as exc:
+            assert "max_position_embeddings" in str(exc)
+
     print("  kv shape: refuse silent 8/128, infer 4 x 96 from ONNX")
+    print("  max_seq_len: max_position_embeddings, sequence aliases, unset stays 0")
     print("  onnx graph: layers, KV axes, dtype, present outputs, external data")
     print("config_loader module: OK\n")
     return True

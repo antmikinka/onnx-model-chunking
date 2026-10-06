@@ -38,6 +38,9 @@ class ModelConfig:
     vocab_size: int = 0
     num_attention_heads: int = 0
     intermediate_size: int = 0
+    # 0 means the config named no static context length. A positive value is
+    # the capacity used to preallocate the KV cache once.
+    max_seq_len: int = 0
     dtype: np.dtype = field(default_factory=lambda: np.float16)
     model_type: str = "unknown"
     
@@ -57,6 +60,8 @@ class ModelConfig:
             raise ValueError(f"num_kv_heads must be positive, got {self.num_kv_heads}")
         if self.head_dim <= 0:
             raise ValueError(f"head_dim must be positive, got {self.head_dim}")
+        if self.max_seq_len < 0:
+            raise ValueError(f"max_seq_len must be non-negative, got {self.max_seq_len}")
         if self.head_dim % 8 != 0:
             warnings.warn(f"head_dim {self.head_dim} is not divisible by 8, may be non-standard")
     
@@ -70,6 +75,7 @@ class ModelConfig:
             "vocab_size": self.vocab_size,
             "num_attention_heads": self.num_attention_heads,
             "intermediate_size": self.intermediate_size,
+            "max_seq_len": self.max_seq_len,
             "dtype": str(self.dtype),
             "model_type": self.model_type,
             "source_file": self.source_file,
@@ -97,6 +103,7 @@ def _parse_genai_config(config: Dict[str, Any], source: str) -> Optional[ModelCo
         head_size = decoder.get("head_size", 0)
         hidden_size = decoder.get("hidden_size", 0)
         num_attention_heads = decoder.get("num_attention_heads", 0)
+        model = config.get("model", {})
         
         if num_layers and num_kv_heads and head_size:
             return ModelConfig(
@@ -105,8 +112,9 @@ def _parse_genai_config(config: Dict[str, Any], source: str) -> Optional[ModelCo
                 head_dim=head_size,
                 hidden_size=hidden_size,
                 num_attention_heads=num_attention_heads,
-                vocab_size=config.get("model", {}).get("vocab_size", 0),
-                model_type=config.get("model", {}).get("type", "unknown"),
+                vocab_size=model.get("vocab_size", 0) if isinstance(model, dict) else 0,
+                model_type=model.get("type", "unknown") if isinstance(model, dict) else "unknown",
+                max_seq_len=_max_seq_len_from(decoder, model, config),
                 source_file=source,
             )
     except (KeyError, TypeError):
@@ -146,6 +154,7 @@ def _parse_hf_config(config: Dict[str, Any], source: str) -> Optional[ModelConfi
                 num_attention_heads=num_attention_heads,
                 intermediate_size=config.get("intermediate_size", 0),
                 model_type=config.get("model_type", "unknown"),
+                max_seq_len=_max_seq_len_from(config),
                 source_file=source,
             )
     except (KeyError, TypeError):
@@ -180,6 +189,34 @@ def _as_dim(value: Any) -> Optional[int]:
         if sign.isdigit():
             return int(text)
     raise ValueError(f"expected an integer dimension, got {value!r}")
+
+
+# First positive value wins. ``max_position_embeddings`` is the Hugging Face name.
+_MAX_SEQ_LEN_KEYS = (
+    "max_seq_len",
+    "max_position_embeddings",
+    "max_sequence_length",
+    "seq_length",
+    "n_positions",
+)
+
+
+def _max_seq_len_from(*sources: Any) -> int:
+    """Read a static context length. Missing and zero values stay unset."""
+    for key in _MAX_SEQ_LEN_KEYS:
+        for source in sources:
+            if not isinstance(source, dict) or key not in source or source[key] is None:
+                continue
+            try:
+                value = _as_dim(source[key])
+            except ValueError as exc:
+                raise ValueError(f"{key} must be an integer, got {source[key]!r}") from exc
+            if value is None or value == 0:
+                continue
+            if value < 0:
+                raise ValueError(f"{key} must be non-negative, got {value}")
+            return value
+    return 0
 
 
 def _read_field(sources: tuple, keys: tuple) -> Any:
@@ -426,6 +463,7 @@ def _parse_model_info(
         head_dim=head_dim,
         hidden_size=hidden_size or 0,
         num_attention_heads=_as_dim(_read_field(sources, ("num_attention_heads",))) or 0,
+        max_seq_len=_max_seq_len_from(*sources),
         model_type=str(config.get("strategy", config.get("model_type", "unknown"))),
         source_file=source,
     )

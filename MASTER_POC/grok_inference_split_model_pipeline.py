@@ -166,7 +166,10 @@ class SequentialModelPipeline:
         try:
             self.config = load_model_config(self.model_dir, t_path)
             self._log(f"  [Config] Loaded from {self.config.source_file}")
-            self._log(f"  [Config] {self.config.num_layers} layers, {self.config.num_kv_heads} KV heads, {self.config.head_dim} head dim")
+            self._log(
+                f"  [Config] {self.config.num_layers} layers, {self.config.num_kv_heads} KV heads, "
+                f"{self.config.head_dim} head dim, max_seq_len {self.config.max_seq_len}"
+            )
         except FileNotFoundError:
             self._log("  [Warning] No config found, using defaults (may be incorrect)")
             self.config = ModelConfig(
@@ -176,13 +179,20 @@ class SequentialModelPipeline:
                 source_file="defaults"
             )
         
-        # Initialize KV cache manager
+        # Initialize KV cache manager. A positive max_seq_len preallocates
+        # the static buffer once; 0 leaves the cache to grow per token.
+        raw_limit = getattr(self.config, "max_seq_len", 0)
+        try:
+            max_seq_len = int(raw_limit)
+        except (TypeError, ValueError):
+            max_seq_len = 0
         self.kv_cache = KVCacheManager(
             num_layers=self.config.num_layers,
             num_kv_heads=self.config.num_kv_heads,
             head_dim=self.config.head_dim,
             dtype=self.config.dtype,
-            batch_size=1
+            batch_size=1,
+            **({"max_seq_len": max_seq_len} if max_seq_len > 0 else {}),
         )
         
         # Session management
