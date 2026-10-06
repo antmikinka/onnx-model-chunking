@@ -117,7 +117,10 @@ from .backend import (
     get_backend_for_model,
     providers_for_device,
     resolve_onnx_providers,
+    resolve_execution_policy,
+    build_execution_plan,
     DEVICE_PROVIDER_MAP,
+    HybridExecutionPlan,
 )
 
 from .dtypes import GGUF_DTYPE_MAP, AWQ_DTYPE_MAP
@@ -230,7 +233,10 @@ __all__ = [
     "get_backend_for_model",
     "providers_for_device",
     "resolve_onnx_providers",
+    "resolve_execution_policy",
+    "build_execution_plan",
     "DEVICE_PROVIDER_MAP",
+    "HybridExecutionPlan",
     # npu_config exports (P1.4)
     "NPUConfig",
     "NPUOffloadConfig",

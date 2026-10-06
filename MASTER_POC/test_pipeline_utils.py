@@ -3256,6 +3256,7 @@ def test_backend():
 
     import os
     import tempfile
+    import warnings
 
     import onnxruntime as ort
 
@@ -3267,7 +3268,9 @@ def test_backend():
         _pair_present_to_past,
         _sample_next_token,
         _sequential_pipeline_class,
+        build_execution_plan,
         providers_for_device,
+        resolve_execution_policy,
         resolve_onnx_providers,
     )
 
@@ -3398,11 +3401,23 @@ def test_backend():
         assert "custom_bias" in str(exc)
 
     class _FakePipeline:
-        def __init__(self, model_path, providers=None, verbose=True, persist_sessions=False):
+        def __init__(
+            self,
+            model_path,
+            providers=None,
+            verbose=True,
+            persist_sessions=False,
+            phase_providers=None,
+            component_providers=None,
+            **kwargs,
+        ):
             self.model_path = model_path
             self.providers = list(providers or [])
             self.verbose = verbose
             self.persist_sessions = persist_sessions
+            self.phase_providers = phase_providers
+            self.component_providers = component_providers
+            self.extra = dict(kwargs)
             self.session_manager = type("Manager", (), {
                 "get_memory_usage": lambda self: {"sessions": 2},
             })()
@@ -3434,6 +3449,7 @@ def test_backend():
         split = OnnxRuntimeBackend(BackendConfig(
             onnx_providers=["CPUExecutionProvider"],
             low_memory=False,
+            execution_policy="monolithic",
         ))
         split.load(split_dir)
         assert split._is_split is True
@@ -3482,6 +3498,7 @@ def test_backend():
             onnx_providers=["CPUExecutionProvider"],
             onnx_optimization_level="DISABLE",
             n_threads=2,
+            execution_policy="monolithic",
         ))
         single.load(model_file.name)
         assert single._is_split is False
@@ -3491,8 +3508,17 @@ def test_backend():
         assert captured["threads"] == 2
         assert captured["level"] == ort.GraphOptimizationLevel.ORT_DISABLE_ALL
     finally:
-        ort.InferenceSession = real_session
-        os.remove(model_file.name)
+        try:
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                ort.InferenceSession = _PatchedSession
+                single_hybrid = OnnxRuntimeBackend(BackendConfig(execution_policy="hybrid"))
+                single_hybrid.load(model_file.name)
+                assert any("single ONNX file" in str(item.message) for item in caught)
+                single_hybrid.cleanup()
+        finally:
+            ort.InferenceSession = real_session
+            os.remove(model_file.name)
 
     import sys
     import types
@@ -3587,7 +3613,10 @@ def test_backend():
     ]
     ort.InferenceSession = _PatchedSession
     try:
-        gpu = OnnxRuntimeBackend(BackendConfig(device=DeviceType.GPU))
+        gpu = OnnxRuntimeBackend(BackendConfig(
+            device=DeviceType.GPU,
+            execution_policy="monolithic",
+        ))
         assert gpu.providers == ["ROCmExecutionProvider", "CPUExecutionProvider"]
         gpu.load(model_file.name)
         assert captured["providers"] == ["ROCmExecutionProvider", "CPUExecutionProvider"]
@@ -3619,8 +3648,102 @@ def test_backend():
         ort.get_available_providers = real_available
         os.rmdir(npu_dir)
 
+    installed = [
+        "VitisAIExecutionProvider",
+        "RyzenAIExecutionProvider",
+        "ROCmExecutionProvider",
+        "CUDAExecutionProvider",
+        "DmlExecutionProvider",
+        "CPUExecutionProvider",
+    ]
+    hybrid = build_execution_plan(BackendConfig(), installed)
+    assert hybrid.policy == "hybrid"
+    assert hybrid.persist_sessions is False
+    assert hybrid.phase_providers["prefill"][0] == "VitisAIExecutionProvider"
+    assert hybrid.phase_providers["decode"][0] == "ROCmExecutionProvider"
+    assert hybrid.component_providers["router"] == ["CPUExecutionProvider"]
+    assert hybrid.component_providers["expert_*"][0] == "VitisAIExecutionProvider"
+    ranged = build_execution_plan(
+        BackendConfig(execution_policy="hybrid", npu_layer_range=(0, 2)),
+        installed,
+    )
+    assert ranged.npu_layer_range == (0, 2)
+    assert ranged.component_providers["layer_0"][0] == "VitisAIExecutionProvider"
+    assert ranged.component_providers["layer_1"][0] == "VitisAIExecutionProvider"
+    assert ranged.component_providers["layer_*"] == ["CPUExecutionProvider"]
+    assert resolve_execution_policy(BackendConfig(
+        execution_policy="auto",
+        prefill_device=DeviceType.CPU,
+        decode_device=DeviceType.CPU,
+    )) == "monolithic"
+    assert resolve_execution_policy(BackendConfig(
+        execution_policy="auto",
+        prefill_device=DeviceType.CPU,
+        decode_device=DeviceType.CPU,
+        low_memory=True,
+    )) == "sequential"
+    assert build_execution_plan(
+        BackendConfig(execution_policy="monolithic"),
+        installed,
+    ).phase_providers == {}
+    try:
+        resolve_execution_policy(BackendConfig(execution_policy="pipeline"))
+        raise AssertionError("unknown execution policy was accepted")
+    except ValueError as exc:
+        assert "pipeline" in str(exc)
+    try:
+        build_execution_plan(BackendConfig(
+            execution_policy="monolithic",
+            npu_layer_range=(0, 2),
+        ))
+        raise AssertionError("a monolithic layer range was accepted")
+    except ValueError as exc:
+        assert "npu_layer_range" in str(exc)
+    try:
+        build_execution_plan(BackendConfig(npu_layer_range=(2, 2)))
+        raise AssertionError("an empty layer range was accepted")
+    except ValueError as exc:
+        assert "npu_layer_range" in str(exc)
+
+    backend_mod._sequential_pipeline_class = _fake_pipeline_class
+    hybrid_dir = tempfile.mkdtemp(prefix="onnx-hybrid-")
+    try:
+        placed = OnnxRuntimeBackend(BackendConfig(
+            execution_policy="hybrid",
+            prefill_device=DeviceType.NPU,
+            decode_device=DeviceType.GPU,
+            npu_layer_range=(0, 2),
+        ))
+        placed.load(hybrid_dir)
+        loaded = created["pipeline"]
+        assert loaded.persist_sessions is False
+        assert loaded.phase_providers["prefill"]
+        assert loaded.phase_providers["decode"]
+        assert loaded.component_providers["layer_0"]
+        assert loaded.component_providers["router"] == ["CPUExecutionProvider"]
+        assert placed.get_memory_usage()["execution_policy"] == "hybrid"
+        placed.cleanup()
+    finally:
+        backend_mod._sequential_pipeline_class = original_factory
+        os.rmdir(hybrid_dir)
+
+    pipeline_cls = _sequential_pipeline_class()
+    routed = pipeline_cls.__new__(pipeline_cls)
+    routed.component_providers = ranged.component_providers
+    routed.phase_providers = ranged.phase_providers
+    routed.providers = ["CPUExecutionProvider"]
+    routed.phase = "prefill"
+    assert routed._get_component_providers("layer_0")[0] == "VitisAIExecutionProvider"
+    assert routed._get_component_providers("layer_9") == ["CPUExecutionProvider"]
+    assert routed._get_component_providers("embedding")[0] == "VitisAIExecutionProvider"
+    routed.phase = "decode"
+    assert routed._get_component_providers("embedding")[0] == "ROCmExecutionProvider"
+    assert routed._get_component_providers("router") == ["CPUExecutionProvider"]
+    assert routed._get_component_providers("expert_1")[0] == "VitisAIExecutionProvider"
+
     print("  generate: split pipeline and monolithic prefill/decode")
     print("  providers: NPU, GPU, CPU, and auto-detect")
+    print("  hybrid: prefill/decode, NPU layer range, MoE router and experts")
     print("backend module: OK\n")
     return True
 

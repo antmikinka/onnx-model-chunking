@@ -264,6 +264,10 @@ class SequentialModelPipeline:
                 if component_name.startswith(prefix):
                     return providers
 
+        # A phase list covers components that are not pinned to one device.
+        if self.phase_providers:
+            return self.phase_providers.get(self.phase, self.providers)
+
         # Fallback to default providers
         return self.providers
 

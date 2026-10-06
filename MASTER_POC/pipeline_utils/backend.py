@@ -19,12 +19,13 @@ Usage:
 from abc import ABC, abstractmethod
 from enum import Enum
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Any, Union, Sequence
+from typing import Optional, List, Dict, Any, Union, Sequence, Tuple
 import importlib
 import json
 import os
 import re
 import sys
+import warnings
 
 import numpy as np
 
@@ -96,6 +97,13 @@ class BackendConfig:
     
     # Memory
     low_memory: bool = False
+
+    # Hybrid execution. ``auto`` becomes hybrid when prefill and decode
+    # devices differ, which is the default, or when ``npu_layer_range`` is set.
+    execution_policy: str = "auto"  # monolithic, sequential, hybrid
+    prefill_device: DeviceType = DeviceType.NPU
+    decode_device: DeviceType = DeviceType.GPU
+    npu_layer_range: Optional[Tuple[int, int]] = None
 
 
 def _coerce_device(device: Union[DeviceType, str]) -> DeviceType:
@@ -178,6 +186,151 @@ def resolve_onnx_providers(
             f"Available: {list(available)}"
         )
     return providers_for_device(config.device, available)
+
+
+_EXECUTION_POLICY_ALIASES = {
+    "auto": "auto",
+    "monolithic": "monolithic",
+    "monolithic_only": "monolithic",
+    "sequential": "sequential",
+    "split": "sequential",
+    "split_cpu_memory_optimized": "sequential",
+    "hybrid": "hybrid",
+    "hybrid_npu_igpu": "hybrid",
+    "hybrid_npu_igpu_phase_split": "hybrid",
+    "hybrid_npu_moe_routing": "hybrid",
+}
+
+
+@dataclass
+class HybridExecutionPlan:
+    """
+    Where each ONNX phase and component should run.
+
+    ``policy`` is ``monolithic``, ``sequential``, or ``hybrid``. A hybrid
+    plan puts prefill on ``prefill_device`` and decode on ``decode_device``.
+    Layers inside ``npu_layer_range`` stay on the NPU and the other layers
+    stay on CPU. The MoE router stays on CPU and experts stay on the NPU.
+    """
+
+    policy: str
+    phase_providers: Dict[str, List[str]]
+    component_providers: Dict[str, List[str]]
+    npu_layer_range: Optional[Tuple[int, int]]
+    prefill_device: DeviceType
+    decode_device: DeviceType
+
+    @property
+    def persist_sessions(self) -> bool:
+        """Hybrid and sequential loads recreate a session with that step's providers."""
+        return self.policy == "monolithic"
+
+
+def _coerce_layer_range(value: Optional[Sequence[int]]) -> Optional[Tuple[int, int]]:
+    """Accept a half-open ``(start, end)`` span of transformer layers."""
+    if value is None:
+        return None
+    if isinstance(value, (str, bytes)) or not isinstance(value, (tuple, list)) or len(value) != 2:
+        raise ValueError(
+            "npu_layer_range must be (start, end), a half-open layer span"
+        )
+    start = int(value[0])
+    end = int(value[1])
+    if start < 0 or end <= start:
+        raise ValueError(
+            f"npu_layer_range must satisfy 0 <= start < end, got {(start, end)}"
+        )
+    return (start, end)
+
+
+def resolve_execution_policy(config: "BackendConfig") -> str:
+    """
+    Resolve ``auto`` to monolithic, sequential, or hybrid.
+
+    Hybrid is selected when prefill and decode target different devices or
+    an NPU layer span is set. Sequential is selected for a low-memory load
+    whose phase devices match. Anything else stays one device.
+    """
+    text = str(config.execution_policy or "auto").strip().lower().replace("-", "_")
+    if text not in _EXECUTION_POLICY_ALIASES:
+        allowed = "auto, monolithic, sequential, hybrid"
+        raise ValueError(
+            f"Unknown execution policy '{config.execution_policy}'. Expected one of: {allowed}"
+        )
+    chosen = _EXECUTION_POLICY_ALIASES[text]
+    layer_range = _coerce_layer_range(config.npu_layer_range)
+    if chosen == "monolithic" and layer_range is not None:
+        raise ValueError(
+            "npu_layer_range applies to hybrid or sequential execution, not monolithic"
+        )
+    if chosen != "auto":
+        return chosen
+    prefill = _coerce_device(config.prefill_device)
+    decode = _coerce_device(config.decode_device)
+    if layer_range is not None or prefill != decode:
+        return "hybrid"
+    if config.low_memory:
+        return "sequential"
+    return "monolithic"
+
+
+def _hybrid_component_providers(
+    config: "BackendConfig",
+    available: Sequence[str],
+) -> Tuple[Dict[str, List[str]], Optional[Tuple[int, int]]]:
+    """Layer-range and MoE pins. Exact layer names win over the ``layer_*`` fallback."""
+    components: Dict[str, List[str]] = {}
+    span = _coerce_layer_range(config.npu_layer_range)
+    cpu = providers_for_device(DeviceType.CPU, available)
+    npu = providers_for_device(DeviceType.NPU, available)
+    if span is not None:
+        components["layer_*"] = list(cpu)
+        start, end = span
+        for index in range(start, end):
+            components[f"layer_{index}"] = list(npu)
+    for name in ("router", "moe_router", "router_*"):
+        components[name] = list(cpu)
+    for name in ("expert", "experts", "moe_expert", "expert_*", "experts_*", "moe_expert_*"):
+        components[name] = list(npu)
+    return components, span
+
+
+def build_execution_plan(
+    config: "BackendConfig",
+    available: Optional[Sequence[str]] = None,
+) -> HybridExecutionPlan:
+    """
+    Build the hybrid placement for one backend config.
+
+    A monolithic plan leaves the provider maps empty. Hybrid and sequential
+    plans record prefill, decode, the NPU layer span, and the MoE pins.
+    """
+    if available is None:
+        available = _available_execution_providers()
+    policy = resolve_execution_policy(config)
+    prefill = _coerce_device(config.prefill_device)
+    decode = _coerce_device(config.decode_device)
+    if policy == "monolithic":
+        return HybridExecutionPlan(
+            policy=policy,
+            phase_providers={},
+            component_providers={},
+            npu_layer_range=None,
+            prefill_device=prefill,
+            decode_device=decode,
+        )
+    components, span = _hybrid_component_providers(config, available)
+    return HybridExecutionPlan(
+        policy=policy,
+        phase_providers={
+            "prefill": providers_for_device(prefill, available),
+            "decode": providers_for_device(decode, available),
+        },
+        component_providers=components,
+        npu_layer_range=span,
+        prefill_device=prefill,
+        decode_device=decode,
+    )
 
 
 # =============================================================================
@@ -524,6 +677,7 @@ class OnnxRuntimeBackend(InferenceBackend):
         self._pipeline = None
         self._tokenizer = None
         self.providers = resolve_onnx_providers(self.config)
+        self.execution_plan = build_execution_plan(self.config)
 
     @property
     def backend_type(self) -> BackendType:
@@ -539,13 +693,18 @@ class OnnxRuntimeBackend(InferenceBackend):
         self._is_split = os.path.isdir(model_path)
         self._pipeline = None
         self.providers = resolve_onnx_providers(self.config)
+        self.execution_plan = build_execution_plan(self.config)
         if self._is_split:
             pipeline_cls = _sequential_pipeline_class()
+            plan = self.execution_plan
+            persist = (not self.config.low_memory) and plan.persist_sessions
             self._pipeline = pipeline_cls(
                 model_path,
                 providers=list(self.providers),
                 verbose=False,
-                persist_sessions=not self.config.low_memory,
+                persist_sessions=persist,
+                phase_providers=dict(plan.phase_providers) or None,
+                component_providers=dict(plan.component_providers) or None,
             )
             self.model = getattr(self._pipeline, "session_manager", None) or self._pipeline
             self._tokenizer = getattr(self._pipeline, "tokenizer", None)
@@ -567,6 +726,13 @@ class OnnxRuntimeBackend(InferenceBackend):
                 providers=list(self.providers),
             )
             self._tokenizer = _load_tokenizer(model_path)
+            if self.execution_plan.policy != "monolithic":
+                warnings.warn(
+                    "A single ONNX file uses one session. Prefill, decode, "
+                    "layer-range, and MoE placement apply to a split model directory.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
         self.is_loaded = True
 
     def generate(
@@ -706,12 +872,14 @@ class OnnxRuntimeBackend(InferenceBackend):
             usage = dict(source.get_memory_usage())
             usage["split"] = self._is_split
             usage["providers"] = list(self.providers)
+            usage["execution_policy"] = self.execution_plan.policy
             return usage
         return {
             "backend": "onnx_runtime",
             "loaded": self.is_loaded,
             "split": self._is_split,
             "providers": list(self.providers),
+            "execution_policy": self.execution_plan.policy,
         }
 
     def cleanup(self) -> None:
@@ -911,6 +1079,9 @@ __all__ = [
     "get_backend_for_model",
     "providers_for_device",
     "resolve_onnx_providers",
-    # Provider map
+    "resolve_execution_policy",
+    "build_execution_plan",
+    # Provider map and hybrid plan
     "DEVICE_PROVIDER_MAP",
+    "HybridExecutionPlan",
 ]
