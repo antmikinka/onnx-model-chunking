@@ -7,11 +7,13 @@ creating per-component ONNX files for embeddings, layers, norm, and lm_head.
 
 import os
 import json
+import warnings
 from collections import defaultdict
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Any, Set
 
 import onnx
-from onnx import numpy_helper, helper, TensorProto
+from onnx import numpy_helper, helper
 from onnx import shape_inference
 
 from ..common.path_utils import sanitize_model_name
@@ -155,7 +157,9 @@ def create_component_onnx(
     Create a standalone ONNX model for a single component.
 
     Output names are chosen from one consumer map. A tensor is an output when
-    it is a graph output or a node outside this component reads it.
+    it is a graph output or a node outside this component reads it. Dtype and
+    shape come from value info, then an initializer, then a name heuristic.
+    The heuristic tier warns.
 
     Args:
         model: Original ONNX model.
@@ -214,18 +218,26 @@ def create_component_onnx(
         for inp in node.input:
             consumers[inp].append(idx)
 
-    output_tensors = set()
-    for output in component_outputs:
-        if output in graph_output_names:
-            output_tensors.add(output)
-            continue
-        if any(consumer_idx not in component_node_set for consumer_idx in consumers[output]):
-            output_tensors.add(output)
+    # Preserve component node order. A set would follow hash order.
+    output_tensors = []
+    seen_outputs = set()
+    for node in component_nodes:
+        for output in node.output:
+            if output in seen_outputs:
+                continue
+            if output in graph_output_names or any(
+                consumer_idx not in component_node_set
+                for consumer_idx in consumers[output]
+            ):
+                output_tensors.append(output)
+                seen_outputs.add(output)
     
     # If no outputs identified, use all outputs from the last node
     if not output_tensors and component_nodes:
         for output in component_nodes[-1].output:
-            output_tensors.add(output)
+            if output not in seen_outputs:
+                output_tensors.append(output)
+                seen_outputs.add(output)
     
     # Build lookups for value info
     init_dict = {i.name: i for i in graph.initializer}
@@ -235,56 +247,23 @@ def create_component_onnx(
     for go in graph.output:
         value_info_dict[go.name] = go
     
-    # Create input ValueInfoProtos
+    # Create input and output ValueInfoProtos. A complete value info is kept
+    # so symbolic dimension names survive. A guessed dtype or shape warns.
     input_value_infos = []
     for inp_name in boundary_inputs:
         if not inp_name:
             continue
         vi = value_info_dict.get(inp_name)
-        if vi and vi.name and vi.type.tensor_type.elem_type != 0:
-            input_value_infos.append(vi)
-            continue
-            
-        if inp_name in init_dict:
-            init = init_dict[inp_name]
-            shape = list(init.dims)
-            elem_type = init.data_type
-            new_vi = helper.make_tensor_value_info(inp_name, elem_type, shape)
-            input_value_infos.append(new_vi)
-            continue
-            
-        # Heuristic for unknown inputs
-        rank = 1
-        if "2D" in inp_name: rank = 2
-        elif "3D" in inp_name: rank = 3
-        elif "4D" in inp_name: rank = 4
-        
-        elem_type = TensorProto.FLOAT16
-        if "position" in inp_name or "mask" in inp_name or "idx" in inp_name or "constants" in inp_name:
-            elem_type = TensorProto.INT64
-            
-        shape = [None] * rank
-        new_vi = helper.make_tensor_value_info(inp_name, elem_type, shape)
-        input_value_infos.append(new_vi)
-    
-    # Create output ValueInfoProtos
+        resolved = resolve_tensor_type(inp_name, vi, init_dict.get(inp_name), role="input")
+        input_value_infos.append(_component_value_info(inp_name, vi, resolved))
+
     output_value_infos = []
     for out_name in output_tensors:
         if not out_name:
             continue
         vi = value_info_dict.get(out_name)
-        if vi and vi.name and vi.type.tensor_type.elem_type != 0:
-            output_value_infos.append(vi)
-            continue
-        
-        # Fallback for unknown outputs
-        elem_type = TensorProto.FLOAT16
-        if any(word in out_name.lower() for word in ["mask", "idx", "position", "count"]):
-            elem_type = TensorProto.INT32
-        
-        shape = [None]
-        new_vi = helper.make_tensor_value_info(out_name, elem_type, shape)
-        output_value_infos.append(new_vi)
+        resolved = resolve_tensor_type(out_name, vi, init_dict.get(out_name), role="output")
+        output_value_infos.append(_component_value_info(out_name, vi, resolved))
     
     # Create the graph
     component_graph = helper.make_graph(
@@ -419,25 +398,14 @@ def _dims_from_value(value) -> Optional[List[Optional[int]]]:
     return parsed
 
 
-def _dtype_from_value(value, name: str) -> Optional[str]:
-    """ONNX element type as a dtype name. An unset type stays unset."""
-    type_proto = getattr(value, "type", None)
-    tensor_type = getattr(type_proto, "tensor_type", None) if type_proto is not None else None
-    if tensor_type is None:
-        return None
-    elem = getattr(tensor_type, "elem_type", 0)
-    if isinstance(elem, bool) or not isinstance(elem, int) or elem == 0:
-        return None
-    dtype = _ONNX_ELEM_DTYPE.get(elem)
-    if dtype is None:
-        raise ValueError(f"boundary {name} has unsupported ONNX element type {elem}")
-    return dtype
-
-
 def _heuristic_dtype(name: str) -> str:
-    """Dtype used when the graph does not record an element type."""
+    """Dtype used when the graph does not record an element type.
+
+    Index-like names use int64 on both inputs and outputs so a guessed mask
+    does not change width at a component boundary.
+    """
     lowered = name.lower()
-    if any(word in lowered for word in ("position", "mask", "idx", "constants")):
+    if any(word in lowered for word in ("position", "mask", "idx", "constants", "count")):
         return "int64"
     return "float16"
 
@@ -452,6 +420,155 @@ def _heuristic_shape(name: str) -> List[Optional[int]]:
     elif "2D" in name:
         rank = 2
     return [None] * rank
+
+
+@dataclass(frozen=True)
+class ResolvedTensorType:
+    """Dtype and shape chosen for one boundary tensor.
+
+    ``dtype_source`` and ``shape_source`` are ``value_info``, ``initializer``,
+    or ``heuristic``. A heuristic field is a guess from the tensor name.
+    """
+
+    name: str
+    dtype: str
+    elem_type: int
+    shape: List[Optional[int]]
+    dtype_source: str
+    shape_source: str
+
+
+def _elem_type_code(value) -> Optional[int]:
+    """Nonzero ONNX element type, or None when the value info leaves it unset."""
+    type_proto = getattr(value, "type", None)
+    tensor_type = getattr(type_proto, "tensor_type", None) if type_proto is not None else None
+    if tensor_type is None:
+        return None
+    elem = getattr(tensor_type, "elem_type", 0)
+    if isinstance(elem, bool) or not isinstance(elem, int) or elem == 0:
+        return None
+    return elem
+
+
+def _dtype_name_for_elem(elem: int, name: str) -> str:
+    dtype = _ONNX_ELEM_DTYPE.get(elem)
+    if dtype is None:
+        raise ValueError(f"boundary {name} has unsupported ONNX element type {elem}")
+    return dtype
+
+
+def _elem_for_dtype(dtype: str) -> int:
+    for code, name in _ONNX_ELEM_DTYPE.items():
+        if name == dtype:
+            return code
+    raise ValueError(f"boundary dtype {dtype} has no ONNX element type")
+
+
+def _initializer_dtype_and_shape(initializer, name: str):
+    """Tier 2: initializer data type and dimensions. Unset type stays unset."""
+    if initializer is None:
+        return None, None
+    elem = getattr(initializer, "data_type", 0)
+    if isinstance(elem, bool) or not isinstance(elem, int):
+        raise ValueError(
+            f"boundary {name} initializer data_type must be an integer, got {elem!r}"
+        )
+    dtype = None if elem == 0 else _dtype_name_for_elem(elem, name)
+    dims = getattr(initializer, "dims", None)
+    if dims is None:
+        return dtype, None
+    shape: List[Optional[int]] = []
+    for dim in dims:
+        if isinstance(dim, bool) or not isinstance(dim, int):
+            raise ValueError(
+                f"boundary {name} initializer dim must be an integer, got {dim!r}"
+            )
+        if dim < 0:
+            raise ValueError(f"boundary {name} initializer dim {dim} is negative")
+        shape.append(dim)
+    return dtype, shape
+
+
+def _warn_heuristic_type(role: str, name: str, dtype: str, shape, guessed_dtype: bool, guessed_shape: bool) -> None:
+    parts = []
+    if guessed_dtype:
+        parts.append(f"dtype {dtype}")
+    if guessed_shape:
+        parts.append(f"shape {list(shape)}")
+    warnings.warn(
+        f"{role} tensor {name} uses a name heuristic for {' and '.join(parts)} "
+        f"because the ONNX graph does not record it",
+        UserWarning,
+        stacklevel=3,
+    )
+
+
+def resolve_tensor_type(name, value=None, initializer=None, *, role: str = "boundary") -> ResolvedTensorType:
+    """
+    Resolve one tensor dtype and shape in three tiers.
+
+    Tier 1 is value info, a graph input, or a graph output. Tier 2 is an
+    initializer. Tier 3 is the name heuristic. Dtype and shape are chosen
+    separately, so a declared dtype stays in place when only the shape is
+    missing. The heuristic tier warns. An unknown element type, a blank
+    name, and a bad initializer dimension raise.
+
+    Args:
+        name: Tensor name.
+        value: Optional value info or graph input or output.
+        initializer: Optional initializer with ``data_type`` and ``dims``.
+        role: ``input``, ``output``, or ``boundary``. Named in the warning.
+
+    Returns:
+        Resolved dtype name, ONNX element type, shape, and the tier of each.
+    """
+    if role not in {"input", "output", "boundary"}:
+        raise ValueError(f"tensor role must be input, output, or boundary, got {role!r}")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError(f"{role} tensor name must be a non-empty string, got {name!r}")
+
+    declared_dtype = None
+    declared_elem = None
+    declared_shape = None
+    if value is not None:
+        declared_elem = _elem_type_code(value)
+        if declared_elem is not None:
+            declared_dtype = _dtype_name_for_elem(declared_elem, name)
+        declared_shape = _dims_from_value(value)
+
+    init_dtype, init_shape = _initializer_dtype_and_shape(initializer, name)
+    dtype = declared_dtype if declared_dtype is not None else init_dtype
+    shape = declared_shape if declared_shape is not None else init_shape
+    dtype_source = "value_info" if declared_dtype is not None else ("initializer" if init_dtype is not None else None)
+    shape_source = "value_info" if declared_shape is not None else ("initializer" if init_shape is not None else None)
+    guessed_dtype = dtype is None
+    guessed_shape = shape is None
+    if guessed_dtype:
+        dtype = _heuristic_dtype(name)
+        dtype_source = "heuristic"
+        declared_elem = _elem_for_dtype(dtype)
+    elif declared_elem is None:
+        declared_elem = _elem_for_dtype(dtype)
+    if guessed_shape:
+        shape = _heuristic_shape(name)
+        shape_source = "heuristic"
+    if guessed_dtype or guessed_shape:
+        _warn_heuristic_type(role, name, dtype, shape, guessed_dtype, guessed_shape)
+    return ResolvedTensorType(
+        name=name,
+        dtype=dtype,
+        elem_type=declared_elem,
+        shape=list(shape),
+        dtype_source=dtype_source,
+        shape_source=shape_source,
+    )
+
+
+def _component_value_info(name: str, value, resolved: ResolvedTensorType):
+    """Reuse a complete value info. A filled-in type becomes a new proto."""
+    if resolved.dtype_source == "value_info" and resolved.shape_source == "value_info" and value is not None:
+        return value
+    return helper.make_tensor_value_info(name, resolved.elem_type, list(resolved.shape))
 
 
 def _unique_component_names(names: List[str]) -> List[str]:
@@ -472,8 +589,8 @@ def collect_boundary_tensors(model, components) -> List[BoundaryTensor]:
     A boundary is a tensor that leaves a component: a graph input, a graph
     output, a stateful KV tensor, or a value one component writes and another
     reads. Initializers stay inside the component that owns them. Dtype and
-    shape come from value info. A missing type uses the same name heuristic
-    as ``create_component_onnx``. KV tensors prefer the NPU and are zero-copy.
+    shape use value info, then an initializer, then a name heuristic. The
+    heuristic tier warns. KV tensors prefer the NPU and are zero-copy.
 
     Args:
         model: ONNX model or graph.
@@ -558,16 +675,11 @@ def collect_boundary_tensors(model, components) -> List[BoundaryTensor]:
         if not stateful and not activation and not crosses:
             continue
         value = info.get(name)
-        dtype = _dtype_from_value(value, name) if value is not None else None
-        shape = _dims_from_value(value) if value is not None else None
-        if dtype is None:
-            dtype = _heuristic_dtype(name)
-        if shape is None:
-            shape = _heuristic_shape(name)
+        resolved = resolve_tensor_type(name, value, role="boundary")
         boundaries.append(BoundaryTensor(
             name=name,
-            dtype=dtype,
-            shape=shape,
+            dtype=resolved.dtype,
+            shape=list(resolved.shape),
             producer_component=producer,
             consumer_components=consumer_components,
             is_stateful=stateful,

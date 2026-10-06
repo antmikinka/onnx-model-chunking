@@ -10088,13 +10088,11 @@ def test_output_detection():
         return model
 
     original_helper = splitter.helper
-    original_tensor = splitter.TensorProto
     splitter.helper = types.SimpleNamespace(
         make_tensor_value_info=make_tensor_value_info,
         make_graph=make_graph,
         make_model=make_model,
     )
-    splitter.TensorProto = types.SimpleNamespace(FLOAT16=10, INT64=7, INT32=6)
     try:
         _Inputs.iterations = 0
         _Inputs.contains_calls = 0
@@ -10194,12 +10192,285 @@ def test_output_detection():
         assert _Inputs.contains_calls == 0
     finally:
         splitter.helper = original_helper
-        splitter.TensorProto = original_tensor
 
     print("output detection: OK")
     print("  one consumer map selects tensors read outside the component")
     print("  a graph output stays an output")
     print("  an internal tensor stays inside the component")
+    return True
+
+
+def test_dtype_resolution():
+    """Dtype and shape use value info, then an initializer, then a warned heuristic."""
+    print("=" * 50)
+    print("Testing dtype resolution...")
+    print("=" * 50)
+
+    import sys
+    import types
+    import warnings
+    import chunking_utils
+
+    try:
+        from chunking_utils.onnx.splitter import (
+            collect_boundary_tensors,
+            create_component_onnx,
+            resolve_tensor_type,
+        )
+        import chunking_utils.onnx.splitter as splitter
+    except ModuleNotFoundError:
+        for name in list(sys.modules):
+            if name == "chunking_utils.onnx" or name.startswith("chunking_utils.onnx."):
+                del sys.modules[name]
+        onnx_stub = types.ModuleType("onnx")
+        onnx_stub.ModelProto = type("ModelProto", (), {})
+        onnx_stub.numpy_helper = types.SimpleNamespace()
+        onnx_stub.helper = types.SimpleNamespace()
+        onnx_stub.TensorProto = types.SimpleNamespace()
+        onnx_stub.shape_inference = types.SimpleNamespace()
+        sys.modules["onnx"] = onnx_stub
+        from chunking_utils.onnx.splitter import (
+            collect_boundary_tensors,
+            create_component_onnx,
+            resolve_tensor_type,
+        )
+        import chunking_utils.onnx.splitter as splitter
+
+    from chunking_utils.onnx.types import ComponentInfo
+
+    assert chunking_utils.resolve_tensor_type is resolve_tensor_type
+
+    class _Dim:
+        def __init__(self, value=None, param=""):
+            self.dim_value = 0 if value is None else value
+            self.dim_param = param
+
+    class _Value:
+        def __init__(self, name, elem, dims):
+            shape = None if dims is None else types.SimpleNamespace(dim=dims)
+            self.name = name
+            self.type = types.SimpleNamespace(
+                tensor_type=types.SimpleNamespace(elem_type=elem, shape=shape)
+            )
+
+    class _Init:
+        def __init__(self, data_type, dims):
+            self.data_type = data_type
+            self.dims = dims
+
+    def _quiet(name, value=None, initializer=None, role="boundary"):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            resolved = resolve_tensor_type(name, value, initializer, role=role)
+        return resolved, caught
+
+    declared = _Value("attention_mask", 1, [_Dim(1), _Dim(8)])
+    resolved, caught = _quiet(
+        "attention_mask",
+        declared,
+        _Init(3, [4]),
+    )
+    assert resolved.dtype == "float32"
+    assert resolved.elem_type == 1
+    assert resolved.shape == [1, 8]
+    assert resolved.dtype_source == "value_info"
+    assert resolved.shape_source == "value_info"
+    assert caught == []
+    resolved.shape.append(9)
+    again, _ = _quiet("attention_mask", declared, _Init(3, [4]))
+    assert again.shape == [1, 8]
+
+    resolved, caught = _quiet("attention_mask", None, _Init(3, [4, 4]))
+    assert resolved.dtype == "int8"
+    assert resolved.elem_type == 3
+    assert resolved.shape == [4, 4]
+    assert resolved.dtype_source == "initializer"
+    assert resolved.shape_source == "initializer"
+    assert caught == []
+
+    resolved, caught = _quiet(
+        "hidden",
+        _Value("hidden", 1, None),
+        _Init(0, [2, 2]),
+    )
+    assert resolved.dtype == "float32"
+    assert resolved.elem_type == 1
+    assert resolved.shape == [2, 2]
+    assert resolved.dtype_source == "value_info"
+    assert resolved.shape_source == "initializer"
+    assert caught == []
+
+    resolved, caught = _quiet("hidden", _Value("hidden", 1, None))
+    assert resolved.dtype == "float32"
+    assert resolved.shape == [None]
+    assert resolved.dtype_source == "value_info"
+    assert resolved.shape_source == "heuristic"
+    assert len(caught) == 1
+    assert issubclass(caught[0].category, UserWarning)
+    assert "heuristic" in str(caught[0].message)
+    assert "shape" in str(caught[0].message)
+    assert "dtype" not in str(caught[0].message)
+
+    resolved, caught = _quiet("hidden_4D")
+    assert resolved.dtype == "float16"
+    assert resolved.elem_type == 10
+    assert resolved.shape == [None, None, None, None]
+    assert resolved.dtype_source == "heuristic"
+    assert resolved.shape_source == "heuristic"
+    assert "dtype float16" in str(caught[0].message)
+    assert "shape" in str(caught[0].message)
+
+    resolved, caught = _quiet("attention_mask", role="output")
+    assert resolved.dtype == "int64"
+    assert resolved.elem_type == 7
+    assert resolved.shape == [None]
+    assert "output tensor attention_mask" in str(caught[0].message)
+    resolved, _ = _quiet("token_count", role="input")
+    assert resolved.dtype == "int64"
+    resolved, _ = _quiet("cache_2D")
+    assert resolved.shape == [None, None]
+    assert resolved.dtype == "float16"
+
+    try:
+        resolve_tensor_type("  ")
+        raise AssertionError("a blank tensor name was accepted")
+    except ValueError as exc:
+        assert "name" in str(exc)
+    try:
+        resolve_tensor_type("logits", _Value("logits", 99, [_Dim(1)]))
+        raise AssertionError("an unknown element type was accepted")
+    except ValueError as exc:
+        assert "logits" in str(exc)
+    try:
+        resolve_tensor_type("weight", None, _Init(True, [1]))
+        raise AssertionError("a bool data_type was accepted")
+    except ValueError as exc:
+        assert "data_type" in str(exc)
+    try:
+        resolve_tensor_type("weight", None, _Init(1, [-1]))
+        raise AssertionError("a negative initializer dim was accepted")
+    except ValueError as exc:
+        assert "negative" in str(exc)
+    try:
+        resolve_tensor_type("hidden", role="side")
+        raise AssertionError("an unknown role was accepted")
+    except ValueError as exc:
+        assert "role" in str(exc)
+
+    class _Node:
+        def __init__(self, name, inputs, outputs):
+            self.name = name
+            self.input = list(inputs)
+            self.output = list(outputs)
+
+    class _Graph:
+        def __init__(self, nodes, outputs, inputs=None, initializers=None, value_info=None):
+            self.node = list(nodes)
+            self.output = list(outputs)
+            self.input = list(inputs or [])
+            self.initializer = list(initializers or [])
+            self.value_info = list(value_info or [])
+
+    class _Model:
+        def __init__(self, graph):
+            self.graph = graph
+            self.opset_import = []
+            self.ir_version = 8
+
+    made = []
+
+    def make_tensor_value_info(name, elem_type, shape):
+        made.append((name, elem_type, list(shape)))
+        return _Value(name, elem_type, [_Dim(dim) for dim in shape if dim is not None] or [])
+
+    def make_graph(nodes, name, inputs, outputs, initializer):
+        return types.SimpleNamespace(
+            node=nodes, name=name, input=inputs, output=outputs, initializer=initializer
+        )
+
+    def make_model(graph, producer_name, opset_imports):
+        return types.SimpleNamespace(
+            graph=graph, producer_name=producer_name, opset_import=opset_imports, ir_version=0
+        )
+
+    original_helper = splitter.helper
+    splitter.helper = types.SimpleNamespace(
+        make_tensor_value_info=make_tensor_value_info,
+        make_graph=make_graph,
+        make_model=make_model,
+    )
+    try:
+        known = _Value("hidden", 1, [_Dim(1), _Dim(4)])
+        graph = _Graph(
+            [_Node("proj", ["hidden"], ["hidden_2D"])],
+            outputs=[_Value("hidden_2D", 0, None)],
+            inputs=[known],
+            value_info=[known],
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            created = create_component_onnx(
+                _Model(graph),
+                ComponentInfo(component_type="other", node_indices=[0]),
+                "proj",
+            )
+        assert created.graph.input[0] is known
+        assert ("hidden", 1, [1, 4]) not in made
+        assert ("hidden_2D", 10, [None, None]) in made
+        assert any("hidden_2D" in str(item.message) and "heuristic" in str(item.message) for item in caught)
+        assert all("hidden uses a name heuristic" not in str(item.message) for item in caught)
+
+        mask_graph = _Graph(
+            [_Node("mask", ["hidden"], ["attention_mask"])],
+            outputs=[],
+            inputs=[known],
+            value_info=[known],
+        )
+        made.clear()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            create_component_onnx(
+                _Model(mask_graph),
+                ComponentInfo(component_type="other", node_indices=[0]),
+                "mask",
+            )
+        assert ("attention_mask", 7, [None]) in made
+        assert any("output tensor attention_mask" in str(item.message) for item in caught)
+
+        class _Part:
+            def __init__(self, indices):
+                self.node_indices = list(indices)
+
+        bare = _Graph(
+            [
+                _Node("embed", ["input_ids"], ["hidden"]),
+                _Node("head", ["hidden"], ["logits"]),
+            ],
+            outputs=[_Value("logits", 10, [_Dim(1), _Dim(4)])],
+            inputs=[_Value("input_ids", 7, [_Dim(1), _Dim(param="seq")])],
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            found = collect_boundary_tensors(bare, {
+                "embedding": _Part([0]),
+                "lm_head": _Part([1]),
+            })
+        by_name = {item.name: item for item in found}
+        assert by_name["hidden"].dtype == "float16"
+        assert by_name["hidden"].shape == [None]
+        assert by_name["input_ids"].dtype == "int64"
+        assert by_name["logits"].dtype == "float16"
+        hidden_warnings = [item for item in caught if "boundary tensor hidden " in str(item.message)]
+        assert len(hidden_warnings) == 1
+        assert all("input_ids" not in str(item.message) for item in caught)
+        assert all("logits" not in str(item.message) for item in caught)
+    finally:
+        splitter.helper = original_helper
+
+    print("dtype resolution: OK")
+    print("  value info, then initializer, then a name heuristic")
+    print("  a heuristic dtype or shape warns")
+    print("  a mask input and a mask output stay int64")
     return True
 
 
@@ -10537,6 +10808,12 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"output_detection: FAILED - {e}")
         results.append(("output_detection", False))
+
+    try:
+        results.append(("dtype_resolution", test_dtype_resolution()))
+    except Exception as e:
+        print(f"dtype_resolution: FAILED - {e}")
+        results.append(("dtype_resolution", False))
 
     try:
         results.append(("path_manager", test_path_manager()))

@@ -19,6 +19,7 @@ from .splitter import (
     extract_components,
     create_component_onnx,
     collect_boundary_tensors,
+    resolve_tensor_type,
     detect_architecture_from_onnx,
 )
 from .merger import merge_onnx
@@ -37,6 +38,7 @@ __all__ = [
     "extract_components",
     "create_component_onnx",
     "collect_boundary_tensors",
+    "resolve_tensor_type",
     # Architecture detection
     "detect_architecture_from_onnx",
     # Types
