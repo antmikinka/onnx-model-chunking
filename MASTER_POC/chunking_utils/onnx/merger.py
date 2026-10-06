@@ -5,6 +5,7 @@ This module provides utilities for merging split ONNX component files
 back into a single unified ONNX model.
 """
 
+import gc
 import json
 import math
 import os
@@ -1147,6 +1148,274 @@ def merge_onnx(
         onnx.save(merged_model, destination)
         print(f"  Saved merged model to: {destination}")
 
+    return merged_model
+
+
+class _HeldGraph:
+    """Input and output names kept after the component model is released."""
+
+    def __init__(self, inputs, outputs):
+        self.input = inputs
+        self.output = outputs
+        self.node = []
+        self.initializer = []
+        self.value_info = []
+
+
+class _HeldModel:
+    """Boundary view that does not retain the component weight payload."""
+
+    def __init__(self, inputs, outputs):
+        self.graph = _HeldGraph(inputs, outputs)
+
+
+def _require_memory_budget(memory_budget_mb) -> int:
+    """A positive whole number of megabytes. A bool or a zero raises."""
+    if isinstance(memory_budget_mb, bool) or not isinstance(memory_budget_mb, int):
+        raise ValueError(
+            f"memory_budget_mb must be a positive int, got {memory_budget_mb!r}"
+        )
+    if memory_budget_mb <= 0:
+        raise ValueError(
+            f"memory_budget_mb must be a positive int, got {memory_budget_mb!r}"
+        )
+    return memory_budget_mb
+
+
+def _require_streaming_save_path(save_path: str) -> str:
+    """Streaming merge always writes a file. None and a blank path raise."""
+    destination = _require_save_path(save_path)
+    if destination is None:
+        raise ValueError(
+            f"save_path must be a non-empty string, got {save_path!r}"
+        )
+    return destination
+
+
+def _graph_sequence(value, role: str) -> list:
+    """Copy a graph field into a list. A string or a missing field raises."""
+    if value is None or isinstance(value, (str, bytes)):
+        raise ValueError(f"component graph {role} must be a list, got {value!r}")
+    try:
+        return list(value)
+    except TypeError as exc:
+        raise ValueError(
+            f"component graph {role} must be a list, got {value!r}"
+        ) from exc
+
+
+def _detach_message(value):
+    """Own a protobuf message so the source model can be released."""
+    copy_from = getattr(value, "CopyFrom", None)
+    if not callable(copy_from):
+        return value
+    try:
+        clone = value.__class__()
+    except Exception:
+        return value
+    clone.CopyFrom(value)
+    return clone
+
+
+def _tensor_bytes(init) -> int:
+    """Bytes of one initializer. raw_data wins, then a declared memory_bytes."""
+    raw = getattr(init, "raw_data", None)
+    if isinstance(raw, (bytes, bytearray)) and len(raw) > 0:
+        return len(raw)
+    for field, width in (
+        ("float_data", 4),
+        ("int32_data", 4),
+        ("int64_data", 8),
+        ("double_data", 8),
+        ("uint64_data", 8),
+    ):
+        data = getattr(init, field, None)
+        if data is None or isinstance(data, (str, bytes)):
+            continue
+        try:
+            count = len(data)
+        except TypeError:
+            continue
+        if count > 0:
+            return count * width
+    explicit = getattr(init, "memory_bytes", None)
+    if explicit is None:
+        return 0
+    if isinstance(explicit, bool) or not isinstance(explicit, int) or explicit < 0:
+        raise ValueError(
+            f"initializer memory_bytes must be a non-negative int, got {explicit!r}"
+        )
+    return explicit
+
+
+def merge_onnx_streaming(
+    output_dir: str,
+    save_path: str,
+    memory_budget_mb: int = 4096,
+) -> onnx.ModelProto:
+    """
+    Merge component files one at a time and write the result.
+
+    Each component is loaded with its external data, its nodes and
+    initializers are appended to the merged graph, and that component
+    model is released before the next file is opened. Retained initializer
+    bytes must stay within ``memory_budget_mb`` (4096 MB by default).
+    The linear order is embedding, layers, norm, and lm_head, with other
+    inserted from its inputs. Boundary reconnection and a saved
+    quantization contract are checked before the file is written.
+
+    Args:
+        output_dir: Directory containing component ONNX files.
+        save_path: File path for the merged model.
+        memory_budget_mb: Maximum retained initializer bytes, in megabytes.
+
+    Returns:
+        Merged ONNX ModelProto.
+
+    Raises:
+        FileNotFoundError: If model_info.json is missing.
+        ValueError: If the directory, the save path, the budget, or a
+            component would pass the budget.
+    """
+    budget = _require_memory_budget(memory_budget_mb)
+    destination = _require_streaming_save_path(save_path)
+    print(f"\nStreaming merge from: {output_dir}")
+    _require_merge_dir(output_dir)
+    model_info = _load_model_info(output_dir)
+    components = _component_map(model_info)
+    component_order = _linear_component_order(model_info)
+    budget_bytes = budget * 1024 * 1024
+
+    all_nodes = []
+    all_initializers = []
+    all_inputs = []
+    all_outputs = []
+    lm_head_outputs = None
+    opset_imports = None
+    ir_version = None
+    seen_initializers = set()
+    seen_inputs = set()
+    loaded_views = []
+    retained = 0
+
+    for comp_name in component_order:
+        if comp_name not in components:
+            continue
+
+        comp_info = components[comp_name]
+        if not isinstance(comp_info, dict):
+            raise ValueError(
+                f"component {comp_name} must be a dict, got {comp_info!r}"
+            )
+        filename = comp_info.get("file", "")
+        if not isinstance(filename, str) or not filename.strip():
+            continue
+
+        filepath = os.path.join(output_dir, filename)
+        if os.path.isdir(filepath):
+            raise ValueError(f"component file must be a file, got a directory {filepath}")
+        if not os.path.isfile(filepath):
+            print(f"  Warning: {filename} not found, skipping")
+            continue
+
+        comp_model = onnx.load(filepath, load_external_data=True)
+        try:
+            graph = _component_graph(comp_model)
+            nodes = [
+                _detach_message(item)
+                for item in _graph_sequence(getattr(graph, "node", None), "node")
+            ]
+            initializers = [
+                _detach_message(item)
+                for item in _graph_sequence(
+                    getattr(graph, "initializer", None), "initializer"
+                )
+            ]
+            inputs = [
+                _detach_message(item)
+                for item in _graph_sequence(getattr(graph, "input", None), "input")
+            ]
+            outputs = [
+                _detach_message(item)
+                for item in _graph_sequence(getattr(graph, "output", None), "output")
+            ]
+            if opset_imports is None:
+                opset_value = getattr(comp_model, "opset_import", [])
+                if opset_value is None:
+                    opset_value = []
+                opset_imports = [
+                    _detach_message(item)
+                    for item in _graph_sequence(opset_value, "opset_import")
+                ]
+                ir_version = getattr(comp_model, "ir_version", None)
+
+            kept = []
+            added = 0
+            for init in initializers:
+                name = getattr(init, "name", None)
+                if not isinstance(name, str):
+                    raise ValueError(
+                        f"initializer name must be a string, got {name!r}"
+                    )
+                if name in seen_initializers:
+                    continue
+                added += _tensor_bytes(init)
+                kept.append((name, init))
+            if retained + added > budget_bytes:
+                raise ValueError(
+                    f"component {comp_name} exceeds memory budget of {budget} MB"
+                )
+            retained += added
+            for name, init in kept:
+                seen_initializers.add(name)
+                all_initializers.append(init)
+
+            all_nodes.extend(nodes)
+            for inp in inputs:
+                name = getattr(inp, "name", None)
+                if not isinstance(name, str) or not name.strip():
+                    raise ValueError(
+                        f"component graph input name must be a non-empty string, got {name!r}"
+                    )
+                if name not in seen_inputs and name not in seen_initializers:
+                    all_inputs.append(inp)
+                    seen_inputs.add(name)
+
+            if comp_name != "lm_head":
+                all_outputs = list(outputs)
+            if comp_name == "lm_head":
+                lm_head_outputs = list(outputs)
+            loaded_views.append(_HeldModel(inputs, outputs))
+            print(f"  Loaded {filename}: {len(nodes)} nodes")
+        finally:
+            comp_model = None
+            gc.collect()
+
+    reconnection = validate_boundary_reconnection(loaded_views, model_info)
+    if not reconnection["valid"]:
+        detail = "; ".join(reconnection["errors"])
+        raise ValueError(f"boundary reconnection failed: {detail}")
+
+    final_outputs = lm_head_outputs if lm_head_outputs else all_outputs
+    merged_graph = helper.make_graph(
+        nodes=all_nodes,
+        name="merged_graph",
+        inputs=all_inputs,
+        outputs=final_outputs,
+        initializer=all_initializers,
+    )
+    merged_model = helper.make_model(
+        merged_graph,
+        producer_name="chunking_utils_merged",
+        opset_imports=opset_imports or [],
+    )
+    if ir_version:
+        merged_model.ir_version = ir_version
+
+    _check_saved_quantization(merged_model, model_info.get("quantization_info"))
+    print(f"  Merged model: {len(all_nodes)} nodes, {len(all_initializers)} initializers")
+    onnx.save(merged_model, destination)
+    print(f"  Saved merged model to: {destination}")
     return merged_model
 
 

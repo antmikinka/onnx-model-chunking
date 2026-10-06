@@ -14408,6 +14408,261 @@ def test_merge_psnr():
     return True
 
 
+def test_streaming_merge():
+    """One component is loaded, appended, and released before the next file."""
+    print("=" * 50)
+    print("Testing streaming merge...")
+    print("=" * 50)
+
+    import inspect
+    import json
+    import os
+    import sys
+    import tempfile
+    import types
+    import weakref
+
+    try:
+        import chunking_utils.onnx.merger as merger
+    except ModuleNotFoundError:
+        for name in list(sys.modules):
+            if name == "chunking_utils.onnx" or name.startswith("chunking_utils.onnx."):
+                del sys.modules[name]
+        onnx_stub = types.ModuleType("onnx")
+        onnx_stub.ModelProto = type("ModelProto", (), {})
+        onnx_stub.numpy_helper = types.SimpleNamespace()
+        onnx_stub.helper = types.SimpleNamespace()
+        onnx_stub.TensorProto = types.SimpleNamespace()
+        onnx_stub.shape_inference = types.SimpleNamespace()
+        sys.modules["onnx"] = onnx_stub
+        import chunking_utils.onnx.merger as merger
+
+    import chunking_utils.onnx as onnx_pkg
+
+    assert list(inspect.signature(merger.merge_onnx).parameters) == [
+        "output_dir",
+        "save_path",
+        "execution_plan",
+    ]
+    assert list(inspect.signature(merger.merge_onnx_streaming).parameters) == [
+        "output_dir",
+        "save_path",
+        "memory_budget_mb",
+    ]
+    assert (
+        inspect.signature(merger.merge_onnx_streaming).parameters["memory_budget_mb"].default
+        == 4096
+    )
+    assert "merge_onnx_streaming" not in onnx_pkg.__all__
+
+    def expect_value_error(callable_check, text):
+        try:
+            callable_check()
+            raise AssertionError(text)
+        except ValueError:
+            return
+
+    loads = []
+    expect_value_error(
+        lambda: merger.merge_onnx_streaming("unused", "merged.onnx", memory_budget_mb=True),
+        "a bool memory budget was accepted",
+    )
+    expect_value_error(
+        lambda: merger.merge_onnx_streaming("unused", "merged.onnx", memory_budget_mb=0),
+        "a zero memory budget was accepted",
+    )
+    expect_value_error(
+        lambda: merger.merge_onnx_streaming("unused", "merged.onnx", memory_budget_mb=-1),
+        "a negative memory budget was accepted",
+    )
+    expect_value_error(
+        lambda: merger.merge_onnx_streaming("unused", "merged.onnx", memory_budget_mb=4.5),
+        "a float memory budget was accepted",
+    )
+    expect_value_error(
+        lambda: merger.merge_onnx_streaming("unused", None),
+        "a missing save path was accepted",
+    )
+    expect_value_error(
+        lambda: merger.merge_onnx_streaming("unused", ""),
+        "a blank save path was accepted",
+    )
+    expect_value_error(
+        lambda: merger.merge_onnx_streaming("unused", "   "),
+        "a whitespace save path was accepted",
+    )
+    assert loads == []
+
+    mebibyte = 1024 * 1024
+    refs = []
+    load_external = []
+    saved = {}
+    captured = {}
+
+    class Component:
+        def __init__(self, weight_name, weight_bytes, output_name):
+            self.graph = types.SimpleNamespace(
+                name="component_graph",
+                node=[types.SimpleNamespace(op_type="Identity", input=["x"], output=[output_name])],
+                initializer=[
+                    types.SimpleNamespace(name=weight_name, memory_bytes=weight_bytes)
+                ],
+                input=[],
+                output=[types.SimpleNamespace(name=output_name)],
+                value_info=[],
+            )
+            self.opset_import = []
+            self.ir_version = 8
+
+    def component(weight_name, weight_bytes, output_name):
+        return Component(weight_name, weight_bytes, output_name)
+
+    def fake_load(filepath, load_external_data=True):
+        load_external.append(load_external_data)
+        if any(ref() is not None for ref in refs):
+            raise AssertionError(f"a previous component was still loaded at {filepath}")
+        name = os.path.basename(filepath)
+        model = factories[name]()
+        refs.append(weakref.ref(model))
+        return model
+
+    def make_graph(nodes, name, inputs, outputs, initializer):
+        captured["nodes"] = list(nodes)
+        captured["outputs"] = list(outputs)
+        captured["initializers"] = list(initializer)
+        return types.SimpleNamespace(
+            node=list(nodes),
+            name=name,
+            input=list(inputs),
+            output=list(outputs),
+            initializer=list(initializer),
+            value_info=[],
+        )
+
+    def make_model(graph, producer_name, opset_imports):
+        return types.SimpleNamespace(
+            graph=graph,
+            producer_name=producer_name,
+            ir_version=None,
+        )
+
+    def fake_save(model, path):
+        saved["path"] = path
+        saved["model"] = model
+
+    factories = {
+        "embedding.onnx": lambda: component("embed_w", 2 * mebibyte, "hidden"),
+        "norm.onnx": lambda: component("norm_w", 2 * mebibyte, "norm_out"),
+        "lm_head.onnx": lambda: component("head_w", 1, "logits"),
+    }
+
+    if not hasattr(merger.onnx, "load"):
+        merger.onnx.load = None
+    if not hasattr(merger.onnx, "save"):
+        merger.onnx.save = None
+    original_load = merger.onnx.load
+    original_save = merger.onnx.save
+    original_helper = merger.helper
+    merger.onnx.load = fake_load
+    merger.onnx.save = fake_save
+    merger.helper = types.SimpleNamespace(make_graph=make_graph, make_model=make_model)
+    try:
+        with tempfile.TemporaryDirectory() as root:
+            directory = os.path.join(root, "chunks")
+            os.makedirs(directory)
+            destination = os.path.join(root, "merged.onnx")
+            info_path = os.path.join(directory, "model_info.json")
+
+            def write_case(payload, filenames):
+                refs.clear()
+                load_external.clear()
+                saved.clear()
+                captured.clear()
+                for filename in ("embedding.onnx", "norm.onnx", "lm_head.onnx"):
+                    path = os.path.join(directory, filename)
+                    if filename in filenames:
+                        with open(path, "w", encoding="utf-8") as handle:
+                            handle.write("onnx")
+                    elif os.path.isfile(path):
+                        os.remove(path)
+                with open(info_path, "w", encoding="utf-8") as handle:
+                    json.dump(payload, handle)
+
+            payload = {
+                "num_layers": 0,
+                "components": {
+                    "embedding": {"file": "embedding.onnx"},
+                    "norm": {"file": "norm.onnx"},
+                    "lm_head": {"file": "lm_head.onnx"},
+                },
+            }
+            write_case(payload, ["embedding.onnx", "norm.onnx", "lm_head.onnx"])
+            merged = merger.merge_onnx_streaming(directory, destination)
+            assert merged.producer_name == "chunking_utils_merged"
+            assert saved["path"] == destination
+            assert saved["model"] is merged
+            assert load_external == [True, True, True]
+            assert len(captured["nodes"]) == 3
+            assert [item.name for item in captured["initializers"]] == [
+                "embed_w",
+                "norm_w",
+                "head_w",
+            ]
+            assert [item.name for item in captured["outputs"]] == ["logits"]
+            assert all(ref() is None for ref in refs)
+
+            write_case(payload, ["embedding.onnx", "norm.onnx", "lm_head.onnx"])
+            factories["embedding.onnx"] = lambda: component("embed_w", 3 * mebibyte, "hidden")
+            factories["norm.onnx"] = lambda: component("norm_w", 3 * mebibyte, "norm_out")
+            try:
+                merger.merge_onnx_streaming(directory, destination, memory_budget_mb=4)
+                raise AssertionError("a merge past the memory budget was accepted")
+            except ValueError as exc:
+                assert "memory budget" in str(exc)
+                assert "4" in str(exc)
+            assert saved == {}
+            assert load_external == [True, True]
+            assert all(ref() is None for ref in refs)
+
+            write_case(payload, ["embedding.onnx", "norm.onnx"])
+            factories["embedding.onnx"] = lambda: component("shared_w", 3 * mebibyte, "hidden")
+            factories["norm.onnx"] = lambda: component("shared_w", 8 * mebibyte, "norm_out")
+            duplicate = merger.merge_onnx_streaming(
+                directory,
+                destination,
+                memory_budget_mb=4,
+            )
+            assert duplicate.producer_name == "chunking_utils_merged"
+            assert [item.name for item in captured["initializers"]] == ["shared_w"]
+            assert saved["path"] == destination
+
+            write_case(payload, ["embedding.onnx"])
+            factories["embedding.onnx"] = lambda: component("embed_w", 4 * mebibyte, "hidden")
+            exact = merger.merge_onnx_streaming(directory, destination, memory_budget_mb=4)
+            assert exact.producer_name == "chunking_utils_merged"
+            assert len(captured["initializers"]) == 1
+
+            try:
+                merger.merge_onnx_streaming(root, destination)
+                raise AssertionError("a missing model_info was accepted")
+            except FileNotFoundError as exc:
+                assert "model_info.json" in str(exc)
+
+            with tempfile.TemporaryDirectory() as save_dir:
+                expect_value_error(
+                    lambda: merger.merge_onnx_streaming(directory, save_dir),
+                    "a directory save path was accepted",
+                )
+    finally:
+        merger.onnx.load = original_load
+        merger.onnx.save = original_save
+        merger.helper = original_helper
+
+    print("streaming merge: OK")
+    print("  one component is live at a time, external data is loaded, a small budget raises, and the merged file is saved")
+    return True
+
+
 def test_path_manager():
     """ONNX discovery, external data, split directories, and NPU cache paths."""
     print("=" * 50)
@@ -14814,6 +15069,12 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"merge_psnr: FAILED - {e}")
         results.append(("merge_psnr", False))
+
+    try:
+        results.append(("streaming_merge", test_streaming_merge()))
+    except Exception as e:
+        print(f"streaming_merge: FAILED - {e}")
+        results.append(("streaming_merge", False))
 
     try:
         results.append(("path_manager", test_path_manager()))
