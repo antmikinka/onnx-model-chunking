@@ -13351,6 +13351,287 @@ def test_other_dependencies():
     return True
 
 
+def test_boundary_reconnection():
+    """Boundary outputs reconnect to downstream inputs with the same name, dtype, and shape."""
+    print("=" * 50)
+    print("Testing boundary reconnection...")
+    print("=" * 50)
+
+    import json
+    import os
+    import sys
+    import tempfile
+    import types
+
+    try:
+        import chunking_utils.onnx.merger as merger
+    except ModuleNotFoundError:
+        for name in list(sys.modules):
+            if name == "chunking_utils.onnx" or name.startswith("chunking_utils.onnx."):
+                del sys.modules[name]
+        onnx_stub = types.ModuleType("onnx")
+        onnx_stub.ModelProto = type("ModelProto", (), {})
+        onnx_stub.numpy_helper = types.SimpleNamespace()
+        onnx_stub.helper = types.SimpleNamespace()
+        onnx_stub.TensorProto = types.SimpleNamespace()
+        onnx_stub.shape_inference = types.SimpleNamespace()
+        sys.modules["onnx"] = onnx_stub
+        import chunking_utils.onnx.merger as merger
+
+    class _Dim:
+        def __init__(self, value=None, param=""):
+            self.dim_value = 0 if value is None else value
+            self.dim_param = "" if value is not None else (param or "sym")
+
+    class _Value:
+        def __init__(self, name, elem=None, shape=None):
+            self.name = name
+            if elem is None and shape is None:
+                return
+            dims = None
+            if shape is not None:
+                dims = [_Dim(dim) for dim in shape]
+            self.type = types.SimpleNamespace(
+                tensor_type=types.SimpleNamespace(
+                    elem_type=0 if elem is None else elem,
+                    shape=None if dims is None else types.SimpleNamespace(dim=dims),
+                )
+            )
+
+    def model(graph_name, inputs, outputs):
+        return types.SimpleNamespace(
+            graph=types.SimpleNamespace(
+                name=graph_name,
+                input=list(inputs),
+                output=list(outputs),
+                node=[],
+                initializer=[],
+            ),
+            opset_import=[],
+            ir_version=8,
+        )
+
+    def component(filename, **fields):
+        record = {"file": filename}
+        record.update(fields)
+        return record
+
+    hidden = {
+        "name": "hidden",
+        "dtype": "float16",
+        "shape": [1, None, 16],
+        "producer": "embedding",
+        "producer_component": "embedding",
+        "consumers": ["layer_0"],
+        "consumer_components": ["layer_0"],
+    }
+    embedding = model(
+        "embedding_graph",
+        [_Value("input_ids", 7, [1, None])],
+        [_Value("hidden", 10, [1, None, 16])],
+    )
+    other = model(
+        "other_graph",
+        [_Value("input_ids", 7, [1, None])],
+        [_Value("ngram", 7, [1, None])],
+    )
+    layer = model(
+        "layer_0_graph",
+        [_Value("hidden", 10, [1, 4, 16]), _Value("ngram", 7, [1, None])],
+        [_Value("h0", 10, [1, 4, 16])],
+    )
+    chain_info = {
+        "num_layers": 1,
+        "components": {
+            "embedding": component("embedding.onnx", output_names=["hidden"]),
+            "other": component("other.onnx", output_names=["ngram"]),
+            "layer_0": component("layer_0.onnx", input_names=["hidden", "ngram"], output_names=["h0"]),
+        },
+        "boundary_tensors": [
+            hidden,
+            {
+                "name": "ngram",
+                "dtype": "int64",
+                "shape": [1, None],
+                "producer": "other",
+                "consumers": ["layer_0"],
+            },
+        ],
+    }
+    report = merger.validate_boundary_reconnection([embedding, other, layer], chain_info)
+    assert report["valid"] is True
+    assert report["errors"] == []
+
+    early = model("embedding_graph", [_Value("input_ids", 7, [1, None])], [_Value("token", 7, [1, None])])
+    middle = model("layer_0_graph", [_Value("hidden", 10, [1, None, 16])], [_Value("h0", 10, [1, None, 16])])
+    late = model("lm_head_graph", [_Value("h0", 10, [1, None, 16])], [_Value("hidden", 10, [1, None, 16])])
+    unresolved = merger.validate_boundary_reconnection([early, middle, late], {"components": {}})
+    assert unresolved["valid"] is False
+    assert "Unresolved input: hidden" in unresolved["errors"]
+
+    renamed_layer = model(
+        "layer_0_graph",
+        [_Value("hidden_states", 10, [1, None, 16])],
+        [_Value("h0", 10, [1, None, 16])],
+    )
+    renamed = merger.validate_boundary_reconnection(
+        [embedding, renamed_layer],
+        {"components": chain_info["components"], "boundary_tensors": [hidden]},
+    )
+    assert renamed["valid"] is False
+    assert any("not an input of layer_0" in error for error in renamed["errors"])
+
+    wide = model(
+        "layer_0_graph",
+        [_Value("hidden", 1, [1, 8, 32])],
+        [_Value("h0", 1, [1, 8, 32])],
+    )
+    mismatched = merger.validate_boundary_reconnection(
+        [embedding, wide],
+        {"components": chain_info["components"], "boundary_tensors": [hidden]},
+    )
+    assert mismatched["valid"] is False
+    assert any("dtype" in error for error in mismatched["errors"])
+    assert any("shape" in error for error in mismatched["errors"])
+
+    missing_output = model(
+        "embedding_graph",
+        [_Value("input_ids", 7, [1, None])],
+        [_Value("token", 7, [1, None])],
+    )
+    absent = merger.validate_boundary_reconnection(
+        [missing_output, layer],
+        {"components": chain_info["components"], "boundary_tensors": [hidden]},
+    )
+    assert absent["valid"] is False
+    assert any("not an output of embedding" in error for error in absent["errors"])
+
+    alias = dict(hidden)
+    alias["dtype"] = "fp16"
+    aliased = merger.validate_boundary_reconnection(
+        [embedding, layer],
+        {"components": chain_info["components"], "boundary_tensors": [alias]},
+    )
+    assert aliased["valid"] is True
+
+    try:
+        merger.validate_boundary_reconnection("components", {})
+        raise AssertionError("a string component list was accepted")
+    except ValueError as exc:
+        assert "list" in str(exc)
+
+    try:
+        merger.validate_boundary_reconnection([], [])
+        raise AssertionError("a list model_info was accepted")
+    except ValueError as exc:
+        assert "dict" in str(exc)
+
+    try:
+        merger.validate_boundary_reconnection([], {"boundary_tensors": "hidden"})
+        raise AssertionError("a string boundary list was accepted")
+    except ValueError as exc:
+        assert "list" in str(exc)
+
+    try:
+        merger.validate_boundary_reconnection(
+            [model("embedding_graph", [_Value(" ")], [])],
+            {},
+        )
+        raise AssertionError("a blank tensor name was accepted")
+    except ValueError as exc:
+        assert "name" in str(exc)
+
+    try:
+        merger.validate_boundary_reconnection([], {"graph_inputs": "input_ids"})
+        raise AssertionError("a string graph_inputs was accepted")
+    except ValueError as exc:
+        assert "list" in str(exc)
+
+    captured = {}
+
+    def fake_load(filepath, load_external_data=True):
+        name = os.path.splitext(os.path.basename(filepath))[0]
+        if name == "embedding":
+            return embedding
+        if name == "layer_0":
+            return wide
+        return model(name + "_graph", [], [_Value(name + "_out")])
+
+    def make_graph(nodes, name, inputs, outputs, initializer):
+        captured["built"] = True
+        return types.SimpleNamespace(node=list(nodes), input=list(inputs), output=list(outputs), initializer=list(initializer))
+
+    def make_model(graph, producer_name, opset_imports):
+        return types.SimpleNamespace(graph=graph, producer_name=producer_name, ir_version=None)
+
+    if not hasattr(merger.onnx, "load"):
+        merger.onnx.load = None
+    if not hasattr(merger.onnx, "save"):
+        merger.onnx.save = None
+    original_load = merger.onnx.load
+    original_helper = merger.helper
+    merger.onnx.load = fake_load
+    merger.helper = types.SimpleNamespace(make_graph=make_graph, make_model=make_model)
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            payload = {
+                "num_layers": 1,
+                "components": {
+                    "embedding": component("embedding.onnx", output_names=["hidden"]),
+                    "layer_0": component("layer_0.onnx", input_names=["hidden"], output_names=["h0"]),
+                    "norm": component("norm.onnx"),
+                    "lm_head": component("lm_head.onnx"),
+                    "other": component("other.onnx"),
+                },
+                "boundary_tensors": [hidden],
+            }
+            with open(os.path.join(directory, "model_info.json"), "w", encoding="utf-8") as handle:
+                json.dump(payload, handle)
+            for info in payload["components"].values():
+                with open(os.path.join(directory, info["file"]), "w", encoding="utf-8") as handle:
+                    handle.write("onnx")
+            try:
+                merger.merge_onnx(directory)
+                raise AssertionError("a dtype mismatch was merged")
+            except ValueError as exc:
+                assert "boundary reconnection failed" in str(exc)
+                assert "dtype" in str(exc)
+            assert captured.get("built") is not True
+
+            result = merger.merge_onnx_with_result(directory)
+            assert result.success is False
+            assert "boundary" in result.error
+
+            payload["boundary_tensors"] = []
+            payload["components"] = {
+                "embedding": component("embedding.onnx"),
+                "layer_0": component("layer_0.onnx"),
+            }
+            with open(os.path.join(directory, "model_info.json"), "w", encoding="utf-8") as handle:
+                json.dump(payload, handle)
+            captured.clear()
+            merger.onnx.load = lambda filepath, load_external_data=True: model(
+                os.path.splitext(os.path.basename(filepath))[0] + "_graph",
+                [_Value(os.path.splitext(os.path.basename(filepath))[0] + "_in")],
+                [_Value(os.path.splitext(os.path.basename(filepath))[0] + "_out")],
+            )
+            merged = merger.merge_onnx(directory, execution_plan={
+                "steps": [
+                    {"component_name": "embedding"},
+                    {"component_name": "layer_0", "depends_on": ["embedding"]},
+                ],
+            })
+            assert captured.get("built") is True
+            assert merged.producer_name == "chunking_utils_merged"
+    finally:
+        merger.onnx.load = original_load
+        merger.helper = original_helper
+
+    print("boundary reconnection: OK")
+    print("  a renamed input, a dtype mismatch, and a shape mismatch raise")
+    return True
+
+
 def test_path_manager():
     """ONNX discovery, external data, split directories, and NPU cache paths."""
     print("=" * 50)
@@ -13739,6 +14020,12 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"other_dependencies: FAILED - {e}")
         results.append(("other_dependencies", False))
+
+    try:
+        results.append(("boundary_reconnection", test_boundary_reconnection()))
+    except Exception as e:
+        print(f"boundary_reconnection: FAILED - {e}")
+        results.append(("boundary_reconnection", False))
 
     try:
         results.append(("path_manager", test_path_manager()))

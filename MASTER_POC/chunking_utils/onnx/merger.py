@@ -7,12 +7,16 @@ back into a single unified ONNX model.
 
 import json
 import os
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import onnx
 from onnx import helper
 
-from chunking_utils.common.types import ExecutionPlan, _coerce_execution_plan
+from chunking_utils.common.types import (
+    ExecutionPlan,
+    _canonical_dtype_name,
+    _coerce_execution_plan,
+)
 
 from .types import OnnxMergeResult
 
@@ -301,6 +305,419 @@ def _linear_component_order(model_info: dict) -> List[str]:
     return order
 
 
+_ONNX_ELEM_DTYPE = {
+    1: "float32",
+    2: "uint8",
+    3: "int8",
+    4: "uint16",
+    5: "int16",
+    6: "int32",
+    7: "int64",
+    9: "bool",
+    10: "float16",
+    11: "float64",
+    12: "uint32",
+    13: "uint64",
+    16: "bfloat16",
+}
+
+
+def _component_graph(component):
+    """Return the graph on a loaded component model."""
+    graph = getattr(component, "graph", None)
+    if graph is None or isinstance(graph, (str, bytes, int, bool)):
+        raise ValueError(f"component must be an ONNX model, got {component!r}")
+    return graph
+
+
+def _io_values(component, role: str):
+    """Names and value infos for graph inputs or graph outputs."""
+    graph = _component_graph(component)
+    values = getattr(graph, role, None)
+    if values is None or isinstance(values, (str, bytes)):
+        raise ValueError(f"component graph {role} must be a list, got {values!r}")
+    try:
+        items = list(values)
+    except TypeError as exc:
+        raise ValueError(f"component graph {role} must be a list, got {values!r}") from exc
+    names: List[str] = []
+    by_name: Dict[str, Any] = {}
+    for item in items:
+        name = getattr(item, "name", None)
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(
+                f"component graph {role} name must be a non-empty string, got {name!r}"
+            )
+        name = name.strip()
+        if name in by_name:
+            raise ValueError(f"component graph {role} repeats {name!r}")
+        names.append(name)
+        by_name[name] = item
+    return names, by_name
+
+
+def _value_dtype(value) -> Optional[str]:
+    """Canonical dtype from a value info. An unset element type stays unset."""
+    type_proto = getattr(value, "type", None)
+    tensor_type = getattr(type_proto, "tensor_type", None) if type_proto is not None else None
+    if tensor_type is None:
+        return None
+    elem = getattr(tensor_type, "elem_type", 0)
+    if isinstance(elem, bool) or not isinstance(elem, int) or elem == 0:
+        return None
+    dtype = _ONNX_ELEM_DTYPE.get(elem)
+    if dtype is None:
+        name = getattr(value, "name", "")
+        raise ValueError(f"tensor {name} has unsupported ONNX element type {elem}")
+    return _canonical_dtype_name(dtype)
+
+
+def _value_shape(value) -> Optional[List[Optional[int]]]:
+    """Shape from a value info. A symbolic axis is None. A missing shape stays unset."""
+    type_proto = getattr(value, "type", None)
+    tensor_type = getattr(type_proto, "tensor_type", None) if type_proto is not None else None
+    if tensor_type is None:
+        return None
+    shape_proto = getattr(tensor_type, "shape", None)
+    if shape_proto is None:
+        return None
+    dims = getattr(shape_proto, "dim", None)
+    if dims is None:
+        return None
+    parsed: List[Optional[int]] = []
+    name = getattr(value, "name", "")
+    for dim in dims:
+        param = getattr(dim, "dim_param", "") or ""
+        if isinstance(param, str) and param:
+            parsed.append(None)
+            continue
+        number = getattr(dim, "dim_value", 0)
+        if isinstance(number, bool) or not isinstance(number, int):
+            raise ValueError(
+                f"tensor {name} dim must be an integer, got {number!r}"
+            )
+        if number < 0:
+            raise ValueError(f"tensor {name} dim {number} is negative")
+        parsed.append(None if number == 0 else number)
+    return parsed
+
+
+def _declared_shape(shape, label: str) -> List[Optional[int]]:
+    """Copy a boundary shape. Null is a symbolic axis."""
+    if isinstance(shape, (str, bytes)) or not isinstance(shape, list):
+        raise ValueError(f"{label} must be a list, got {shape!r}")
+    parsed: List[Optional[int]] = []
+    for dim in shape:
+        if dim is None:
+            parsed.append(None)
+            continue
+        if isinstance(dim, bool) or not isinstance(dim, int):
+            raise ValueError(f"{label} dim must be an integer or null, got {dim!r}")
+        if dim < 0:
+            raise ValueError(f"{label} dim {dim} is negative")
+        parsed.append(dim)
+    return parsed
+
+
+def _shapes_compatible(left: List[Optional[int]], right: List[Optional[int]]) -> bool:
+    """Same rank. A symbolic axis matches a concrete axis. Concrete axes must be equal."""
+    if len(left) != len(right):
+        return False
+    for declared, observed in zip(left, right):
+        if declared is None or observed is None:
+            continue
+        if declared != observed:
+            return False
+    return True
+
+
+def _explicit_graph_inputs(model_info: dict) -> set:
+    """Names recorded as graph-level inputs. The key may be absent."""
+    if "graph_inputs" not in model_info:
+        return set()
+    raw = model_info["graph_inputs"]
+    if isinstance(raw, (str, bytes)) or not isinstance(raw, list):
+        raise ValueError(f"graph_inputs must be a list, got {raw!r}")
+    names = set()
+    for item in raw:
+        if isinstance(item, str):
+            if not item.strip():
+                raise ValueError(
+                    f"graph input must be a non-empty string, got {item!r}"
+                )
+            names.add(item.strip())
+            continue
+        if isinstance(item, dict):
+            name = item.get("name")
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError(
+                    f"graph input name must be a non-empty string, got {name!r}"
+                )
+            names.add(name.strip())
+            continue
+        raise ValueError(f"graph input must be a string or a dict, got {item!r}")
+    return names
+
+
+def _boundary_records(model_info: dict) -> List[dict]:
+    """Named boundary tensors. A record without a name is not a reconnect contract."""
+    boundaries = model_info.get("boundary_tensors")
+    if boundaries is None:
+        return []
+    if isinstance(boundaries, (str, bytes)) or not isinstance(boundaries, list):
+        raise ValueError(f"boundary_tensors must be a list, got {boundaries!r}")
+    records = []
+    seen = set()
+    for item in boundaries:
+        if not isinstance(item, dict):
+            raise ValueError(f"boundary tensor must be a dict, got {item!r}")
+        if "name" not in item:
+            continue
+        name = item.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(
+                f"boundary tensor name must be a non-empty string, got {name!r}"
+            )
+        name = name.strip()
+        if name in seen:
+            raise ValueError(f"boundary_tensors contains a duplicate name {name!r}")
+        seen.add(name)
+        producer = item.get("producer_component", item.get("producer"))
+        if not isinstance(producer, str) or not producer.strip():
+            raise ValueError(
+                f"producer_component must be a non-empty string, got {producer!r}"
+            )
+        producer = producer.strip()
+        consumers = item.get("consumer_components", item.get("consumers", []))
+        if consumers is None:
+            consumers = []
+        dtype = None
+        if "dtype" in item and item.get("dtype") is not None:
+            dtype = _canonical_dtype_name(item.get("dtype"))
+        shape = None
+        if "shape" in item and item.get("shape") is not None:
+            shape = _declared_shape(item.get("shape"), f"boundary {name} shape")
+        records.append({
+            "name": name,
+            "producer": producer,
+            "consumers": _name_list(consumers, "consumer_components"),
+            "dtype": dtype,
+            "shape": shape,
+        })
+    return records
+
+
+def _match_component_models(components: list, model_info: dict) -> Dict[str, Any]:
+    """Map a component name to the loaded model when the graph identifies it."""
+    info = model_info.get("components")
+    if info is None:
+        info = {}
+    if not isinstance(info, dict):
+        raise ValueError(f"model_info components must be a dict, got {info!r}")
+    matched: Dict[str, Any] = {}
+    for model in components:
+        graph = _component_graph(model)
+        label = None
+        graph_name = getattr(graph, "name", None)
+        if isinstance(graph_name, str) and graph_name.strip():
+            text = graph_name.strip()
+            if text.endswith("_graph"):
+                candidate = text[: -len("_graph")]
+            else:
+                candidate = text
+            if candidate in info:
+                label = candidate
+        if label is None:
+            output_names, _ = _io_values(model, "output")
+            for name, comp in info.items():
+                if name in matched or not isinstance(comp, dict):
+                    continue
+                if "output_names" not in comp:
+                    continue
+                recorded = _name_list(comp.get("output_names"), f"{name} output_names")
+                if recorded and set(recorded) == set(output_names):
+                    label = name
+                    break
+        if label is None:
+            continue
+        if label in matched:
+            raise ValueError(f"component {label!r} matches more than one loaded model")
+        matched[label] = model
+    return matched
+
+
+def validate_boundary_reconnection(components, model_info) -> Dict[str, Any]:
+    """
+    Verify all boundary tensors reconnect correctly.
+
+    A downstream input must be an output of an earlier component or a
+    graph-level input. A named boundary must use that exact name on the
+    producer output and on each consumer input. Declared dtypes must agree.
+    Shapes must share a rank, and a symbolic axis matches a concrete axis.
+
+    Returns:
+        valid and the list of reconnect errors.
+
+    Raises:
+        ValueError: If components, model_info, a tensor name, or a dtype is unusable.
+    """
+    if isinstance(components, (str, bytes)) or not isinstance(components, list):
+        raise ValueError(f"components must be a list, got {components!r}")
+    if not isinstance(model_info, dict):
+        raise ValueError(f"model_info must be a dict, got {model_info!r}")
+
+    parsed = []
+    for component in components:
+        input_names, input_values = _io_values(component, "input")
+        output_names, output_values = _io_values(component, "output")
+        parsed.append({
+            "model": component,
+            "inputs": input_names,
+            "outputs": output_names,
+            "input_values": input_values,
+            "output_values": output_values,
+        })
+
+    errors: List[str] = []
+    graph_inputs = _explicit_graph_inputs(model_info)
+    boundaries = _boundary_records(model_info)
+    for record in boundaries:
+        if record["producer"] == "external":
+            graph_inputs.add(record["name"])
+    for index, item in enumerate(parsed):
+        for name in item["inputs"]:
+            produced_elsewhere = any(
+                name in other["outputs"]
+                for other_index, other in enumerate(parsed)
+                if other_index != index
+            )
+            if not produced_elsewhere:
+                graph_inputs.add(name)
+
+    # Check that downstream inputs are satisfied by an earlier output
+    # or by graph-level inputs. Outputs already merged stay available,
+    # so a component inserted between a producer and its consumer still
+    # leaves that tensor connected.
+    available = set(graph_inputs)
+    for index, item in enumerate(parsed):
+        upstream_outputs = set(parsed[index - 1]["outputs"]) if index else set()
+        for inp in item["inputs"]:
+            if inp not in upstream_outputs and inp not in available:
+                errors.append(f"Unresolved input: {inp}")
+        available.update(item["outputs"])
+
+    producers_of: Dict[str, Any] = {}
+    for index, item in enumerate(parsed):
+        for name, value in item["output_values"].items():
+            previous = producers_of.get(name)
+            if previous is not None:
+                raise ValueError(
+                    f"tensor {name!r} is produced by more than one component"
+                )
+            producers_of[name] = (index, value)
+
+    matched = _match_component_models(components, model_info)
+    parsed_by_model = {id(item["model"]): item for item in parsed}
+
+    for record in boundaries:
+        name = record["name"]
+        producer = record["producer"]
+        consumers = [
+            consumer for consumer in record["consumers"]
+            if consumer not in ("external", producer)
+        ]
+        if producer == "external":
+            if not any(name in item["inputs"] for item in parsed):
+                errors.append(f"boundary {name} has no matching input")
+        else:
+            producer_item = None
+            if producer in matched:
+                producer_item = parsed_by_model.get(id(matched[producer]))
+            if producer_item is not None:
+                if name not in producer_item["outputs"]:
+                    errors.append(f"boundary {name} is not an output of {producer}")
+            elif name not in producers_of:
+                errors.append(f"boundary {name} has no matching output")
+            if consumers:
+                for consumer in consumers:
+                    if consumer in matched:
+                        consumer_item = parsed_by_model.get(id(matched[consumer]))
+                        present = consumer_item is not None and name in consumer_item["inputs"]
+                    else:
+                        present = any(name in item["inputs"] for item in parsed)
+                    if not present:
+                        errors.append(f"boundary {name} is not an input of {consumer}")
+            elif "external" not in record["consumers"]:
+                producer_index = None
+                if producer_item is not None:
+                    producer_index = next(
+                        item_index
+                        for item_index, item in enumerate(parsed)
+                        if item is producer_item
+                    )
+                elif name in producers_of:
+                    producer_index = producers_of[name][0]
+                if producer_index is None:
+                    if not any(name in item["inputs"] for item in parsed):
+                        errors.append(f"boundary {name} has no matching input")
+                elif producer_index < len(parsed) - 1:
+                    later = parsed[producer_index + 1:]
+                    if not any(name in item["inputs"] for item in later):
+                        errors.append(f"boundary {name} has no matching input")
+
+        declared_dtype = record["dtype"]
+        declared_shape = record["shape"]
+        compared = []
+        if name in producers_of and producer != "external":
+            compared.append(producers_of[name][1])
+        for item in parsed:
+            if name in item["input_values"]:
+                compared.append(item["input_values"][name])
+        for value in compared:
+            dtype = _value_dtype(value)
+            shape = _value_shape(value)
+            if declared_dtype and dtype and dtype != declared_dtype:
+                errors.append(
+                    f"boundary {name} dtype {dtype} does not match {declared_dtype}"
+                )
+            if (
+                declared_shape is not None
+                and shape is not None
+                and not _shapes_compatible(shape, declared_shape)
+            ):
+                errors.append(
+                    f"boundary {name} shape {list(shape)} does not match {list(declared_shape)}"
+                )
+
+    for name, (producer_index, producer_value) in producers_of.items():
+        producer_dtype = _value_dtype(producer_value)
+        producer_shape = _value_shape(producer_value)
+        for item in parsed[producer_index + 1:]:
+            if name not in item["input_values"]:
+                continue
+            consumer_value = item["input_values"][name]
+            consumer_dtype = _value_dtype(consumer_value)
+            consumer_shape = _value_shape(consumer_value)
+            if producer_dtype and consumer_dtype and producer_dtype != consumer_dtype:
+                errors.append(
+                    f"boundary {name} dtype {producer_dtype} does not match {consumer_dtype}"
+                )
+            if (
+                producer_shape is not None
+                and consumer_shape is not None
+                and not _shapes_compatible(producer_shape, consumer_shape)
+            ):
+                errors.append(
+                    f"boundary {name} shape {list(producer_shape)} does not match {list(consumer_shape)}"
+                )
+
+    unique: List[str] = []
+    for error in errors:
+        if error not in unique:
+            unique.append(error)
+    return {"valid": len(unique) == 0, "errors": unique}
+
+
 def _plan_from_value(execution_plan) -> ExecutionPlan:
     """Copy an ExecutionPlan, or build one from a dict. Other types raise."""
     if isinstance(execution_plan, ExecutionPlan):
@@ -354,6 +771,9 @@ def merge_onnx(
         execution_plan: Optional plan whose step list is the merge order.
             When omitted, components merge as embedding, layers, norm,
             and lm_head. other is inserted where its inputs are produced.
+            Loaded components are checked with validate_boundary_reconnection
+            before the graph is built. A renamed boundary, a dtype mismatch,
+            or a shape mismatch raises.
 
     Returns:
         Merged ONNX ModelProto.
@@ -389,6 +809,7 @@ def merge_onnx(
 
     seen_initializers = set()
     seen_inputs = set()
+    loaded_models = []
 
     for comp_name in component_order:
         if comp_name not in components:
@@ -416,6 +837,7 @@ def merge_onnx(
 
         # Load component
         comp_model = onnx.load(filepath, load_external_data=True)
+        loaded_models.append(comp_model)
 
         if opset_imports is None:
             opset_imports = list(comp_model.opset_import)
@@ -444,6 +866,11 @@ def merge_onnx(
             lm_head_outputs = list(comp_model.graph.output)
 
         print(f"  Loaded {filename}: {len(comp_model.graph.node)} nodes")
+
+    reconnection = validate_boundary_reconnection(loaded_models, model_info)
+    if not reconnection["valid"]:
+        detail = "; ".join(reconnection["errors"])
+        raise ValueError(f"boundary reconnection failed: {detail}")
 
     # Use lm_head outputs as final outputs if available (proper transformer output)
     final_outputs = all_outputs if planned else (lm_head_outputs if lm_head_outputs else all_outputs)
