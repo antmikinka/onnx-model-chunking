@@ -194,10 +194,20 @@ class SequentialModelPipeline:
                 kv_note += f", kv layout {kv_layout}"
             if getattr(self.config, "use_sliding_window", False) is True:
                 kv_note += ", sliding kv"
+            hint_note = ""
+            hints = getattr(self.config, "execution_hints", None)
+            if isinstance(hints, dict):
+                plan = hints.get("recommended_execution")
+                prefill = hints.get("recommended_prefill_device")
+                decode = hints.get("recommended_decode_device")
+                if isinstance(plan, str) and isinstance(prefill, str) and isinstance(decode, str):
+                    hint_note = f", plan {plan} prefill {prefill} decode {decode}"
+                if hints.get("sequential_split_safe") is False:
+                    hint_note += ", sequential split unsafe"
             self._log(
                 f"  [Config] {self.config.num_layers} layers, {self.config.num_kv_heads} KV heads, "
                 f"{self.config.head_dim} head dim, max_seq_len {self.config.max_seq_len}"
-                f"{quant_note}{arch_note}{kv_note}"
+                f"{quant_note}{arch_note}{kv_note}{hint_note}"
             )
         except FileNotFoundError:
             self._log("  [Warning] No config found, using defaults (may be incorrect)")

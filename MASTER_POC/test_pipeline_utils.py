@@ -2003,6 +2003,56 @@ def test_config_loader():
     assert d["kv_cache_dtype"] is None
     assert d["kv_cache_layout"] == "BNSD"
     assert d["kv_cache_max_len"] is None
+    assert config.execution_hints["npu_safe"] is True
+    assert config.execution_hints["recommended_npu_mode"] == "monolithic"
+    assert config.execution_hints["recommended_prefill_device"] == "npu"
+    assert config.execution_hints["recommended_decode_device"] == "igpu"
+    assert config.execution_hints["recommended_execution"] == "hybrid"
+    assert config.execution_hints["sequential_split_safe"] is False
+    assert config.execution_hints["supports_static_kv_cache"] is False
+    assert d["execution_hints"] == config.execution_hints
+    assert d["execution_hints"] is not config.execution_hints
+    wide = ModelConfig(num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096)
+    assert wide.execution_hints["supports_static_kv_cache"] is True
+    assert wide.execution_hints["recommended_decode_device"] == "igpu"
+    cpu_only = ModelConfig(num_layers=1, num_kv_heads=1, head_dim=8, dtype=np.dtype(np.float32))
+    assert cpu_only.execution_hints["npu_safe"] is False
+    assert cpu_only.execution_hints["recommended_prefill_device"] == "igpu"
+    assert cpu_only.execution_hints["recommended_execution"] == "monolithic"
+    assert cpu_only.execution_hints["sequential_split_safe"] is True
+    assert cpu_only.execution_hints["recommended_npu_mode"] == "monolithic"
+    int4 = ModelConfig(num_layers=1, num_kv_heads=1, head_dim=8, weight_dtype="int4")
+    assert int4.execution_hints["npu_safe"] is True
+    fp32_weights = ModelConfig(num_layers=1, num_kv_heads=1, head_dim=8, weight_dtype="float32")
+    assert fp32_weights.execution_hints["npu_safe"] is False
+    sliding = ModelConfig(num_layers=1, num_kv_heads=1, head_dim=8, use_sliding_window=True)
+    assert sliding.execution_hints["supports_static_kv_cache"] is True
+    pinned = ModelConfig(
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=8,
+        execution_hints={"recommended_decode_device": "CPU"},
+    )
+    assert pinned.execution_hints["recommended_decode_device"] == "cpu"
+    assert pinned.execution_hints["recommended_prefill_device"] == "npu"
+    assert pinned.execution_hints["npu_safe"] is True
+    try:
+        ModelConfig(num_layers=1, num_kv_heads=1, head_dim=8, execution_hints={"turbo": True})
+        raise AssertionError("an unknown execution hint must be rejected")
+    except ValueError as exc:
+        assert "turbo" in str(exc)
+    try:
+        ModelConfig(num_layers=1, num_kv_heads=1, head_dim=8, execution_hints="no")
+        raise AssertionError("a non-dict execution hint must be rejected")
+    except ValueError as exc:
+        assert "execution_hints" in str(exc)
+    broken = ModelConfig(num_layers=1, num_kv_heads=1, head_dim=8)
+    broken.execution_hints = {}
+    try:
+        broken.validate()
+        raise AssertionError("an empty execution hint dict must be rejected")
+    except ValueError as exc:
+        assert "execution_hints" in str(exc)
     try:
         ModelConfig(num_layers=1, num_kv_heads=1, head_dim=8, kv_cache_max_len=0).validate()
         raise AssertionError("a zero kv cache length must be rejected")
@@ -3261,6 +3311,75 @@ def test_config_loader():
         assert skipped["source_files"] == []
         assert any("tokenizer_config.json" in str(item.message) for item in caught)
 
+    with tempfile.TemporaryDirectory() as directory:
+        payload = dict(hf_base)
+        payload["max_position_embeddings"] = 2048
+        payload["execution_hints"] = {"recommended_decode_device": "i-gpu"}
+        _write_json(directory, "config.json", payload)
+        hinted = load_model_config(directory)
+        assert hinted.execution_hints["npu_safe"] is True
+        assert hinted.execution_hints["recommended_npu_mode"] == "monolithic"
+        assert hinted.execution_hints["recommended_prefill_device"] == "npu"
+        assert hinted.execution_hints["recommended_decode_device"] == "igpu"
+        assert hinted.execution_hints["recommended_execution"] == "hybrid"
+        assert hinted.execution_hints["sequential_split_safe"] is False
+        assert hinted.execution_hints["supports_static_kv_cache"] is True
+        assert hinted.max_seq_len == 2048
+    with tempfile.TemporaryDirectory() as directory:
+        payload = dict(hf_base)
+        payload["torch_dtype"] = "float32"
+        _write_json(directory, "config.json", payload)
+        wide_compute = load_model_config(directory)
+        assert wide_compute.execution_hints["npu_safe"] is False
+        assert wide_compute.execution_hints["recommended_prefill_device"] == "igpu"
+        assert wide_compute.execution_hints["recommended_execution"] == "monolithic"
+        assert wide_compute.execution_hints["sequential_split_safe"] is True
+    with tempfile.TemporaryDirectory() as directory:
+        _write_json(directory, "genai_config.json", {
+            "model": {
+                "type": "llama",
+                "vocab_size": 10,
+                "decoder": {
+                    "num_hidden_layers": 2,
+                    "num_key_value_heads": 2,
+                    "head_size": 64,
+                    "hidden_size": 256,
+                    "num_attention_heads": 4,
+                    "num_local_experts": 8,
+                    "num_experts_per_tok": 2,
+                    "kv_cache_max_len": 128,
+                },
+            },
+        })
+        genai_hints = load_model_config(directory)
+        assert genai_hints.is_moe is True
+        assert genai_hints.execution_hints["npu_safe"] is True
+        assert genai_hints.execution_hints["recommended_npu_mode"] == "monolithic"
+        assert genai_hints.execution_hints["recommended_execution"] == "hybrid"
+        assert genai_hints.execution_hints["sequential_split_safe"] is False
+        assert genai_hints.execution_hints["supports_static_kv_cache"] is True
+        assert genai_hints.execution_hints["recommended_decode_device"] == "igpu"
+    with tempfile.TemporaryDirectory() as directory:
+        _write_json(directory, "model_info.json", {
+            "num_layers": 2,
+            "num_kv_heads": 2,
+            "head_dim": 64,
+            "amd_execution_hints": {"recommended_prefill_device": "cpu"},
+        })
+        info_hints = load_model_config(directory, require_all_fields=True)
+        assert info_hints.execution_hints["recommended_prefill_device"] == "cpu"
+        assert info_hints.execution_hints["recommended_decode_device"] == "igpu"
+        assert info_hints.execution_hints["supports_static_kv_cache"] is False
+    with tempfile.TemporaryDirectory() as directory:
+        payload = dict(hf_base)
+        payload["execution_hints"] = []
+        _write_json(directory, "config.json", payload)
+        try:
+            load_model_config(directory)
+            raise AssertionError("a list of execution hints must be rejected")
+        except ValueError as exc:
+            assert "execution_hints" in str(exc)
+
     print("  kv shape: refuse silent 8/128, infer 4 x 96 from ONNX")
     print("  require_all_fields: non-positive KV shape raises")
     print("  max_seq_len: max_position_embeddings, sequence aliases, unset stays 0")
@@ -3269,6 +3388,7 @@ def test_config_loader():
     print("  architecture: moe experts, hybrid attention, dense stays empty")
     print("  kv cache: dtype, BNSD layout, max len, page size, sliding window")
     print("  generation metadata: eos, bos, pad, chat template")
+    print("  execution hints: monolithic NPU, iGPU decode, sequential split unsafe")
     print("  onnx graph: layers, KV axes, dtype, present outputs, external data")
     print("config_loader module: OK\n")
     return True

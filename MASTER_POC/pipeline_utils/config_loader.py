@@ -68,9 +68,25 @@ class ModelConfig:
     use_sliding_window: bool = False
     dtype: np.dtype = field(default_factory=lambda: np.dtype(np.float16))
     model_type: str = "unknown"
+    # AMD placement advice. Empty until __post_init__ fills it from the
+    # architecture. A caller-supplied dict overrides individual keys.
+    execution_hints: Dict[str, Any] = field(default_factory=dict)
     
     # Source info
     source_file: str = ""
+
+    def __post_init__(self) -> None:
+        overrides = self.execution_hints
+        if overrides is None:
+            overrides = {}
+        if not isinstance(overrides, dict):
+            raise ValueError(
+                f"execution_hints must be a dict, got {overrides!r}"
+            )
+        inferred = _infer_execution_hints(self)
+        if overrides:
+            inferred.update(_normalize_hint_overrides(overrides))
+        self.execution_hints = inferred
     
     def validate(self) -> None:
         """
@@ -152,6 +168,16 @@ class ModelConfig:
             raise ValueError(
                 f"use_sliding_window must be a boolean, got {self.use_sliding_window!r}"
             )
+        if not isinstance(self.execution_hints, dict):
+            raise ValueError(
+                f"execution_hints must be a dict, got {self.execution_hints!r}"
+            )
+        for key in _EXECUTION_HINT_KEYS:
+            if key not in self.execution_hints:
+                raise ValueError(f"execution_hints is missing {key}")
+        _normalize_hint_overrides({
+            key: self.execution_hints[key] for key in _EXECUTION_HINT_KEYS
+        })
         if self.head_dim % 8 != 0:
             warnings.warn(f"head_dim {self.head_dim} is not divisible by 8, may be non-standard")
     
@@ -182,10 +208,167 @@ class ModelConfig:
             "kv_cache_max_len": self.kv_cache_max_len,
             "kv_cache_page_size": self.kv_cache_page_size,
             "use_sliding_window": self.use_sliding_window,
+            "execution_hints": dict(self.execution_hints),
             "dtype": str(self.dtype),
             "model_type": self.model_type,
             "source_file": self.source_file,
         }
+
+
+_EXECUTION_HINT_KEYS = (
+    "npu_safe",
+    "recommended_npu_mode",
+    "recommended_prefill_device",
+    "recommended_decode_device",
+    "recommended_execution",
+    "sequential_split_safe",
+    "supports_static_kv_cache",
+)
+_HINT_BOOL_KEYS = (
+    "npu_safe",
+    "sequential_split_safe",
+    "supports_static_kv_cache",
+)
+_HINT_CHOICES = {
+    "recommended_npu_mode": ("monolithic", "hybrid", "split"),
+    "recommended_prefill_device": ("npu", "igpu", "gpu", "cpu"),
+    "recommended_decode_device": ("npu", "igpu", "gpu", "cpu"),
+    "recommended_execution": ("monolithic", "hybrid", "split"),
+}
+_NPU_COMPUTE_DTYPES = {"float16", "int8", "uint8"}
+_NPU_WEIGHT_DTYPES = {"int4", "uint4", "int8", "uint8", "float16", "fp8", "fp4", "float8"}
+_HINT_BLOCK_KEYS = ("execution_hints", "amd_execution_hints")
+
+
+def _dtype_token(value: Any) -> Optional[str]:
+    """Return a short dtype name. bfloat16 is checked before float16."""
+    if value is None or isinstance(value, (dict, list, tuple, bool)):
+        return None
+    text = str(value).strip().lower().replace(" ", "")
+    if not text:
+        return None
+    if "bfloat16" in text or text == "bf16":
+        return "bfloat16"
+    if "float16" in text or text in {"fp16", "half"}:
+        return "float16"
+    if "float64" in text or text in {"fp64", "double"}:
+        return "float64"
+    if "float32" in text or text in {"fp32", "float"}:
+        return "float32"
+    if "uint8" in text:
+        return "uint8"
+    if "int8" in text:
+        return "int8"
+    if text in {"int4", "uint4", "fp8", "fp4", "float8"}:
+        return text
+    return text
+
+
+def _positive_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _npu_safe_dtype(config: "ModelConfig") -> bool:
+    """True when compute and named weight types fit the Ryzen AI NPU set."""
+    compute = _dtype_token(config.dtype) or "float16"
+    weight = _dtype_token(config.weight_dtype)
+    activation = _dtype_token(config.activation_dtype)
+    if weight is not None and weight not in _NPU_WEIGHT_DTYPES and weight not in _NPU_COMPUTE_DTYPES:
+        return False
+    if activation is not None and activation not in _NPU_COMPUTE_DTYPES:
+        return False
+    return compute in _NPU_COMPUTE_DTYPES
+
+
+def _supports_static_kv(config: "ModelConfig") -> bool:
+    """True when a context length or a sliding window can preallocate KV."""
+    if _positive_int(config.kv_cache_max_len) or _positive_int(config.max_seq_len):
+        return True
+    if config.use_sliding_window is True:
+        return True
+    extras = config.architecture_extras if isinstance(config.architecture_extras, dict) else {}
+    return _positive_int(extras.get("sliding_window"))
+
+
+def _infer_execution_hints(config: "ModelConfig") -> Dict[str, Any]:
+    """
+    Recommend an AMD placement.
+
+    The NPU graph stays monolithic. Sequential layer splits on the NPU are
+    not safe. Prefill uses the NPU when the dtypes fit, and decode stays on
+    the iGPU. A dtype the NPU cannot consume stays one iGPU graph, where a
+    CPU sequential split is allowed.
+    """
+    npu_safe = _npu_safe_dtype(config)
+    if npu_safe:
+        prefill = "npu"
+        execution = "hybrid"
+        sequential_ok = False
+    else:
+        prefill = "igpu"
+        execution = "monolithic"
+        sequential_ok = True
+    return {
+        "npu_safe": npu_safe,
+        "recommended_npu_mode": "monolithic",
+        "recommended_prefill_device": prefill,
+        "recommended_decode_device": "igpu",
+        "recommended_execution": execution,
+        "sequential_split_safe": sequential_ok,
+        "supports_static_kv_cache": _supports_static_kv(config),
+    }
+
+
+def _normalize_hint_overrides(overrides: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate caller or file keys. Known names are canonicalized."""
+    if not isinstance(overrides, dict):
+        raise ValueError(f"execution_hints must be a dict, got {overrides!r}")
+    normalized: Dict[str, Any] = {}
+    for key, value in overrides.items():
+        if key not in _EXECUTION_HINT_KEYS:
+            raise ValueError(f"execution_hints key {key!r} is not recognized")
+        if key in _HINT_BOOL_KEYS:
+            if not isinstance(value, bool):
+                raise ValueError(f"execution_hints {key} must be a boolean, got {value!r}")
+            normalized[key] = value
+            continue
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"execution_hints {key} must be a string, got {value!r}")
+        token = value.strip().lower().replace("-", "").replace("_", "").replace(" ", "")
+        if token in {"igpu", "i gpu"} or token == "igpu":
+            token = "igpu"
+        if token in {"sequential", "layersplit"}:
+            token = "split"
+        allowed = _HINT_CHOICES[key]
+        # Device names lose underscores already. "igpu" stays "igpu".
+        if token not in allowed:
+            # Restore the underscore form used by the choice list.
+            spaced = value.strip().lower().replace("-", "_").replace(" ", "_")
+            if spaced in allowed:
+                token = spaced
+            else:
+                raise ValueError(
+                    f"execution_hints {key} must be one of {', '.join(allowed)}, got {value!r}"
+                )
+        normalized[key] = token
+    return normalized
+
+
+def _execution_hint_overrides(*sources: Any) -> Dict[str, Any]:
+    """Return explicit hint keys from the first source that names them."""
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for key in _HINT_BLOCK_KEYS:
+            if key not in source:
+                continue
+            block = source[key]
+            if block is None:
+                continue
+            if not isinstance(block, dict):
+                raise ValueError(f"{key} must be an object, got {block!r}")
+            return _normalize_hint_overrides(block)
+    return {}
 
 
 def _load_json_safe(path: str) -> Optional[Dict[str, Any]]:
@@ -225,6 +408,7 @@ def _parse_genai_config(config: Dict[str, Any], source: str) -> Optional[ModelCo
                 **_architecture_from(decoder, model, config),
                 **_kv_cache_from(decoder, model, config),
                 dtype=get_dtype_from_config(config),
+                execution_hints=_execution_hint_overrides(decoder, model, config),
                 source_file=source,
             )
     except (KeyError, TypeError):
@@ -269,6 +453,7 @@ def _parse_hf_config(config: Dict[str, Any], source: str) -> Optional[ModelConfi
                 **_architecture_from(config),
                 **_kv_cache_from(config),
                 dtype=get_dtype_from_config(config),
+                execution_hints=_execution_hint_overrides(config),
                 source_file=source,
             )
     except (KeyError, TypeError):
@@ -1216,6 +1401,7 @@ def _parse_model_info(
         **_architecture_from(*sources),
         **_kv_cache_from(*sources),
         dtype=get_dtype_from_config(config),
+        execution_hints=_execution_hint_overrides(*sources),
         model_type=str(config.get("strategy", config.get("model_type", "unknown"))),
         source_file=source,
     )
@@ -1253,6 +1439,11 @@ def load_model_config(
     KV cache metadata stays at ``kv_cache_dtype`` none, layout ``BNSD``, and
     no max length until the file names them. ``kv_cache_max_len`` is the
     capacity passed to the KV cache. It is separate from ``max_seq_len``.
+    ``execution_hints`` recommends an AMD placement. The NPU mode stays
+    monolithic. Prefill uses the NPU when the dtype fits, decode stays on
+    the iGPU, and a sequential NPU layer split is marked unsafe. A positive
+    context length or a sliding window sets ``supports_static_kv_cache``.
+    A file may override individual keys with ``execution_hints``.
     
     Args:
         model_dir: Directory containing model/config files
