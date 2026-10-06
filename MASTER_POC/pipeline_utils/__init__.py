@@ -43,6 +43,11 @@ from .dtypes import (
     get_dtype_info,
     supports_bfloat16,
     get_bfloat16_dtype,
+    PROVIDER_DTYPE_POLICY,
+    get_dtype_preferences,
+    resolve_preferred_dtype,
+    get_recommended_dtype,
+    get_recommended_quantized_dtype,
 )
 
 from .kv_cache import (
@@ -187,6 +192,11 @@ __all__ = [
     "get_dtype_info",
     "supports_bfloat16",
     "get_bfloat16_dtype",
+    "PROVIDER_DTYPE_POLICY",
+    "get_dtype_preferences",
+    "resolve_preferred_dtype",
+    "get_recommended_dtype",
+    "get_recommended_quantized_dtype",
     # kv_cache exports
     "KVCacheManager",
     "KVCacheBackend",

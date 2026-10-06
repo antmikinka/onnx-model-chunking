@@ -30,6 +30,11 @@ def test_dtypes():
         unpack_quantized,
         pack_weights,
         unpack_weights,
+        get_recommended_dtype,
+        get_dtype_preferences,
+        get_recommended_quantized_dtype,
+        resolve_preferred_dtype,
+        PROVIDER_DTYPE_POLICY,
         supports_bfloat16,
         get_bfloat16_dtype,
         get_dtype_info
@@ -233,6 +238,55 @@ def test_dtypes():
     except ValueError as exc:
         assert "whole bytes" in str(exc)
     print("  quantized dtype: INT4 block, MatMulNBits, AWQ, GPTQ")
+
+    assert get_recommended_dtype("CPUExecutionProvider", "weight") == np.int8
+    assert get_recommended_dtype("CPUExecutionProvider", "activation") == np.float32
+    assert get_recommended_dtype("CPUExecutionProvider", "kv") == np.float16
+    assert get_recommended_dtype("cpu") == np.float32
+    assert get_recommended_dtype("ROCmExecutionProvider", "weight") == np.float16
+    assert get_recommended_dtype("hip", "activation") == np.float16
+    assert get_recommended_dtype("igpu", "kv") == np.float16
+    assert get_dtype_preferences("ROCmExecutionProvider", "weight") == ("fp16", "bf16", "int8")
+    assert get_dtype_preferences("ROCmExecutionProvider", "kv") == ("fp16", "fp8", "int8")
+    assert get_recommended_dtype("VitisAIExecutionProvider", "weight") == np.int8
+    assert get_recommended_dtype("VitisAIExecutionProvider", "activation") == np.int8
+    assert get_recommended_dtype("VitisAIExecutionProvider", "kv") == np.float16
+    assert get_recommended_quantized_dtype("VitisAIExecutionProvider", "weight") is INT4_BLOCKWISE
+    assert get_recommended_quantized_dtype("npu", "kv") is None
+    assert get_dtype_preferences("RyzenAIExecutionProvider", "weight") == ("int4", "int8")
+    assert get_recommended_dtype("ryzenai", "weight") == np.int8
+    assert get_recommended_dtype("DmlExecutionProvider", "weight") == np.float16
+    assert get_recommended_dtype("directml", "activation") == np.float16
+    assert get_recommended_dtype("dml", "kv") == np.float16
+    assert get_dtype_preferences("DmlExecutionProvider", "kv") == ("fp16",)
+    assert get_recommended_quantized_dtype("CPUExecutionProvider", "weight") is None
+    assert set(PROVIDER_DTYPE_POLICY) == {
+        "CPUExecutionProvider",
+        "ROCmExecutionProvider",
+        "VitisAIExecutionProvider",
+        "DmlExecutionProvider",
+    }
+    with warnings.catch_warnings(record=True) as policy_warnings:
+        warnings.simplefilter("always")
+        fallen_back = resolve_preferred_dtype(("bf16", "fp32"))
+    if supports_bfloat16():
+        assert fallen_back == np.dtype(get_bfloat16_dtype())
+    else:
+        assert fallen_back == np.float32
+        assert any("bf16" in str(item.message) for item in policy_warnings)
+    assert pipeline_utils.get_recommended_dtype is get_recommended_dtype
+    assert pipeline_utils.PROVIDER_DTYPE_POLICY is PROVIDER_DTYPE_POLICY
+    try:
+        get_recommended_dtype("CUDAExecutionProvider", "weight")
+        raise AssertionError("CUDA has no dtype policy row")
+    except ValueError as exc:
+        assert "CUDAExecutionProvider" in str(exc)
+    try:
+        get_recommended_dtype("CPUExecutionProvider", "logits")
+        raise AssertionError("logits is not a tensor role")
+    except ValueError as exc:
+        assert "logits" in str(exc)
+    print("  provider dtype policy: CPU, ROCm, VitisAI, DirectML")
     
     print("dtypes module: OK\n")
     return True

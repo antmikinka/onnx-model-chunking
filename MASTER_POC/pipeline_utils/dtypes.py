@@ -11,7 +11,7 @@ Usage:
 
 import warnings
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Dict, Optional, Sequence, Tuple, Union
 import numpy as np
 
 # =============================================================================
@@ -815,6 +815,177 @@ def get_dtype_info(dtype: np.dtype) -> dict:
 
 
 # =============================================================================
+# PROVIDER DTYPE POLICY
+# =============================================================================
+
+# Ordered logical dtypes for AMD hybrid execution. The first name is the
+# preferred choice. Later names are the fallbacks for that tensor role.
+# "int4" materializes as the packed int8 container described by INT4_BLOCKWISE.
+PROVIDER_DTYPE_POLICY: Dict[str, Dict[str, Tuple[str, ...]]] = {
+    "CPUExecutionProvider": {
+        "weight": ("int8", "fp32"),
+        "activation": ("fp32", "int8"),
+        "kv": ("fp16", "int8"),
+    },
+    "ROCmExecutionProvider": {
+        "weight": ("fp16", "bf16", "int8"),
+        "activation": ("fp16", "bf16"),
+        "kv": ("fp16", "fp8", "int8"),
+    },
+    "VitisAIExecutionProvider": {
+        "weight": ("int4", "int8"),
+        "activation": ("int8", "fp16"),
+        "kv": ("fp16", "int8"),
+    },
+    "DmlExecutionProvider": {
+        "weight": ("fp16", "fp32"),
+        "activation": ("fp16", "fp32"),
+        "kv": ("fp16",),
+    },
+}
+
+_PROVIDER_ALIASES = {
+    "cpu": "CPUExecutionProvider",
+    "cpuexecutionprovider": "CPUExecutionProvider",
+    "rocm": "ROCmExecutionProvider",
+    "rocmexecutionprovider": "ROCmExecutionProvider",
+    "hip": "ROCmExecutionProvider",
+    "igpu": "ROCmExecutionProvider",
+    "vitisai": "VitisAIExecutionProvider",
+    "vitisaiexecutionprovider": "VitisAIExecutionProvider",
+    "npu": "VitisAIExecutionProvider",
+    "ryzenai": "VitisAIExecutionProvider",
+    "ryzenaiexecutionprovider": "VitisAIExecutionProvider",
+    "dml": "DmlExecutionProvider",
+    "directml": "DmlExecutionProvider",
+    "dmlexecutionprovider": "DmlExecutionProvider",
+}
+
+_ROLE_ALIASES = {
+    "weight": "weight",
+    "weights": "weight",
+    "activation": "activation",
+    "activations": "activation",
+    "kv": "kv",
+    "kvcache": "kv",
+    "kv_cache": "kv",
+    "cache": "kv",
+}
+
+
+def _canonical_provider(provider: str) -> str:
+    key = str(provider).strip().lower().replace("-", "").replace("_", "").replace(" ", "")
+    if key not in _PROVIDER_ALIASES:
+        known = ", ".join(PROVIDER_DTYPE_POLICY)
+        raise ValueError(f"Unrecognized provider for dtype policy: {provider}. Known providers: {known}")
+    return _PROVIDER_ALIASES[key]
+
+
+def _canonical_role(tensor_role: str) -> str:
+    key = str(tensor_role).strip().lower().replace("-", "").replace("_", "").replace(" ", "")
+    if key not in _ROLE_ALIASES:
+        raise ValueError(
+            f"Unrecognized tensor role: {tensor_role}. Known roles: weight, activation, kv"
+        )
+    return _ROLE_ALIASES[key]
+
+
+def _fp8_dtype():
+    """OCP FP8 dtype from ml_dtypes, or None when that package is absent."""
+    try:
+        import ml_dtypes
+    except ImportError:
+        return None
+    for name in ("float8_e4m3fn", "float8_e5m2"):
+        candidate = getattr(ml_dtypes, name, None)
+        if candidate is not None:
+            return candidate
+    return None
+
+
+def _dtype_for_logical(logical: str):
+    """Numpy dtype for a policy name. None when this process cannot construct it."""
+    key = str(logical).strip().lower()
+    if key == "int4":
+        return np.dtype(np.int8)
+    if key == "int8":
+        return np.dtype(np.int8)
+    if key == "fp16":
+        return np.dtype(np.float16)
+    if key == "fp32":
+        return np.dtype(np.float32)
+    if key in ("bf16", "bfloat16"):
+        bf16 = get_bfloat16_dtype()
+        return None if bf16 is None else np.dtype(bf16)
+    if key in ("fp8", "float8"):
+        fp8 = _fp8_dtype()
+        return None if fp8 is None else np.dtype(fp8)
+    raise ValueError(f"Unrecognized logical dtype: {logical}")
+
+
+def get_dtype_preferences(provider: str, tensor_role: str = "activation") -> Tuple[str, ...]:
+    """Ordered logical dtypes for a provider and tensor role."""
+    canonical = _canonical_provider(provider)
+    role = _canonical_role(tensor_role)
+    return PROVIDER_DTYPE_POLICY[canonical][role]
+
+
+def resolve_preferred_dtype(preferences: Sequence[str]) -> np.dtype:
+    """Return the first listed dtype this process can construct.
+
+    A missing bfloat16 or float8 dtype is skipped. The next listed dtype
+    is used, and one warning names the dtype that was skipped.
+    """
+    if not preferences:
+        raise ValueError("dtype preferences must not be empty")
+    skipped = []
+    for logical in preferences:
+        dtype = _dtype_for_logical(logical)
+        if dtype is None:
+            skipped.append(str(logical))
+            continue
+        if skipped:
+            warnings.warn(
+                f"Preferred dtype {skipped[0]} is unavailable. Using {logical}.",
+                UserWarning,
+            )
+        return dtype
+    raise ValueError(
+        "None of the preferred dtypes are available: " + ", ".join(str(name) for name in preferences)
+    )
+
+
+def get_recommended_dtype(
+    provider: str,
+    tensor_role: str = "activation",
+) -> np.dtype:
+    """Preferred numpy dtype for a provider and tensor role.
+
+    VitisAI weights return the packed INT4 container (``np.int8``). The
+    matching ``QuantizedDtype`` is ``INT4_BLOCKWISE``, available from
+    ``get_recommended_quantized_dtype``. KV cache on that NPU is float16.
+    RyzenAI uses the same NPU policy as VitisAI.
+    """
+    return resolve_preferred_dtype(get_dtype_preferences(provider, tensor_role))
+
+
+def get_recommended_quantized_dtype(
+    provider: str,
+    tensor_role: str = "activation",
+) -> Optional[QuantizedDtype]:
+    """Packing record when the preferred dtype is sub-byte, else None."""
+    for logical in get_dtype_preferences(provider, tensor_role):
+        if _dtype_for_logical(logical) is None:
+            continue
+        if logical == "int4":
+            return INT4_BLOCKWISE
+        return None
+    raise ValueError(
+        f"No materialized dtype for {provider} role {tensor_role}"
+    )
+
+
+# =============================================================================
 # CONVENIENCE EXPORTS
 # =============================================================================
 
@@ -828,6 +999,7 @@ __all__ = [
     "GGUF_DTYPE_MAP",
     "AWQ_DTYPE_MAP",
     "QUANTIZED_DTYPE_MAP",
+    "PROVIDER_DTYPE_POLICY",
     # Quantized metadata
     "QuantizedDtype",
     "INT4_BLOCKWISE",
@@ -848,4 +1020,8 @@ __all__ = [
     "get_dtype_info",
     "supports_bfloat16",
     "get_bfloat16_dtype",
+    "get_dtype_preferences",
+    "resolve_preferred_dtype",
+    "get_recommended_dtype",
+    "get_recommended_quantized_dtype",
 ]
