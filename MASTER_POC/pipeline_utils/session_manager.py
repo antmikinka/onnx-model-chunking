@@ -21,9 +21,12 @@ Usage:
 
 import os
 import json
+import re
 import threading
+import warnings
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Any, Tuple
+from enum import Enum
+from typing import Dict, Iterable, List, Optional, Sequence, Any, Tuple, Union
 import onnxruntime as ort
 
 
@@ -45,12 +48,171 @@ SUPPORTED_PROVIDERS = [
     'CPUExecutionProvider',        # Universal fallback
 ]
 
-# Provider categories for documentation
+# Provider categories for documentation.
+# DirectML stays in the NPU category for device selection, but it is also the
+# iGPU side of hybrid dispatch, so the monolithic guard does not treat it as
+# an ahead-of-time NPU.
 PROVIDER_CATEGORIES = {
     'gpu': ['CUDAExecutionProvider', 'ROCmExecutionProvider', 'TensorrtExecutionProvider', 'MIGraphXExecutionProvider'],
     'npu': ['RyzenAIExecutionProvider', 'VitisAIExecutionProvider', 'OpenVINOExecutionProvider', 'CoreMLExecutionProvider', 'DmlExecutionProvider'],
     'cpu': ['CPUExecutionProvider']
 }
+
+# Ahead-of-time accelerators. A layer-by-layer session on these providers
+# recompiles or context-switches between graphs.
+NPU_PROVIDER_MARKERS = (
+    "vitisai",
+    "ryzenai",
+    "openvino",
+    "coreml",
+)
+
+GPU_PROVIDER_MARKERS = (
+    "cuda",
+    "rocm",
+    "tensorrt",
+    "migraphx",
+    "dml",
+    "directml",
+)
+
+_LAYER_COMPONENT = re.compile(r"(^|_)layer_\d+$")
+
+NPU_SEQUENTIAL_SPLIT_ERROR = (
+    "Sequential layer splitting on NPU causes AOT/context-switch penalties. "
+    "Use monolithic, phase-split, or MoE expert-routing mode."
+)
+
+
+class ExecutionPolicy(Enum):
+    """
+    How a model is allowed to be divided across sessions.
+
+    MONOLITHIC_ONLY is the only general NPU policy. The two hybrid values
+    are the specialized exceptions: prefill on the NPU and decode on the
+    iGPU, or MoE expert routing. The split values are for CPU and GPU.
+    """
+
+    MONOLITHIC_ONLY = "monolithic_only"
+    SPLIT_CPU_MEMORY_OPTIMIZED = "split_cpu_memory_optimized"
+    SPLIT_GPU_PERSISTENT = "split_gpu_persistent"
+    HYBRID_NPU_IGPU_PHASE_SPLIT = "hybrid_npu_igpu_phase_split"
+    HYBRID_NPU_MOE_ROUTING = "hybrid_npu_moe_routing"
+
+
+SEQUENTIAL_LAYER_SPLIT_POLICIES = frozenset({
+    ExecutionPolicy.SPLIT_CPU_MEMORY_OPTIMIZED,
+    ExecutionPolicy.SPLIT_GPU_PERSISTENT,
+})
+
+HYBRID_NPU_POLICIES = frozenset({
+    ExecutionPolicy.HYBRID_NPU_IGPU_PHASE_SPLIT,
+    ExecutionPolicy.HYBRID_NPU_MOE_ROUTING,
+})
+
+
+def _provider_name(provider: Any) -> str:
+    """Return the provider name from a string or an (name, options) pair."""
+    if isinstance(provider, (list, tuple)) and provider:
+        provider = provider[0]
+    return str(provider)
+
+
+def provider_is_npu(provider: Any) -> bool:
+    """True for VitisAI, RyzenAI, OpenVINO, and CoreML provider names."""
+    name = _provider_name(provider).lower()
+    return any(marker in name for marker in NPU_PROVIDER_MARKERS)
+
+
+def provider_is_gpu(provider: Any) -> bool:
+    """True for CUDA, ROCm, TensorRT, MIGraphX, and DirectML."""
+    name = _provider_name(provider).lower()
+    return any(marker in name for marker in GPU_PROVIDER_MARKERS)
+
+
+def providers_target_npu(providers: Optional[Iterable[Any]]) -> bool:
+    """True when any configured provider is an ahead-of-time NPU."""
+    return any(provider_is_npu(provider) for provider in (providers or ()))
+
+
+def is_sequential_layer_split(component_names: Optional[Iterable[str]]) -> bool:
+    """
+    True when the model is a layer-by-layer session series.
+
+    Two or more components named ``layer_<index>`` (or ``*_layer_<index>``)
+    are the sequential split MASTER_REFERENCE forbids on an NPU.
+    """
+    names = list(component_names or ())
+    layer_count = sum(1 for name in names if _LAYER_COMPONENT.search(str(name)))
+    return layer_count >= 2
+
+
+def coerce_execution_policy(policy: Union[ExecutionPolicy, str]) -> ExecutionPolicy:
+    """Accept an enum value or its string value."""
+    if isinstance(policy, ExecutionPolicy):
+        return policy
+    try:
+        return ExecutionPolicy(str(policy))
+    except ValueError as exc:
+        allowed = ", ".join(item.value for item in ExecutionPolicy)
+        raise ValueError(
+            f"Unknown execution policy '{policy}'. Expected one of: {allowed}"
+        ) from exc
+
+
+def validate_npu_execution_policy(
+    execution_policy: Union[ExecutionPolicy, str],
+    providers: Optional[Sequence[Any]],
+    component_names: Optional[Iterable[str]] = None,
+) -> ExecutionPolicy:
+    """
+    Reject NPU sessions that would compile one graph per layer.
+
+    Phase-split and MoE routing are allowed. CPU and GPU split policies are
+    allowed. A policy that does not match the selected device warns.
+    """
+    policy = coerce_execution_policy(execution_policy)
+    provider_list = list(providers or ())
+    names = list(component_names or ())
+    targets_npu = providers_target_npu(provider_list)
+    targets_gpu = any(provider_is_gpu(provider) for provider in provider_list)
+    layer_split = is_sequential_layer_split(names)
+    # SPLIT_* is the explicit sequential/persistent layer policy. A layer
+    # series under any other non-hybrid policy is the same shape in practice.
+    sequential_split = policy in SEQUENTIAL_LAYER_SPLIT_POLICIES or (
+        policy not in HYBRID_NPU_POLICIES and layer_split
+    )
+
+    if targets_npu and sequential_split and policy not in HYBRID_NPU_POLICIES:
+        raise RuntimeError(NPU_SEQUENTIAL_SPLIT_ERROR)
+
+    if policy in HYBRID_NPU_POLICIES and not targets_npu:
+        warnings.warn(
+            f"Execution policy '{policy.value}' is an NPU hybrid strategy, "
+            "but the provider list has no VitisAI, RyzenAI, OpenVINO, or "
+            "CoreML provider.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    elif policy == ExecutionPolicy.SPLIT_GPU_PERSISTENT and not targets_gpu:
+        warnings.warn(
+            "Execution policy 'split_gpu_persistent' expects a GPU provider "
+            "(CUDA, ROCm, TensorRT, MIGraphX, or DirectML).",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    elif (
+        policy == ExecutionPolicy.SPLIT_CPU_MEMORY_OPTIMIZED
+        and targets_gpu
+        and not targets_npu
+    ):
+        warnings.warn(
+            "Execution policy 'split_cpu_memory_optimized' unloads each "
+            "layer. A GPU target should use 'split_gpu_persistent'.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    return policy
 
 
 # =============================================================================
@@ -71,6 +233,9 @@ class SessionConfig:
         enable_profiling: Enable ONNX Runtime profiling
         graph_optimization_level: Enum for optimization level
         disable_shape_check: Disable node shape checking for dynamic shapes
+        execution_policy: How this model may be split across sessions.
+            NPU targets reject sequential layer splits. Phase-split and MoE
+            routing are the allowed NPU exceptions.
 
     NPU-Specific Options (for VitisAIExecutionProvider):
         npu_graph_capture: Enable NPU graph capture for faster inference (default: True)
@@ -86,6 +251,7 @@ class SessionConfig:
             - "optimized": Slower compilation, maximum optimization
     """
     providers: List[str] = field(default_factory=lambda: ['CPUExecutionProvider'])
+    execution_policy: ExecutionPolicy = ExecutionPolicy.MONOLITHIC_ONLY
     optimization_level: str = "DISABLE"  # DISABLE, BASIC, EXTENDED, ALL
     inter_op_threads: int = 0  # 0 = auto
     intra_op_threads: int = 0  # 0 = auto
@@ -187,6 +353,27 @@ class SessionConfig:
             self.npu_compilation_mode
         )
 
+    def resolved_execution_policy(self) -> ExecutionPolicy:
+        """Return ``execution_policy`` as an enum, accepting its string value."""
+        self.execution_policy = coerce_execution_policy(self.execution_policy)
+        return self.execution_policy
+
+    def validate_execution_policy(
+        self,
+        component_names: Optional[Iterable[str]] = None,
+    ) -> ExecutionPolicy:
+        """
+        Raise if this config would layer-split an NPU.
+
+        ``component_names`` comes from the discovered model. With no names,
+        an explicit ``SPLIT_*`` policy is still rejected on an NPU provider.
+        """
+        return validate_npu_execution_policy(
+            self.resolved_execution_policy(),
+            self.providers,
+            component_names,
+        )
+
 
 @dataclass
 class SessionInfo:
@@ -247,6 +434,8 @@ class SessionManager:
     - Track memory usage
     - Thread-safe access
     - Provider fallback handling
+    - Reject layer-by-layer loads on VitisAI, RyzenAI, OpenVINO, and CoreML
+      unless the policy is phase-split or MoE expert routing
     """
     
     def __init__(
@@ -280,9 +469,11 @@ class SessionManager:
         self._sessions: Dict[str, ort.InferenceSession] = {}
         self._session_info: Dict[str, SessionInfo] = {}
         self._lock = threading.Lock()
+        self._policy_signature: Optional[Tuple[Any, ...]] = None
         
         # Pre-populate session info (without loading)
         self._discover_sessions()
+        self._enforce_execution_policy()
     
     def _discover_sessions(self) -> None:
         """Discover all available sessions from model_info without loading them."""
@@ -324,6 +515,7 @@ class SessionManager:
             return None
         
         try:
+            self._enforce_execution_policy()
             opts = self.config.create_session_options()
             session = ort.InferenceSession(
                 info.file_path,
@@ -362,6 +554,7 @@ class SessionManager:
             Dict of component name to SessionInfo
         """
         with self._lock:
+            self._enforce_execution_policy()
             loaded_count = 0
             failed_count = 0
             total_size = 0
@@ -397,7 +590,8 @@ class SessionManager:
         with self._lock:
             if name in self._sessions:
                 return self._sessions[name]
-            
+
+            self._enforce_execution_policy()
             # Lazy load if not found
             session = self._load_single_session(name)
             if session:
@@ -497,6 +691,25 @@ class SessionManager:
         
         return ordered
     
+    def _enforce_execution_policy(self) -> None:
+        """
+        Reject an NPU layer-by-layer load.
+
+        The same provider list and component set is checked once. A later
+        change to ``config.providers`` or ``config.execution_policy`` is
+        checked again on the next load.
+        """
+        policy = self.config.resolved_execution_policy()
+        signature = (
+            policy,
+            tuple(_provider_name(provider) for provider in self.config.providers),
+            tuple(sorted(self._session_info)),
+        )
+        if signature == self._policy_signature:
+            return
+        self.config.validate_execution_policy(self._session_info.keys())
+        self._policy_signature = signature
+
     def __len__(self) -> int:
         """Number of available sessions (loaded or not)."""
         return len(self._session_info)
@@ -567,12 +780,19 @@ def get_provider_for_device(device_type: str = "auto") -> List[str]:
 __all__ = [
     # Classes
     "SessionManager",
-    "SessionConfig", 
+    "SessionConfig",
     "SessionInfo",
+    "ExecutionPolicy",
     # Functions
     "get_available_providers",
     "get_provider_for_device",
+    "provider_is_npu",
+    "providers_target_npu",
+    "is_sequential_layer_split",
+    "validate_npu_execution_policy",
     # Constants
     "SUPPORTED_PROVIDERS",
     "PROVIDER_CATEGORIES",
+    "NPU_SEQUENTIAL_SPLIT_ERROR",
+    "NPU_PROVIDER_MARKERS",
 ]

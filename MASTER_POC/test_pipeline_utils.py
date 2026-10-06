@@ -161,10 +161,15 @@ def test_session_manager():
         SessionManager,
         SessionConfig,
         SessionInfo,
+        ExecutionPolicy,
         get_available_providers,
         get_provider_for_device,
+        provider_is_npu,
+        validate_npu_execution_policy,
+        NPU_SEQUENTIAL_SPLIT_ERROR,
         SUPPORTED_PROVIDERS,
     )
+    import warnings
     
     # Test available providers
     providers = get_available_providers()
@@ -199,7 +204,106 @@ def test_session_manager():
     
     # Test SUPPORTED_PROVIDERS constant
     print(f"  Supported provider count: {len(SUPPORTED_PROVIDERS)}")
-    
+
+    assert provider_is_npu("VitisAIExecutionProvider")
+    assert provider_is_npu("RyzenAIExecutionProvider")
+    assert not provider_is_npu("DmlExecutionProvider")
+    assert not provider_is_npu("CPUExecutionProvider")
+    split_layers = ["embedding", "layer_0", "layer_1", "lm_head"]
+    monolithic = ["model"]
+
+    def _expect_npu_split_rejected(providers, policy, components):
+        try:
+            validate_npu_execution_policy(policy, providers, components)
+        except RuntimeError as exc:
+            assert str(exc) == NPU_SEQUENTIAL_SPLIT_ERROR
+            return
+        raise AssertionError(f"{providers} + {policy} was accepted")
+
+    _expect_npu_split_rejected(
+        ["VitisAIExecutionProvider", "CPUExecutionProvider"],
+        ExecutionPolicy.SPLIT_CPU_MEMORY_OPTIMIZED,
+        split_layers,
+    )
+    _expect_npu_split_rejected(
+        ["RyzenAIExecutionProvider"],
+        ExecutionPolicy.SPLIT_GPU_PERSISTENT,
+        split_layers,
+    )
+    _expect_npu_split_rejected(
+        ["VitisAIExecutionProvider"],
+        ExecutionPolicy.MONOLITHIC_ONLY,
+        split_layers,
+    )
+    _expect_npu_split_rejected(
+        ["RyzenAIExecutionProvider"],
+        "split_cpu_memory_optimized",
+        monolithic,
+    )
+    validate_npu_execution_policy(
+        ExecutionPolicy.MONOLITHIC_ONLY,
+        ["VitisAIExecutionProvider", "CPUExecutionProvider"],
+        monolithic,
+    )
+    validate_npu_execution_policy(
+        ExecutionPolicy.HYBRID_NPU_IGPU_PHASE_SPLIT,
+        ["VitisAIExecutionProvider", "DmlExecutionProvider"],
+        split_layers,
+    )
+    validate_npu_execution_policy(
+        ExecutionPolicy.HYBRID_NPU_MOE_ROUTING,
+        ["RyzenAIExecutionProvider", "ROCmExecutionProvider"],
+        split_layers,
+    )
+    validate_npu_execution_policy(
+        ExecutionPolicy.SPLIT_CPU_MEMORY_OPTIMIZED,
+        ["CPUExecutionProvider"],
+        split_layers,
+    )
+
+    split_info = {
+        "components": {
+            "layer_0": {"file": "layer_0.onnx", "input_names": [], "output_names": []},
+            "layer_1": {"file": "layer_1.onnx", "input_names": [], "output_names": []},
+        }
+    }
+    try:
+        SessionManager(
+            ".",
+            SessionConfig(providers=["VitisAIExecutionProvider"]),
+            model_info=split_info,
+        )
+        raise AssertionError("VitisAI SessionManager loaded a layer split")
+    except RuntimeError as exc:
+        assert NPU_SEQUENTIAL_SPLIT_ERROR in str(exc)
+    phase_manager = SessionManager(
+        ".",
+        SessionConfig(
+            providers=["RyzenAIExecutionProvider", "DmlExecutionProvider"],
+            execution_policy=ExecutionPolicy.HYBRID_NPU_IGPU_PHASE_SPLIT,
+        ),
+        model_info=split_info,
+    )
+    assert len(phase_manager) == 2
+    cpu_manager = SessionManager(
+        ".",
+        SessionConfig(
+            providers=["CPUExecutionProvider"],
+            execution_policy=ExecutionPolicy.SPLIT_CPU_MEMORY_OPTIMIZED,
+        ),
+        model_info=split_info,
+    )
+    assert "layer_0" in cpu_manager
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        validate_npu_execution_policy(
+            ExecutionPolicy.HYBRID_NPU_MOE_ROUTING,
+            ["CPUExecutionProvider"],
+            split_layers,
+        )
+    assert caught and issubclass(caught[0].category, RuntimeWarning)
+    print("  NPU sequential split rejected; phase-split and MoE routing allowed")
+
     print("session_manager module: OK\n")
     return True
 
