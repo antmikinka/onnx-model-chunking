@@ -7,6 +7,7 @@ creating per-component ONNX files for embeddings, layers, norm, and lm_head.
 
 import os
 import json
+from collections import defaultdict
 from typing import Dict, List, Optional, Tuple, Any, Set
 
 import onnx
@@ -152,7 +153,10 @@ def create_component_onnx(
 ) -> onnx.ModelProto:
     """
     Create a standalone ONNX model for a single component.
-    
+
+    Output names are chosen from one consumer map. A tensor is an output when
+    it is a graph output or a node outside this component reads it.
+
     Args:
         model: Original ONNX model.
         component: ComponentInfo for this component.
@@ -200,23 +204,23 @@ def create_component_onnx(
         if init_name in initializer_dict and init_name not in [i.name for i in component_initializers]:
             component_initializers.append(initializer_dict[init_name])
     
-    # Determine outputs (consumed by nodes outside this component OR graph outputs)
+    # Determine outputs (consumed by nodes outside this component OR graph outputs).
+    # The consumer map is built once so each output is a membership test, not
+    # another walk over the whole graph.
     graph_output_names = {out.name for out in graph.output}
     component_node_set = set(component.node_indices)
-    
+    consumers: Dict[str, List[int]] = defaultdict(list)
+    for idx, node in enumerate(graph.node):
+        for inp in node.input:
+            consumers[inp].append(idx)
+
     output_tensors = set()
-    for node in component_nodes:
-        for output in node.output:
-            # Check if it's a graph output
-            if output in graph_output_names:
-                output_tensors.add(output)
-                continue
-            # Check if consumed by nodes outside this component
-            for other_idx, other_node in enumerate(all_nodes):
-                if other_idx not in component_node_set:
-                    if output in other_node.input:
-                        output_tensors.add(output)
-                        break
+    for output in component_outputs:
+        if output in graph_output_names:
+            output_tensors.add(output)
+            continue
+        if any(consumer_idx not in component_node_set for consumer_idx in consumers[output]):
+            output_tensors.add(output)
     
     # If no outputs identified, use all outputs from the last node
     if not output_tensors and component_nodes:

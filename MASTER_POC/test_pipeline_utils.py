@@ -9987,6 +9987,222 @@ def test_boundary_contract():
     return True
 
 
+def test_output_detection():
+    """Component outputs come from one consumer map."""
+    print("=" * 50)
+    print("Testing output detection...")
+    print("=" * 50)
+
+    import sys
+    import types
+    import chunking_utils
+
+    try:
+        from chunking_utils.onnx.splitter import create_component_onnx
+        import chunking_utils.onnx.splitter as splitter
+    except ModuleNotFoundError:
+        for name in list(sys.modules):
+            if name == "chunking_utils.onnx" or name.startswith("chunking_utils.onnx."):
+                del sys.modules[name]
+        onnx_stub = types.ModuleType("onnx")
+        onnx_stub.ModelProto = type("ModelProto", (), {})
+        onnx_stub.numpy_helper = types.SimpleNamespace()
+        onnx_stub.helper = types.SimpleNamespace()
+        onnx_stub.TensorProto = types.SimpleNamespace(FLOAT16=10, INT64=7, INT32=6)
+        onnx_stub.shape_inference = types.SimpleNamespace()
+        sys.modules["onnx"] = onnx_stub
+        from chunking_utils.onnx.splitter import create_component_onnx
+        import chunking_utils.onnx.splitter as splitter
+
+    from chunking_utils.onnx.types import ComponentInfo
+
+    assert chunking_utils.create_component_onnx is create_component_onnx
+
+    class _Inputs(list):
+        iterations = 0
+        contains_calls = 0
+
+        def __iter__(self):
+            type(self).iterations += 1
+            return super().__iter__()
+
+        def __contains__(self, item):
+            type(self).contains_calls += 1
+            return super().__contains__(item)
+
+    class _Node:
+        def __init__(self, name, inputs, outputs):
+            self.name = name
+            self.input = _Inputs(inputs)
+            self.output = list(outputs)
+            self.op_type = "MatMul"
+
+    class _Init:
+        def __init__(self, name):
+            self.name = name
+
+    class _Value:
+        def __init__(self, name, elem=10):
+            self.name = name
+            self.type = types.SimpleNamespace(
+                tensor_type=types.SimpleNamespace(elem_type=elem)
+            )
+
+    class _Graph:
+        def __init__(self, nodes, outputs, inputs=None, initializers=None, value_info=None):
+            self.node = list(nodes)
+            self.output = list(outputs)
+            self.input = list(inputs or [])
+            self.initializer = list(initializers or [])
+            self.value_info = list(value_info or [])
+
+    class _Model:
+        def __init__(self, graph):
+            self.graph = graph
+            self.opset_import = []
+            self.ir_version = 8
+
+    captured = {}
+
+    def make_tensor_value_info(name, elem_type, shape):
+        return _Value(name, elem_type)
+
+    def make_graph(nodes, name, inputs, outputs, initializer):
+        captured["outputs"] = [item.name for item in outputs]
+        captured["inputs"] = [item.name for item in inputs]
+        return types.SimpleNamespace(
+            node=nodes,
+            name=name,
+            input=inputs,
+            output=outputs,
+            initializer=initializer,
+        )
+
+    def make_model(graph, producer_name, opset_imports):
+        model = types.SimpleNamespace(
+            graph=graph,
+            producer_name=producer_name,
+            opset_import=opset_imports,
+            ir_version=0,
+        )
+        return model
+
+    original_helper = splitter.helper
+    original_tensor = splitter.TensorProto
+    splitter.helper = types.SimpleNamespace(
+        make_tensor_value_info=make_tensor_value_info,
+        make_graph=make_graph,
+        make_model=make_model,
+    )
+    splitter.TensorProto = types.SimpleNamespace(FLOAT16=10, INT64=7, INT32=6)
+    try:
+        _Inputs.iterations = 0
+        _Inputs.contains_calls = 0
+        embed = _Node("embed", ["input_ids", ""], ["hidden"])
+        q_proj = _Node("q_proj", ["hidden", "wq"], ["q"])
+        readers = [
+            _Node(f"read_{index}", ["q"], [f"side_{index}"])
+            for index in range(40)
+        ]
+        out_proj = _Node("out_proj", ["q"], ["hidden_1", "present.0.key"])
+        nxt = _Node("next", ["hidden_1"], ["logits"])
+        nodes = [embed, q_proj, *readers, out_proj, nxt]
+        out_index = len(nodes) - 2
+        next_index = len(nodes) - 1
+        values = [
+            _Value(name)
+            for name in (
+                "input_ids",
+                "hidden",
+                "q",
+                "hidden_1",
+                "present.0.key",
+                "logits",
+                "scratch",
+                "second",
+                "first",
+            )
+        ]
+        graph = _Graph(
+            nodes,
+            outputs=[_Value("logits"), _Value("present.0.key")],
+            inputs=[_Value("input_ids", 7)],
+            initializers=[_Init("wq")],
+            value_info=values,
+        )
+        model = _Model(graph)
+        layer = ComponentInfo(
+            component_type="layer",
+            layer_id=0,
+            node_indices=[1, *range(2, out_index), out_index],
+        )
+        created = create_component_onnx(model, layer, "layer_0")
+        assert captured["outputs"] == ["hidden_1", "present.0.key"]
+        assert created.graph.output[0].name == "hidden_1"
+        assert "q" not in captured["outputs"]
+        assert all(not name.startswith("side_") for name in captured["outputs"])
+        assert captured["inputs"] == ["hidden"]
+        assert _Inputs.contains_calls == 0
+        # required-input scan plus one consumer-map pass
+        assert _Inputs.iterations == len(layer.node_indices) + len(nodes)
+
+        embedding = ComponentInfo(component_type="embedding", node_indices=[0])
+        create_component_onnx(model, embedding, "embedding")
+        assert captured["outputs"] == ["hidden"]
+
+        head = ComponentInfo(component_type="lm_head", node_indices=[next_index])
+        create_component_onnx(model, head, "lm_head")
+        assert captured["outputs"] == ["logits"]
+        assert captured["inputs"] == ["hidden_1"]
+
+        closed = ComponentInfo(
+            component_type="layer",
+            layer_id=1,
+            node_indices=[out_index, next_index],
+        )
+        graph.output = [_Value("present.0.key")]
+        create_component_onnx(model, closed, "layer_1")
+        assert captured["outputs"] == ["present.0.key"]
+
+        solo = _Node("solo", ["hidden"], ["scratch"])
+        dead = _Model(_Graph(
+            [solo],
+            outputs=[],
+            inputs=[_Value("hidden")],
+            value_info=values,
+        ))
+        create_component_onnx(
+            dead,
+            ComponentInfo(component_type="other", node_indices=[0]),
+            "other",
+        )
+        assert captured["outputs"] == ["scratch"]
+
+        later = _Node("later", [], ["second"])
+        earlier = _Node("earlier", [], ["first"])
+        ordered = _Model(_Graph(
+            [earlier, later],
+            outputs=[_Value("first"), _Value("second")],
+            value_info=values,
+        ))
+        create_component_onnx(
+            ordered,
+            ComponentInfo(component_type="other", node_indices=[1, 0]),
+            "ordered",
+        )
+        assert captured["outputs"] == ["second", "first"]
+        assert _Inputs.contains_calls == 0
+    finally:
+        splitter.helper = original_helper
+        splitter.TensorProto = original_tensor
+
+    print("output detection: OK")
+    print("  one consumer map selects tensors read outside the component")
+    print("  a graph output stays an output")
+    print("  an internal tensor stays inside the component")
+    return True
+
+
 def test_path_manager():
     """ONNX discovery, external data, split directories, and NPU cache paths."""
     print("=" * 50)
@@ -10315,6 +10531,12 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"boundary_contract: FAILED - {e}")
         results.append(("boundary_contract", False))
+
+    try:
+        results.append(("output_detection", test_output_detection()))
+    except Exception as e:
+        print(f"output_detection: FAILED - {e}")
+        results.append(("output_detection", False))
 
     try:
         results.append(("path_manager", test_path_manager()))
