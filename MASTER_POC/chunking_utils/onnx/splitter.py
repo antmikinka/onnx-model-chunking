@@ -26,7 +26,7 @@ from .graph_analysis import (
     resolve_tensor_type,
 )
 from .kv_contract import extract_kv_cache_info
-from .loader import load_onnx_model
+from .loader import infer_shapes_with_lazy_fallback, load_onnx_model
 from .metadata_writer import write_execution_contract
 from .npu_policy import extract_execution_policy
 from .quantization import extract_quantization_info
@@ -200,11 +200,12 @@ def split_onnx(
     onnx_model = load_onnx_model(model_path)
 
     print("Running static shape inference on the master model...")
-    try:
-        onnx_model = shape_inference.infer_shapes(onnx_model)
-        print("  Shape inference successful.")
-    except Exception as exc:
-        print(f"  Warning: Shape inference failed: {exc}. Subgraphs may have unknown shapes.")
+    # Resolve infer_shapes at call time so a test patch still applies, and so a
+    # missing attribute is the same caught failure as an inference error.
+    onnx_model = infer_shapes_with_lazy_fallback(
+        onnx_model,
+        infer_shapes=lambda loaded: shape_inference.infer_shapes(loaded),
+    )
 
     arch = detect_architecture(onnx_model.graph)
     components = extract_components(onnx_model, arch=arch)

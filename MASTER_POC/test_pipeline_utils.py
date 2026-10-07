@@ -15843,6 +15843,246 @@ def test_genai_external_data():
     return True
 
 
+def test_lazy_shape_inference():
+    """A lazy-loaded model warns when shape inference cannot see weight values."""
+    print("=" * 50)
+    print("Testing lazy shape inference...")
+    print("=" * 50)
+
+    import io
+    import os
+    import sys
+    import tempfile
+    import types
+    from contextlib import redirect_stdout
+
+    try:
+        import chunking_utils.onnx as onnx_pkg
+        import chunking_utils.onnx.loader as loader
+        import chunking_utils.onnx.splitter as splitter
+    except ModuleNotFoundError:
+        for name in list(sys.modules):
+            if name == "chunking_utils.onnx" or name.startswith("chunking_utils.onnx."):
+                del sys.modules[name]
+        onnx_stub = types.ModuleType("onnx")
+        onnx_stub.ModelProto = type("ModelProto", (), {})
+        onnx_stub.numpy_helper = types.SimpleNamespace()
+        onnx_stub.helper = types.SimpleNamespace()
+        onnx_stub.TensorProto = types.SimpleNamespace()
+        onnx_stub.shape_inference = types.SimpleNamespace()
+        sys.modules["onnx"] = onnx_stub
+        import chunking_utils.onnx as onnx_pkg
+        import chunking_utils.onnx.loader as loader
+        import chunking_utils.onnx.splitter as splitter
+
+    assert "infer_shapes_with_lazy_fallback" not in onnx_pkg.__all__
+    assert splitter.infer_shapes_with_lazy_fallback is loader.infer_shapes_with_lazy_fallback
+
+    class _Entry:
+        def __init__(self, key, value):
+            self.key = key
+            self.value = value
+
+    class _Dim:
+        def __init__(self, value=0, param=""):
+            self.dim_value = value
+            self.dim_param = param
+
+    class _Value:
+        def __init__(self, name, dims):
+            self.name = name
+            self.type = types.SimpleNamespace(
+                tensor_type=types.SimpleNamespace(
+                    shape=types.SimpleNamespace(dim=list(dims)),
+                )
+            )
+
+    class _Init:
+        def __init__(self, name, location, raw):
+            self.name = name
+            self.external_data = [_Entry("location", location)] if location else []
+            self.raw_data = raw
+
+    class _Node:
+        def __init__(self, op_type, inputs, outputs):
+            self.op_type = op_type
+            self.input = inputs
+            self.output = outputs
+
+    class _Model:
+        def __init__(self, nodes, initializers, value_info):
+            self.graph = types.SimpleNamespace(
+                node=list(nodes),
+                initializer=list(initializers),
+                value_info=list(value_info),
+                output=[],
+                sparse_initializer=[],
+            )
+            self.ir_version = 8
+            self.producer_name = "lazy"
+
+    def reshape_model(raw, dims, lazy_flag):
+        model = _Model(
+            [_Node("Reshape", ["x", "shape"], ["y"])],
+            [_Init("shape", "model.onnx.data", raw)],
+            [_Value("y", dims)],
+        )
+        model._chunking_lazy_loaded = lazy_flag
+        return model
+
+    def identity(model):
+        return model
+
+    def boom(model):
+        raise RuntimeError("missing weight")
+
+    def capture(model, infer):
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            result = loader.infer_shapes_with_lazy_fallback(model, infer_shapes=infer)
+        return result, buffer.getvalue()
+
+    def expect(callable_check, error_type, text):
+        try:
+            callable_check()
+            raise AssertionError(text)
+        except error_type:
+            return
+
+    calls = []
+
+    def fake_load(path, load_external_data=True):
+        calls.append((path, load_external_data))
+        return _Model([], [], [])
+
+    had_load = hasattr(loader.onnx, "load")
+    original_load = getattr(loader.onnx, "load", None)
+    loader.onnx.load = fake_load
+    try:
+        with tempfile.TemporaryDirectory() as root:
+            model_path = os.path.join(root, "model.onnx")
+            with open(model_path, "wb") as handle:
+                handle.write(b"graph")
+            with open(model_path + ".data", "wb") as handle:
+                handle.write(b"AAAA")
+
+            calls.clear()
+            lazy = loader.load_onnx_model(model_path, lazy_load_threshold_mb=0)
+            assert calls == [(model_path, False)]
+            assert lazy._chunking_lazy_loaded is True
+
+            calls.clear()
+            eager = loader.load_onnx_model(model_path, lazy_load_threshold_mb=10000)
+            assert calls == [(model_path, True)]
+            assert eager._chunking_lazy_loaded is False
+
+        lazy_dynamic = reshape_model(b"", [_Dim(0, "unk")], True)
+        kept, text = capture(lazy_dynamic, boom)
+        assert kept is lazy_dynamic
+        assert "lazy-loaded" in text
+        assert "Falling back" in text
+        assert "Static NPU buffers" in text
+
+        inferred, text = capture(lazy_dynamic, identity)
+        assert inferred is lazy_dynamic
+        assert "dynamic shapes" in text
+        assert "Shape inference successful." not in text
+
+        concrete, text = capture(reshape_model(b"", [_Dim(8, "")], True), identity)
+        assert concrete._chunking_lazy_loaded is True
+        assert "Shape inference successful." in text
+        assert "dynamic shapes" not in text
+
+        resident, text = capture(
+            reshape_model(b"\x08\x00\x00\x00", [_Dim(0, "batch")], True),
+            identity,
+        )
+        assert resident is not None
+        assert "dynamic shapes" not in text
+        assert "Shape inference successful." in text
+
+        constant = _Model(
+            [_Node("ConstantOfShape", ["shape"], ["y"])],
+            [_Init("shape", "model.onnx.data", b"")],
+            [_Value("y", [_Dim(0, "unk")])],
+        )
+        constant._chunking_lazy_loaded = True
+        _, text = capture(constant, identity)
+        assert "dynamic shapes" in text
+
+        scalar = _Model(
+            [_Node("ConstantOfShape", ["shape"], ["y"])],
+            [_Init("shape", "model.onnx.data", b"")],
+            [_Value("y", [])],
+        )
+        scalar._chunking_lazy_loaded = True
+        _, text = capture(scalar, identity)
+        assert "dynamic shapes" not in text
+        assert "Shape inference successful." in text
+
+        bool_dim = reshape_model(b"", [_Dim(True, "")], True)
+        _, text = capture(bool_dim, identity)
+        assert "dynamic shapes" in text
+
+        plain = reshape_model(b"", [_Dim(0, "unk")], False)
+        kept_plain, text = capture(plain, boom)
+        assert kept_plain is plain
+        assert "Subgraphs may have unknown shapes." in text
+        assert "lazy-loaded" not in text
+
+        def cloned(model):
+            return _Model(model.graph.node, model.graph.initializer, model.graph.value_info)
+
+        source = reshape_model(b"\x01", [_Dim(4, "")], True)
+        copied, text = capture(source, cloned)
+        assert copied is not source
+        assert copied._chunking_lazy_loaded is True
+        assert "Shape inference successful." in text
+
+        def none_infer(model):
+            return None
+
+        none_kept, text = capture(source, none_infer)
+        assert none_kept is source
+        assert "no model returned" in text
+        assert "Falling back" in text
+
+        expect(
+            lambda: loader.infer_shapes_with_lazy_fallback(True),
+            ValueError,
+            "a bool model was accepted",
+        )
+        expect(
+            lambda: loader.infer_shapes_with_lazy_fallback(" "),
+            ValueError,
+            "a blank model was accepted",
+        )
+        expect(
+            lambda: loader.infer_shapes_with_lazy_fallback(None),
+            ValueError,
+            "a missing model was accepted",
+        )
+        expect(
+            lambda: loader.infer_shapes_with_lazy_fallback(source, infer_shapes=True),
+            ValueError,
+            "a bool infer_shapes was accepted",
+        )
+        expect(
+            lambda: loader.infer_shapes_with_lazy_fallback(root),
+            ValueError,
+            "a directory path was accepted",
+        )
+    finally:
+        if had_load:
+            loader.onnx.load = original_load
+        elif hasattr(loader.onnx, "load"):
+            del loader.onnx.load
+
+    print("lazy shape inference: OK")
+    print("  a failed lazy inference keeps the graph, a dynamic Reshape warns, and a bool model raises")
+    return True
+
+
 def test_path_manager():
     """ONNX discovery, external data, split directories, and NPU cache paths."""
     print("=" * 50)
@@ -16297,6 +16537,12 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"genai_external_data: FAILED - {e}")
         results.append(("genai_external_data", False))
+
+    try:
+        results.append(("lazy_shape_inference", test_lazy_shape_inference()))
+    except Exception as e:
+        print(f"lazy_shape_inference: FAILED - {e}")
+        results.append(("lazy_shape_inference", False))
 
     try:
         results.append(("path_manager", test_path_manager()))

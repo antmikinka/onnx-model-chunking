@@ -361,6 +361,187 @@ def _load_known_external_data(
         _store_raw(tensor, _read_span(resolved, offset, length))
 
 
+# Ops whose output shape is the values of a small tensor, not the graph structure.
+_VALUE_SHAPE_INPUT = {
+    "ConstantOfShape": 0,
+    "Reshape": 1,
+    "Expand": 1,
+    "Tile": 1,
+}
+
+
+def _mark_lazy_loaded(model: Any, lazy: bool) -> None:
+    """Record whether this load skipped weight bytes. A bool is stored as itself."""
+    try:
+        setattr(model, "_chunking_lazy_loaded", True if lazy else False)
+    except Exception:
+        return
+
+
+def _is_lazy_loaded(model: Any) -> bool:
+    """True only when this load took the size-threshold lazy path."""
+    return getattr(model, "_chunking_lazy_loaded", False) is True
+
+
+def _named_items(items: Any) -> dict:
+    found = {}
+    for item in items or []:
+        name = getattr(item, "name", None)
+        if isinstance(name, str) and name and name not in found:
+            found[name] = item
+    return found
+
+
+def _has_external_location(tensor: Any) -> bool:
+    for entry in getattr(tensor, "external_data", None) or []:
+        if isinstance(entry, dict):
+            key = entry.get("key")
+            value = entry.get("value")
+        else:
+            key = getattr(entry, "key", None)
+            value = getattr(entry, "value", None)
+        if key == "location" and isinstance(value, str) and value.strip():
+            return True
+    return False
+
+
+def _initializer_has_values(tensor: Any) -> bool:
+    raw = getattr(tensor, "raw_data", b"")
+    if isinstance(raw, (bytes, bytearray)) and len(raw) > 0:
+        return True
+    for field in (
+        "float_data",
+        "int32_data",
+        "int64_data",
+        "double_data",
+        "uint64_data",
+        "string_data",
+    ):
+        payload = getattr(tensor, field, None)
+        if payload:
+            return True
+    return False
+
+
+def _output_shape_unresolved(info: Any) -> bool:
+    """A missing shape is unresolved. A scalar or one concrete dim is resolved."""
+    if info is None:
+        return True
+    type_proto = getattr(info, "type", None)
+    tensor_type = getattr(type_proto, "tensor_type", None) if type_proto is not None else None
+    if tensor_type is None:
+        return True
+    shape = getattr(tensor_type, "shape", None)
+    if shape is None:
+        return True
+    dims = getattr(shape, "dim", None)
+    if dims is None:
+        return True
+    dims = list(dims)
+    if not dims:
+        return False
+    for dim in dims:
+        value = getattr(dim, "dim_value", 0)
+        if isinstance(value, bool) or not isinstance(value, int):
+            continue
+        if value > 0:
+            return False
+    return True
+
+
+def _lazy_value_shapes_unresolved(model: Any) -> bool:
+    """True when a value-dependent op still has no concrete output dim."""
+    graph = getattr(model, "graph", None)
+    if graph is None:
+        return False
+    initializers = _named_items(getattr(graph, "initializer", None))
+    outputs = {}
+    outputs.update(_named_items(getattr(graph, "value_info", None)))
+    outputs.update(_named_items(getattr(graph, "output", None)))
+    for node in getattr(graph, "node", None) or []:
+        index = _VALUE_SHAPE_INPUT.get(getattr(node, "op_type", None))
+        if index is None:
+            continue
+        inputs = list(getattr(node, "input", None) or [])
+        if index >= len(inputs):
+            continue
+        tensor = initializers.get(inputs[index])
+        if tensor is None:
+            continue
+        if not _has_external_location(tensor) or _initializer_has_values(tensor):
+            continue
+        node_outputs = list(getattr(node, "output", None) or [])
+        if not node_outputs:
+            return True
+        for name in node_outputs:
+            if _output_shape_unresolved(outputs.get(name)):
+                return True
+    return False
+
+
+def infer_shapes_with_lazy_fallback(model: Any, infer_shapes=None) -> Any:
+    """
+    Run shape inference and keep the graph when a lazy load has no weights.
+
+    Reshape and ConstantOfShape read the values of a shape tensor. Lazy loading
+    leaves those bytes on disk, so inference can raise or leave the output
+    dynamic. A failure returns the original model. A dynamic value-dependent
+    output returns the inferred model and warns that static NPU buffers may
+    not be allocated.
+    """
+    if model is None or isinstance(model, (bool, str, int, float, bytes, bytearray)):
+        raise ValueError(f"model must be an ONNX model, got {model!r}")
+    if infer_shapes is None:
+        shape_inference = getattr(onnx, "shape_inference", None)
+        infer_shapes = getattr(shape_inference, "infer_shapes", None)
+        if infer_shapes is None or not callable(infer_shapes):
+            raise ValueError("shape inference is not available")
+    elif isinstance(infer_shapes, bool) or not callable(infer_shapes):
+        raise ValueError(f"infer_shapes must be callable, got {infer_shapes!r}")
+
+    lazy = _is_lazy_loaded(model)
+    try:
+        inferred = infer_shapes(model)
+    except Exception as exc:
+        if lazy:
+            print(
+                "  Warning: Shape inference failed on a lazy-loaded model: "
+                f"{exc}. Weights were not loaded, so Reshape and ConstantOfShape "
+                "shapes stay unresolved. Falling back to the graph without inferred "
+                "shapes. Static NPU buffers may not be allocated."
+            )
+        else:
+            print(
+                f"  Warning: Shape inference failed: {exc}. Subgraphs may have unknown shapes."
+            )
+        return model
+    if inferred is None:
+        if lazy:
+            print(
+                "  Warning: Shape inference failed on a lazy-loaded model: "
+                "no model returned. Weights were not loaded, so Reshape and "
+                "ConstantOfShape shapes stay unresolved. Falling back to the graph "
+                "without inferred shapes. Static NPU buffers may not be allocated."
+            )
+        else:
+            print(
+                "  Warning: Shape inference failed: no model returned. "
+                "Subgraphs may have unknown shapes."
+            )
+        return model
+    if lazy and inferred is not model:
+        _mark_lazy_loaded(inferred, True)
+    if lazy and _lazy_value_shapes_unresolved(inferred):
+        print(
+            "  Warning: Shape inference left dynamic shapes on a lazy-loaded model. "
+            "Reshape and ConstantOfShape need the weight values that lazy loading "
+            "left on disk. Static NPU buffers may not be allocated."
+        )
+        return inferred
+    print("  Shape inference successful.")
+    return inferred
+
+
 def _map_external_data(model: onnx.ModelProto, model_file: str, data_file: str) -> None:
     """Point missing external locations at the master data file and read them."""
     stored = _location_for_master(model_file, data_file)
@@ -397,7 +578,9 @@ def load_onnx_model(
     - ONNX files with external data (.onnx.data files)
     - GenAI shards ``model.onnx.data``, ``model.onnx.data_1``, and ``model.onnx_1.data``
     - A shared master data file when the component sibling is absent
-    - Lazy loading for very large models (>10GB by default)
+    - Lazy loading for very large models (>10GB by default). A lazy model is
+      marked so shape inference can warn when Reshape or ConstantOfShape
+      still need those weight values.
     
     Args:
         model_path: Path to ONNX model file or directory.
@@ -422,6 +605,7 @@ def load_onnx_model(
     # master file is the fallback when this graph has no shards of its own.
     data_files = find_all_external_data_files(model_file)
     retarget = False
+    lazy = False
     if not data_files and fallback is not None:
         data_files, retarget = _fallback_external_files(fallback, model_file)
     
@@ -438,6 +622,7 @@ def load_onnx_model(
         # For very large models, use lazy loading to avoid OOM
         if total_mb > lazy_load_threshold_mb:
             print(f"  Using LAZY loading (graph structure only) for large model")
+            lazy = True
             model = onnx.load(model_file, load_external_data=False)
         elif not load_external_data:
             model = onnx.load(model_file, load_external_data=False)
@@ -456,6 +641,7 @@ def load_onnx_model(
     print(f"  Producer: {model.producer_name}")
     print(f"  Nodes: {len(model.graph.node)}")
     print(f"  Initializers: {len(model.graph.initializer)}")
+    _mark_lazy_loaded(model, lazy)
     
     return model
 
