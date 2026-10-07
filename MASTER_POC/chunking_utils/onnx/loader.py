@@ -686,20 +686,202 @@ def get_model_info(model: onnx.ModelProto) -> dict:
     }
 
 
-def validate_onnx_model(model_path: str) -> bool:
+# Short names used by the AMD stack. RyzenAI ships as the VitisAI provider.
+_PROVIDER_ALIASES = {
+    "cpu": "CPUExecutionProvider",
+    "cuda": "CUDAExecutionProvider",
+    "rocm": "ROCMExecutionProvider",
+    "dml": "DmlExecutionProvider",
+    "directml": "DmlExecutionProvider",
+    "vitisai": "VitisAIExecutionProvider",
+    "ryzenai": "VitisAIExecutionProvider",
+    "azure": "AzureExecutionProvider",
+}
+
+
+def _normalize_provider(name: Any) -> str:
+    """Return the ONNX Runtime provider id. A bool or a blank name raises."""
+    if isinstance(name, bool) or not isinstance(name, str) or not name.strip():
+        raise ValueError(f"provider must be a non-empty string, got {name!r}")
+    text = name.strip()
+    alias = _PROVIDER_ALIASES.get(text.lower())
+    if alias is not None:
+        return alias
+    if text.endswith("ExecutionProvider"):
+        return text
+    raise ValueError(f"provider must be an ONNX Runtime provider, got {name!r}")
+
+
+def _coerce_providers(providers: Any) -> Optional[List[str]]:
+    """None keeps the installed providers. A string or a bool raises."""
+    if providers is None:
+        return None
+    if isinstance(providers, (bool, str)) or not isinstance(providers, (list, tuple)):
+        raise ValueError(f"providers must be a list of provider names, got {providers!r}")
+    if len(providers) == 0:
+        raise ValueError("providers must name at least one provider")
+    return [_normalize_provider(name) for name in providers]
+
+
+def _validate_lazy_structure(model: Any) -> Optional[str]:
+    """Check the graph without reading weight bytes. A problem is a message."""
+    graph = getattr(model, "graph", None)
+    if graph is None:
+        return "model has no graph"
+    for kind in ("input", "output"):
+        for item in getattr(graph, kind, None) or []:
+            name = getattr(item, "name", None)
+            if isinstance(name, bool) or not isinstance(name, str) or not name.strip():
+                return f"graph {kind} has a blank name"
+    for node in getattr(graph, "node", None) or []:
+        op_type = getattr(node, "op_type", None)
+        if isinstance(op_type, bool) or not isinstance(op_type, str) or not op_type.strip():
+            return "a node has a blank op_type"
+    tensors = list(getattr(graph, "initializer", None) or [])
+    tensors.extend(getattr(graph, "sparse_initializer", None) or [])
+    for tensor in tensors:
+        external = getattr(tensor, "external_data", None)
+        if external and not _has_external_location(tensor):
+            tensor_name = getattr(tensor, "name", "")
+            return f"initializer {tensor_name} external data has no location"
+    return None
+
+
+def _installed_runtime() -> Optional[tuple]:
+    """Return installed providers and (domain, op, provider) kernels."""
+    try:
+        import onnxruntime as ort
+        from onnxruntime.capi import onnxruntime_pybind11_state as state
+    except ImportError:
+        return None
+    available = getattr(ort, "get_available_providers", None)
+    kernels_of = getattr(state, "get_all_opkernel_def", None)
+    if not callable(available) or not callable(kernels_of):
+        return None
+    try:
+        providers = [provider for provider in available() if isinstance(provider, str) and provider]
+        kernels = []
+        for kernel in kernels_of():
+            op_name = getattr(kernel, "op_name", None)
+            provider = getattr(kernel, "provider", None)
+            if not isinstance(op_name, str) or not op_name or not isinstance(provider, str) or not provider:
+                continue
+            domain = getattr(kernel, "domain", "") or ""
+            if not isinstance(domain, str):
+                domain = ""
+            kernels.append((domain, op_name, provider))
+    except Exception:
+        return None
+    return providers, kernels
+
+
+def _kernel_supports(domain: str, op_type: str, providers: List[str], kernels: List[tuple]) -> bool:
+    """True when one selected provider has a kernel for this op."""
+    accepted = {domain}
+    if domain == "":
+        accepted.add("com.microsoft")
+    selected = set(providers)
+    for kernel_domain, kernel_op, kernel_provider in kernels:
+        if kernel_op != op_type or kernel_provider not in selected:
+            continue
+        if (kernel_domain or "") in accepted:
+            return True
+    return False
+
+
+def _unsupported_ops(model: Any, providers: List[str], kernels: List[tuple]) -> List[str]:
+    """Name each op that the selected providers cannot run."""
+    graph = getattr(model, "graph", None)
+    if graph is None:
+        return ["model graph"]
+    missing = []
+    seen = set()
+    for node in getattr(graph, "node", None) or []:
+        op_type = getattr(node, "op_type", None)
+        if not isinstance(op_type, str) or not op_type.strip():
+            continue
+        op_type = op_type.strip()
+        domain = getattr(node, "domain", "") or ""
+        if not isinstance(domain, str):
+            domain = ""
+        domain = domain.strip()
+        key = (domain, op_type)
+        if key in seen:
+            continue
+        seen.add(key)
+        if _kernel_supports(domain, op_type, providers, kernels):
+            continue
+        if domain:
+            missing.append(f"{op_type} ({domain})")
+        else:
+            missing.append(op_type)
+    return missing
+
+
+def validate_onnx_model(model_path: str, providers: Optional[List[str]] = None) -> bool:
     """
-    Validate that an ONNX model is well-formed.
-    
-    Args:
-        model_path: Path to ONNX model file.
-    
-    Returns:
-        True if model is valid, False otherwise.
+    Validate an ONNX model and the kernels of the installed ONNX Runtime.
+
+    A lazy-loaded model has no weight bytes, so ``onnx.checker`` is skipped
+    and only the graph structure is checked. Every node must have a kernel
+    on a selected installed provider. MatMulNBits is the com.microsoft op
+    that a VitisAI wheel often does not register.
     """
+    if isinstance(model_path, bool) or not isinstance(model_path, str) or not model_path.strip():
+        raise ValueError(f"model_path must be a non-empty string, got {model_path!r}")
+    selected = _coerce_providers(providers)
     try:
         model = load_onnx_model(model_path)
-        onnx.checker.check_model(model)
-        return True
-    except Exception as e:
-        print(f"Model validation failed: {e}")
+    except Exception as exc:
+        print(f"Model validation failed: {exc}")
         return False
+    try:
+        if _is_lazy_loaded(model):
+            print(
+                "  Warning: lazy-loaded model skipped tensor-data checks. "
+                "onnx.checker was not run because external weights were not loaded."
+            )
+            problem = _validate_lazy_structure(model)
+            if problem is not None:
+                print(f"Model validation failed: {problem}")
+                return False
+        else:
+            checker = getattr(onnx, "checker", None)
+            check_model = getattr(checker, "check_model", None) if checker is not None else None
+            if check_model is None or not callable(check_model):
+                print("Model validation failed: onnx.checker is not available.")
+                return False
+            check_model(model)
+    except Exception as exc:
+        print(f"Model validation failed: {exc}")
+        return False
+    runtime = _installed_runtime()
+    if runtime is None:
+        print(
+            "Model validation failed: onnxruntime is not installed, "
+            "so provider kernels were not checked."
+        )
+        return False
+    available, kernels = runtime
+    if selected is None:
+        selected = list(available)
+    if not selected:
+        print("Model validation failed: onnxruntime reported no installed provider.")
+        return False
+    installed = set(available)
+    for provider in selected:
+        if provider not in installed:
+            print(
+                f"Model validation failed: {provider} is not an installed ONNX Runtime provider."
+            )
+            return False
+    missing = _unsupported_ops(model, selected, kernels)
+    if missing:
+        joined = ", ".join(missing)
+        provider_list = ", ".join(selected)
+        print(
+            f"Model validation failed: {joined} is not supported by {provider_list}."
+        )
+        return False
+    print("Model validation successful.")
+    return True

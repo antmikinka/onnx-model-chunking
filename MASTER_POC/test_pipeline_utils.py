@@ -16083,6 +16083,271 @@ def test_lazy_shape_inference():
     return True
 
 
+def test_onnx_model_validation():
+    """A lazy model skips tensor checks, and provider kernels must exist."""
+    print("=" * 50)
+    print("Testing ONNX model validation...")
+    print("=" * 50)
+
+    import io
+    import os
+    import sys
+    import tempfile
+    import types
+    from contextlib import redirect_stdout
+
+    try:
+        import chunking_utils.onnx as onnx_pkg
+        import chunking_utils.onnx.loader as loader
+    except ModuleNotFoundError:
+        for name in list(sys.modules):
+            if name == "chunking_utils.onnx" or name.startswith("chunking_utils.onnx."):
+                del sys.modules[name]
+        onnx_stub = types.ModuleType("onnx")
+        onnx_stub.ModelProto = type("ModelProto", (), {})
+        onnx_stub.numpy_helper = types.SimpleNamespace()
+        onnx_stub.helper = types.SimpleNamespace()
+        onnx_stub.TensorProto = types.SimpleNamespace()
+        onnx_stub.shape_inference = types.SimpleNamespace()
+        sys.modules["onnx"] = onnx_stub
+        import chunking_utils.onnx as onnx_pkg
+        import chunking_utils.onnx.loader as loader
+
+    assert "validate_onnx_model" not in onnx_pkg.__all__
+
+    class _Node:
+        def __init__(self, op_type, domain=""):
+            self.op_type = op_type
+            self.domain = domain
+
+    class _Named:
+        def __init__(self, name):
+            self.name = name
+
+    class _Tensor:
+        def __init__(self, name, location):
+            self.name = name
+            self.raw_data = b""
+            self.external_data = [types.SimpleNamespace(key="location", value=location)]
+
+    class _Model:
+        def __init__(self, nodes, initializers=None, inputs=None, outputs=None, lazy=False):
+            self.graph = types.SimpleNamespace(
+                node=list(nodes),
+                initializer=list(initializers or []),
+                sparse_initializer=[],
+                input=list(inputs if inputs is not None else [_Named("x")]),
+                output=list(outputs if outputs is not None else [_Named("y")]),
+            )
+            self.ir_version = 8
+            self.producer_name = "validate"
+            self._chunking_lazy_loaded = lazy
+
+    checker_calls = []
+
+    def check_model(model):
+        checker_calls.append(model)
+
+    def boom(model):
+        raise RuntimeError("tensor data is empty")
+
+    def expect(callable_check, error_type, text):
+        try:
+            callable_check()
+            raise AssertionError(text)
+        except error_type:
+            return
+
+    def capture(path, **kwargs):
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            result = loader.validate_onnx_model(path, **kwargs)
+        return result, buffer.getvalue()
+
+    models = {}
+
+    def fake_load(path, **kwargs):
+        key = os.path.normpath(path)
+        if os.path.isdir(key) or key not in models:
+            raise FileNotFoundError(key)
+        return models[key]
+
+    def injected_runtime():
+        return (
+            ["CPUExecutionProvider", "VitisAIExecutionProvider"],
+            [
+                ("", "MatMul", "CPUExecutionProvider"),
+                ("com.microsoft", "MatMulNBits", "CPUExecutionProvider"),
+            ],
+        )
+
+    original_load = loader.load_onnx_model
+    original_runtime = loader._installed_runtime
+    had_checker = hasattr(loader.onnx, "checker")
+    original_checker = getattr(loader.onnx, "checker", None)
+    loader.load_onnx_model = fake_load
+    loader._installed_runtime = injected_runtime
+    loader.onnx.checker = types.SimpleNamespace(check_model=check_model)
+    try:
+        with tempfile.TemporaryDirectory() as root:
+            model_path = os.path.join(root, "model.onnx")
+            with open(model_path, "wb") as handle:
+                handle.write(b"graph")
+            empty = os.path.join(root, "empty")
+            os.makedirs(empty)
+            key = os.path.normpath(model_path)
+
+            models[key] = _Model([_Node("MatMulNBits", "com.microsoft")], lazy=True)
+            checker_calls.clear()
+            ok, text = capture(model_path)
+            assert ok is True
+            assert checker_calls == []
+            assert "skipped tensor-data checks" in text
+            assert "Model validation successful." in text
+
+            models[key] = _Model([_Node("  ")], lazy=True)
+            checker_calls.clear()
+            failed, text = capture(model_path)
+            assert failed is False
+            assert checker_calls == []
+            assert "blank op_type" in text
+
+            models[key] = _Model(
+                [_Node("MatMul")],
+                initializers=[_Tensor("w", "  ")],
+                lazy=True,
+            )
+            failed, text = capture(model_path)
+            assert failed is False
+            assert "no location" in text
+
+            models[key] = _Model([_Node(True)], lazy=True)
+            failed, text = capture(model_path)
+            assert failed is False
+            assert "blank op_type" in text
+
+            eager = _Model([_Node("MatMulNBits", "com.microsoft")], lazy=False)
+            models[key] = eager
+            checker_calls.clear()
+            ok, text = capture(model_path, providers=["cpu"])
+            assert ok is True
+            assert checker_calls == [eager]
+            assert "Model validation successful." in text
+
+            loader.onnx.checker = types.SimpleNamespace(check_model=boom)
+            failed, text = capture(model_path)
+            assert failed is False
+            assert "tensor data is empty" in text
+            loader.onnx.checker = types.SimpleNamespace(check_model=check_model)
+
+            failed, text = capture(model_path, providers=["vitisai"])
+            assert failed is False
+            assert "MatMulNBits (com.microsoft)" in text
+            assert "VitisAIExecutionProvider" in text
+            assert "is not supported by" in text
+
+            failed, text = capture(model_path, providers=["ryzenai"])
+            assert failed is False
+            assert "VitisAIExecutionProvider" in text
+
+            models[key] = _Model([_Node("MatMulNBits", "")], lazy=False)
+            ok, text = capture(model_path, providers=["CPUExecutionProvider"])
+            assert ok is True
+
+            models[key] = _Model([_Node("MatMulNBits", "com.example")], lazy=False)
+            failed, text = capture(model_path, providers=["cpu"])
+            assert failed is False
+            assert "MatMulNBits (com.example)" in text
+
+            failed, text = capture(model_path, providers=["CUDAExecutionProvider"])
+            assert failed is False
+            assert "CUDAExecutionProvider is not an installed" in text
+
+            failed, text = capture(os.path.join(root, "missing.onnx"))
+            assert failed is False
+            failed, text = capture(empty)
+            assert failed is False
+
+            expect(
+                lambda: loader.validate_onnx_model(" "),
+                ValueError,
+                "a blank path was accepted",
+            )
+            expect(
+                lambda: loader.validate_onnx_model(True),
+                ValueError,
+                "a bool path was accepted",
+            )
+            expect(
+                lambda: loader.validate_onnx_model(model_path, providers=True),
+                ValueError,
+                "a bool provider list was accepted",
+            )
+            expect(
+                lambda: loader.validate_onnx_model(model_path, providers="cpu"),
+                ValueError,
+                "a provider string was accepted",
+            )
+            expect(
+                lambda: loader.validate_onnx_model(model_path, providers=[]),
+                ValueError,
+                "an empty provider list was accepted",
+            )
+            expect(
+                lambda: loader.validate_onnx_model(model_path, providers=[""]),
+                ValueError,
+                "a blank provider was accepted",
+            )
+            expect(
+                lambda: loader.validate_onnx_model(model_path, providers=[True]),
+                ValueError,
+                "a bool provider was accepted",
+            )
+            expect(
+                lambda: loader.validate_onnx_model(model_path, providers=["gpu"]),
+                ValueError,
+                "an unknown provider name was accepted",
+            )
+
+            loader._installed_runtime = original_runtime
+            runtime = loader._installed_runtime()
+            assert runtime is not None
+            available, real_kernels = runtime
+            assert "CPUExecutionProvider" in available
+            assert any(
+                op_name == "MatMulNBits" and provider == "CPUExecutionProvider"
+                for _domain, op_name, provider in real_kernels
+            )
+            models[key] = _Model([_Node("MatMulNBits", "com.microsoft")], lazy=False)
+            checker_calls.clear()
+            ok, text = capture(model_path, providers=["CPUExecutionProvider"])
+            assert ok is True
+            assert checker_calls
+            assert "Model validation successful." in text
+            if "VitisAIExecutionProvider" not in available:
+                failed, text = capture(model_path, providers=["vitisai"])
+                assert failed is False
+                assert "VitisAIExecutionProvider is not an installed" in text
+            else:
+                has_kernel = any(
+                    op_name == "MatMulNBits" and provider == "VitisAIExecutionProvider"
+                    for _domain, op_name, provider in real_kernels
+                )
+                result, text = capture(model_path, providers=["VitisAIExecutionProvider"])
+                assert result is has_kernel
+    finally:
+        loader.load_onnx_model = original_load
+        loader._installed_runtime = original_runtime
+        if had_checker:
+            loader.onnx.checker = original_checker
+        elif hasattr(loader.onnx, "checker"):
+            del loader.onnx.checker
+
+    print("onnx model validation: OK")
+    print("  a lazy model skips the checker, MatMulNBits on VitisAI fails, and a blank path raises")
+    return True
+
+
 def test_path_manager():
     """ONNX discovery, external data, split directories, and NPU cache paths."""
     print("=" * 50)
@@ -16543,6 +16808,12 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"lazy_shape_inference: FAILED - {e}")
         results.append(("lazy_shape_inference", False))
+
+    try:
+        results.append(("onnx_model_validation", test_onnx_model_validation()))
+    except Exception as e:
+        print(f"onnx_model_validation: FAILED - {e}")
+        results.append(("onnx_model_validation", False))
 
     try:
         results.append(("path_manager", test_path_manager()))
