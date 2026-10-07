@@ -16348,6 +16348,535 @@ def test_onnx_model_validation():
     return True
 
 
+def test_split_inference():
+    """Sequential, persistent, and IO-bound execution of a split ONNX graph."""
+    print("=" * 50)
+    print("Testing split inference...")
+    print("=" * 50)
+
+    import inspect
+    import io
+    import json
+    import os
+    import sys
+    import tempfile
+    import types
+    import warnings
+    from contextlib import redirect_stdout
+
+    import numpy as np
+
+    try:
+        import chunking_utils.onnx as onnx_pkg
+    except ModuleNotFoundError:
+        for name in list(sys.modules):
+            if name == "chunking_utils.onnx" or name.startswith("chunking_utils.onnx."):
+                del sys.modules[name]
+        onnx_stub = types.ModuleType("onnx")
+        onnx_stub.ModelProto = type("ModelProto", (), {})
+        onnx_stub.numpy_helper = types.SimpleNamespace()
+        onnx_stub.helper = types.SimpleNamespace()
+        onnx_stub.TensorProto = types.SimpleNamespace()
+        onnx_stub.shape_inference = types.SimpleNamespace()
+        sys.modules["onnx"] = onnx_stub
+        import chunking_utils.onnx as onnx_pkg
+
+    import chunking_utils
+    from chunking_utils.onnx import inference
+    from chunking_utils.onnx.inference import (
+        InferenceConfig,
+        InferenceMode,
+        SplitModelInferenceEngine,
+        create_inference_engine,
+        run_inference,
+    )
+    from pipeline_utils.session_manager import get_provider_for_device
+
+    assert "run_inference" in onnx_pkg.__all__
+    assert "SplitModelInferenceEngine" not in onnx_pkg.__all__
+    assert "InferenceConfig" not in onnx_pkg.__all__
+    assert "create_inference_engine" not in onnx_pkg.__all__
+    assert chunking_utils.infer_onnx is run_inference
+    assert list(inspect.signature(run_inference).parameters) == [
+        "output_dir",
+        "prompt",
+        "config",
+        "max_new_tokens",
+    ]
+
+    cpu = InferenceConfig(providers=["cpu"], mode="sequential", optimization_level="basic")
+    assert cpu.providers == ["CPUExecutionProvider"]
+    assert cpu.mode is InferenceMode.SEQUENTIAL
+    assert cpu.optimization_level == "BASIC"
+    assert InferenceConfig(providers=["ryzenai"]).providers == ["VitisAIExecutionProvider"]
+    assert InferenceConfig(providers=["RyzenAIExecutionProvider"]).providers == [
+        "RyzenAIExecutionProvider"
+    ]
+    npu = InferenceConfig(device="xdna", providers=["cpu"])
+    assert npu.device == "npu"
+    assert npu.providers == get_provider_for_device("npu")
+    igpu = InferenceConfig(device="rdna")
+    assert igpu.device == "igpu"
+    assert igpu.providers == get_provider_for_device("gpu")
+    bound = InferenceConfig(mode="io_bound", use_io_binding=False)
+    assert bound.mode is InferenceMode.IO_BOUND
+    assert bound.use_io_binding is True
+    copied = InferenceConfig(stop_token_ids=[4])
+    copied.stop_token_ids.append(9)
+    again = InferenceConfig()
+    assert again.stop_token_ids == []
+
+    rejected = (
+        ("providers", {"providers": True}),
+        ("providers", {"providers": "cpu"}),
+        ("providers", {"providers": []}),
+        ("provider", {"providers": [""]}),
+        ("provider", {"providers": [True]}),
+        ("provider", {"providers": ["gpu"]}),
+        ("mode", {"mode": True}),
+        ("mode", {"mode": "draft"}),
+        ("device", {"device": " "}),
+        ("device", {"device": "tpu"}),
+        ("max_new_tokens", {"max_new_tokens": True}),
+        ("max_new_tokens", {"max_new_tokens": 0}),
+        ("temperature", {"temperature": True}),
+        ("temperature", {"temperature": -1}),
+        ("warmup_iterations", {"warmup_iterations": -1}),
+        ("max_seq_len", {"max_seq_len": True}),
+        ("static_kv_cache", {"static_kv_cache": 1}),
+        ("optimization_level", {"optimization_level": "fast"}),
+        ("stop_token_ids", {"stop_token_ids": "4"}),
+        ("stop token", {"stop_token_ids": [True]}),
+        ("io_binding_device", {"io_binding_device": " "}),
+        ("kv_cache_dtype", {"kv_cache_dtype": " "}),
+        ("tokenizer_path", {"tokenizer_path": " "}),
+    )
+    for label, kwargs in rejected:
+        try:
+            InferenceConfig(**kwargs)
+            raise AssertionError(label + " was accepted")
+        except ValueError as exc:
+            assert label.split()[0] in str(exc)
+
+    class Port:
+        def __init__(self, name, type_name):
+            self.name = name
+            self.type = type_name
+
+    class Session:
+        def __init__(self, runner, inputs, outputs):
+            self.direct = 0
+            self._runner = runner
+            self._inputs = inputs
+            self._outputs = outputs
+
+        def get_inputs(self):
+            return self._inputs
+
+        def get_outputs(self):
+            return self._outputs
+
+        def run(self, output_names, feeds):
+            self.direct += 1
+            return self._runner(output_names, feeds)
+
+        def produce(self, output_names, feeds):
+            return self._runner(output_names, feeds)
+
+    class Tokenizer:
+        eos_token_id = 2
+
+        def __call__(self, prompt, return_tensors="np"):
+            assert prompt == "Hello"
+            return {"input_ids": np.array([[4, 6]], dtype=np.int64)}
+
+        def decode(self, ids):
+            if isinstance(ids, np.ndarray):
+                ids = ids.tolist()
+            return ",".join(str(int(item)) for item in ids)
+
+    ran = []
+    past_shapes = []
+    head_calls = []
+
+    def embed_run(output_names, feeds):
+        ran.append("embedding")
+        seq = int(np.asarray(feeds["input_ids"]).shape[-1])
+        return [np.ones((1, seq, 4), dtype=np.float32)]
+
+    def layer_run(output_names, feeds):
+        ran.append("layer_0")
+        past = np.asarray(feeds["past_key_values.0.key"])
+        past_shapes.append(tuple(past.shape))
+        seq = int(np.asarray(feeds["attention_mask"]).shape[-1])
+        present = np.zeros((1, 1, seq, 8), dtype=np.float16)
+        hidden = np.zeros((1, seq, 4), dtype=np.float32)
+        values = {
+            "hidden": hidden,
+            "present.0.key": present,
+            "present.0.value": present.copy(),
+        }
+        return [values[name] for name in output_names]
+
+    def head_run(output_names, feeds):
+        ran.append("lm_head")
+        head_calls.append(1)
+        seq = int(np.asarray(feeds["hidden"]).shape[1])
+        logits = np.zeros((1, seq, 8), dtype=np.float32)
+        token = 5 if len(head_calls) == 1 else 2
+        logits[0, -1, token] = 10.0
+        return [logits]
+
+    def make_sessions(direct):
+        embedding = Session(
+            embed_run,
+            [Port("input_ids", "tensor(int64)")],
+            [Port("hidden", "tensor(float32)")],
+        )
+        layer = Session(
+            layer_run,
+            [
+                Port("hidden", "tensor(float32)"),
+                Port("past_key_values.0.key", "tensor(float16)"),
+                Port("past_key_values.0.value", "tensor(float16)"),
+                Port("attention_mask", "tensor(int64)"),
+                Port("position_ids", "tensor(int64)"),
+            ],
+            [
+                Port("hidden", "tensor(float32)"),
+                Port("present.0.key", "tensor(float16)"),
+                Port("present.0.value", "tensor(float16)"),
+            ],
+        )
+        head = Session(
+            head_run,
+            [Port("hidden", "tensor(float32)")],
+            [Port("logits", "tensor(float32)")],
+        )
+        if not direct:
+            def refuse(output_names, feeds):
+                raise RuntimeError("direct session.run")
+            embedding.run = refuse
+            layer.run = refuse
+            head.run = refuse
+        return {"embedding": embedding, "layer_0": layer, "lm_head": head}
+
+    original_session = inference.ort.InferenceSession
+    original_manager = inference.SessionManager
+    original_binding = inference.IOBindingManager
+    original_choice = np.random.choice
+    try:
+        with tempfile.TemporaryDirectory() as root:
+            split_dir = os.path.join(root, "split")
+            os.makedirs(split_dir)
+            info = {
+                "num_layers": 1,
+                "num_kv_heads": 1,
+                "head_dim": 8,
+                "components": {
+                    "embedding": {
+                        "file": "embedding.onnx",
+                        "input_names": ["input_ids"],
+                        "output_names": ["hidden"],
+                    },
+                    "layer_0": {
+                        "file": "layer_0.onnx",
+                        "input_names": [
+                            "hidden",
+                            "past_key_values.0.key",
+                            "past_key_values.0.value",
+                            "attention_mask",
+                            "position_ids",
+                        ],
+                        "output_names": ["hidden", "present.0.key", "present.0.value"],
+                    },
+                    "lm_head": {
+                        "file": "lm_head.onnx",
+                        "input_names": ["hidden"],
+                        "output_names": ["logits"],
+                    },
+                },
+            }
+            for name in ("embedding.onnx", "layer_0.onnx", "lm_head.onnx"):
+                with open(os.path.join(split_dir, name), "wb") as handle:
+                    handle.write(b"onnx")
+            with open(os.path.join(split_dir, "model_info.json"), "w", encoding="utf-8") as handle:
+                json.dump(info, handle)
+
+            def reject_manager(*args, **kwargs):
+                raise AssertionError("SessionManager was constructed")
+
+            sequential_sessions = make_sessions(True)
+
+            def sequential_ort(path, sess_options=None, providers=None):
+                assert providers == ["CPUExecutionProvider"]
+                return sequential_sessions[os.path.basename(path).replace(".onnx", "")]
+
+            inference.SessionManager = reject_manager
+            inference.ort.InferenceSession = sequential_ort
+
+            try:
+                SplitModelInferenceEngine(" ", verbose=False)
+                raise AssertionError("a blank path was accepted")
+            except ValueError as exc:
+                assert "model_dir" in str(exc)
+            try:
+                SplitModelInferenceEngine(True, verbose=False)
+                raise AssertionError("a bool path was accepted")
+            except ValueError as exc:
+                assert "model_dir" in str(exc)
+            try:
+                SplitModelInferenceEngine(os.path.join(root, "missing"), verbose=False)
+                raise AssertionError("a missing path was accepted")
+            except FileNotFoundError as exc:
+                assert "not found" in str(exc)
+            empty = os.path.join(root, "empty")
+            os.makedirs(empty)
+            try:
+                SplitModelInferenceEngine(empty, verbose=False)
+                raise AssertionError("a directory without model_info was accepted")
+            except FileNotFoundError as exc:
+                assert "model_info.json" in str(exc)
+
+            def write_info(folder, payload):
+                os.makedirs(folder, exist_ok=True)
+                with open(os.path.join(folder, "model_info.json"), "w", encoding="utf-8") as handle:
+                    handle.write(payload)
+
+            cases = (
+                ("not valid JSON", "{"),
+                ("JSON object", "[]"),
+                ("num_layers", '{"num_layers": true}'),
+                ("missing num_layers", "{}"),
+                ("components", '{"num_layers": 1, "components": []}'),
+            )
+            for label, payload in cases:
+                folder = os.path.join(root, label.split()[0])
+                write_info(folder, payload)
+                try:
+                    SplitModelInferenceEngine(folder, verbose=False)
+                    raise AssertionError(label + " was accepted")
+                except ValueError as exc:
+                    assert label.split()[-1] in str(exc) or label in str(exc)
+
+            mono_dir = os.path.join(root, "mono")
+            os.makedirs(mono_dir)
+            mono_path = os.path.join(mono_dir, "model.onnx")
+            with open(mono_path, "wb") as handle:
+                handle.write(b"onnx")
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                monolith = SplitModelInferenceEngine(mono_path, verbose=False)
+            assert monolith.is_monolith is True
+            assert monolith.num_layers == 32
+            assert any("No config found" in str(item.message) for item in caught)
+            monolith.cleanup()
+
+            try:
+                SplitModelInferenceEngine(
+                    split_dir,
+                    config=InferenceConfig(kv_cache_dtype="not-a-dtype"),
+                    verbose=False,
+                )
+                raise AssertionError("an unknown cache dtype was accepted")
+            except ValueError as exc:
+                assert "dtype" in str(exc).lower() or "not-a-dtype" in str(exc)
+
+            static_engine = SplitModelInferenceEngine(
+                split_dir,
+                config=InferenceConfig(static_kv_cache=True, max_seq_len=32),
+                verbose=False,
+            )
+            assert static_engine.kv_cache.static is True
+            assert static_engine.kv_cache.max_seq_len == 32
+            static_engine.cleanup()
+
+            engine = SplitModelInferenceEngine(split_dir, verbose=True)
+            assert engine.num_layers == 1
+            assert "sequential" in repr(engine)
+            assert engine.get_result().text == ""
+            streamed = io.StringIO()
+            with redirect_stdout(streamed):
+                engine.warmup(1)
+            assert "failed" in streamed.getvalue()
+            try:
+                engine.warmup(True)
+                raise AssertionError("a bool warmup count was accepted")
+            except ValueError as exc:
+                assert "warmup_iterations" in str(exc)
+            engine.tokenizer = Tokenizer()
+            present_key, present_value, past_key, past_value = engine._detect_kv_format()
+            assert present_key == "present.{layer}.key"
+            assert present_value == "present.{layer}.value"
+            assert past_key == "past_key_values.{layer}.key"
+            assert past_value == "past_key_values.{layer}.value"
+            heard = []
+
+            def callback(index, text, elapsed):
+                heard.append((index, text))
+
+            text = engine.generate("Hello", max_new_tokens=4, stream_callback=callback)
+            assert text == "4,6,5,2"
+            assert ran == ["embedding", "layer_0", "lm_head", "embedding", "layer_0", "lm_head"]
+            assert past_shapes == [(1, 1, 0, 8), (1, 1, 2, 8)]
+            assert heard == [(0, "5"), (1, "2")]
+            result = engine.get_result()
+            assert result.text == text
+            assert result.token_ids == [5, 2]
+            assert result.num_tokens_generated == 2
+            result.token_ids.append(9)
+            assert engine.get_result().token_ids == [5, 2]
+            assert engine.kv_cache.get_sequence_length() == 3
+            stats = engine.get_stats()
+            assert stats["num_tokens"] == 2
+            engine.cleanup()
+
+            ran.clear()
+            past_shapes.clear()
+            head_calls.clear()
+            engine.tokenizer = Tokenizer()
+            engine.config.temperature = 0.5
+            engine.config.stop_token_ids = [3]
+
+            def choice(size, p=None):
+                return 3
+
+            np.random.choice = choice
+            sampled = engine.generate("Hello", max_new_tokens=4)
+            assert sampled == "4,6,3"
+            assert engine.get_result().token_ids == [3]
+            np.random.choice = original_choice
+
+            def broken_session(path, sess_options=None, providers=None):
+                raise RuntimeError("unavailable")
+
+            inference.ort.InferenceSession = broken_session
+            try:
+                engine.generate("Hello", max_new_tokens=1)
+                raise AssertionError("a broken session was accepted")
+            except RuntimeError as exc:
+                assert "Failed to load embedding" in str(exc)
+
+            try:
+                engine.generate(True, max_new_tokens=1)
+                raise AssertionError("a bool prompt was accepted")
+            except ValueError as exc:
+                assert "prompt" in str(exc)
+
+            created = []
+
+            class Manager:
+                def __init__(self, model_dir, config=None, model_info=None):
+                    self.model_dir = model_dir
+                    self.config = config
+                    self.model_info = model_info
+                    self.loaded = 0
+                    self.unloaded = 0
+                    self.sessions = make_sessions(False)
+                    created.append(self)
+
+                def load_all(self):
+                    self.loaded += 1
+                    return {}
+
+                def get_session(self, name):
+                    return self.sessions.get(name)
+
+                def get_memory_usage(self):
+                    return {"total_mb": 2.5}
+
+                def unload_all(self):
+                    self.unloaded += 1
+                    return 0
+
+            binders = []
+
+            class Binder:
+                def __init__(self, device_type="cpu", device_id=0, auto_reallocate=True, max_seq_len=4096):
+                    self.device_type = device_type
+                    self.max_seq_len = max_seq_len
+                    self.calls = 0
+                    binders.append(self)
+
+                def run_with_binding(self, session, inputs):
+                    self.calls += 1
+                    names = [item.name for item in session.get_outputs()]
+                    values = session.produce(names, inputs)
+                    return {name: value for name, value in zip(names, values)}
+
+                def deallocate_all(self):
+                    return 0
+
+            ran.clear()
+            past_shapes.clear()
+            head_calls.clear()
+            inference.SessionManager = Manager
+            inference.IOBindingManager = Binder
+            inference.ort.InferenceSession = broken_session
+            io_engine = SplitModelInferenceEngine(
+                split_dir,
+                config=InferenceConfig(mode=InferenceMode.IO_BOUND, max_new_tokens=1),
+                verbose=False,
+            )
+            io_engine.tokenizer = Tokenizer()
+            io_text = io_engine.generate("Hello")
+            assert io_text == "4,6,5"
+            assert created[0].loaded == 1
+            assert created[0].config.providers == ["CPUExecutionProvider"]
+            assert binders[0].device_type == "cpu"
+            assert binders[0].max_seq_len == 4096
+            assert binders[0].calls == 3
+            assert past_shapes == [(1, 1, 0, 8)]
+            assert io_engine.get_result().peak_memory_mb == 2.5
+            assert io_engine.get_result().token_ids == [5]
+            io_engine.cleanup()
+            assert created[0].unloaded == 1
+
+            built = create_inference_engine(split_dir, providers=["cpu"], persist=False)
+            assert built.config.mode is InferenceMode.SEQUENTIAL
+            assert built.config.providers == ["CPUExecutionProvider"]
+            built.cleanup()
+            try:
+                create_inference_engine(split_dir, persist=1)
+                raise AssertionError("a non-bool persist flag was accepted")
+            except ValueError as exc:
+                assert "persist" in str(exc)
+            try:
+                run_inference(" ", prompt="Hello")
+                raise AssertionError("a blank inference path was accepted")
+            except ValueError as exc:
+                assert "model_dir" in str(exc)
+            try:
+                run_inference(split_dir, prompt=True)
+                raise AssertionError("a bool prompt was accepted")
+            except ValueError as exc:
+                assert "prompt" in str(exc)
+            try:
+                run_inference(split_dir, max_new_tokens=True)
+                raise AssertionError("a bool token count was accepted")
+            except ValueError as exc:
+                assert "max_new_tokens" in str(exc)
+            try:
+                run_inference(split_dir, config=object())
+                raise AssertionError("a plain config object was accepted")
+            except ValueError as exc:
+                assert "InferenceConfig" in str(exc)
+            try:
+                run_inference(split_dir, prompt="Hello", max_new_tokens=1)
+                raise AssertionError("a missing tokenizer was accepted")
+            except RuntimeError as exc:
+                assert "tokenizer" in str(exc)
+    finally:
+        inference.ort.InferenceSession = original_session
+        inference.SessionManager = original_manager
+        inference.IOBindingManager = original_binding
+        np.random.choice = original_choice
+
+    print("split inference: OK")
+    print("  a layer receives its past keys, IO binding skips session.run, and a blank path raises")
+    return True
+
+
 def test_path_manager():
     """ONNX discovery, external data, split directories, and NPU cache paths."""
     print("=" * 50)
@@ -16814,6 +17343,12 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"onnx_model_validation: FAILED - {e}")
         results.append(("onnx_model_validation", False))
+
+    try:
+        results.append(("split_inference", test_split_inference()))
+    except Exception as e:
+        print(f"split_inference: FAILED - {e}")
+        results.append(("split_inference", False))
 
     try:
         results.append(("path_manager", test_path_manager()))
