@@ -12,7 +12,7 @@ To add support for a new architecture:
 """
 
 from enum import Enum
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 from dataclasses import dataclass, field, replace
 
 
@@ -496,6 +496,25 @@ class ArchitectureDescriptor:
     def has_hybrid_attention(self) -> bool:
         """True when the family names more than one attention variant."""
         return len(self.attention_variants) > 1
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Copy the capabilities so a split can store them in model_info.json."""
+        return {
+            "arch_type": self.arch_type.value,
+            "supports_gqa": self.supports_gqa,
+            "supports_mqa": self.supports_mqa,
+            "is_moe": self.is_moe,
+            "num_experts": self.num_experts,
+            "experts_per_token": self.experts_per_token,
+            "has_sliding_window": self.has_sliding_window,
+            "has_tied_embeddings": self.has_tied_embeddings,
+            "attention_variants": list(self.attention_variants),
+            "max_seq_len": self.max_seq_len,
+            "has_mtp_head": self.has_mtp_head,
+            "has_ngram_embedding": self.has_ngram_embedding,
+            "quantization_format": self.quantization_format,
+            "has_hybrid_attention": self.has_hybrid_attention,
+        }
 
 
 def _describe(arch: ArchitectureType, **kwargs: object) -> ArchitectureDescriptor:

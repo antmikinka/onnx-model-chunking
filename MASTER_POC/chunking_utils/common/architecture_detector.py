@@ -12,7 +12,7 @@ format. RyzenAI compiled names such as ``gqo_``, ``ssmlp_``, and
 
 import json
 import re
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Optional
 
 from .architecture import (
     ArchitectureDescriptor,
@@ -62,7 +62,10 @@ def detect_architecture(
     Gated DeltaNet is recorded as ``gdn`` and sparse attention as ``qsa``.
     An MTP head, n-gram embeddings, and expert routing select a Qwen3.8
     hybrid when those signals are present. A graph with no stronger match
-    stays LLaMA. No graph and no config stays unknown.
+    stays LLaMA. No graph and no config stays unknown. Head counts select
+    grouped-query or multi-query attention. A positive sliding window or
+    ``use_sliding_window`` records the window, and ``tie_word_embeddings``
+    records tied embeddings. A silent config keeps the family default.
 
     Args:
         graph: ONNX graph, ONNX model, or None.
@@ -171,16 +174,32 @@ def detect_architecture(
     max_seq_len = _positive_int(
         configs, ("max_seq_len", "max_position_embeddings", "max_sequence_length")
     )
+    supports_gqa, supports_mqa = _attention_grouping(
+        family.supports_gqa,
+        family.supports_mqa,
+        _positive_int(configs, ("num_attention_heads", "num_heads", "n_head")),
+        _positive_int(configs, ("num_key_value_heads", "num_kv_heads", "n_kv_heads")),
+    )
+    has_sliding_window = _capability_flag(
+        family.has_sliding_window,
+        _optional_bool(configs, ("use_sliding_window", "has_sliding_window")),
+        _positive_int(configs, ("sliding_window", "sliding_window_size")) > 0,
+    )
+    has_tied_embeddings = _capability_flag(
+        family.has_tied_embeddings,
+        _optional_bool(configs, ("tie_word_embeddings", "has_tied_embeddings")),
+        False,
+    )
 
     return ArchitectureDescriptor(
         arch_type=arch,
-        supports_gqa=family.supports_gqa,
-        supports_mqa=family.supports_mqa,
+        supports_gqa=supports_gqa,
+        supports_mqa=supports_mqa,
         is_moe=is_moe,
         num_experts=num_experts,
         experts_per_token=experts_per_token,
-        has_sliding_window=family.has_sliding_window,
-        has_tied_embeddings=family.has_tied_embeddings,
+        has_sliding_window=has_sliding_window,
+        has_tied_embeddings=has_tied_embeddings,
         attention_variants=variants,
         max_seq_len=max_seq_len,
         has_mtp_head=has_mtp,
@@ -273,6 +292,48 @@ def _positive_int(payloads: Iterable[Dict[str, Any]], keys: Iterable[str]) -> in
         if chosen:
             found = chosen
     return found
+
+
+def _optional_bool(payloads: Iterable[Dict[str, Any]], keys: Iterable[str]) -> Optional[bool]:
+    """The last real bool wins. An integer is not a flag."""
+    found: Optional[bool] = None
+    key_set = tuple(keys)
+    for payload in payloads:
+        for blob in _iter_dicts(payload):
+            for key in key_set:
+                value = blob.get(key)
+                if type(value) is bool:
+                    found = value
+    return found
+
+
+def _attention_grouping(
+    family_gqa: bool,
+    family_mqa: bool,
+    heads: int,
+    kv_heads: int,
+) -> tuple:
+    """Head counts replace the family default. A silent config keeps it."""
+    if not heads or not kv_heads:
+        return family_gqa, family_mqa
+    if kv_heads > heads:
+        raise ValueError(
+            f"num_key_value_heads {kv_heads} exceeds num_attention_heads {heads}"
+        )
+    if kv_heads == 1 and heads > 1:
+        return False, True
+    if kv_heads < heads:
+        return True, False
+    return False, False
+
+
+def _capability_flag(family: bool, explicit: Optional[bool], enabled: bool) -> bool:
+    """An explicit flag wins. A positive measure turns the capability on."""
+    if explicit is not None:
+        return explicit
+    if enabled:
+        return True
+    return family
 
 
 def _any_true(payloads: Iterable[Dict[str, Any]], keys: Iterable[str]) -> bool:

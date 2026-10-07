@@ -9335,11 +9335,86 @@ def test_architecture():
         assert "quantization_format" in str(exc)
     stored = ArchitectureDescriptor(ArchitectureType.LLAMA, quantization_format="matmul_nbits")
     assert stored.quantization_format == "matmulnbits"
+    copied = get_architecture_descriptor(ArchitectureType.LLAMA).to_dict()
+    copied["attention_variants"].append("full")
+    assert get_architecture_descriptor(ArchitectureType.LLAMA).attention_variants == []
+    assert copied["arch_type"] == "llama"
+    assert copied["supports_gqa"] is True
+    assert copied["has_sliding_window"] is False
+    assert copied["has_tied_embeddings"] is False
+    assert copied["is_moe"] is False
+    assert copied["has_hybrid_attention"] is False
+
+    grouped = detect_architecture(
+        None,
+        config_json={
+            "model_type": "llama",
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+        },
+    )
+    assert grouped.supports_gqa is True
+    assert grouped.supports_mqa is False
+    multi_query = detect_architecture(
+        None,
+        config_json={
+            "model_type": "llama",
+            "num_attention_heads": 32,
+            "num_key_value_heads": 1,
+        },
+    )
+    assert multi_query.supports_gqa is False
+    assert multi_query.supports_mqa is True
+    matched_heads = detect_architecture(
+        None,
+        config_json={
+            "model_type": "llama",
+            "num_attention_heads": 8,
+            "num_key_value_heads": 8,
+        },
+    )
+    assert matched_heads.supports_gqa is False
+    assert matched_heads.supports_mqa is False
+    window = detect_architecture(
+        None,
+        config_json={"model_type": "llama", "sliding_window": 4096},
+    )
+    assert window.has_sliding_window is True
+    closed_window = detect_architecture(
+        None,
+        config_json={"model_type": "mistral", "use_sliding_window": False},
+    )
+    assert closed_window.has_sliding_window is False
+    tied = detect_architecture(
+        None,
+        config_json={"model_type": "llama", "tie_word_embeddings": True},
+    )
+    assert tied.has_tied_embeddings is True
+    untied = detect_architecture(
+        None,
+        config_json={"model_type": "gemma", "tie_word_embeddings": False},
+    )
+    assert untied.has_tied_embeddings is False
+    silent = detect_architecture(None, config_json={"model_type": "gemma", "tie_word_embeddings": 1})
+    assert silent.has_tied_embeddings is True
+    try:
+        detect_architecture(
+            None,
+            config_json={
+                "model_type": "llama",
+                "num_attention_heads": 4,
+                "num_key_value_heads": 8,
+            },
+        )
+        raise AssertionError("more kv heads than query heads were accepted")
+    except ValueError as exc:
+        assert "num_key_value_heads" in str(exc)
 
     print("  architecture prefixes: dense llama record, moe router and expert, hybrid mtp head")
     print("  architecture names: longest qwen3_moe, dense qwen3, qwen2.5")
     print("  quantized onnx nodes: MatMulNBits int4, QLinearMatMul int8, AWQMatMul awq")
     print("  architecture descriptor: gqa, moe counts, sliding window, tied embeddings, hybrid attention")
+    print("  checkpoint head counts, sliding window, and tied embeddings replace the family default")
     print("  architecture detector: hybrid gdn qsa, mtp, ngram, matmulnbits, ryzenai config")
     print("architecture prefixes: OK\n")
     return True
@@ -10755,6 +10830,75 @@ def test_quantization_metadata():
     except ValueError as exc:
         assert "list" in str(exc)
 
+    kept = {}
+
+    def make_tensor_value_info(name, elem_type, shape):
+        return _Value(name, elem_type, shape)
+
+    def make_graph(nodes, name, inputs, outputs, initializer):
+        kept["nodes"] = nodes
+        kept["initializer"] = initializer
+        return types.SimpleNamespace(
+            node=list(nodes),
+            name=name,
+            input=list(inputs),
+            output=list(outputs),
+            initializer=list(initializer),
+        )
+
+    def make_model(graph, producer_name, opset_imports):
+        return types.SimpleNamespace(
+            graph=graph,
+            producer_name=producer_name,
+            opset_import=opset_imports,
+            ir_version=0,
+        )
+
+    original_helper = splitter.helper
+    splitter.helper = types.SimpleNamespace(
+        make_tensor_value_info=make_tensor_value_info,
+        make_graph=make_graph,
+        make_model=make_model,
+    )
+    try:
+        survived = _nbits("/model/layers.0/self_attn/q_proj/MatMulNBits")
+        survived.output = ["hidden_out"]
+        weight = _Init("q_weight", 2, [8, 4, 16])
+        scale = _Init("q_scale", 10, [8, 4])
+        zero = _Init("q_zp", 2, [8, 4])
+        component_graph = _Graph(
+            [survived],
+            value_info=list(values) + [_Value("hidden_out", 10, [1, 8])],
+            initializers=[weight, scale, zero],
+        )
+        component_model = types.SimpleNamespace(
+            graph=component_graph,
+            opset_import=[],
+            ir_version=8,
+        )
+        created = splitter.create_component_onnx(
+            component_model,
+            ComponentInfo(
+                component_type="layer",
+                layer_id=0,
+                node_indices=[0],
+                initializer_names={"q_weight", "q_scale", "q_zp"},
+            ),
+            "layer_0",
+        )
+        assert created.graph.node[0] is survived
+        assert created.graph.node[0].attribute[0].name == "bits"
+        assert created.graph.node[0].attribute[0].i == 4
+        assert created.graph.node[0].attribute[1].name == "block_size"
+        assert created.graph.node[0].attribute[1].i == 32
+        assert {item.name for item in created.graph.initializer} == {
+            "q_weight",
+            "q_scale",
+            "q_zp",
+        }
+    finally:
+        splitter.helper = original_helper
+
     class _SplitModel:
         def __init__(self, graph):
             self.graph = graph
@@ -10814,6 +10958,14 @@ def test_quantization_metadata():
             os.makedirs(output_path)
             with open(model_path, "w", encoding="utf-8") as handle:
                 handle.write("onnx")
+            with open(os.path.join(directory, "config.json"), "w", encoding="utf-8") as handle:
+                json.dump({
+                    "model_type": "qwen3",
+                    "num_attention_heads": 16,
+                    "num_key_value_heads": 2,
+                    "sliding_window": 2048,
+                    "tie_word_embeddings": True,
+                }, handle)
             result = splitter.split_onnx(
                 model=model_path,
                 output=output_path,
@@ -10821,6 +10973,15 @@ def test_quantization_metadata():
             )
             info_path = os.path.join(result.output_dir, "model_info.json")
             saved = json.load(open(info_path, encoding="utf-8"))
+            assert saved["architecture"] == "qwen3"
+            descriptor = saved["architecture_descriptor"]
+            assert descriptor["arch_type"] == "qwen3"
+            assert descriptor["supports_gqa"] is True
+            assert descriptor["supports_mqa"] is False
+            assert descriptor["is_moe"] is False
+            assert descriptor["has_sliding_window"] is True
+            assert descriptor["has_tied_embeddings"] is True
+            assert descriptor["quantization_format"] == "matmulnbits"
             assert saved["quantization_info"]["method"] == "MatMulNBits"
             assert saved["quantization_info"]["weight_dtype"] == "int4"
             assert saved["quantization_info"]["activation_dtype"] == "float16"
@@ -10831,6 +10992,24 @@ def test_quantization_metadata():
             assert saved["quantization_info"]["scale_dtype"] == "float16"
             assert saved["quantization_info"]["zero_point_dtype"] == "uint8"
             assert result.model_info["quantization_info"] == saved["quantization_info"]
+            assert result.model_info["architecture_descriptor"] == descriptor
+            bad_model = os.path.join(directory, "broken.onnx")
+            with open(bad_model, "w", encoding="utf-8") as handle:
+                handle.write("onnx")
+            with open(os.path.join(directory, "config.json"), "w", encoding="utf-8") as handle:
+                handle.write("{")
+            try:
+                splitter.split_onnx(model=bad_model, output=output_path, split_only=True)
+                raise AssertionError("broken config json was accepted")
+            except ValueError as exc:
+                assert "config.json" in str(exc)
+            with open(os.path.join(directory, "config.json"), "w", encoding="utf-8") as handle:
+                handle.write("[]")
+            try:
+                splitter.split_onnx(model=bad_model, output=output_path, split_only=True)
+                raise AssertionError("a config list was accepted")
+            except ValueError as exc:
+                assert "JSON object" in str(exc)
     finally:
         splitter.load_onnx_model = original_load
         splitter.extract_components = original_extract
@@ -10849,7 +11028,8 @@ def test_quantization_metadata():
     print("quantization metadata: OK")
     print("  matmul nbits: int4 group 32 packed uint8")
     print("  formats: AWQ, GPTQ, scale and zero point")
-    print("  model_info: quantization_info saved")
+    print("  model_info: quantization_info and architecture capabilities saved")
+    print("  matmul nbits params stay on the component graph")
     return True
 
 
@@ -11259,6 +11439,15 @@ def test_kv_cache_metadata():
             assert saved["kv_cache_info"]["max_seq_len"] == 128
             assert saved["kv_cache_info"]["stateful"] is True
             assert result.model_info["kv_cache_info"] == saved["kv_cache_info"]
+            assert saved["architecture"] == "llama"
+            assert saved["architecture_descriptor"]["arch_type"] == "llama"
+            assert saved["architecture_descriptor"]["supports_gqa"] is True
+            assert saved["architecture_descriptor"]["is_moe"] is False
+            assert saved["architecture_descriptor"]["has_sliding_window"] is False
+            assert saved["architecture_descriptor"]["has_tied_embeddings"] is False
+            assert saved["kv_cache_info"]["layout"] == "BNSD"
+            assert saved["kv_cache_info"]["dtype"] == "float16"
+            assert saved["kv_cache_info"]["max_seq_len"] == 128
     finally:
         splitter.load_onnx_model = original_load
         splitter.extract_components = original_extract

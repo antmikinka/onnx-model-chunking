@@ -7,6 +7,7 @@ live in the modules next to this file. This module re-exports those
 public functions so callers and tests keep one import path.
 """
 
+import json
 import os
 from typing import Any, Dict, Optional
 
@@ -153,7 +154,8 @@ def split_onnx(
     - layer_0_of_N.onnx, layer_1_of_N.onnx, ... (one per layer!)
     - norm.onnx
     - lm_head.onnx
-    - model_info.json, including quantization_info, kv_cache_info, execution_policy, and weight_storage
+    - model_info.json, including quantization_info, kv_cache_info,
+      architecture_descriptor, execution_policy, and weight_storage
 
     Boundary contracts and component IO are validated before any component file is written.
     External weights use the selected weight strategy before those files are written.
@@ -207,8 +209,19 @@ def split_onnx(
         infer_shapes=lambda loaded: shape_inference.infer_shapes(loaded),
     )
 
-    arch = detect_architecture(onnx_model.graph)
-    components = extract_components(onnx_model, arch=arch)
+    config_json = _load_sibling_config(model_path, "config.json")
+    genai_config = _load_sibling_config(model_path, "genai_config.json")
+    arch = detect_architecture(
+        onnx_model.graph,
+        config_json=config_json,
+        genai_config=genai_config,
+    )
+    components = extract_components(
+        onnx_model,
+        config_json=config_json,
+        genai_config=genai_config,
+        arch=arch,
+    )
     boundary_contract = build_boundary_contract(onnx_model, components)
     quant_info = extract_quantization_info(onnx_model)
     kv_info = extract_kv_cache_info(onnx_model, components)
@@ -236,7 +249,8 @@ def split_onnx(
         "original_model": str(model_path),
         "num_layers": num_layers,
         "num_components": len(components),
-        "architecture": detect_architecture_from_onnx(onnx_model.graph).value,
+        "architecture": arch.arch_type.value,
+        "architecture_descriptor": arch.to_dict(),
         "ir_version": onnx_model.ir_version,
         "producer": onnx_model.producer_name,
         "components": {
@@ -272,6 +286,24 @@ def split_onnx(
         components=components,
         boundary_tensors=boundary_contract,
     )
+
+
+def _load_sibling_config(model_path: str, filename: str) -> Optional[Dict[str, Any]]:
+    """Read one JSON object beside the model. A missing file stays unset."""
+    if isinstance(model_path, bool) or not isinstance(model_path, str) or not model_path.strip():
+        raise ValueError(f"model path must be a non-empty string, got {model_path!r}")
+    directory = model_path if os.path.isdir(model_path) else os.path.dirname(model_path)
+    path = os.path.join(directory, filename)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as handle:
+            parsed = json.load(handle)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{filename} is not valid JSON") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{filename} must be a JSON object")
+    return parsed
 
 
 __all__ = [
