@@ -30,7 +30,7 @@ import json
 import argparse
 import gc
 import time
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional, Tuple, Callable
 import numpy as np
 
 import onnxruntime as ort
@@ -166,7 +166,49 @@ class SequentialModelPipeline:
         try:
             self.config = load_model_config(self.model_dir, t_path)
             self._log(f"  [Config] Loaded from {self.config.source_file}")
-            self._log(f"  [Config] {self.config.num_layers} layers, {self.config.num_kv_heads} KV heads, {self.config.head_dim} head dim")
+            quant_note = ""
+            method = getattr(self.config, "quantization_method", None)
+            if isinstance(method, str) and method:
+                quant_note = (
+                    f", quant {method}"
+                    f" weights {getattr(self.config, 'weight_dtype', None)}"
+                    f" activations {getattr(self.config, 'activation_dtype', None)}"
+                    f" group {getattr(self.config, 'quantization_group_size', None)}"
+                    f" format {getattr(self.config, 'quantization_format', None)}"
+                )
+            arch_note = ""
+            variant = getattr(self.config, "attention_variant", "dense")
+            if isinstance(variant, str) and variant and variant != "dense":
+                arch_note = f", attention {variant}"
+            if getattr(self.config, "is_moe", False) is True:
+                arch_note += (
+                    f", moe experts {getattr(self.config, 'num_experts', 0)}"
+                    f" per_token {getattr(self.config, 'num_experts_per_token', 0)}"
+                )
+            kv_note = ""
+            kv_dtype_name = getattr(self.config, "kv_cache_dtype", None)
+            if isinstance(kv_dtype_name, str) and kv_dtype_name:
+                kv_note += f", kv {kv_dtype_name}"
+            kv_layout = getattr(self.config, "kv_cache_layout", "BNSD")
+            if isinstance(kv_layout, str) and kv_layout and kv_layout != "BNSD":
+                kv_note += f", kv layout {kv_layout}"
+            if getattr(self.config, "use_sliding_window", False) is True:
+                kv_note += ", sliding kv"
+            hint_note = ""
+            hints = getattr(self.config, "execution_hints", None)
+            if isinstance(hints, dict):
+                plan = hints.get("recommended_execution")
+                prefill = hints.get("recommended_prefill_device")
+                decode = hints.get("recommended_decode_device")
+                if isinstance(plan, str) and isinstance(prefill, str) and isinstance(decode, str):
+                    hint_note = f", plan {plan} prefill {prefill} decode {decode}"
+                if hints.get("sequential_split_safe") is False:
+                    hint_note += ", sequential split unsafe"
+            self._log(
+                f"  [Config] {self.config.num_layers} layers, {self.config.num_kv_heads} KV heads, "
+                f"{self.config.head_dim} head dim, max_seq_len {self.config.max_seq_len}"
+                f"{quant_note}{arch_note}{kv_note}{hint_note}"
+            )
         except FileNotFoundError:
             self._log("  [Warning] No config found, using defaults (may be incorrect)")
             self.config = ModelConfig(
@@ -176,13 +218,55 @@ class SequentialModelPipeline:
                 source_file="defaults"
             )
         
-        # Initialize KV cache manager
+        # Initialize KV cache manager. A positive kv_cache_max_len, or else
+        # max_seq_len, preallocates the static buffer once. 0 leaves a CPU
+        # cache to grow per token. BNSD is the layout this manager allocates.
+        raw_limit = getattr(self.config, "max_seq_len", 0)
+        try:
+            max_seq_len = int(raw_limit)
+        except (TypeError, ValueError):
+            max_seq_len = 0
+        raw_kv_limit = getattr(self.config, "kv_cache_max_len", None)
+        if (
+            isinstance(raw_kv_limit, int)
+            and not isinstance(raw_kv_limit, bool)
+            and raw_kv_limit > 0
+        ):
+            max_seq_len = raw_kv_limit
+        kv_kwargs = {}
+        if max_seq_len > 0:
+            kv_kwargs["max_seq_len"] = max_seq_len
+        kv_scheme = getattr(self.config, "kv_cache_dtype", None)
+        if isinstance(kv_scheme, str) and kv_scheme in {
+            "fp16", "bf16", "int8", "fp8", "int4", "fp4",
+        }:
+            kv_kwargs["kv_quantization"] = kv_scheme
+        page = getattr(self.config, "kv_cache_page_size", None)
+        if isinstance(page, int) and not isinstance(page, bool) and page > 0:
+            kv_kwargs["block_size"] = page
+        if getattr(self.config, "use_sliding_window", False) is True:
+            window = None
+            extras = getattr(self.config, "architecture_extras", None)
+            if isinstance(extras, dict):
+                raw_window = extras.get("sliding_window")
+                if (
+                    isinstance(raw_window, int)
+                    and not isinstance(raw_window, bool)
+                    and raw_window > 0
+                ):
+                    window = raw_window
+            if window is None and max_seq_len > 0:
+                window = max_seq_len
+            if isinstance(window, int) and window > 0:
+                kv_kwargs["policy"] = "sliding_window"
+                kv_kwargs["window_size"] = window
         self.kv_cache = KVCacheManager(
             num_layers=self.config.num_layers,
             num_kv_heads=self.config.num_kv_heads,
             head_dim=self.config.head_dim,
             dtype=self.config.dtype,
-            batch_size=1
+            batch_size=1,
+            **kv_kwargs,
         )
         
         # Session management
@@ -263,6 +347,10 @@ class SequentialModelPipeline:
                 prefix = pattern[:-1]
                 if component_name.startswith(prefix):
                     return providers
+
+        # A phase list covers components that are not pinned to one device.
+        if self.phase_providers:
+            return self.phase_providers.get(self.phase, self.providers)
 
         # Fallback to default providers
         return self.providers
@@ -559,13 +647,20 @@ class SequentialModelPipeline:
                 present_value_format=present_val_fmt
             )
         
-    def generate(self, prompt: str, max_new_tokens: int = 20) -> str:
+    def generate(
+        self,
+        prompt: str,
+        max_new_tokens: int = 20,
+        stream_callback: Optional[Callable[[str, int], None]] = None,
+    ) -> str:
         """
         Generate text using the sequential pipeline with proper prefill/decode.
         
         Args:
             prompt: Text prompt
             max_new_tokens: Number of tokens to generate
+            stream_callback: Called with each new token's text and its
+                0-based index as soon as that token is chosen.
             
         Returns:
             Generated text
@@ -676,6 +771,8 @@ class SequentialModelPipeline:
             generated_token_ids.append(last_token_id)
             
             token_text = self.tokenizer.decode([last_token_id])
+            if stream_callback is not None:
+                stream_callback(token_text, token_idx)
             self._log(f"  Generated: '{token_text}' (id={last_token_id})")
             
             # Check for EOS

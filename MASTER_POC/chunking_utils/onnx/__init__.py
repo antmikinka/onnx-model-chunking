@@ -18,7 +18,27 @@ from .splitter import (
     split_onnx,
     extract_components,
     create_component_onnx,
+    collect_boundary_tensors,
+    build_boundary_contract,
+    save_components,
+    write_execution_contract,
+    resolve_tensor_type,
+    extract_quantization_info,
+    extract_kv_cache_info,
+    extract_execution_policy,
     detect_architecture_from_onnx,
+)
+from .validator import (
+    compute_psnr,
+    verify_split_correctness,
+    validate_boundary_contracts,
+    validate_component_io,
+)
+from .weight_store import (
+    WeightStrategy,
+    coerce_weight_strategy,
+    plan_weight_storage,
+    store_component_weights,
 )
 from .merger import merge_onnx
 from .loader import load_onnx_model, resolve_model_path
@@ -35,6 +55,22 @@ __all__ = [
     # Component extraction
     "extract_components",
     "create_component_onnx",
+    "collect_boundary_tensors",
+    "build_boundary_contract",
+    "save_components",
+    "write_execution_contract",
+    "resolve_tensor_type",
+    "extract_quantization_info",
+    "extract_kv_cache_info",
+    "extract_execution_policy",
+    "compute_psnr",
+    "verify_split_correctness",
+    "validate_boundary_contracts",
+    "validate_component_io",
+    "WeightStrategy",
+    "coerce_weight_strategy",
+    "plan_weight_storage",
+    "store_component_weights",
     # Architecture detection
     "detect_architecture_from_onnx",
     # Types

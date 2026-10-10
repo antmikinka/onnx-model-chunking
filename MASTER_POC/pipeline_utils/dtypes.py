@@ -10,7 +10,8 @@ Usage:
 """
 
 import warnings
-from typing import Optional, Union
+from dataclasses import dataclass
+from typing import Dict, Optional, Sequence, Tuple, Union
 import numpy as np
 
 # =============================================================================
@@ -38,6 +39,261 @@ def get_bfloat16_dtype():
     if supports_bfloat16():
         return _BFLOAT16_DTYPE
     return None
+
+
+def _is_bfloat16_dtype(dtype) -> bool:
+    """True for ml_dtypes.bfloat16 or the dtype get_bfloat16_dtype() returns."""
+    try:
+        resolved = np.dtype(dtype)
+    except TypeError:
+        return False
+    native = get_bfloat16_dtype()
+    if native is not None:
+        try:
+            if resolved == np.dtype(native):
+                return True
+        except TypeError:
+            pass
+    return "bfloat16" in resolved.name.lower()
+
+
+def _round_float32_to_bf16_bits(values: np.ndarray) -> np.ndarray:
+    """Round float32 values to the nearest even bfloat16 and return uint16 bits.
+
+    Bfloat16 keeps the top 16 bits of float32. The low bit of that half selects
+    round-to-nearest-even. A NaN whose payload sits only in the discarded bits
+    gets a quiet bit in the kept half so the result stays a NaN.
+    """
+    bits = np.ascontiguousarray(values, dtype=np.float32).view(np.uint32).astype(np.uint64)
+    nan = (bits & np.uint64(0x7FFFFFFF)) > np.uint64(0x7F800000)
+    bits = np.where(nan, bits | np.uint64(0x00400000), bits)
+    rounded = (
+        bits + np.uint64(0x7FFF) + ((bits >> np.uint64(16)) & np.uint64(1))
+    ) >> np.uint64(16)
+    return np.ascontiguousarray(rounded.astype(np.uint16))
+
+
+def bfloat16_to_uint16_view(arr: np.ndarray) -> np.ndarray:
+    """View bfloat16 storage as uint16 bits.
+
+    Accepts a native bfloat16 array or a uint16 container. The result shares
+    memory with ``arr`` so a cache can be transported without a copy.
+    """
+    array = np.asarray(arr)
+    if array.dtype == np.dtype(np.uint16):
+        return array.view(np.uint16)
+    if not _is_bfloat16_dtype(array.dtype):
+        raise ValueError(
+            "bfloat16_to_uint16_view expects bfloat16 or uint16 bit storage, "
+            f"got {array.dtype}"
+        )
+    if array.dtype.itemsize != np.dtype(np.uint16).itemsize:
+        raise ValueError(f"bfloat16 dtype {array.dtype} is not a 16-bit container")
+    return array.view(np.uint16)
+
+
+def uint16_view_to_bfloat16(arr: np.ndarray) -> np.ndarray:
+    """View uint16 bfloat16 bits as the native dtype, or keep the uint16 container.
+
+    NumPy has no built-in bfloat16. When ml_dtypes is absent the uint16 array
+    is the bfloat16 value. When ml_dtypes is present the same bits are viewed
+    as that dtype.
+    """
+    array = np.asarray(arr)
+    if _is_bfloat16_dtype(array.dtype):
+        return array
+    if array.dtype != np.dtype(np.uint16):
+        raise ValueError(
+            f"uint16_view_to_bfloat16 expects uint16 bit storage, got {array.dtype}"
+        )
+    native = get_bfloat16_dtype()
+    if native is None:
+        return array
+    native_dtype = np.dtype(native)
+    if native_dtype.itemsize != np.dtype(np.uint16).itemsize:
+        raise ValueError(f"bfloat16 dtype {native_dtype} is not a 16-bit container")
+    return array.view(native_dtype)
+
+
+def bfloat16_to_float32(arr: np.ndarray) -> np.ndarray:
+    """Expand bfloat16 values to float32.
+
+    ``arr`` is native bfloat16 or a uint16 bit container. Each code is placed
+    in the high half of a float32 and the low half is zero.
+    """
+    bits = bfloat16_to_uint16_view(arr)
+    wide = np.ascontiguousarray(bits).astype(np.uint32) << np.uint32(16)
+    return wide.view(np.float32)
+
+
+def float32_to_bfloat16(arr: np.ndarray) -> np.ndarray:
+    """Round numeric values to bfloat16.
+
+    The result is ml_dtypes.bfloat16 when that dtype is installed. Otherwise
+    it is the uint16 bit container used to transport bfloat16 through NumPy
+    and ORT session boundaries.
+    """
+    values = np.ascontiguousarray(arr, dtype=np.float32)
+    return uint16_view_to_bfloat16(_round_float32_to_bf16_bits(values))
+
+
+# =============================================================================
+# FLOAT8 SUPPORT DETECTION
+# =============================================================================
+
+try:
+    import ml_dtypes
+    FP8_E4M3 = getattr(ml_dtypes, "float8_e4m3fn", None)
+    FP8_E5M2 = getattr(ml_dtypes, "float8_e5m2", None)
+    FP8_E4M3FNUZ = getattr(ml_dtypes, "float8_e4m3fnuz", None)
+    FP8_E5M2FNUZ = getattr(ml_dtypes, "float8_e5m2fnuz", None)
+except ImportError:
+    FP8_E4M3 = None
+    FP8_E5M2 = None
+    FP8_E4M3FNUZ = None
+    FP8_E5M2FNUZ = None
+
+_FLOAT8_BY_KIND = {
+    "e4m3": "e4m3fn",
+    "e4m3fn": "e4m3fn",
+    "float8e4m3fn": "e4m3fn",
+    "e5m2": "e5m2",
+    "float8e5m2": "e5m2",
+    "e4m3fnuz": "e4m3fnuz",
+    "float8e4m3fnuz": "e4m3fnuz",
+    "e5m2fnuz": "e5m2fnuz",
+    "float8e5m2fnuz": "e5m2fnuz",
+}
+
+
+def _float8_kind(kind: str) -> str:
+    key = str(kind).strip().lower().replace("-", "").replace("_", "")
+    if key not in _FLOAT8_BY_KIND:
+        known = ", ".join(sorted(set(_FLOAT8_BY_KIND.values())))
+        raise ValueError(f"Unrecognized float8 kind: {kind}. Known kinds: {known}")
+    return _FLOAT8_BY_KIND[key]
+
+
+def _float8_constant(kind: str):
+    canonical = _float8_kind(kind)
+    return {
+        "e4m3fn": FP8_E4M3,
+        "e5m2": FP8_E5M2,
+        "e4m3fnuz": FP8_E4M3FNUZ,
+        "e5m2fnuz": FP8_E5M2FNUZ,
+    }[canonical]
+
+
+def supports_float8() -> bool:
+    """True when ml_dtypes provides both OCP E4M3FN and E5M2."""
+    return FP8_E4M3 is not None and FP8_E5M2 is not None
+
+
+def get_float8_dtype(kind: str = "e4m3fn"):
+    """Return one FP8 dtype, or None when that variant is not installed."""
+    return _float8_constant(kind)
+
+
+def float8_storage_dtype(kind: str = "e4m3fn") -> np.dtype:
+    """Dtype used to store compressed FP8 values.
+
+    A native ml_dtypes value is stored as itself. E4M3 without that package
+    is stored as uint8 codes. Other variants fall back to float16.
+    """
+    native = get_float8_dtype(kind)
+    if native is not None:
+        return np.dtype(native)
+    if _float8_kind(kind) == "e4m3fn":
+        return np.dtype(np.uint8)
+    return np.dtype(np.float16)
+
+
+def _build_fp8_e4m3_table() -> np.ndarray:
+    """OCP E4M3FN codes. Only exponent 15 with mantissa 7 is NaN."""
+    table = np.empty(256, dtype=np.float32)
+    for code in range(256):
+        sign = -1.0 if code & 0x80 else 1.0
+        exp = (code >> 3) & 0xF
+        mant = code & 0x7
+        if exp == 15 and mant == 7:
+            table[code] = np.nan
+            continue
+        if exp == 0:
+            mag = (mant / 8.0) * (2.0 ** -6)
+        else:
+            mag = (1.0 + mant / 8.0) * (2.0 ** (exp - 7))
+        table[code] = np.float32(sign * mag)
+    return table
+
+
+_FP8_E4M3_TABLE = _build_fp8_e4m3_table()
+_FP8_POS_ORDER = np.array(
+    [
+        code
+        for code in np.argsort(_FP8_E4M3_TABLE[:128], kind="stable")
+        if np.isfinite(_FP8_E4M3_TABLE[code])
+    ],
+    dtype=np.uint8,
+)
+_FP8_POS_LEVELS = np.ascontiguousarray(_FP8_E4M3_TABLE[_FP8_POS_ORDER])
+
+
+def _quantize_e4m3_codes(values: np.ndarray) -> np.ndarray:
+    scaled = np.nan_to_num(
+        np.asarray(values, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0
+    )
+    abs_vals = np.minimum(np.abs(scaled), _FP8_POS_LEVELS[-1])
+    index = np.searchsorted(_FP8_POS_LEVELS, abs_vals, side="left")
+    index = np.clip(index, 1, len(_FP8_POS_LEVELS) - 1)
+    left = index - 1
+    right_dist = np.abs(_FP8_POS_LEVELS[index] - abs_vals)
+    left_dist = np.abs(_FP8_POS_LEVELS[left] - abs_vals)
+    pick = np.where(right_dist < left_dist, index, left)
+    codes = _FP8_POS_ORDER[pick].astype(np.uint8)
+    return np.where(scaled < 0, codes | np.uint8(0x80), codes).astype(np.uint8)
+
+
+def quantize_float8(
+    values: np.ndarray,
+    scale: float = 1.0,
+    kind: str = "e4m3fn",
+) -> np.ndarray:
+    """Compress values to FP8 for a cache that ORT will see only after dequantization.
+
+    Native ml_dtypes keeps the real FP8 dtype. E4M3 without that package
+    stores uint8 codes. The matching ``dequantize_float8`` call expands
+    either form to float32 at the session boundary.
+    """
+    if float(scale) == 0.0 or not np.isfinite(scale):
+        raise ValueError(f"float8 scale must be finite and non-zero, got {scale}")
+    scaled = np.asarray(values, dtype=np.float32) / np.float32(scale)
+    native = get_float8_dtype(kind)
+    if native is not None:
+        return np.ascontiguousarray(scaled.astype(native))
+    if _float8_kind(kind) == "e4m3fn":
+        return np.ascontiguousarray(_quantize_e4m3_codes(scaled))
+    warnings.warn(
+        f"Float8 kind '{kind}' falling back to float16",
+        UserWarning,
+    )
+    return np.ascontiguousarray(scaled.astype(np.float16))
+
+
+def dequantize_float8(stored: np.ndarray, scale: float = 1.0) -> np.ndarray:
+    """Expand a compressed FP8 buffer to float32."""
+    array = np.asarray(stored)
+    factor = np.float32(scale)
+    native_dtypes = [
+        dtype
+        for dtype in (FP8_E4M3, FP8_E5M2, FP8_E4M3FNUZ, FP8_E5M2FNUZ)
+        if dtype is not None and array.dtype == np.dtype(dtype)
+    ]
+    if native_dtypes or array.dtype == np.dtype(np.float16):
+        return np.asarray(array, dtype=np.float32) * factor
+    if array.dtype == np.dtype(np.uint8) or array.dtype.itemsize == 1:
+        codes = np.ascontiguousarray(array).view(np.uint8)
+        return _FP8_E4M3_TABLE[codes] * factor
+    raise ValueError(f"Cannot dequantize float8 storage dtype {array.dtype}")
 
 
 # =============================================================================
@@ -77,20 +333,64 @@ ONNX_DTYPE_MAP = {
     "tensor(int4)": np.int8,      # Packed 2x per byte
     "tensor(uint4)": np.uint8,    # Packed 2x per byte
     
-    # Float8 Types (emerging standard for inference)
-    "tensor(float8e4m3fn)": np.float16,   # Fallback with precision warning
-    "tensor(float8e5m2)": np.float16,     # Fallback with precision warning
-    "tensor(float8e4m3fnuz)": np.float16, # Fallback with precision warning
-    "tensor(float8e5m2fnuz)": np.float16, # Fallback with precision warning
+    # Float8 Types. Resolved to ml_dtypes when installed, else float16.
+    "tensor(float8e4m3fn)": "float8e4m3fn",
+    "tensor(float8e5m2)": "float8e5m2",
+    "tensor(float8e4m3fnuz)": "float8e4m3fnuz",
+    "tensor(float8e5m2fnuz)": "float8e5m2fnuz",
 }
 
 # Types that require special handling or have precision implications
 SPECIAL_TYPES = {
-    "bfloat16": "Uses ml_dtypes if available, else falls back to float32",
-    "int4": "Packed format - 2 values per byte, requires unpacking for computation",
-    "uint4": "Packed format - 2 values per byte, requires unpacking for computation",
-    "float8e4m3fn": "8-bit float (E4M3), falls back to float16",
-    "float8e5m2": "8-bit float (E5M2), falls back to float16",
+    "bfloat16": "Session dtype uses ml_dtypes if available, else float32. Transport stores round-to-nearest-even bits in uint16 when the native dtype is absent.",
+    "int4": "Signed 4-bit values, two per int8 byte. INT4_BLOCKWISE records the group, scale, and zero point.",
+    "uint4": "Unsigned 4-bit values, two per uint8 byte. UINT4_BLOCKWISE records the group, scale, and zero point.",
+    "float8e4m3fn": "OCP E4M3FN. Uses ml_dtypes when available, else uint8 codes dequantized at the session boundary.",
+    "float8e5m2": "OCP E5M2. Uses ml_dtypes when available, else falls back to float16.",
+}
+
+# Numeric ONNX TensorProto.DataType codes.
+# 16 (BFLOAT16) stays the string sentinel used by ONNX_DTYPE_MAP. ml_dtypes
+# is optional, so the reverse map has no bfloat16 key.
+# 14 and 15 are COMPLEX64 and COMPLEX128. io_binding already converts those
+# dtypes, so they stay on this shared map.
+ONNX_ELEMENT_TYPE_TO_NUMPY = {
+    1: np.float32,
+    2: np.uint8,
+    3: np.int8,
+    4: np.uint16,
+    5: np.int16,
+    6: np.int32,
+    7: np.int64,
+    9: np.bool_,
+    10: np.float16,
+    11: np.float64,
+    12: np.uint32,
+    13: np.uint64,
+    14: np.complex64,
+    15: np.complex128,
+    16: "bfloat16",
+    17: "float8e4m3fn",
+    18: "float8e4m3fnuz",
+    19: "float8e5m2",
+    20: "float8e5m2fnuz",
+}
+
+NUMPY_TO_ONNX_ELEMENT_TYPE = {
+    np.float32: 1,
+    np.uint8: 2,
+    np.int8: 3,
+    np.uint16: 4,
+    np.int16: 5,
+    np.int32: 6,
+    np.int64: 7,
+    np.bool_: 9,
+    np.float16: 10,
+    np.float64: 11,
+    np.uint32: 12,
+    np.uint64: 13,
+    np.complex64: 14,
+    np.complex128: 15,
 }
 
 # Short form type mappings (without "tensor()" wrapper)
@@ -101,6 +401,10 @@ SHORT_DTYPE_MAP = {
     "float": np.float32,
     "double": np.float64,
     "bfloat16": "bfloat16",
+    "float8e4m3fn": "float8e4m3fn",
+    "float8e5m2": "float8e5m2",
+    "float8e4m3fnuz": "float8e4m3fnuz",
+    "float8e5m2fnuz": "float8e5m2fnuz",
     "int8": np.int8,
     "int16": np.int16,
     "int32": np.int32,
@@ -164,8 +468,447 @@ AWQ_DTYPE_MAP = {
 
 
 # =============================================================================
+# QUANTIZED DTYPE METADATA
+# =============================================================================
+
+@dataclass(frozen=True)
+class QuantizedDtype:
+    """Packing metadata for a sub-byte weight dtype.
+
+    ``ONNX_DTYPE_MAP`` still names the storage numpy dtype. This record
+    names the logical width, the group, the scale, the zero point, and
+    the packing order used by blocked INT4, MatMulNBits, AWQ, and GPTQ.
+    """
+
+    logical_dtype: str
+    bits: int
+    signed: bool
+    storage_dtype: np.dtype
+    group_size: Optional[int]
+    has_scale: bool
+    has_zero_point: bool
+    scale_dtype: Optional[np.dtype]
+    zero_point_dtype: Optional[np.dtype]
+    layout: Optional[str]
+    packing_axis: Optional[str] = None
+    bit_order: str = "low_bits_first"
+    interleave: int = 1
+
+    def __post_init__(self):
+        storage = np.dtype(self.storage_dtype)
+        object.__setattr__(self, "storage_dtype", storage)
+        if self.scale_dtype is not None:
+            object.__setattr__(self, "scale_dtype", np.dtype(self.scale_dtype))
+        if self.zero_point_dtype is not None:
+            object.__setattr__(self, "zero_point_dtype", np.dtype(self.zero_point_dtype))
+        width = storage.itemsize * 8
+        if self.bits < 1 or self.bits > width:
+            raise ValueError(f"bits must fit in {storage}, got {self.bits}")
+        if width % self.bits != 0:
+            raise ValueError(
+                f"{self.bits}-bit values do not pack evenly into {storage}"
+            )
+        if self.group_size is not None:
+            if int(self.group_size) < 1:
+                raise ValueError(f"group_size must be positive, got {self.group_size}")
+            object.__setattr__(self, "group_size", int(self.group_size))
+        if self.has_scale and self.scale_dtype is None:
+            raise ValueError("has_scale requires scale_dtype")
+        if not self.has_scale and self.scale_dtype is not None:
+            raise ValueError("scale_dtype is set but has_scale is false")
+        if self.has_zero_point and self.zero_point_dtype is None:
+            raise ValueError("has_zero_point requires zero_point_dtype")
+        if not self.has_zero_point and self.zero_point_dtype is not None:
+            raise ValueError("zero_point_dtype is set but has_zero_point is false")
+        if self.bit_order not in ("low_bits_first", "high_bits_first"):
+            raise ValueError(f"unsupported bit_order: {self.bit_order}")
+        if int(self.interleave) < 1:
+            raise ValueError(f"interleave must be positive, got {self.interleave}")
+        object.__setattr__(self, "interleave", int(self.interleave))
+
+    @property
+    def values_per_storage_element(self) -> int:
+        """Logical values stored in one storage scalar."""
+        return (self.storage_dtype.itemsize * 8) // self.bits
+
+    @property
+    def block_size(self) -> Optional[int]:
+        """MatMulNBits block size. These layouts use the group size."""
+        return self.group_size
+
+    def matmul_nbits_attributes(self) -> dict:
+        """Attributes a MatMulNBits node needs besides K and N."""
+        if self.group_size is None:
+            raise ValueError("group_size is required for MatMulNBits block_size")
+        return {"bits": int(self.bits), "block_size": int(self.group_size)}
+
+    def packing_order(self) -> dict:
+        """How logical values sit inside the storage container."""
+        layout = (self.layout or "").lower()
+        axis = self.packing_axis
+        if axis is None:
+            axis = {
+                "blocked": "k_block",
+                "matmul_nbits": "k_block",
+                "awq": "output",
+                "gptq": "input",
+            }.get(layout)
+        return {
+            "layout": self.layout,
+            "bit_order": self.bit_order,
+            "axis": axis,
+            "interleave": self.interleave,
+            "values_per_storage_element": self.values_per_storage_element,
+            "group_size": self.group_size,
+            "block_size": self.group_size,
+        }
+
+    def scale_shape(self, weight_shape: tuple) -> tuple:
+        """Scale tensor shape for a rank-2 weight of this layout."""
+        if self.group_size is None:
+            raise ValueError("group_size is required to place scales")
+        if len(weight_shape) != 2:
+            raise ValueError(f"weight shape must be rank 2, got {weight_shape}")
+        layout = (self.layout or "").lower()
+        if layout == "awq":
+            rows, cols = weight_shape
+            if rows % self.group_size != 0:
+                raise ValueError(
+                    f"AWQ K {rows} is not a multiple of group_size {self.group_size}"
+                )
+            return (rows // self.group_size, cols)
+        rows, cols = weight_shape
+        if cols % self.group_size != 0:
+            raise ValueError(
+                f"K {cols} is not a multiple of group_size {self.group_size}"
+            )
+        return (rows, cols // self.group_size)
+
+
+INT4_BLOCKWISE = QuantizedDtype(
+    logical_dtype="int4",
+    bits=4,
+    signed=True,
+    storage_dtype=np.int8,
+    group_size=32,
+    has_scale=True,
+    has_zero_point=True,
+    scale_dtype=np.float16,
+    zero_point_dtype=np.uint8,
+    layout="blocked",
+)
+
+UINT4_BLOCKWISE = QuantizedDtype(
+    logical_dtype="uint4",
+    bits=4,
+    signed=False,
+    storage_dtype=np.uint8,
+    group_size=32,
+    has_scale=True,
+    has_zero_point=True,
+    scale_dtype=np.float16,
+    zero_point_dtype=np.uint8,
+    layout="blocked",
+)
+
+AWQ_INT4 = QuantizedDtype(
+    logical_dtype="uint4",
+    bits=4,
+    signed=False,
+    storage_dtype=np.int32,
+    group_size=128,
+    has_scale=True,
+    has_zero_point=True,
+    scale_dtype=np.float16,
+    zero_point_dtype=np.int32,
+    layout="awq",
+    packing_axis="output",
+)
+
+GPTQ_INT4 = QuantizedDtype(
+    logical_dtype="uint4",
+    bits=4,
+    signed=False,
+    storage_dtype=np.int32,
+    group_size=128,
+    has_scale=True,
+    has_zero_point=True,
+    scale_dtype=np.float16,
+    zero_point_dtype=np.int32,
+    layout="gptq",
+    packing_axis="input",
+)
+
+
+def quantized_dtype_from_matmul_nbits(
+    bits: int = 4,
+    block_size: int = 128,
+    signed: bool = False,
+    has_zero_point: bool = True,
+    scale_dtype: Optional[np.dtype] = np.float16,
+    zero_point_dtype: Optional[np.dtype] = np.uint8,
+) -> QuantizedDtype:
+    """Build MatMulNBits metadata from the node attributes.
+
+    ORT packs ``block_size`` values along K. The low bits of each byte
+    hold the first value. ``block_size`` is the group size. The default
+    attributes are bits 4 and block size 128.
+    """
+    if bits not in (4, 8):
+        raise ValueError(f"MatMulNBits bits must be 4 or 8, got {bits}")
+    if int(block_size) < 1 or (int(block_size) * int(bits)) % 8 != 0:
+        raise ValueError(
+            f"block_size {block_size} * bits {bits} must fill whole bytes"
+        )
+    return QuantizedDtype(
+        logical_dtype=f"{'int' if signed else 'uint'}{int(bits)}",
+        bits=int(bits),
+        signed=bool(signed),
+        storage_dtype=np.int8 if signed else np.uint8,
+        group_size=int(block_size),
+        has_scale=True,
+        has_zero_point=bool(has_zero_point),
+        scale_dtype=scale_dtype,
+        zero_point_dtype=zero_point_dtype if has_zero_point else None,
+        layout="matmul_nbits",
+        packing_axis="k_block",
+    )
+
+
+MATMUL_NBITS_INT4 = quantized_dtype_from_matmul_nbits()
+
+QUANTIZED_DTYPE_MAP = {
+    "int4": INT4_BLOCKWISE,
+    "tensor(int4)": INT4_BLOCKWISE,
+    "int4_blockwise": INT4_BLOCKWISE,
+    "uint4": UINT4_BLOCKWISE,
+    "tensor(uint4)": UINT4_BLOCKWISE,
+    "uint4_blockwise": UINT4_BLOCKWISE,
+    "matmul_nbits": MATMUL_NBITS_INT4,
+    "matmulnbits": MATMUL_NBITS_INT4,
+    "awq": AWQ_INT4,
+    "awq_int4": AWQ_INT4,
+    "awq_uint4": AWQ_INT4,
+    "awq_gemm_int4": AWQ_INT4,
+    "awq_gemv_int4": AWQ_INT4,
+    "awq_w4a16": AWQ_INT4,
+    "gptq": GPTQ_INT4,
+    "gptq_int4": GPTQ_INT4,
+}
+
+
+def get_quantized_dtype(name: str) -> QuantizedDtype:
+    """Return packing metadata for an INT4, UINT4, MatMulNBits, AWQ, or GPTQ name."""
+    key = str(name).strip().lower()
+    if key not in QUANTIZED_DTYPE_MAP:
+        known = ", ".join(sorted(QUANTIZED_DTYPE_MAP))
+        raise ValueError(f"Unrecognized quantized dtype: {name}. Known names: {known}")
+    return QUANTIZED_DTYPE_MAP[key]
+
+
+def _logical_to_codes(matrix: np.ndarray, spec: QuantizedDtype) -> np.ndarray:
+    values = np.asarray(matrix, dtype=np.int32)
+    mask = (1 << spec.bits) - 1
+    if spec.signed:
+        limit = 1 << (spec.bits - 1)
+        if np.any(values < -limit) or np.any(values > limit - 1):
+            raise ValueError(
+                f"signed {spec.bits}-bit values must be in [{-limit}, {limit - 1}]"
+            )
+        return (values & mask).astype(np.uint32)
+    if np.any(values < 0) or np.any(values > mask):
+        raise ValueError(f"unsigned {spec.bits}-bit values must be in [0, {mask}]")
+    return values.astype(np.uint32)
+
+
+def _as_unsigned_words(packed: np.ndarray, storage: np.dtype) -> np.ndarray:
+    raw = np.asarray(packed)
+    if storage == np.dtype(np.int8):
+        return raw.view(np.uint8).astype(np.uint32)
+    if storage == np.dtype(np.uint8):
+        return raw.astype(np.uint32)
+    if storage == np.dtype(np.int32):
+        return raw.view(np.uint32)
+    if storage == np.dtype(np.uint32):
+        return raw.astype(np.uint32)
+    raise ValueError(f"unsupported storage dtype {storage}")
+
+
+def _store_words(words: np.ndarray, storage: np.dtype) -> np.ndarray:
+    if storage.itemsize == 1:
+        narrowed = words.astype(np.uint8)
+        if storage == np.dtype(np.int8):
+            return narrowed.view(np.int8)
+        return narrowed
+    if storage == np.dtype(np.int32):
+        return words.astype(np.uint32).view(np.int32)
+    if storage == np.dtype(np.uint32):
+        return words.astype(np.uint32)
+    raise ValueError(f"unsupported storage dtype {storage}")
+
+
+def pack_quantized(values: np.ndarray, spec: QuantizedDtype) -> np.ndarray:
+    """Pack the last axis into ``spec.storage_dtype``.
+
+    Slot 0 occupies the low bits. A 4-bit byte layout stores two values
+    per byte. AWQ and GPTQ store eight values per int32.
+    """
+    array = np.asarray(values)
+    if array.ndim == 0:
+        raise ValueError("values must include a logical axis")
+    if spec.interleave != 1:
+        raise ValueError(
+            f"interleave {spec.interleave} is recorded; packing implements interleave 1"
+        )
+    if spec.bit_order != "low_bits_first":
+        raise ValueError(f"bit_order {spec.bit_order} is not implemented")
+    per = spec.values_per_storage_element
+    logical = array.shape[-1]
+    if logical % per != 0:
+        raise ValueError(f"logical count {logical} is not a multiple of {per}")
+    leading = array.shape[:-1]
+    rows = int(np.prod(leading, dtype=np.int64)) if leading else 1
+    codes = _logical_to_codes(np.reshape(array, (rows, logical)), spec)
+    words = np.zeros((rows, logical // per), dtype=np.uint32)
+    for slot in range(per):
+        words |= codes[:, slot::per] << np.uint32(spec.bits * slot)
+    stored = _store_words(words, spec.storage_dtype)
+    return stored.reshape(leading + (logical // per,))
+
+
+def unpack_quantized(packed: np.ndarray, spec: QuantizedDtype) -> np.ndarray:
+    """Inverse of ``pack_quantized``. Signed layouts restore two's-complement nibbles."""
+    array = np.asarray(packed)
+    if array.ndim == 0:
+        raise ValueError("packed values must include a storage axis")
+    if spec.interleave != 1:
+        raise ValueError(
+            f"interleave {spec.interleave} is recorded; unpacking implements interleave 1"
+        )
+    if spec.bit_order != "low_bits_first":
+        raise ValueError(f"bit_order {spec.bit_order} is not implemented")
+    if array.dtype != spec.storage_dtype:
+        raise ValueError(
+            f"packed dtype {array.dtype} does not match storage {spec.storage_dtype}"
+        )
+    per = spec.values_per_storage_element
+    leading = array.shape[:-1]
+    stored = array.shape[-1]
+    rows = int(np.prod(leading, dtype=np.int64)) if leading else 1
+    words = _as_unsigned_words(np.reshape(array, (rows, stored)), spec.storage_dtype)
+    logical = stored * per
+    codes = np.zeros((rows, logical), dtype=np.int16)
+    mask = (1 << spec.bits) - 1
+    for slot in range(per):
+        codes[:, slot::per] = (words >> np.uint32(spec.bits * slot)) & np.uint32(mask)
+    if spec.signed:
+        sign = 1 << (spec.bits - 1)
+        codes = np.where(codes >= sign, codes - (1 << spec.bits), codes)
+    return codes.reshape(leading + (logical,))
+
+
+def pack_weights(weight: np.ndarray, spec: QuantizedDtype) -> np.ndarray:
+    """Pack a rank-2 weight into the layout named by ``spec``.
+
+    Blocked and MatMulNBits weights are ``[N, K]`` and become
+    ``[N, K / block_size, blob]``. AWQ weights are ``[K, N]`` and become
+    ``[K, N / values_per_word]``. GPTQ weights are ``[N, K]`` and become
+    ``[N, K / values_per_word]``.
+    """
+    array = np.asarray(weight)
+    if array.ndim != 2:
+        raise ValueError(f"weight must be rank 2, got shape {array.shape}")
+    layout = (spec.layout or "").lower()
+    if layout in ("blocked", "matmul_nbits"):
+        if spec.group_size is None:
+            raise ValueError("group_size is required for blocked packing")
+        _rows, cols = array.shape
+        if cols % spec.group_size != 0:
+            raise ValueError(
+                f"K {cols} is not a multiple of block_size {spec.group_size}"
+            )
+        blocks = cols // spec.group_size
+        grouped = array.reshape(array.shape[0], blocks, spec.group_size)
+        return pack_quantized(grouped, spec)
+    if layout == "awq":
+        _rows, cols = array.shape
+        if cols % spec.values_per_storage_element != 0:
+            raise ValueError(
+                f"AWQ N {cols} is not a multiple of {spec.values_per_storage_element}"
+            )
+        return pack_quantized(array, spec)
+    if layout == "gptq":
+        _rows, cols = array.shape
+        if cols % spec.values_per_storage_element != 0:
+            raise ValueError(
+                f"GPTQ K {cols} is not a multiple of {spec.values_per_storage_element}"
+            )
+        return pack_quantized(array, spec)
+    raise ValueError(f"unsupported quantized layout: {spec.layout}")
+
+
+def unpack_weights(packed: np.ndarray, spec: QuantizedDtype) -> np.ndarray:
+    """Inverse of ``pack_weights``."""
+    array = np.asarray(packed)
+    layout = (spec.layout or "").lower()
+    if layout in ("blocked", "matmul_nbits"):
+        if array.ndim != 3:
+            raise ValueError(
+                f"MatMulNBits storage must be [N, blocks, blob], got {array.shape}"
+            )
+        if spec.group_size is None:
+            raise ValueError("group_size is required for blocked unpacking")
+        logical = unpack_quantized(array, spec)
+        if logical.shape[-1] != spec.group_size:
+            raise ValueError(
+                f"unpacked block {logical.shape[-1]} does not match group_size {spec.group_size}"
+            )
+        return logical.reshape(logical.shape[0], logical.shape[1] * logical.shape[2])
+    if layout in ("awq", "gptq"):
+        if array.ndim != 2:
+            raise ValueError(f"{layout} storage must be rank 2, got {array.shape}")
+        return unpack_quantized(array, spec)
+    raise ValueError(f"unsupported quantized layout: {spec.layout}")
+
+
+# =============================================================================
 # TYPE CONVERSION UTILITIES
 # =============================================================================
+
+_FLOAT8_SENTINELS = {
+    "float8e4m3fn": "e4m3fn",
+    "float8e5m2": "e5m2",
+    "float8e4m3fnuz": "e4m3fnuz",
+    "float8e5m2fnuz": "e5m2fnuz",
+}
+
+
+def _resolve_float8_sentinel(name: str, onnx_type: str):
+    native = get_float8_dtype(_FLOAT8_SENTINELS[name])
+    if native is not None:
+        return native
+    warnings.warn(
+        f"Float8 type '{onnx_type}' falling back to float16",
+        UserWarning,
+    )
+    return np.float16
+
+
+def _materialize_mapped_dtype(result, onnx_type: str):
+    if result == "bfloat16":
+        bf16 = get_bfloat16_dtype()
+        if bf16 is not None:
+            return bf16
+        warnings.warn(
+            "bfloat16 requested but ml_dtypes not available. "
+            "Falling back to float32 to preserve precision.",
+            UserWarning,
+        )
+        return np.float32
+    if isinstance(result, str) and result in _FLOAT8_SENTINELS:
+        return _resolve_float8_sentinel(result, onnx_type)
+    return result
+
 
 def get_numpy_dtype(onnx_type: str) -> np.dtype:
     """
@@ -182,47 +925,34 @@ def get_numpy_dtype(onnx_type: str) -> np.dtype:
     """
     # Try full form first
     if onnx_type in ONNX_DTYPE_MAP:
-        result = ONNX_DTYPE_MAP[onnx_type]
-        if result == "bfloat16":
-            bf16 = get_bfloat16_dtype()
-            if bf16 is not None:
-                return bf16
-            warnings.warn(
-                "bfloat16 requested but ml_dtypes not available. "
-                "Falling back to float32 to preserve precision.",
-                UserWarning
-            )
-            return np.float32
-        return result
+        return _materialize_mapped_dtype(ONNX_DTYPE_MAP[onnx_type], onnx_type)
     
     # Try extracting type from tensor() wrapper
     if onnx_type.startswith("tensor(") and onnx_type.endswith(")"):
         inner_type = onnx_type[7:-1]
         if inner_type in SHORT_DTYPE_MAP:
-            result = SHORT_DTYPE_MAP[inner_type]
-            if result == "bfloat16":
-                bf16 = get_bfloat16_dtype()
-                return bf16 if bf16 is not None else np.float32
-            return result
+            return _materialize_mapped_dtype(SHORT_DTYPE_MAP[inner_type], onnx_type)
     
     # Try short form
     if onnx_type in SHORT_DTYPE_MAP:
-        result = SHORT_DTYPE_MAP[onnx_type]
-        if result == "bfloat16":
-            bf16 = get_bfloat16_dtype()
-            return bf16 if bf16 is not None else np.float32
-        return result
+        return _materialize_mapped_dtype(SHORT_DTYPE_MAP[onnx_type], onnx_type)
     
     # Fallback: try parsing common patterns
     onnx_lower = onnx_type.lower()
     if "float16" in onnx_lower:
         return np.float16
     elif "bfloat16" in onnx_lower:
-        bf16 = get_bfloat16_dtype()
-        return bf16 if bf16 is not None else np.float32
+        return _materialize_mapped_dtype("bfloat16", onnx_type)
     elif "float8" in onnx_lower:
-        warnings.warn(f"Float8 type '{onnx_type}' falling back to float16", UserWarning)
-        return np.float16
+        if "e4m3fnuz" in onnx_lower:
+            sentinel = "float8e4m3fnuz"
+        elif "e5m2fnuz" in onnx_lower:
+            sentinel = "float8e5m2fnuz"
+        elif "e5m2" in onnx_lower:
+            sentinel = "float8e5m2"
+        else:
+            sentinel = "float8e4m3fn"
+        return _resolve_float8_sentinel(sentinel, onnx_type)
     elif "float64" in onnx_lower or "double" in onnx_lower:
         return np.float64
     elif "float" in onnx_lower:
@@ -254,27 +984,175 @@ def get_numpy_dtype(onnx_type: str) -> np.dtype:
     raise ValueError(f"Unrecognized ONNX type: {onnx_type}")
 
 
+def numpy_dtype_from_onnx_element_type(element_type: int):
+    """
+    Get the numpy dtype for an ONNX TensorProto.DataType code.
+
+    Args:
+        element_type: TensorProto.DataType integer, e.g. 1 for FLOAT
+
+    Returns:
+        numpy dtype for that code. BFLOAT16 (16) uses ml_dtypes when
+        it is installed and float32 otherwise.
+
+    Raises:
+        ValueError: If the element type code is not recognized
+    """
+    if element_type not in ONNX_ELEMENT_TYPE_TO_NUMPY:
+        raise ValueError(f"Unrecognized ONNX element type: {element_type}")
+    result = ONNX_ELEMENT_TYPE_TO_NUMPY[element_type]
+    return _materialize_mapped_dtype(result, f"tensor({result})")
+
+
+# Integers larger than this are not exact in float64.
+_EXACT_INT_IN_FLOAT64 = 1 << 53
+
+
+def _integer_outside(array: np.ndarray, lo: int, hi: int) -> np.ndarray:
+    """True where an integer array cannot fit in [lo, hi].
+
+    Bounds are applied only when they fit in the source dtype. Comparing a
+    uint8 value with 300 would otherwise wrap the bound and hide the overflow.
+    """
+    src = np.iinfo(array.dtype)
+    src_lo = int(src.min)
+    src_hi = int(src.max)
+    if hi >= src_hi:
+        above = np.zeros(array.shape, dtype=bool)
+    elif hi < src_lo:
+        above = np.ones(array.shape, dtype=bool)
+    else:
+        above = array > np.array(hi, dtype=array.dtype)
+    if lo <= src_lo:
+        below = np.zeros(array.shape, dtype=bool)
+    elif lo > src_hi:
+        below = np.ones(array.shape, dtype=bool)
+    else:
+        below = array < np.array(lo, dtype=array.dtype)
+    return above | below
+
+
+def _outside_target_range(array: np.ndarray, target: np.dtype) -> np.ndarray:
+    """Mask of values that overflow, underflow, or are not finite in ``target``."""
+    if array.size == 0:
+        return np.zeros(array.shape, dtype=bool)
+    if np.issubdtype(target, np.integer):
+        info = np.iinfo(target)
+        lo, hi = int(info.min), int(info.max)
+        if np.issubdtype(array.dtype, np.floating):
+            wide = np.asarray(array, dtype=np.float64)
+            if hi > _EXACT_INT_IN_FLOAT64:
+                # int64 and uint64 limits are not exact in float64.
+                above = wide >= np.float64(1 << 64) if hi >= (1 << 64) - 1 else wide >= np.float64(1 << 63)
+            else:
+                above = wide > hi
+            if lo < -_EXACT_INT_IN_FLOAT64:
+                below = wide < np.float64(-(1 << 63))
+            else:
+                below = wide < lo
+            return ~np.isfinite(wide) | above | below
+        if np.issubdtype(array.dtype, np.integer):
+            return _integer_outside(array, lo, hi)
+        return np.zeros(array.shape, dtype=bool)
+    if np.issubdtype(target, np.floating):
+        info = np.finfo(target)
+        if np.issubdtype(array.dtype, np.integer):
+            limit = float(info.max)
+            if limit >= int(np.iinfo(array.dtype).max):
+                return np.zeros(array.shape, dtype=bool)
+            bound = int(limit)
+            return _integer_outside(array, -bound, bound)
+        if np.issubdtype(array.dtype, np.floating):
+            finite = np.isfinite(array)
+            overflow = finite & ((array > info.max) | (array < -info.max))
+            sub = np.float64(info.smallest_subnormal)
+            magnitude = np.abs(np.asarray(array, dtype=np.float64))
+            underflow = finite & (array != 0) & (magnitude < sub)
+            return overflow | underflow
+    return np.zeros(array.shape, dtype=bool)
+
+
+def _saturate_to_integer(array: np.ndarray, target: np.dtype) -> np.ndarray:
+    """Clamp to the target integer limits, then cast."""
+    info = np.iinfo(target)
+    lo, hi = int(info.min), int(info.max)
+    if np.issubdtype(array.dtype, np.floating):
+        values = np.nan_to_num(
+            np.asarray(array, dtype=np.float64),
+            nan=0.0,
+            posinf=np.inf,
+            neginf=-np.inf,
+        )
+        if hi > _EXACT_INT_IN_FLOAT64:
+            ceiling = np.float64(1 << 64) if hi >= (1 << 64) - 1 else np.float64(1 << 63)
+            hi_f = np.nextafter(ceiling, np.float64(0.0))
+        else:
+            hi_f = np.float64(hi)
+        lo_f = np.float64(-(1 << 63)) if lo < -_EXACT_INT_IN_FLOAT64 else np.float64(lo)
+        return np.clip(values, lo_f, hi_f).astype(target)
+    if np.issubdtype(array.dtype, np.unsignedinteger):
+        src_hi = int(np.iinfo(array.dtype).max)
+        hi_fit = hi if hi < src_hi else src_hi
+        clipped = np.minimum(array, np.array(hi_fit, dtype=array.dtype))
+        if lo > 0:
+            clipped = np.maximum(clipped, np.array(min(lo, src_hi), dtype=array.dtype))
+        return clipped.astype(target)
+    src = np.iinfo(array.dtype)
+    lo_c = max(lo, int(src.min))
+    hi_c = min(hi, int(src.max))
+    return np.clip(array, lo_c, hi_c).astype(target)
+
+
+def _saturate_to_float(array: np.ndarray, target: np.dtype) -> np.ndarray:
+    """Clamp overflow to the finite maximum and underflow to the tiniest subnormal."""
+    info = np.finfo(target)
+    if np.issubdtype(array.dtype, np.integer):
+        limit = np.float64(info.max)
+        return np.clip(np.asarray(array, dtype=np.float64), -limit, limit).astype(target)
+    values = np.asarray(array, dtype=np.float64)
+    finite = np.isfinite(values)
+    clipped = np.clip(values, -np.float64(info.max), np.float64(info.max))
+    sub = np.float64(info.smallest_subnormal)
+    magnitude = np.abs(clipped)
+    tiny = finite & (magnitude > 0) & (magnitude < sub)
+    sign = np.where(clipped < 0, -1.0, 1.0)
+    clipped = np.where(tiny, sign * sub, clipped)
+    return clipped.astype(target)
+
+
 def safe_cast(
-    array: np.ndarray, 
+    array: np.ndarray,
     target_dtype: np.dtype,
-    warn_on_precision_loss: bool = True
+    warn_on_precision_loss: bool = True,
+    check_range: bool = False,
+    saturate: bool = False,
 ) -> np.ndarray:
     """
     Safely cast a numpy array to target dtype with optional precision warnings.
-    
+
     Args:
         array: Source numpy array
         target_dtype: Target numpy dtype
         warn_on_precision_loss: If True, warn when casting may lose precision
-        
+        check_range: If True, raise ValueError when a finite value overflows
+            or underflows the target, or when a non-finite value is cast to
+            an integer. NaN and inf are allowed when the target is floating.
+        saturate: If True, clamp out-of-range values into the target instead
+            of raising. Integer NaN becomes 0 and infinities become the limits.
+            Float underflow becomes the smallest subnormal of that sign.
+
     Returns:
         Array cast to target dtype
+
+    Raises:
+        ValueError: ``check_range`` is set and a value does not fit
     """
+    target_dtype = np.dtype(target_dtype)
     if array.dtype == target_dtype:
         return array
-    
+
     source_dtype = array.dtype
-    
+
     # Check for potential precision loss
     if warn_on_precision_loss:
         precision_loss_cases = [
@@ -294,7 +1172,7 @@ def safe_cast(
             (np.float32, np.int32),
             (np.float16, np.int16),
         ]
-        
+
         for src, tgt in precision_loss_cases:
             if np.issubdtype(source_dtype, src) and target_dtype == tgt:
                 warnings.warn(
@@ -302,7 +1180,33 @@ def safe_cast(
                     UserWarning
                 )
                 break
-    
+
+    if check_range or saturate:
+        outside = _outside_target_range(array, target_dtype)
+        if bool(outside.any()):
+            count = int(outside.sum())
+            if saturate:
+                warnings.warn(
+                    f"Saturating {count} value(s) into {target_dtype}",
+                    UserWarning,
+                )
+                if np.issubdtype(target_dtype, np.integer):
+                    return _saturate_to_integer(array, target_dtype)
+                if np.issubdtype(target_dtype, np.floating):
+                    return _saturate_to_float(array, target_dtype)
+            if check_range:
+                sample = np.asarray(array[outside]).reshape(-1)[0].item()
+                if np.issubdtype(target_dtype, np.integer):
+                    info = np.iinfo(target_dtype)
+                    lo, hi = int(info.min), int(info.max)
+                else:
+                    info = np.finfo(target_dtype)
+                    lo, hi = float(-info.max), float(info.max)
+                raise ValueError(
+                    f"safe_cast cannot represent {sample} as {target_dtype}; "
+                    f"range is [{lo}, {hi}] ({count} value(s) out of range)"
+                )
+
     return array.astype(target_dtype)
 
 
@@ -340,20 +1244,548 @@ def get_dtype_info(dtype: np.dtype) -> dict:
 
 
 # =============================================================================
+# PROVIDER DTYPE POLICY
+# =============================================================================
+
+# Ordered logical dtypes for AMD hybrid execution. The first name is the
+# preferred choice. Later names are the fallbacks for that tensor role.
+# "int4" materializes as the packed int8 container described by INT4_BLOCKWISE.
+PROVIDER_DTYPE_POLICY: Dict[str, Dict[str, Tuple[str, ...]]] = {
+    "CPUExecutionProvider": {
+        "weight": ("int8", "fp32"),
+        "activation": ("fp32", "int8"),
+        "kv": ("fp16", "int8"),
+    },
+    "ROCmExecutionProvider": {
+        "weight": ("fp16", "bf16", "int8"),
+        "activation": ("fp16", "bf16"),
+        "kv": ("fp16", "fp8", "int8"),
+    },
+    "VitisAIExecutionProvider": {
+        "weight": ("int4", "int8"),
+        "activation": ("int8", "fp16"),
+        "kv": ("fp16", "int8"),
+    },
+    "DmlExecutionProvider": {
+        "weight": ("fp16", "fp32"),
+        "activation": ("fp16", "fp32"),
+        "kv": ("fp16",),
+    },
+}
+
+_PROVIDER_ALIASES = {
+    "cpu": "CPUExecutionProvider",
+    "cpuexecutionprovider": "CPUExecutionProvider",
+    "rocm": "ROCmExecutionProvider",
+    "rocmexecutionprovider": "ROCmExecutionProvider",
+    "hip": "ROCmExecutionProvider",
+    "igpu": "ROCmExecutionProvider",
+    "vitisai": "VitisAIExecutionProvider",
+    "vitisaiexecutionprovider": "VitisAIExecutionProvider",
+    "npu": "VitisAIExecutionProvider",
+    "ryzenai": "VitisAIExecutionProvider",
+    "ryzenaiexecutionprovider": "VitisAIExecutionProvider",
+    "dml": "DmlExecutionProvider",
+    "directml": "DmlExecutionProvider",
+    "dmlexecutionprovider": "DmlExecutionProvider",
+}
+
+_ROLE_ALIASES = {
+    "weight": "weight",
+    "weights": "weight",
+    "activation": "activation",
+    "activations": "activation",
+    "kv": "kv",
+    "kvcache": "kv",
+    "kv_cache": "kv",
+    "cache": "kv",
+}
+
+
+def _canonical_provider(provider: str) -> str:
+    key = str(provider).strip().lower().replace("-", "").replace("_", "").replace(" ", "")
+    if key not in _PROVIDER_ALIASES:
+        known = ", ".join(PROVIDER_DTYPE_POLICY)
+        raise ValueError(f"Unrecognized provider for dtype policy: {provider}. Known providers: {known}")
+    return _PROVIDER_ALIASES[key]
+
+
+def _canonical_role(tensor_role: str) -> str:
+    key = str(tensor_role).strip().lower().replace("-", "").replace("_", "").replace(" ", "")
+    if key not in _ROLE_ALIASES:
+        raise ValueError(
+            f"Unrecognized tensor role: {tensor_role}. Known roles: weight, activation, kv"
+        )
+    return _ROLE_ALIASES[key]
+
+
+def _fp8_dtype():
+    """OCP E4M3FN from ml_dtypes, or None when that variant is absent."""
+    native = get_float8_dtype("e4m3fn")
+    return None if native is None else np.dtype(native)
+
+
+def _dtype_for_logical(logical: str):
+    """Numpy dtype for a policy name. None when this process cannot construct it."""
+    key = str(logical).strip().lower()
+    if key == "int4":
+        return np.dtype(np.int8)
+    if key == "int8":
+        return np.dtype(np.int8)
+    if key == "fp16":
+        return np.dtype(np.float16)
+    if key == "fp32":
+        return np.dtype(np.float32)
+    if key in ("bf16", "bfloat16"):
+        bf16 = get_bfloat16_dtype()
+        return None if bf16 is None else np.dtype(bf16)
+    if key in ("fp8", "float8"):
+        fp8 = _fp8_dtype()
+        return None if fp8 is None else np.dtype(fp8)
+    raise ValueError(f"Unrecognized logical dtype: {logical}")
+
+
+def get_dtype_preferences(provider: str, tensor_role: str = "activation") -> Tuple[str, ...]:
+    """Ordered logical dtypes for a provider and tensor role."""
+    canonical = _canonical_provider(provider)
+    role = _canonical_role(tensor_role)
+    return PROVIDER_DTYPE_POLICY[canonical][role]
+
+
+def resolve_preferred_dtype(preferences: Sequence[str]) -> np.dtype:
+    """Return the first listed dtype this process can construct.
+
+    A missing bfloat16 or float8 dtype is skipped. The next listed dtype
+    is used, and one warning names the dtype that was skipped.
+    """
+    if not preferences:
+        raise ValueError("dtype preferences must not be empty")
+    skipped = []
+    for logical in preferences:
+        dtype = _dtype_for_logical(logical)
+        if dtype is None:
+            skipped.append(str(logical))
+            continue
+        if skipped:
+            warnings.warn(
+                f"Preferred dtype {skipped[0]} is unavailable. Using {logical}.",
+                UserWarning,
+            )
+        return dtype
+    raise ValueError(
+        "None of the preferred dtypes are available: " + ", ".join(str(name) for name in preferences)
+    )
+
+
+def get_recommended_dtype(
+    provider: str,
+    tensor_role: str = "activation",
+) -> np.dtype:
+    """Preferred numpy dtype for a provider and tensor role.
+
+    VitisAI weights return the packed INT4 container (``np.int8``). The
+    matching ``QuantizedDtype`` is ``INT4_BLOCKWISE``, available from
+    ``get_recommended_quantized_dtype``. KV cache on that NPU is float16.
+    RyzenAI uses the same NPU policy as VitisAI.
+    """
+    return resolve_preferred_dtype(get_dtype_preferences(provider, tensor_role))
+
+
+def get_recommended_quantized_dtype(
+    provider: str,
+    tensor_role: str = "activation",
+) -> Optional[QuantizedDtype]:
+    """Packing record when the preferred dtype is sub-byte, else None."""
+    for logical in get_dtype_preferences(provider, tensor_role):
+        if _dtype_for_logical(logical) is None:
+            continue
+        if logical == "int4":
+            return INT4_BLOCKWISE
+        return None
+    raise ValueError(
+        f"No materialized dtype for {provider} role {tensor_role}"
+    )
+
+
+# =============================================================================
+# KV CACHE DTYPE POLICY
+# =============================================================================
+
+# Compute dtype for a long-context cache. ``compressed`` is the INT8 row.
+# BF16, FP8, and packed INT4/FP4 are selected through ``compression``.
+KV_CACHE_DTYPE_POLICY = {
+    "default": np.float16,
+    "npu": np.float16,
+    "rocm": np.float16,
+    "cpu": np.float32,
+    "compressed": np.int8,
+}
+
+_KV_CACHE_PROVIDER_ALIASES = {
+    "default": "default",
+    "npu": "npu",
+    "vitisai": "npu",
+    "vitisaiexecutionprovider": "npu",
+    "ryzenai": "npu",
+    "ryzenaiexecutionprovider": "npu",
+    "rocm": "rocm",
+    "rocmexecutionprovider": "rocm",
+    "hip": "rocm",
+    "igpu": "rocm",
+    "cpu": "cpu",
+    "cpuexecutionprovider": "cpu",
+}
+
+_KV_COMPRESSION_ALIASES = {
+    "compressed": "compressed",
+    "int8": "compressed",
+    "fp16": "fp16",
+    "float16": "fp16",
+    "half": "fp16",
+    "bf16": "bf16",
+    "bfloat16": "bf16",
+    "fp8": "fp8",
+    "float8": "fp8",
+    "e4m3": "fp8",
+    "e4m3fn": "fp8",
+    "int4": "int4",
+    "fp4": "fp4",
+    "float4": "fp4",
+    "fp32": "fp32",
+    "float32": "fp32",
+    "float": "fp32",
+}
+
+
+def _normalize_kv_token(value: str) -> str:
+    return str(value).strip().lower().replace("-", "").replace("_", "").replace(" ", "")
+
+
+def _kv_cache_provider_key(provider: str) -> str:
+    key = _normalize_kv_token(provider)
+    if key not in _KV_CACHE_PROVIDER_ALIASES:
+        known = ", ".join(KV_CACHE_DTYPE_POLICY)
+        raise ValueError(
+            f"Unrecognized provider for KV cache dtype: {provider}. Known policies: {known}"
+        )
+    return _KV_CACHE_PROVIDER_ALIASES[key]
+
+
+def _kv_compression_scheme(compression: Optional[str]) -> Optional[str]:
+    """Map a compression name onto a storage scheme. None keeps the provider row."""
+    if compression is None:
+        return None
+    text = str(compression).strip()
+    if text == "":
+        return None
+    if ":" in text or "=" in text:
+        raise ValueError(
+            f"Split KV precision '{compression}' needs get_kv_cache_dtypes()"
+        )
+    key = _normalize_kv_token(text)
+    if key in ("", "none"):
+        return None
+    if key not in _KV_COMPRESSION_ALIASES:
+        known = "fp16, bf16, int8, fp8, int4, fp4, fp32, compressed"
+        raise ValueError(
+            f"Unrecognized KV compression '{compression}'. Expected one of: {known}"
+        )
+    return _KV_COMPRESSION_ALIASES[key]
+
+
+def _dtype_for_kv_compression(scheme: str) -> np.dtype:
+    if scheme == "compressed":
+        return np.dtype(KV_CACHE_DTYPE_POLICY["compressed"])
+    if scheme == "fp16":
+        return np.dtype(np.float16)
+    if scheme == "fp32":
+        return np.dtype(np.float32)
+    if scheme == "bf16":
+        native = get_bfloat16_dtype()
+        if native is not None:
+            return np.dtype(native)
+        return np.dtype(np.uint16)
+    if scheme == "fp8":
+        return float8_storage_dtype("e4m3fn")
+    if scheme in ("int4", "fp4"):
+        return np.dtype(np.uint8)
+    raise ValueError(f"Unrecognized KV compression scheme: {scheme}")
+
+
+def get_kv_cache_dtype(provider: str, compression: Optional[str] = None) -> np.dtype:
+    """Storage dtype for a KV cache on ``provider``.
+
+    With no compression, the result is the policy row: float16 for default,
+    NPU, and ROCm, float32 for CPU, and int8 when ``compression`` is
+    ``compressed`` or ``int8``. ``bf16`` uses native bfloat16 or a uint16
+    container. ``fp8`` uses the E4M3 storage dtype. ``int4`` and ``fp4`` use
+    the packed uint8 container.
+    """
+    _kv_cache_provider_key(provider)
+    scheme = _kv_compression_scheme(compression)
+    if scheme is None:
+        return np.dtype(KV_CACHE_DTYPE_POLICY[_kv_cache_provider_key(provider)])
+    return _dtype_for_kv_compression(scheme)
+
+
+def _split_kv_compression(
+    compression: Optional[str],
+    key: Optional[str],
+    value: Optional[str],
+) -> Tuple[Optional[str], Optional[str]]:
+    if key is None and value is None and compression is not None:
+        text = str(compression)
+        if ":" in text or "=" in text:
+            parts: Dict[str, str] = {}
+            for piece in text.split(","):
+                if ":" in piece:
+                    name, scheme = piece.split(":", 1)
+                elif "=" in piece:
+                    name, scheme = piece.split("=", 1)
+                else:
+                    raise ValueError(
+                        f"Split KV compression '{compression}' needs key and value sides"
+                    )
+                side = _normalize_kv_token(name)
+                if side in ("k", "key"):
+                    side = "key"
+                elif side in ("v", "value"):
+                    side = "value"
+                else:
+                    raise ValueError(f"Unrecognized KV side '{name}' in '{compression}'")
+                parts[side] = scheme.strip()
+            if "key" not in parts or "value" not in parts:
+                raise ValueError(
+                    f"Split KV compression '{compression}' needs both key and value"
+                )
+            return parts["key"], parts["value"]
+    return (
+        key if key is not None else compression,
+        value if value is not None else compression,
+    )
+
+
+def get_kv_cache_dtypes(
+    provider: str,
+    compression: Optional[str] = None,
+    *,
+    key: Optional[str] = None,
+    value: Optional[str] = None,
+) -> Tuple[np.dtype, np.dtype]:
+    """Key dtype and value dtype. Both follow ``compression`` unless split.
+
+    ``key`` and ``value`` name separate schemes. A single ``compression`` of
+    ``key:bf16,value:fp8`` (or ``k=bf16,v=int8``) does the same.
+    """
+    key_scheme, value_scheme = _split_kv_compression(compression, key, value)
+    return (
+        get_kv_cache_dtype(provider, key_scheme),
+        get_kv_cache_dtype(provider, value_scheme),
+    )
+
+
+# =============================================================================
+# PROVIDER DTYPE SUPPORT
+# =============================================================================
+
+# Hard limits for an ONNX Runtime execution provider. This is separate from
+# PROVIDER_DTYPE_POLICY, which only orders preferred dtypes.
+# CPU accepts the numeric ONNX types this module already maps.
+# VitisAI and RyzenAI share the NPU limit: INT4, INT8, and FP16.
+# ROCm runs the preferred FP16/BF16 path plus FP32, FP8, and INT8/INT4.
+# DirectML is limited to FP16 and FP32.
+_CPU_DTYPE_SUPPORT = (
+    "fp64", "fp32", "fp16", "bf16", "fp8",
+    "int4", "int8", "int16", "int32", "int64",
+    "uint4", "uint8", "uint16", "uint32", "uint64",
+    "bool", "complex64", "complex128",
+)
+_NPU_DTYPE_SUPPORT = ("int4", "int8", "fp16")
+_ROCM_DTYPE_SUPPORT = ("fp16", "bf16", "fp32", "fp8", "int8", "int4")
+_DML_DTYPE_SUPPORT = ("fp16", "fp32")
+
+PROVIDER_DTYPE_SUPPORT = {
+    "CPUExecutionProvider": _CPU_DTYPE_SUPPORT,
+    "ROCmExecutionProvider": _ROCM_DTYPE_SUPPORT,
+    "VitisAIExecutionProvider": _NPU_DTYPE_SUPPORT,
+    "RyzenAIExecutionProvider": _NPU_DTYPE_SUPPORT,
+    "DmlExecutionProvider": _DML_DTYPE_SUPPORT,
+}
+
+_SUPPORT_PROVIDER_ALIASES = {
+    "cpu": "CPUExecutionProvider",
+    "cpuexecutionprovider": "CPUExecutionProvider",
+    "rocm": "ROCmExecutionProvider",
+    "rocmexecutionprovider": "ROCmExecutionProvider",
+    "hip": "ROCmExecutionProvider",
+    "igpu": "ROCmExecutionProvider",
+    "vitisai": "VitisAIExecutionProvider",
+    "vitisaiexecutionprovider": "VitisAIExecutionProvider",
+    "npu": "VitisAIExecutionProvider",
+    "ryzenai": "RyzenAIExecutionProvider",
+    "ryzenaiexecutionprovider": "RyzenAIExecutionProvider",
+    "dml": "DmlExecutionProvider",
+    "directml": "DmlExecutionProvider",
+    "dmlexecutionprovider": "DmlExecutionProvider",
+}
+
+_DTYPE_SUPPORT_ALIASES = {
+    "fp64": "fp64",
+    "float64": "fp64",
+    "double": "fp64",
+    "fp32": "fp32",
+    "float32": "fp32",
+    "float": "fp32",
+    "fp16": "fp16",
+    "float16": "fp16",
+    "half": "fp16",
+    "bf16": "bf16",
+    "bfloat16": "bf16",
+    "fp8": "fp8",
+    "float8": "fp8",
+    "float8e4m3fn": "fp8",
+    "float8e5m2": "fp8",
+    "float8e4m3fnuz": "fp8",
+    "float8e5m2fnuz": "fp8",
+    "e4m3": "fp8",
+    "e4m3fn": "fp8",
+    "e5m2": "fp8",
+    "int4": "int4",
+    "uint4": "uint4",
+    "int8": "int8",
+    "int16": "int16",
+    "int32": "int32",
+    "int64": "int64",
+    "uint8": "uint8",
+    "uint16": "uint16",
+    "uint32": "uint32",
+    "uint64": "uint64",
+    "bool": "bool",
+    "complex64": "complex64",
+    "complex128": "complex128",
+}
+
+_NUMPY_SUPPORT_DTYPES = {
+    np.dtype(np.float64): "fp64",
+    np.dtype(np.float32): "fp32",
+    np.dtype(np.float16): "fp16",
+    np.dtype(np.int8): "int8",
+    np.dtype(np.int16): "int16",
+    np.dtype(np.int32): "int32",
+    np.dtype(np.int64): "int64",
+    np.dtype(np.uint8): "uint8",
+    np.dtype(np.uint16): "uint16",
+    np.dtype(np.uint32): "uint32",
+    np.dtype(np.uint64): "uint64",
+    np.dtype(np.bool_): "bool",
+    np.dtype(np.complex64): "complex64",
+    np.dtype(np.complex128): "complex128",
+}
+
+
+def _support_provider(provider: str) -> str:
+    """ORT provider name for the support map. RyzenAI stays its own row."""
+    key = _normalize_kv_token(provider)
+    if key not in _SUPPORT_PROVIDER_ALIASES:
+        known = ", ".join(PROVIDER_DTYPE_SUPPORT)
+        raise ValueError(
+            f"Unrecognized provider for dtype support: {provider}. Known providers: {known}"
+        )
+    return _SUPPORT_PROVIDER_ALIASES[key]
+
+
+def _logical_dtype_for_support(dtype) -> str:
+    """Map a numpy dtype or ONNX type string onto a support-map name."""
+    if isinstance(dtype, str):
+        text = dtype.strip()
+        lowered = text.lower()
+        if lowered.startswith("tensor(") and lowered.endswith(")"):
+            text = text[text.find("(") + 1:-1]
+        key = _normalize_kv_token(text)
+        if key not in _DTYPE_SUPPORT_ALIASES:
+            raise ValueError(f"Unrecognized dtype for provider support: {dtype}")
+        return _DTYPE_SUPPORT_ALIASES[key]
+    try:
+        resolved = np.dtype(dtype)
+    except TypeError as exc:
+        raise ValueError(f"Unrecognized dtype for provider support: {dtype}") from exc
+    name = resolved.name.lower()
+    if "bfloat16" in name:
+        return "bf16"
+    if "float8" in name:
+        return "fp8"
+    if resolved not in _NUMPY_SUPPORT_DTYPES:
+        raise ValueError(f"Unrecognized dtype for provider support: {dtype}")
+    return _NUMPY_SUPPORT_DTYPES[resolved]
+
+
+def is_dtype_supported_by_provider(dtype, provider: str) -> bool:
+    """True when ``provider`` can consume ``dtype``.
+
+    ``dtype`` may be a numpy dtype or an ONNX name such as ``tensor(float16)``
+    or ``int4``. INT4 stays distinct from the int8 container, so a packed
+    INT4 weight is supported on the NPU even though its storage dtype is int8.
+    """
+    canonical = _support_provider(provider)
+    logical = _logical_dtype_for_support(dtype)
+    return logical in PROVIDER_DTYPE_SUPPORT[canonical]
+
+
+# =============================================================================
 # CONVENIENCE EXPORTS
 # =============================================================================
 
 __all__ = [
     # Maps
     "ONNX_DTYPE_MAP",
+    "ONNX_ELEMENT_TYPE_TO_NUMPY",
+    "NUMPY_TO_ONNX_ELEMENT_TYPE",
     "SHORT_DTYPE_MAP",
     "SPECIAL_TYPES",
     "GGUF_DTYPE_MAP",
     "AWQ_DTYPE_MAP",
+    "QUANTIZED_DTYPE_MAP",
+    "PROVIDER_DTYPE_POLICY",
+    "KV_CACHE_DTYPE_POLICY",
+    "PROVIDER_DTYPE_SUPPORT",
+    # Quantized metadata
+    "QuantizedDtype",
+    "INT4_BLOCKWISE",
+    "UINT4_BLOCKWISE",
+    "MATMUL_NBITS_INT4",
+    "AWQ_INT4",
+    "GPTQ_INT4",
     # Functions
     "get_numpy_dtype",
+    "numpy_dtype_from_onnx_element_type",
+    "get_quantized_dtype",
+    "quantized_dtype_from_matmul_nbits",
+    "pack_quantized",
+    "unpack_quantized",
+    "pack_weights",
+    "unpack_weights",
     "safe_cast",
     "get_dtype_info",
     "supports_bfloat16",
     "get_bfloat16_dtype",
+    "bfloat16_to_float32",
+    "float32_to_bfloat16",
+    "bfloat16_to_uint16_view",
+    "uint16_view_to_bfloat16",
+    "FP8_E4M3",
+    "FP8_E5M2",
+    "FP8_E4M3FNUZ",
+    "FP8_E5M2FNUZ",
+    "supports_float8",
+    "get_float8_dtype",
+    "float8_storage_dtype",
+    "quantize_float8",
+    "dequantize_float8",
+    "get_dtype_preferences",
+    "resolve_preferred_dtype",
+    "get_recommended_dtype",
+    "get_recommended_quantized_dtype",
+    "get_kv_cache_dtype",
+    "get_kv_cache_dtypes",
+    "is_dtype_supported_by_provider",
 ]

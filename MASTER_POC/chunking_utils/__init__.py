@@ -5,8 +5,10 @@ A unified package for splitting large language models into per-component
 files for efficient deployment, debugging, and modular inference.
 
 Supported Formats:
-    - SafeTensors (.safetensors) - HuggingFace model format
-    - ONNX (.onnx) - Open Neural Network Exchange format
+    - ONNX (.onnx)
+    - SafeTensors (.safetensors)
+    - GGUF (.gguf)
+    - PyTorch .bin (pytorch_bin)
 
 Supported Architectures:
     - LLaMA, Mistral, Phi, Gemma (LLaMA-style)
@@ -49,6 +51,8 @@ Merging:
     >>> merged_model = merge_onnx("./output/model")
 """
 
+import importlib
+
 # ==============================================================================
 # Common Types and Utilities
 # ==============================================================================
@@ -58,8 +62,17 @@ from .common.types import (
     TensorDtype,
     MemoryMode,
     ComponentType,
+    DeviceType,
+    ExecutionPolicy,
+    PROVIDER_FALLBACK,
     SplitConfig,
+    QuantizationConfig,
+    KVCachePolicy,
+    KVCacheConfig,
+    ExecutionStep,
+    ExecutionPlan,
     SplitResult,
+    BoundaryTensor,
     MergeResult,
 )
 
@@ -69,49 +82,92 @@ from .common.architecture import (
     get_prefixes,
     get_prefixes_tuple,
     architecture_from_string,
+    EXACT_MAP,
+    ArchitectureDescriptor,
+    ARCHITECTURE_DESCRIPTORS,
+    get_architecture_descriptor,
+    QUANTIZED_OP_PATTERNS,
+    quantized_op_scheme,
     SAFETENSORS_PREFIXES,
     ONNX_PREFIXES,
     LLAMA_STYLE_ARCHITECTURES,
+)
+
+from .common.architecture_detector import detect_architecture
+from .common.graph_topology import (
+    GraphTopology,
+    NodeGroup,
+    analyze_graph_topology,
 )
 
 from .common.path_utils import (
     is_local_path,
     sanitize_model_name,
 )
-
-# ==============================================================================
-# SafeTensors Operations
-# ==============================================================================
-
-from .safetensors import (
-    split_safetensors,
-    merge_safetensors,
-    load_state_dict,
-    download_model,
-    stream_tensors,
-    get_safetensors_files,
-    find_complete_config,
-    ensure_complete_config,
-    detect_architecture_from_weights,
-    infer as infer_safetensors,
+from .common.path_manager import (
+    find_onnx_model,
+    find_external_data,
+    find_external_data_files,
+    validate_split_model,
+    validate_split_model_dir,
+    get_cache_dir,
+    get_npu_cache_dir,
+    resolve_npu_artifact_cache,
 )
 
-# ==============================================================================
-# ONNX Operations
-# ==============================================================================
+# SafeTensors and ONNX splitters import torch and onnx. They load on first use
+# so ModelFormat can be imported without those packages.
+_LAZY_EXPORTS = {
+    "split_safetensors": (".safetensors", "split_safetensors"),
+    "merge_safetensors": (".safetensors", "merge_safetensors"),
+    "load_state_dict": (".safetensors", "load_state_dict"),
+    "download_model": (".safetensors", "download_model"),
+    "stream_tensors": (".safetensors", "stream_tensors"),
+    "get_safetensors_files": (".safetensors", "get_safetensors_files"),
+    "find_complete_config": (".safetensors", "find_complete_config"),
+    "ensure_complete_config": (".safetensors", "ensure_complete_config"),
+    "detect_architecture_from_weights": (".safetensors", "detect_architecture_from_weights"),
+    "infer_safetensors": (".safetensors", "infer"),
+    "split_onnx": (".onnx", "split_onnx"),
+    "merge_onnx": (".onnx", "merge_onnx"),
+    "load_onnx_model": (".onnx", "load_onnx_model"),
+    "resolve_model_path": (".onnx", "resolve_model_path"),
+    "extract_components": (".onnx", "extract_components"),
+    "create_component_onnx": (".onnx", "create_component_onnx"),
+    "collect_boundary_tensors": (".onnx", "collect_boundary_tensors"),
+    "build_boundary_contract": (".onnx", "build_boundary_contract"),
+    "save_components": (".onnx", "save_components"),
+    "write_execution_contract": (".onnx", "write_execution_contract"),
+    "resolve_tensor_type": (".onnx", "resolve_tensor_type"),
+    "extract_quantization_info": (".onnx", "extract_quantization_info"),
+    "extract_kv_cache_info": (".onnx", "extract_kv_cache_info"),
+    "extract_execution_policy": (".onnx", "extract_execution_policy"),
+    "compute_psnr": (".onnx", "compute_psnr"),
+    "verify_split_correctness": (".onnx", "verify_split_correctness"),
+    "validate_boundary_contracts": (".onnx", "validate_boundary_contracts"),
+    "validate_component_io": (".onnx", "validate_component_io"),
+    "WeightStrategy": (".onnx", "WeightStrategy"),
+    "coerce_weight_strategy": (".onnx", "coerce_weight_strategy"),
+    "plan_weight_storage": (".onnx", "plan_weight_storage"),
+    "store_component_weights": (".onnx", "store_component_weights"),
+    "detect_architecture_from_onnx": (".onnx", "detect_architecture_from_onnx"),
+    "ComponentInfo": (".onnx", "ComponentInfo"),
+    "OnnxSplitResult": (".onnx", "OnnxSplitResult"),
+    "infer_onnx": (".onnx", "run_inference"),
+}
 
-from .onnx import (
-    split_onnx,
-    merge_onnx,
-    load_onnx_model,
-    resolve_model_path,
-    extract_components,
-    create_component_onnx,
-    detect_architecture_from_onnx,
-    ComponentInfo,
-    OnnxSplitResult,
-    run_inference as infer_onnx,
-)
+
+def __getattr__(name):
+    """Import a splitter symbol the first time a caller asks for it."""
+    target = _LAZY_EXPORTS.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_name, attr = target
+    module = importlib.import_module(module_name, __package__)
+    value = getattr(module, attr)
+    globals()[name] = value
+    return value
+
 
 # ==============================================================================
 # Convenience Functions
@@ -131,22 +187,22 @@ def auto_detect_format(model_path: str) -> ModelFormat:
     
     if model_path.endswith(".onnx"):
         return ModelFormat.ONNX
-    
-    if os.path.isdir(model_path):
-        # Check for ONNX files first
-        for f in os.listdir(model_path):
-            if f.endswith(".onnx"):
-                return ModelFormat.ONNX
-        # Default to SafeTensors for directories
-        return ModelFormat.SAFETENSORS
-    
-    # Check extension
+    if model_path.endswith(".gguf"):
+        return ModelFormat.GGUF
     if model_path.endswith(".safetensors"):
         return ModelFormat.SAFETENSORS
     if model_path.endswith(".bin"):
-        return ModelFormat.PYTORCH
+        return ModelFormat.PYTORCH_BIN
     
-    # Default to SafeTensors (works for HuggingFace model IDs)
+    if os.path.isdir(model_path):
+        names = os.listdir(model_path)
+        if any(name.endswith(".onnx") for name in names):
+            return ModelFormat.ONNX
+        if any(name.endswith(".gguf") for name in names):
+            return ModelFormat.GGUF
+        return ModelFormat.SAFETENSORS
+    
+    # HuggingFace model IDs have no local extension.
     return ModelFormat.SAFETENSORS
 
 
@@ -178,9 +234,12 @@ def split_model(
         format = auto_detect_format(model)
     
     if format == ModelFormat.ONNX:
-        return split_onnx(model=model, output=output, **kwargs)
-    else:
-        return split_safetensors(model=model, output=output, **kwargs)
+        return __getattr__("split_onnx")(model=model, output=output, **kwargs)
+    if format in (ModelFormat.SAFETENSORS, ModelFormat.PYTORCH_BIN):
+        return __getattr__("split_safetensors")(model=model, output=output, **kwargs)
+    raise ValueError(
+        f"No splitter for format {format.value}. Supported split formats are onnx and safetensors."
+    )
 
 
 # ==============================================================================
@@ -191,8 +250,17 @@ __all__ = [
     # Types
     "ModelFormat",
     "ComponentType",
+    "DeviceType",
+    "ExecutionPolicy",
+    "PROVIDER_FALLBACK",
     "SplitConfig",
+    "QuantizationConfig",
+    "KVCachePolicy",
+    "KVCacheConfig",
+    "ExecutionStep",
+    "ExecutionPlan",
     "SplitResult",
+    "BoundaryTensor",
     "MergeResult",
     "ComponentInfo",
     "OnnxSplitResult",
@@ -203,6 +271,16 @@ __all__ = [
     "get_prefixes",
     "get_prefixes_tuple",
     "architecture_from_string",
+    "EXACT_MAP",
+    "ArchitectureDescriptor",
+    "ARCHITECTURE_DESCRIPTORS",
+    "get_architecture_descriptor",
+    "QUANTIZED_OP_PATTERNS",
+    "quantized_op_scheme",
+    "detect_architecture",
+    "GraphTopology",
+    "NodeGroup",
+    "analyze_graph_topology",
     "SAFETENSORS_PREFIXES",
     "ONNX_PREFIXES",
     "LLAMA_STYLE_ARCHITECTURES",
@@ -210,6 +288,14 @@ __all__ = [
     # Path utilities
     "is_local_path",
     "sanitize_model_name",
+    "find_onnx_model",
+    "find_external_data",
+    "find_external_data_files",
+    "validate_split_model",
+    "validate_split_model_dir",
+    "get_cache_dir",
+    "get_npu_cache_dir",
+    "resolve_npu_artifact_cache",
     
     # SafeTensors operations
     "split_safetensors",
@@ -228,6 +314,22 @@ __all__ = [
     "resolve_model_path",
     "extract_components",
     "create_component_onnx",
+    "collect_boundary_tensors",
+    "build_boundary_contract",
+    "save_components",
+    "write_execution_contract",
+    "resolve_tensor_type",
+    "extract_quantization_info",
+    "extract_kv_cache_info",
+    "extract_execution_policy",
+    "compute_psnr",
+    "verify_split_correctness",
+    "validate_boundary_contracts",
+    "validate_component_io",
+    "WeightStrategy",
+    "coerce_weight_strategy",
+    "plan_weight_storage",
+    "store_component_weights",
     "detect_architecture_from_onnx",
     "infer_onnx",
     
