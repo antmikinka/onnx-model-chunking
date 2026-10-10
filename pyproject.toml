@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "onnx-model-chunking"
+version = "1.0.0"
+description = "Semantic splitting and sequential inference for ONNX and SafeTensors models"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+]
+
+[project.optional-dependencies]
+onnx = [
+    "onnx",
+    "onnxruntime",
+]
+hf = [
+    "safetensors",
+    "torch",
+    "transformers",
+]
+dev = [
+    "onnx",
+    "onnxruntime",
+    "pytest",
+]
+
+[project.urls]
+Homepage = "https://github.com/antmikinka/onnx-model-chunking"
+Repository = "https://github.com/antmikinka/onnx-model-chunking"
+
+[tool.setuptools.packages.find]
+where = ["MASTER_POC"]
+include = ["chunking_utils*", "pipeline_utils*"]
