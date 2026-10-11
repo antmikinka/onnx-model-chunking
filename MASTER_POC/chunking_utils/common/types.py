@@ -8,7 +8,7 @@ splitting operations, providing a unified interface for configuration and result
 import os
 import re
 from enum import Enum
-from typing import Dict, Iterable, List, Any, Optional
+from typing import Dict, Iterable, List, Any, Optional, Tuple
 from dataclasses import dataclass, field
 
 
@@ -698,6 +698,51 @@ def _coerce_weight_bits(value: Any, weight_dtype: str) -> int:
     return value
 
 
+def _coerce_name_tuple(value: Any, field_name: str) -> Tuple[str, ...]:
+    """None is an empty name list. Each entry is a non-empty string."""
+    if value is None:
+        return ()
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+        raise ValueError(f"{field_name} must be a list of names, got {value!r}")
+    names: List[str] = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, str) or not item.strip():
+            raise ValueError(f"{field_name} must contain non-empty strings, got {item!r}")
+        names.append(item.strip())
+    return tuple(names)
+
+
+def _coerce_float_tuple(value: Any, field_name: str) -> Tuple[float, ...]:
+    """None is an empty scale list. Bools are not scales."""
+    if value is None:
+        return ()
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+        raise ValueError(f"{field_name} must be a list of numbers, got {value!r}")
+    numbers: List[float] = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise ValueError(f"{field_name} must contain numbers, got {item!r}")
+        numbers.append(float(item))
+    return tuple(numbers)
+
+
+def _coerce_int_tuple(value: Any, field_name: str) -> Tuple[int, ...]:
+    """None is an empty zero-point list. Bools are not zero-points."""
+    if value is None:
+        return ()
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+        raise ValueError(f"{field_name} must be a list of integers, got {value!r}")
+    numbers: List[int] = []
+    for item in value:
+        if isinstance(item, bool) or isinstance(item, float) or not isinstance(item, int):
+            if isinstance(item, float) and item.is_integer():
+                numbers.append(int(item))
+                continue
+            raise ValueError(f"{field_name} must contain integers, got {item!r}")
+        numbers.append(int(item))
+    return tuple(numbers)
+
+
 @dataclass
 class QuantizationInfo:
     """
@@ -706,6 +751,8 @@ class QuantizationInfo:
     ``method`` accepts MatMulNBits, AWQ, and GPTQ. ``weight_dtype`` and
     ``activation_dtype`` are canonical names such as float16 or int4.
     ``group_size`` -1 is per-channel. ``weight_bits`` matches the weight dtype.
+    ``scale_tensors`` and ``zero_point_tensors`` name the graph inputs.
+    ``scales`` and ``zero_points`` are the stored values.
     ``QuantizationConfig`` is the planning input. This record is what a split
     stores after the method and dtypes have been resolved.
     """
@@ -715,6 +762,10 @@ class QuantizationInfo:
     activation_dtype: str = "float16"
     group_size: Optional[int] = None
     has_zero_point: bool = False
+    scale_tensors: Tuple[str, ...] = ()
+    zero_point_tensors: Tuple[str, ...] = ()
+    scales: Tuple[float, ...] = ()
+    zero_points: Tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         self.method = _coerce_quant_method(self.method)
@@ -728,6 +779,12 @@ class QuantizationInfo:
             raise ValueError(
                 f"has_zero_point must be a boolean, got {self.has_zero_point!r}"
             )
+        self.scale_tensors = _coerce_name_tuple(self.scale_tensors, "scale_tensors")
+        self.zero_point_tensors = _coerce_name_tuple(
+            self.zero_point_tensors, "zero_point_tensors"
+        )
+        self.scales = _coerce_float_tuple(self.scales, "scales")
+        self.zero_points = _coerce_int_tuple(self.zero_points, "zero_points")
 
     def to_dict(self) -> Dict[str, Any]:
         """Copy the record so a caller can serialize it without sharing this object."""
@@ -738,6 +795,10 @@ class QuantizationInfo:
             "activation_dtype": self.activation_dtype,
             "group_size": self.group_size,
             "has_zero_point": self.has_zero_point,
+            "scale_tensors": list(self.scale_tensors),
+            "zero_point_tensors": list(self.zero_point_tensors),
+            "scales": list(self.scales),
+            "zero_points": list(self.zero_points),
         }
 
 

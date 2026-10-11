@@ -1,7 +1,7 @@
 """Quantization contract extracted from an ONNX graph."""
 
 import warnings
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from ..common.architecture import quantized_op_scheme
 from .graph_analysis import (
@@ -472,3 +472,115 @@ def extract_quantization_info(model) -> Dict[str, Any]:
         if record is not None:
             records.append(record)
     return _merge_quantization(records)
+
+
+def _initializer_numbers(initializer) -> Optional[List[float]]:
+    """Host numbers stored on an initializer. A missing payload stays unset."""
+    if initializer is None:
+        return None
+    explicit = getattr(initializer, "values", None)
+    candidates = [("values", explicit)]
+    for name in ("float_data", "double_data", "int32_data", "int64_data", "uint64_data"):
+        candidates.append((name, getattr(initializer, name, None)))
+    for _name, raw in candidates:
+        if raw is None or isinstance(raw, (str, bytes, bytearray)):
+            continue
+        if isinstance(raw, bool):
+            continue
+        if isinstance(raw, (int, float)):
+            return [float(raw)]
+        try:
+            values = list(raw)
+        except TypeError:
+            continue
+        if not values:
+            continue
+        numbers: List[float] = []
+        for item in values:
+            if isinstance(item, bool) or not isinstance(item, (int, float)):
+                return None
+            numbers.append(float(item))
+        return numbers
+    return None
+
+
+def _quant_parameter_names(node) -> Tuple[str, str]:
+    """Scale and zero-point input names for one quantized node."""
+    kind = _quant_kind(node)
+    if kind is None:
+        return "", ""
+    inputs = _node_input_names(node)
+    if kind == "QLinearMatMul":
+        scale_name = _input_at(inputs, 4)
+        zero_name = _input_at(inputs, 5) or _input_at(inputs, 2)
+    else:
+        scale_name = _input_at(inputs, 2)
+        zero_name = _input_at(inputs, 3)
+    return scale_name, zero_name
+
+
+def extract_quantization_tensors(model) -> Dict[str, Any]:
+    """
+    Names and host values of MatMulNBits, AWQ, GPTQ, and QLinear scales
+    and zero-points.
+
+    The contract dict from ``extract_quantization_info`` stays unchanged.
+    A tensor with no stored numbers contributes its name and no values.
+    """
+    _graph, nodes = _boundary_graph(model)
+    initializers = _initializer_map(_graph)
+    scale_names: List[str] = []
+    zero_names: List[str] = []
+    scales: List[float] = []
+    zero_points: List[int] = []
+    for node in nodes:
+        scale_name, zero_name = _quant_parameter_names(node)
+        if scale_name and scale_name not in scale_names:
+            scale_names.append(scale_name)
+            numbers = _initializer_numbers(initializers.get(scale_name))
+            if numbers is not None:
+                scales.extend(numbers)
+        if zero_name and zero_name not in zero_names:
+            zero_names.append(zero_name)
+            numbers = _initializer_numbers(initializers.get(zero_name))
+            if numbers is not None:
+                zero_points.extend(int(item) for item in numbers)
+    return {
+        "scale_tensors": scale_names,
+        "zero_point_tensors": zero_names,
+        "scales": scales,
+        "zero_points": zero_points,
+    }
+
+
+def build_quantization_info(model):
+    """
+    QuantizationInfo for a MatMulNBits, AWQ, or GPTQ graph.
+
+    Group size, bits, and zero-point tensors come from the graph. A dense
+    graph and QLinearMatMul stay unset because QuantizationInfo does not
+    record that method. Returns None when there is no supported contract.
+    """
+    from .types import QuantizationInfo
+
+    info = extract_quantization_info(model)
+    method = info.get("method")
+    if method not in {"MatMulNBits", "AWQ", "GPTQ"}:
+        return None
+    tensors = extract_quantization_tensors(model)
+    weight = info.get("weight_dtype") or "float16"
+    bits = info.get("bits")
+    if bits is None:
+        bits = {"int4": 4, "int8": 8, "float16": 16, "float32": 32}.get(weight, 16)
+    return QuantizationInfo(
+        method=method,
+        weight_bits=int(bits),
+        weight_dtype=weight,
+        activation_dtype=info.get("activation_dtype") or "float16",
+        group_size=info.get("group_size"),
+        has_zero_point=bool(info.get("has_zero_point")),
+        scale_tensors=tuple(tensors["scale_tensors"]),
+        zero_point_tensors=tuple(tensors["zero_point_tensors"]),
+        scales=tuple(float(item) for item in tensors["scales"]),
+        zero_points=tuple(int(item) for item in tensors["zero_points"]),
+    )

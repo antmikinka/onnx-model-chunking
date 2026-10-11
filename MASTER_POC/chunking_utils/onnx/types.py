@@ -216,6 +216,10 @@ def _coerce_quantization_info(value: Any) -> Optional[QuantizationInfo]:
             activation_dtype=value.activation_dtype,
             group_size=value.group_size,
             has_zero_point=value.has_zero_point,
+            scale_tensors=value.scale_tensors,
+            zero_point_tensors=value.zero_point_tensors,
+            scales=value.scales,
+            zero_points=value.zero_points,
         )
     if isinstance(value, dict):
         try:

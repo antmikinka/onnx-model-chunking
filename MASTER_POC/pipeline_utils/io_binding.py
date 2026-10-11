@@ -577,6 +577,40 @@ class DeviceBuffer:
         }
 
 
+_ORT_DTYPE_NAMES = {
+    "float16": np.float16,
+    "float": np.float32,
+    "float32": np.float32,
+    "double": np.float64,
+    "float64": np.float64,
+    "int64": np.int64,
+    "int32": np.int32,
+    "int16": np.int16,
+    "int8": np.int8,
+    "uint8": np.uint8,
+    "bool": np.bool_,
+}
+
+
+def _ort_shape(ort_value: Any) -> Tuple[int, ...]:
+    """Read a bound output shape without copying its elements."""
+    shape = ort_value.shape() if callable(getattr(ort_value, "shape", None)) else ort_value.shape
+    return tuple(int(dim) for dim in shape)
+
+
+def _ort_dtype(ort_value: Any) -> np.dtype:
+    """Map an OrtValue element type. ``numpy()`` is only the last resort."""
+    data_type = getattr(ort_value, "data_type", None)
+    text = str(data_type() if callable(data_type) else data_type or "").lower()
+    text = text.replace("tensor(", "").replace(")", "")
+    if text in _ORT_DTYPE_NAMES:
+        return np.dtype(_ORT_DTYPE_NAMES[text])
+    numpy = getattr(ort_value, "numpy", None)
+    if callable(numpy):
+        return np.dtype(numpy().dtype)
+    return np.dtype(np.float32)
+
+
 # =============================================================================
 # I/O BINDING MANAGER
 # =============================================================================
@@ -1405,6 +1439,52 @@ class IOBindingManager:
         session.run_with_iobinding(io_binding)
         output_names = [o.name for o in session.get_outputs()]
         return self.get_outputs_as_numpy(io_binding, output_names)
+
+    def run_with_device_buffers(
+        self,
+        session: ort.InferenceSession,
+        inputs: Dict[str, Union[np.ndarray, str, DeviceBuffer]],
+        output_names: Optional[List[str]] = None,
+    ) -> Dict[str, DeviceBuffer]:
+        """
+        Run one session and keep each output as a DeviceBuffer.
+
+        NumPy inputs are placed once. A DeviceBuffer input is bound by its
+        OrtValue, so the next component can consume this output without a
+        host copy. Logits sampling is the caller's host copy.
+        """
+        io_binding = self.create_binding(session)
+        self.bind_inputs(io_binding, inputs)
+        self.bind_outputs(io_binding, session)
+        session.run_with_iobinding(io_binding)
+        session_names = [item.name for item in session.get_outputs()]
+        bound = self.get_bound_outputs(io_binding, session_names)
+        selected = session_names if not output_names else list(output_names)
+        result: Dict[str, DeviceBuffer] = {}
+        for name in selected:
+            ort_value = bound.get(name)
+            if ort_value is None:
+                continue
+            buffer = self._buffer_from_bound_output(name, ort_value)
+            self._buffers[name] = buffer
+            result[name] = buffer
+        return result
+
+    def _buffer_from_bound_output(self, name: str, ort_value: Any) -> DeviceBuffer:
+        """Wrap a bound OrtValue. The host copy waits until ``to_numpy``."""
+        shape = _ort_shape(ort_value)
+        dtype = _ort_dtype(ort_value)
+        return DeviceBuffer(
+            name=name,
+            shape=shape,
+            dtype=dtype,
+            device_type=self.device_type,
+            device_id=self.device_id,
+            ort_value=ort_value,
+            is_dynamic=True,
+            ortvalue_device=self.device_type,
+            memory_placement=self.memory_placement,
+        )
     
     def deallocate_buffer(self, name: str) -> bool:
         """

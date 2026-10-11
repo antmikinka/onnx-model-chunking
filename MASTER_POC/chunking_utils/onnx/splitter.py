@@ -17,7 +17,7 @@ from onnx import shape_inference
 
 from ..common.path_utils import sanitize_model_name
 from ..common.architecture_detector import detect_architecture
-from ..common.types import ModelFormat, SplitConfig
+from ..common.types import BoundaryTensor, ModelFormat, SplitConfig
 from .boundary_contract import collect_boundary_tensors
 from .component_builder import create_component_onnx, extract_components
 from .graph_analysis import (
@@ -30,7 +30,7 @@ from .kv_contract import extract_kv_cache_info
 from .loader import infer_shapes_with_lazy_fallback, load_onnx_model
 from .metadata_writer import write_execution_contract
 from .npu_policy import extract_execution_policy
-from .quantization import extract_quantization_info
+from .quantization import build_quantization_info, extract_quantization_info, extract_quantization_tensors
 from .types import OnnxSplitResult
 from .validator import validate_boundary_contracts, validate_component_io
 from .weight_store import (
@@ -94,8 +94,15 @@ def save_components(
         comp_info.output_names = [item.name for item in component_model.graph.output]
         prepared.append((comp_name, comp_info, filename, filepath, component_model))
 
-    validate_component_io(components, boundaries)
-    validate_boundary_contracts(boundaries, components)
+    retained = _retain_live_boundaries(components, boundaries)
+    if isinstance(boundaries, list):
+        boundaries.clear()
+        boundaries.extend(retained)
+        live_boundaries = boundaries
+    else:
+        live_boundaries = retained
+    validate_component_io(components, live_boundaries)
+    validate_boundary_contracts(live_boundaries, components)
 
     if prepared:
         weight_storage = store_component_weights(
@@ -134,6 +141,40 @@ def save_components(
             f"{len(comp_info.initializer_names)} initializers)"
         )
     return component_files, weight_storage, num_layers
+
+
+def _retain_live_boundaries(components, boundaries):
+    """Drop crossings that were copied into the consumer graph.
+
+    Shared Constant nodes are inlined, so they are no longer inputs.
+    A boundary with no remaining reader is not a handoff.
+    """
+    kept = []
+    for tensor in boundaries:
+        consumers = []
+        for name in list(getattr(tensor, "consumer_components", ()) or ()):
+            info = components.get(name)
+            inputs = getattr(info, "input_names", None) if info is not None else None
+            if isinstance(inputs, (str, bytes)) or not isinstance(inputs, (list, tuple)):
+                continue
+            if tensor.name in inputs:
+                consumers.append(name)
+        if not consumers:
+            continue
+        if consumers == list(tensor.consumer_components):
+            kept.append(tensor)
+            continue
+        kept.append(BoundaryTensor(
+            name=tensor.name,
+            dtype=tensor.dtype,
+            shape=list(tensor.shape),
+            producer_component=tensor.producer_component,
+            consumer_components=consumers,
+            is_stateful=tensor.is_stateful,
+            cache_role=tensor.cache_role,
+            device_preference=tensor.device_preference,
+        ))
+    return kept
 
 
 def split_onnx(
@@ -224,6 +265,9 @@ def split_onnx(
     )
     boundary_contract = build_boundary_contract(onnx_model, components)
     quant_info = extract_quantization_info(onnx_model)
+    quant_tensors = extract_quantization_tensors(onnx_model)
+    recorded_quant = dict(quant_info)
+    recorded_quant.update(quant_tensors)
     kv_info = extract_kv_cache_info(onnx_model, components)
     execution_policy = extract_execution_policy(
         onnx_model,
@@ -266,7 +310,7 @@ def split_onnx(
             for name, info in components.items()
         },
         "boundary_tensors": [tensor.to_dict() for tensor in boundary_contract],
-        "quantization_info": quant_info,
+        "quantization_info": recorded_quant,
         "kv_cache_info": kv_info,
         "execution_policy": execution_policy,
         "weight_storage": weight_storage,
@@ -285,6 +329,7 @@ def split_onnx(
         producer=onnx_model.producer_name,
         components=components,
         boundary_tensors=boundary_contract,
+        quantization=build_quantization_info(onnx_model),
     )
 
 
