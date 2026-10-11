@@ -16712,9 +16712,15 @@ def test_split_inference():
         ran.append("layer_0")
         past = np.asarray(feeds["past_key_values.0.key"])
         past_shapes.append(tuple(past.shape))
-        seq = int(np.asarray(feeds["attention_mask"]).shape[-1])
+        new_tokens = int(np.asarray(feeds["hidden"]).shape[1])
+        # Concat semantics: like the GenAI exports, the graph appends the
+        # new tokens to the past it was handed, so the present sequence
+        # axis grows with the injected past shape rather than the mask
+        # width. A static pool injected whole therefore overflows
+        # max_seq_len (pool + delta > pool) unless the cache windows it.
+        seq = int(past.shape[2]) + new_tokens
         present = np.zeros((1, 1, seq, 8), dtype=np.float16)
-        hidden = np.zeros((1, seq, 4), dtype=np.float32)
+        hidden = np.zeros((1, new_tokens, 4), dtype=np.float32)
         values = {
             "hidden": hidden,
             "present.0.key": present,
@@ -16893,7 +16899,31 @@ def test_split_inference():
             )
             assert static_engine.kv_cache.static is True
             assert static_engine.kv_cache.max_seq_len == 32
+
+            # Regression (static pool + concat-style dynamic graph):
+            # prefill must inject an empty past window, not the full
+            # (1, 1, 32, 8) pool. Injecting the pool made the fake graph
+            # return present (1, 1, 34, 8) and update_from_present raised
+            # "sequence length 34 exceeds max_seq_len 32" (in the field:
+            # 4097 > 4096 on Qwen3 IO_BOUND runs).
+            static_engine.tokenizer = Tokenizer()
+            static_text = static_engine.generate("Hello", max_new_tokens=4)
+            assert static_text == "4,6,5,2"
+            assert ran == [
+                "embedding", "layer_0", "lm_head",
+                "embedding", "layer_0", "lm_head",
+            ]
+            assert past_shapes == [(1, 1, 0, 8), (1, 1, 2, 8)]
+            static_result = static_engine.get_result()
+            assert static_result.token_ids == [5, 2]
+            assert static_result.num_tokens_generated == 2
+            assert static_engine.kv_cache.get_sequence_length() == 3
+            assert static_engine.kv_cache.layer_length(0) == 3
             static_engine.cleanup()
+
+            ran.clear()
+            past_shapes.clear()
+            head_calls.clear()
 
             engine = SplitModelInferenceEngine(split_dir, verbose=True)
             assert engine.num_layers == 1
