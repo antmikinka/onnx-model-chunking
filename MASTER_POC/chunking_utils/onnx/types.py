@@ -7,7 +7,7 @@ BoundaryTensor, QuantizationInfo, and KVCacheContract are the shared
 contracts from common.types. BoundaryTensorInfo is the per-component view.
 """
 
-from typing import Dict, List, Optional, Set, Any, Tuple
+from typing import Dict, List, Optional, Set, Any
 from dataclasses import dataclass, field
 
 from ..common.types import (
