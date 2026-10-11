@@ -19,7 +19,7 @@ backbone between the embedding and the final norm into contiguous layers.
 import json
 from collections import deque
 from typing import Any, Dict, Iterable, List, Optional, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .architecture import ArchitectureType, get_prefixes
 from .architecture_detector import detect_architecture
@@ -71,6 +71,7 @@ class GraphTopology:
     initializer_ownership: Dict[str, List[int]]
     topological_order: List[int]
     groups: List[NodeGroup]
+    node_roles: Dict[int, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -83,6 +84,50 @@ class _Label:
         if self.component_type == "layer":
             return f"layer_{self.layer_id}"
         return self.component_type
+
+
+def classify_hybrid_component(name: str) -> Optional[str]:
+    """
+    Classify a Qwen3.8-style node or weight name.
+
+    Returns ``moe_router``, ``moe_expert``, ``gated_deltanet``,
+    ``sparse_attention``, or ``mtp_head``. A dense name, including
+    ``gate_proj``, stays unset. Group membership is unchanged: a name that
+    also matches a layer prefix remains in that layer.
+    """
+    if not isinstance(name, str):
+        return None
+    text = name.strip().lower()
+    if not text:
+        return None
+    if any(
+        token in text
+        for token in ("mlp.experts", ".experts.", "/experts/", "shared_expert", "moe_expert")
+    ):
+        return "moe_expert"
+    if "gate_proj" not in text and any(
+        token in text
+        for token in ("moe_router", "mlp.gate", "/mlp/gate", "/router", ".router")
+    ):
+        return "moe_router"
+    if any(
+        token in text
+        for token in ("gated_deltanet", "gated_delta", "linear_attn", "linear_attention")
+    ):
+        return "gated_deltanet"
+    if any(token in text for token in ("sparse_attention", "sparse_attn")) or _has_qsa_token(text):
+        return "sparse_attention"
+    if any(token in text for token in ("mtp_head", "multi_token")):
+        return "mtp_head"
+    return None
+
+
+def _has_qsa_token(text: str) -> bool:
+    """True when ``qsa`` is its own path segment, not a substring of another word."""
+    for segment in text.replace(".", "/").split("/"):
+        if segment == "qsa" or segment.startswith("qsa_") or segment.endswith("_qsa"):
+            return True
+    return False
 
 
 def _prefix_architecture(arch) -> ArchitectureType:
@@ -178,9 +223,11 @@ def analyze_graph_topology(
     graph_writers = _graph_writers(graph, node_outputs)
 
     labels: Dict[int, _Label] = {}
+    node_roles: Dict[int, str] = {}
     for index, node in enumerate(nodes):
+        node_name = getattr(node, "name", None) or ""
         label = _label_from_name(
-            getattr(node, "name", None) or "",
+            node_name,
             embed_prefix,
             layer_prefix,
             norm_prefix,
@@ -188,6 +235,14 @@ def analyze_graph_topology(
         )
         if label is not None:
             labels[index] = label
+        role = classify_hybrid_component(node_name)
+        if role is None:
+            for tensor_name in node_inputs[index]:
+                role = classify_hybrid_component(tensor_name)
+                if role is not None:
+                    break
+        if role is not None:
+            node_roles[index] = role
     for index, inputs in enumerate(node_inputs):
         if index in labels:
             continue
@@ -237,6 +292,7 @@ def analyze_graph_topology(
         initializer_ownership=ownership,
         topological_order=topological_order,
         groups=groups,
+        node_roles=node_roles,
     )
 
 

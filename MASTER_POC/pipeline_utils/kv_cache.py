@@ -1082,6 +1082,15 @@ class KVCacheManager:
                 self.update_from_present(layer, key_np, value_np)
             return int(self.max_seq_len)
 
+    def preallocate(self, max_seq_len: int) -> int:
+        """
+        Allocate a fixed ``[batch, heads, max_seq_len, head_dim]`` buffer.
+
+        A dynamic cache becomes static at that capacity. Later updates write
+        into the same buffer. This is the public name for ``reserve``.
+        """
+        return self.reserve(max_seq_len)
+
     def _require_static_cursor(self, method: str) -> None:
         self._require_cursor_policy()
         if not self._static or self.max_seq_len is None:

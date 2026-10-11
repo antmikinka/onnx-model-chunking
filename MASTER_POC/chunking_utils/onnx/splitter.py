@@ -30,7 +30,7 @@ from .kv_contract import extract_kv_cache_info
 from .loader import infer_shapes_with_lazy_fallback, load_onnx_model
 from .metadata_writer import write_execution_contract
 from .npu_policy import extract_execution_policy
-from .quantization import extract_quantization_info
+from .quantization import build_quantization_info, extract_quantization_info, extract_quantization_tensors
 from .types import OnnxSplitResult
 from .validator import validate_boundary_contracts, validate_component_io
 from .weight_store import (
@@ -224,6 +224,9 @@ def split_onnx(
     )
     boundary_contract = build_boundary_contract(onnx_model, components)
     quant_info = extract_quantization_info(onnx_model)
+    quant_tensors = extract_quantization_tensors(onnx_model)
+    recorded_quant = dict(quant_info)
+    recorded_quant.update(quant_tensors)
     kv_info = extract_kv_cache_info(onnx_model, components)
     execution_policy = extract_execution_policy(
         onnx_model,
@@ -266,7 +269,7 @@ def split_onnx(
             for name, info in components.items()
         },
         "boundary_tensors": [tensor.to_dict() for tensor in boundary_contract],
-        "quantization_info": quant_info,
+        "quantization_info": recorded_quant,
         "kv_cache_info": kv_info,
         "execution_policy": execution_policy,
         "weight_storage": weight_storage,
@@ -285,6 +288,7 @@ def split_onnx(
         producer=onnx_model.producer_name,
         components=components,
         boundary_tensors=boundary_contract,
+        quantization=build_quantization_info(onnx_model),
     )
 
 

@@ -45,7 +45,7 @@ try:
     from pipeline_utils.kv_cache import KVCacheManager
     from pipeline_utils.config_loader import load_model_config, ModelConfig
     from pipeline_utils.dtypes import get_numpy_dtype, safe_cast
-    from pipeline_utils.io_binding import IOBindingManager
+    from pipeline_utils.io_binding import DeviceBuffer, IOBindingManager
     HAS_PIPELINE_UTILS = True
 except ImportError:
     HAS_PIPELINE_UTILS = False
@@ -177,6 +177,183 @@ def _coerce_providers(providers: Any) -> List[str]:
     return normalized
 
 
+_DEVICE_PROVIDER_LISTS = {
+    "cpu": ["CPUExecutionProvider"],
+    "gpu": ["CUDAExecutionProvider", "ROCmExecutionProvider", "DmlExecutionProvider", "CPUExecutionProvider"],
+    "igpu": ["DmlExecutionProvider", "ROCmExecutionProvider", "CPUExecutionProvider"],
+    "npu": ["VitisAIExecutionProvider", "RyzenAIExecutionProvider", "CPUExecutionProvider"],
+}
+_LAYER_PROVIDER_KEY = re.compile(r"^layer_(\d+|\*)$")
+_HYBRID_POLICIES = {
+    "hybrid",
+    "hybrid_npu_igpu",
+    "phase_split",
+    "moe_routing",
+    "speculative",
+}
+
+
+class _ProviderPlacement:
+    """Phase and role provider lists derived from an existing plan."""
+
+    def __init__(self, phases: Dict[str, List[str]], components: Dict[str, List[str]]):
+        self.phases = phases
+        self.components = components
+
+
+def _device_key(value: Any) -> Optional[str]:
+    if value is None or value == "":
+        return None
+    raw = getattr(value, "value", value)
+    text = str(raw).split(".")[-1].strip().lower()
+    return text or None
+
+
+def _coerce_provider_map(value: Any, label: str) -> Dict[str, List[str]]:
+    if value is None:
+        return {}
+    if isinstance(value, (str, bytes)) or not isinstance(value, dict):
+        raise ValueError(f"{label} must be a mapping of names to providers, got {value!r}")
+    copied: Dict[str, List[str]] = {}
+    for key, providers in value.items():
+        if isinstance(key, bool) or not isinstance(key, str) or not key.strip():
+            raise ValueError(f"{label} key must be a non-empty string, got {key!r}")
+        copied[key.strip()] = _coerce_providers(providers)
+    return copied
+
+
+def _providers_from_step(step: Any) -> List[str]:
+    provider = getattr(step, "provider", None)
+    if isinstance(provider, str) and provider.strip():
+        return _coerce_providers([provider.strip()])
+    device = _device_key(getattr(step, "device", None)) or _device_key(
+        getattr(step, "device_type", None)
+    )
+    if device in _DEVICE_PROVIDER_LISTS:
+        return list(_DEVICE_PROVIDER_LISTS[device])
+    return ["CPUExecutionProvider"]
+
+
+def _policy_text(plan: Any) -> str:
+    policy = getattr(plan, "policy", None)
+    raw = getattr(policy, "value", policy)
+    return str(raw or "").strip().lower().replace("-", "_")
+
+
+def _read_execution_plan(plan: Any, phases: Dict[str, List[str]], components: Dict[str, List[str]]) -> None:
+    if isinstance(plan, (str, bytes, bool, int, float, list, tuple)):
+        raise ValueError(f"execution_plan must be an execution plan, got {plan!r}")
+    phase_map = getattr(plan, "phase_providers", None)
+    component_map = getattr(plan, "component_providers", None)
+    steps = getattr(plan, "steps", None)
+    has_maps = isinstance(phase_map, dict) or isinstance(component_map, dict)
+    has_steps = isinstance(steps, list)
+    if not has_maps and not has_steps and not hasattr(plan, "prefill_device"):
+        raise ValueError(
+            "execution_plan must be a HybridExecutionPlan or an ExecutionPlan"
+        )
+    if isinstance(phase_map, dict) and phase_map:
+        phases.update(_coerce_provider_map(phase_map, "phase_providers"))
+    if isinstance(component_map, dict) and component_map:
+        components.update(_coerce_provider_map(component_map, "component_providers"))
+    if has_steps:
+        for step in steps:
+            phase = str(getattr(step, "phase", "decode") or "decode").strip().lower()
+            providers = _providers_from_step(step)
+            name = getattr(step, "component_name", None)
+            if phase in ("router", "moe_router"):
+                components.setdefault("router", providers)
+                if isinstance(name, str) and name.strip():
+                    components.setdefault(name.strip(), providers)
+            elif phase in ("expert", "experts"):
+                components.setdefault("expert", providers)
+                if isinstance(name, str) and name.strip():
+                    components.setdefault(name.strip(), providers)
+            elif phase in ("prefill", "decode") and phase not in phases:
+                phases[phase] = providers
+    prefill = _device_key(getattr(plan, "prefill_device", None))
+    decode = _device_key(getattr(plan, "decode_device", None))
+    hybrid = _policy_text(plan) in _HYBRID_POLICIES or (
+        prefill is not None and decode is not None and prefill != decode
+    )
+    if hybrid:
+        if prefill in _DEVICE_PROVIDER_LISTS and "prefill" not in phases:
+            phases["prefill"] = list(_DEVICE_PROVIDER_LISTS[prefill])
+        if decode in _DEVICE_PROVIDER_LISTS and "decode" not in phases:
+            phases["decode"] = list(_DEVICE_PROVIDER_LISTS[decode])
+
+
+def _build_placement(
+    phase_providers: Any,
+    component_providers: Any,
+    execution_plan: Any,
+) -> Optional[_ProviderPlacement]:
+    """
+    Provider lists for prefill, decode, the MoE router, and experts.
+
+    Layer-index keys are ignored. A sequential layer series on the NPU is
+    not a placement. The two ExecutionPlan classes stay distinct; this view
+    only reads their fields.
+    """
+    phases: Dict[str, List[str]] = {}
+    components: Dict[str, List[str]] = {}
+    if execution_plan is not None:
+        _read_execution_plan(execution_plan, phases, components)
+    if phase_providers:
+        phases.update(_coerce_provider_map(phase_providers, "phase_providers"))
+    if component_providers:
+        components.update(_coerce_provider_map(component_providers, "component_providers"))
+    components = {
+        key: value
+        for key, value in components.items()
+        if not _LAYER_PROVIDER_KEY.match(key)
+    }
+    if not phases and not components:
+        return None
+    return _ProviderPlacement(phases, components)
+
+
+def _component_role(name: str) -> Optional[str]:
+    """Router or expert. A dense gate projection is neither."""
+    text = name.lower().replace("-", "_")
+    if "gate_proj" in text:
+        return None
+    if "expert" in text:
+        return "expert"
+    if (
+        "router" in text
+        or "mlp.gate" in text
+        or "/mlp/gate" in text
+        or ".gate" in text
+        or "/gate" in text
+        or text.endswith("gate")
+    ):
+        return "router"
+    return None
+
+
+def _is_bound_activation(value: Any) -> bool:
+    """A device buffer stays on device. NumPy values are host tensors."""
+    if isinstance(value, np.ndarray):
+        return False
+    if HAS_PIPELINE_UTILS and isinstance(value, DeviceBuffer):
+        return True
+    return callable(getattr(value, "to_numpy", None)) and hasattr(value, "ort_value")
+
+
+def _as_host(value: Any) -> Any:
+    """Copy one tensor to NumPy. Device buffers stay untouched until this call."""
+    if isinstance(value, np.ndarray):
+        return value
+    to_numpy = getattr(value, "to_numpy", None)
+    if callable(to_numpy):
+        return to_numpy()
+    numpy = getattr(value, "numpy", None)
+    if callable(numpy):
+        return numpy()
+    return np.asarray(value)
+
+
 def _coerce_stop_ids(value: Any) -> List[int]:
     if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
         raise ValueError("stop_token_ids must be a list of token ids")
@@ -262,6 +439,9 @@ class InferenceConfig:
     max_seq_len: int = 4096
     tokenizer_path: Optional[str] = None
     trust_remote_code: bool = True
+    phase_providers: Optional[Dict[str, List[str]]] = None
+    component_providers: Optional[Dict[str, List[str]]] = None
+    execution_plan: Optional[Any] = None
 
     def __post_init__(self) -> None:
         self.mode = _coerce_mode(self.mode)
@@ -297,6 +477,19 @@ class InferenceConfig:
         self.io_binding_device = device_name.strip().lower()
         self.kv_cache_dtype = _optional_text(self.kv_cache_dtype, "kv_cache_dtype")
         self.tokenizer_path = _optional_text(self.tokenizer_path, "tokenizer_path")
+        if self.phase_providers is not None and not isinstance(self.phase_providers, dict):
+            raise ValueError(
+                f"phase_providers must be a mapping, got {self.phase_providers!r}"
+            )
+        if self.component_providers is not None and not isinstance(self.component_providers, dict):
+            raise ValueError(
+                f"component_providers must be a mapping, got {self.component_providers!r}"
+            )
+        self._placement = _build_placement(
+            self.phase_providers,
+            self.component_providers,
+            self.execution_plan,
+        )
 
 
 @dataclass
@@ -353,6 +546,9 @@ class SplitModelInferenceEngine:
         self._kv_val_fmt: Optional[str] = None
         self._past_key_fmt: Optional[str] = None
         self._past_val_fmt: Optional[str] = None
+        self._placement = getattr(self.config, "_placement", None)
+        self._phase_sessions: Dict[Tuple[str, str, Tuple[str, ...]], Any] = {}
+        self._provider_trace: List[Tuple[str, str, List[str]]] = []
 
         if not os.path.exists(self.model_dir):
             raise FileNotFoundError(f"model path not found: {self.model_dir}")
@@ -418,7 +614,10 @@ class SplitModelInferenceEngine:
 
         self.session_manager: Optional[SessionManager] = None
         self.io_manager: Optional[IOBindingManager] = None
-        if self.config.mode in (InferenceMode.PERSISTENT, InferenceMode.IO_BOUND):
+        if (
+            self._placement is None
+            and self.config.mode in (InferenceMode.PERSISTENT, InferenceMode.IO_BOUND)
+        ):
             self._init_persistent_sessions()
         if self.config.use_io_binding and self.config.mode is not InferenceMode.SEQUENTIAL:
             self._init_io_binding()
@@ -540,8 +739,37 @@ class SplitModelInferenceEngine:
             raise ValueError(f"component {component_name} is missing a file name")
         return os.path.join(self.model_dir, filename.strip())
 
-    def _open_session(self, component_name: str) -> Any:
+    def _providers_for(self, component_name: str, phase: str) -> List[str]:
+        """
+        Providers for one component in prefill or decode.
+
+        A router stays on its component list and an expert stays on its
+        component list. Every other component uses the phase list. Layer
+        indexes are not a placement.
+        """
+        placement = self._placement
+        if placement is None:
+            return list(self.config.providers)
+        role = _component_role(component_name)
+        candidates = [component_name]
+        if role == "router":
+            candidates.extend(["router", "moe_router", "router_*", "moe_router_*"])
+        elif role == "expert":
+            candidates.extend(
+                ["expert", "experts", "moe_expert", "expert_*", "experts_*", "moe_expert_*"]
+            )
+        for key in candidates:
+            providers = placement.components.get(key)
+            if providers:
+                return list(providers)
+        phase_providers = placement.phases.get(phase)
+        if phase_providers:
+            return list(phase_providers)
+        return list(self.config.providers)
+
+    def _open_session(self, component_name: str, providers: Optional[List[str]] = None) -> Any:
         filepath = self._component_path(component_name)
+        chosen = list(self.config.providers if providers is None else providers)
         if not os.path.isfile(filepath):
             raise FileNotFoundError(f"{component_name} file not found: {filepath}")
         options = ort.SessionOptions()
@@ -557,13 +785,25 @@ class SplitModelInferenceEngine:
             return ort.InferenceSession(
                 filepath,
                 sess_options=options,
-                providers=list(self.config.providers),
+                providers=chosen,
             )
         except Exception as exc:
             raise RuntimeError(f"Failed to load {component_name}: {exc}") from exc
 
-    def _get_session(self, component_name: str) -> Tuple[Any, bool]:
+    def _get_session(self, component_name: str, phase: str = "decode") -> Tuple[Any, bool]:
         """Return the session and whether this call owns its lifetime."""
+        if self._placement is not None:
+            providers = self._providers_for(component_name, phase)
+            self._provider_trace.append((component_name, phase, list(providers)))
+            key = (component_name, phase, tuple(providers))
+            resident = self._phase_sessions.get(key)
+            if resident is not None:
+                return resident, False
+            session = self._open_session(component_name, providers)
+            if self.config.mode is not InferenceMode.SEQUENTIAL:
+                self._phase_sessions[key] = session
+                return session, False
+            return session, True
         if self.session_manager is not None and not (
             self.is_monolith and component_name == "monolith"
         ):
@@ -598,6 +838,8 @@ class SplitModelInferenceEngine:
         return list(inputs), list(outputs)
 
     def _cast_input(self, name: str, value: Any, expected: Dict[str, str]) -> Any:
+        if _is_bound_activation(value):
+            return value
         type_name = expected.get(name)
         if not type_name:
             return value
@@ -606,8 +848,13 @@ class SplitModelInferenceEngine:
         except (ValueError, KeyError, TypeError):
             return value
 
-    def _run_component(self, component_name: str, registry: Dict[str, Any]) -> None:
-        session, owned = self._get_session(component_name)
+    def _run_component(
+        self,
+        component_name: str,
+        registry: Dict[str, Any],
+        phase: str = "decode",
+    ) -> None:
+        session, owned = self._get_session(component_name, phase)
         try:
             input_names, output_names = self._component_names(session, component_name)
             expected = {item.name: item.type for item in session.get_inputs()}
@@ -618,7 +865,14 @@ class SplitModelInferenceEngine:
             if not session_inputs:
                 raise RuntimeError(f"{component_name} received no inputs")
             if self.io_manager is not None:
-                bound = self.io_manager.run_with_binding(session, session_inputs)
+                device_runner = getattr(self.io_manager, "run_with_device_buffers", None)
+                use_device = callable(device_runner) and (
+                    self.config.mode is InferenceMode.IO_BOUND or self.config.use_io_binding
+                )
+                if use_device:
+                    bound = device_runner(session, session_inputs, output_names)
+                else:
+                    bound = self.io_manager.run_with_binding(session, session_inputs)
                 for name in output_names:
                     if name in bound:
                         registry[name] = bound[name]
@@ -642,6 +896,13 @@ class SplitModelInferenceEngine:
                 order.append(name)
         for index in range(self.num_layers):
             order.append(f"layer_{index}")
+        roles = [
+            name
+            for name in components
+            if name not in order and name not in ("norm", "lm_head") and _component_role(name)
+        ]
+        roles.sort(key=lambda name: (0 if _component_role(name) == "router" else 1, name))
+        order.extend(roles)
         for name in ("norm", "lm_head"):
             if name in components:
                 order.append(name)
@@ -727,6 +988,7 @@ class SplitModelInferenceEngine:
                 past_len = int(self.kv_cache.get_sequence_length())
                 position_ids = np.array([[past_len]], dtype=np.int64)
                 attention_mask = np.ones((1, past_len + 1), dtype=np.int64)
+            phase = "prefill" if token_idx == 0 else "decode"
             registry["input_ids"] = current_ids
             registry["position_ids"] = position_ids
             registry["attention_mask"] = attention_mask
@@ -736,14 +998,14 @@ class SplitModelInferenceEngine:
                 value_format=past_value,
             )
             for component_name in self._execution_order():
-                self._run_component(component_name, registry)
+                self._run_component(component_name, registry, phase)
                 if self.is_monolith or component_name.startswith("layer_"):
                     self.kv_cache.extract_from_registry(
                         registry,
                         present_key_format=present_key,
                         present_value_format=present_value,
                     )
-            logits = self._logits_from(registry)
+            logits = _as_host(self._logits_from(registry))
             last_token_id = _sample_token(np.asarray(logits)[:, -1, :], self.config.temperature)
             generated_ids.append(last_token_id)
             elapsed = time.perf_counter() - token_start
@@ -825,6 +1087,7 @@ class SplitModelInferenceEngine:
         if self.session_manager is not None:
             self.session_manager.unload_all()
         self._resident_sessions.clear()
+        self._phase_sessions.clear()
         if self.io_manager is not None:
             self.io_manager.deallocate_all()
         gc.collect()
