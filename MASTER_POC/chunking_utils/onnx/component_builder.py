@@ -1,7 +1,8 @@
 """Build per-component ONNX graphs from a detected architecture."""
 
+import copy
 from collections import defaultdict
-from typing import Dict, Set
+from typing import Dict, List, Set
 
 import onnx
 
@@ -178,15 +179,35 @@ def create_component_onnx(
             if inp and inp not in component_outputs:
                 required_inputs.add(inp)
     
-    # Separate initializer inputs from boundary inputs
+    # Separate initializer inputs from boundary inputs.
+    # GenAI Constant nodes are shared across layers, and their value_info
+    # shape is a scalar even when the attribute is a 1D shape vector.
+    # Copy the Constant into each consumer so Reshape sees that vector.
+    constant_by_output = _constant_producers(all_nodes)
     boundary_inputs = []
     component_initializers = []
+    inlined_constants = []
+    seen_constants = set()
     
     for inp in required_inputs:
         if inp in initializer_names:
             component_initializers.append(initializer_dict[inp])
-        else:
-            boundary_inputs.append(inp)
+            continue
+        producer = constant_by_output.get(inp)
+        if producer is not None and producer not in component_nodes:
+            if id(producer) not in seen_constants:
+                inlined_constants.append(copy.deepcopy(producer))
+                seen_constants.add(id(producer))
+            continue
+        boundary_inputs.append(inp)
+    if inlined_constants:
+        component_nodes = inlined_constants + component_nodes
+    inlined_names = {
+        output
+        for node in inlined_constants
+        for output in node.output
+        if output
+    }
     
     # Also add explicitly tracked initializers
     for init_name in component.initializer_names:
@@ -208,7 +229,7 @@ def create_component_onnx(
     seen_outputs = set()
     for node in component_nodes:
         for output in node.output:
-            if output in seen_outputs:
+            if output in seen_outputs or output in inlined_names:
                 continue
             if output in graph_output_names or any(
                 consumer_idx not in component_node_set
@@ -270,6 +291,19 @@ def create_component_onnx(
     component_model.ir_version = model.ir_version
     
     return component_model
+
+def _constant_producers(nodes: List) -> Dict[str, object]:
+    """Map a tensor name to the Constant node that writes it."""
+    found: Dict[str, object] = {}
+    for node in nodes:
+        if getattr(node, "op_type", None) != "Constant":
+            continue
+        outputs = list(getattr(node, "output", ()) or ())
+        if len(outputs) != 1 or not outputs[0] or outputs[0] in found:
+            continue
+        found[outputs[0]] = node
+    return found
+
 
 def _component_value_info(name: str, value, resolved: ResolvedTensorType):
     """Reuse a complete value info. A filled-in type becomes a new proto."""
