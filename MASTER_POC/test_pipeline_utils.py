@@ -9515,6 +9515,20 @@ def test_graph_topology():
     assert names_of(clean_topology, topology_nodes, "layer_0") == ["/model/layers.0/self_attn/MatMul"]
     assert names_of(clean_topology, topology_nodes, "lm_head") == ["/lm_head/MatMul"]
 
+    genai_norm = _Graph([
+        _Node("/model/embed_tokens/Gather", ["input_ids"], ["hidden"]),
+        _Node("/model/layers.0/self_attn/MatMul", ["hidden"], ["h0"]),
+        _Node("/model/layers.1/final_norm_layernorm/SkipLayerNorm", ["h0"], ["hn"]),
+        _Node("/lm_head/MatMul", ["hn"], ["logits"]),
+    ], outputs=[_Out("logits")])
+    genai_norm_topology = analyze_graph_topology(genai_norm)
+    assert [group.name for group in genai_norm_topology.groups] == [
+        "embedding",
+        "layer_0",
+        "norm",
+        "lm_head",
+    ]
+
     reversed_nodes = [lm_head, norm, layer1, layer0, embed]
     reversed_graph = _Graph(
         reversed_nodes,

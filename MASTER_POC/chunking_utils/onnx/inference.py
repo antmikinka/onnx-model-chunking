@@ -956,7 +956,8 @@ class SplitModelInferenceEngine:
             raise ValueError("stream_callback must be callable")
 
         inputs = self.tokenizer(prompt, return_tensors="np")
-        if not isinstance(inputs, dict) or "input_ids" not in inputs:
+        # transformers BatchEncoding is a mapping, not a dict.
+        if not (isinstance(inputs, dict) or hasattr(inputs, "keys")) or "input_ids" not in inputs:
             raise RuntimeError("tokenizer did not return input_ids")
         prompt_ids = np.asarray(inputs["input_ids"])
         if prompt_ids.ndim == 1:

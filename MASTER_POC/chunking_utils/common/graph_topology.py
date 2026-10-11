@@ -513,6 +513,10 @@ def _label_from_name(
     lowered = name.lower()
     if not lowered:
         return None
+    # GenAI names the final norm /model/layers.{N}/final_norm_layernorm.
+    # That index is one past the last decoder layer, so it is not a layer.
+    if "final_norm" in lowered:
+        return _Label("norm")
     if (embed_prefix and embed_prefix in lowered) or "embed_tokens" in lowered:
         return _Label("embedding")
     layer_id = _layer_id_from_text(lowered, layer_prefix)
