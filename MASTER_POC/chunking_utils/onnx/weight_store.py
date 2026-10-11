@@ -21,6 +21,8 @@ STREAMING_CHUNK_SIZE = 8 * 1024 * 1024
 _SHARED_FILE = "weights/shared.bin"
 _MANIFEST_FILE = "weights/manifest.json"
 _STREAM_FILE = "weights/stream.json"
+# onnx.TensorProto.DataLocation.EXTERNAL. A location of 0 makes ORT ignore the file.
+_EXTERNAL_DATA_LOCATION = 1
 
 
 class WeightStrategy(str, Enum):
@@ -693,6 +695,7 @@ def _assign_external(tensor: Any, location: str, offset: int, length: int) -> No
         ("offset", str(offset)),
         ("length", str(length)),
     )
+    _mark_external_location(tensor)
     if isinstance(tensor, dict):
         tensor["external_data"] = [{"key": key, "value": value} for key, value in pairs]
         if "data" in tensor:
@@ -725,6 +728,17 @@ def _assign_external(tensor: Any, location: str, offset: int, length: int) -> No
             pass
     if hasattr(tensor, "raw_data"):
         tensor.raw_data = b""
+
+
+def _mark_external_location(tensor: Any) -> None:
+    """Tell ORT the payload lives in the external file, not in raw_data."""
+    if isinstance(tensor, dict):
+        tensor["data_location"] = _EXTERNAL_DATA_LOCATION
+        return
+    try:
+        tensor.data_location = _EXTERNAL_DATA_LOCATION
+    except (AttributeError, TypeError):
+        return
 
 
 def _try_link(source: str, destination: str) -> bool:

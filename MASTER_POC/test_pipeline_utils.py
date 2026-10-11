@@ -12576,6 +12576,7 @@ def test_weight_storage():
         proto, _ = _store(os.path.join(directory, "proto"), proto_components, strategy="copy", size_threshold=1)
         assert tensor.cleared is True
         assert tensor.raw_data == b""
+        assert tensor.data_location == 1
         assert [(item.key, item.value) for item in tensor.external_data] == [
             ("location", "embeddings.onnx.data"),
             ("offset", "0"),
