@@ -168,6 +168,12 @@ from .backend import (
 
 from .dtypes import GGUF_DTYPE_MAP, AWQ_DTYPE_MAP
 
+from chunking_utils.common.types import (
+    BoundaryTensor,
+    KVCacheContract,
+    QuantizationInfo,
+)
+
 # NPU configuration module (P1.4)
 from .npu_config import (
     NPUConfig,
@@ -307,6 +313,9 @@ __all__ = [
     "BackendType",
     "DeviceType",
     "ModelFormat",
+    "BoundaryTensor",
+    "QuantizationInfo",
+    "KVCacheContract",
     "BackendConfig",
     "InferenceBackend",
     "OnnxRuntimeBackend",
