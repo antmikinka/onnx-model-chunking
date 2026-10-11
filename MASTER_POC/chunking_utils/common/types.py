@@ -663,6 +663,177 @@ def _coerce_kv_cache(value: Any) -> KVCacheConfig:
     )
 
 
+# Bit width implied by a canonical weight dtype. auto has no implied width.
+_WEIGHT_DTYPE_BITS = {
+    "float32": 32,
+    "float16": 16,
+    "bfloat16": 16,
+    "int8": 8,
+    "int4": 4,
+}
+_OPEN_WEIGHT_BITS = frozenset({2, 3, 4, 8, 16, 32})
+
+
+def _coerce_info_dtype(value: Any, field_name: str) -> str:
+    """Store a canonical dtype name. None is not a dtype."""
+    if value is None:
+        raise ValueError(f"{field_name} must be a string, got {value!r}")
+    return _coerce_quant_dtype(value, field_name).value
+
+
+def _coerce_weight_bits(value: Any, weight_dtype: str) -> int:
+    """A bool is not a bit count. The count must match the weight dtype."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"weight_bits must be an integer, got {value!r}")
+    if value <= 0:
+        raise ValueError(f"weight_bits must be positive, got {value}")
+    expected = _WEIGHT_DTYPE_BITS.get(weight_dtype)
+    if expected is not None and value != expected:
+        raise ValueError(
+            f"weight_bits {value} does not match weight_dtype {weight_dtype!r}"
+        )
+    if expected is None and value not in _OPEN_WEIGHT_BITS:
+        known = ", ".join(str(item) for item in sorted(_OPEN_WEIGHT_BITS))
+        raise ValueError(f"weight_bits must be one of {known}, got {value}")
+    return value
+
+
+@dataclass
+class QuantizationInfo:
+    """
+    Recorded quantization contract for one split.
+
+    ``method`` accepts MatMulNBits, AWQ, and GPTQ. ``weight_dtype`` and
+    ``activation_dtype`` are canonical names such as float16 or int4.
+    ``group_size`` -1 is per-channel. ``weight_bits`` matches the weight dtype.
+    ``QuantizationConfig`` is the planning input. This record is what a split
+    stores after the method and dtypes have been resolved.
+    """
+    method: Optional[str] = None  # "MatMulNBits", "AWQ", "GPTQ"
+    weight_bits: int = 16
+    weight_dtype: str = "float16"
+    activation_dtype: str = "float16"
+    group_size: Optional[int] = None
+    has_zero_point: bool = False
+
+    def __post_init__(self) -> None:
+        self.method = _coerce_quant_method(self.method)
+        self.weight_dtype = _coerce_info_dtype(self.weight_dtype, "weight_dtype")
+        self.activation_dtype = _coerce_info_dtype(
+            self.activation_dtype, "activation_dtype"
+        )
+        self.weight_bits = _coerce_weight_bits(self.weight_bits, self.weight_dtype)
+        self.group_size = _coerce_group_size(self.group_size)
+        if not isinstance(self.has_zero_point, bool):
+            raise ValueError(
+                f"has_zero_point must be a boolean, got {self.has_zero_point!r}"
+            )
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Copy the record so a caller can serialize it without sharing this object."""
+        return {
+            "method": self.method,
+            "weight_bits": self.weight_bits,
+            "weight_dtype": self.weight_dtype,
+            "activation_dtype": self.activation_dtype,
+            "group_size": self.group_size,
+            "has_zero_point": self.has_zero_point,
+        }
+
+
+def _coerce_positive_int(value: Any, field_name: str) -> int:
+    """A bool is not a count. Zero is not a cache dimension."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{field_name} must be an integer, got {value!r}")
+    if value < 1:
+        raise ValueError(f"{field_name} must be positive, got {value}")
+    return value
+
+
+def _coerce_kv_pattern(value: Any, field_name: str, family: str, role: str) -> str:
+    """A past or present pattern names one layer with {layer}, then key or value."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} must be a non-empty string, got {value!r}")
+    text = value.strip()
+    if text.count("{layer}") != 1:
+        raise ValueError(
+            f"{field_name} must name the layer once with {{layer}}, got {text!r}"
+        )
+    lowered = text.lower()
+    prefixes = (
+        ("past_key_values.", "past.")
+        if family == "past"
+        else ("present_key_values.", "present.")
+    )
+    if not lowered.startswith(prefixes):
+        expected = " or ".join(prefixes)
+        raise ValueError(f"{field_name} must start with {expected}, got {text!r}")
+    tail = lowered.split("{layer}", 1)[1]
+    if role == "key":
+        if ".value" in tail or ".key" not in tail:
+            raise ValueError(f"{field_name} must name a key, got {text!r}")
+    elif ".key" in tail or ".value" not in tail:
+        raise ValueError(f"{field_name} must name a value, got {text!r}")
+    return text
+
+
+@dataclass
+class KVCacheContract:
+    """
+    Past and present KV tensors recorded for one split.
+
+    Layout BNSD is batch, heads, sequence, head dim. Each pattern contains
+    ``{layer}`` once. Past names start with ``past_key_values.`` and present
+    names start with ``present.``. ``KVCacheConfig`` plans capacity and policy.
+    This contract names the tensors a split actually reads and writes.
+    """
+    num_layers: int
+    num_kv_heads: int
+    head_dim: int
+    dtype: str
+    layout: str  # "BNSD"
+    max_seq_len: int
+    past_key_pattern: str
+    past_value_pattern: str
+    present_key_pattern: str
+    present_value_pattern: str
+
+    def __post_init__(self) -> None:
+        self.num_layers = _coerce_positive_int(self.num_layers, "num_layers")
+        self.num_kv_heads = _coerce_positive_int(self.num_kv_heads, "num_kv_heads")
+        self.head_dim = _coerce_positive_int(self.head_dim, "head_dim")
+        self.dtype = _coerce_info_dtype(self.dtype, "dtype")
+        self.layout = _coerce_kv_layout(self.layout)
+        self.max_seq_len = _coerce_positive_int(self.max_seq_len, "max_seq_len")
+        self.past_key_pattern = _coerce_kv_pattern(
+            self.past_key_pattern, "past_key_pattern", "past", "key"
+        )
+        self.past_value_pattern = _coerce_kv_pattern(
+            self.past_value_pattern, "past_value_pattern", "past", "value"
+        )
+        self.present_key_pattern = _coerce_kv_pattern(
+            self.present_key_pattern, "present_key_pattern", "present", "key"
+        )
+        self.present_value_pattern = _coerce_kv_pattern(
+            self.present_value_pattern, "present_value_pattern", "present", "value"
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Copy the contract so a caller can serialize it without sharing this object."""
+        return {
+            "num_layers": self.num_layers,
+            "num_kv_heads": self.num_kv_heads,
+            "head_dim": self.head_dim,
+            "dtype": self.dtype,
+            "layout": self.layout,
+            "max_seq_len": self.max_seq_len,
+            "past_key_pattern": self.past_key_pattern,
+            "past_value_pattern": self.past_value_pattern,
+            "present_key_pattern": self.present_key_pattern,
+            "present_value_pattern": self.present_value_pattern,
+        }
+
+
 @dataclass
 class SplitConfig:
     """
