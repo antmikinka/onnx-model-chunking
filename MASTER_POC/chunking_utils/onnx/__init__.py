@@ -44,6 +44,14 @@ from .merger import merge_onnx
 from .loader import load_onnx_model, resolve_model_path
 from .types import ComponentInfo, OnnxSplitResult
 from .inference import run_inference
+from .quark_optimize import (
+    QuarkOptimizeConfig,
+    QuarkOptimizeResult,
+    QuarkUnavailable,
+    optimize_for_npu,
+    pipeline_order,
+    prepare_model_for_split,
+)
 
 __all__ = [
     # Main operations
@@ -78,4 +86,11 @@ __all__ = [
     "OnnxSplitResult",
     # Inference
     "run_inference",
+    # Quark pre-split stage
+    "QuarkOptimizeConfig",
+    "QuarkOptimizeResult",
+    "QuarkUnavailable",
+    "optimize_for_npu",
+    "pipeline_order",
+    "prepare_model_for_split",
 ]

@@ -17373,6 +17373,13 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"session_manager: FAILED - {e}")
         results.append(("session_manager", False))
+
+    try:
+        from test_quark import main as test_quark
+        results.append(("quark", test_quark()))
+    except Exception as e:
+        print(f"quark: FAILED - {e}")
+        results.append(("quark", False))
     
     try:
         results.append(("io_binding", test_io_binding()))
