@@ -1648,6 +1648,47 @@ def _coerce_device_preference(preference: Any) -> Optional[str]:
     return _DEVICE_PREFERENCE_ALIASES[text]
 
 
+def select_execution_phase(
+    query_len: int,
+    past_len: int = 0,
+    *,
+    explicit: Any = None,
+    decode_query_len: int = 1,
+) -> str:
+    """
+    Choose prefill or decode without reading cache values.
+
+    A query longer than the decode length is prefill, including a chunk
+    whose past is already warm. One token with no valid past is still
+    prefill: that step builds the cache. Decode is one token with a
+    positive valid past length. ``past_len`` is that count, not the
+    allocated buffer and not ``min(cache)``.
+    """
+    query = int(query_len)
+    past = int(past_len)
+    step = int(decode_query_len)
+    if query < 1:
+        raise ValueError(f"query_len must be positive, got {query}")
+    if past < 0:
+        raise ValueError(f"past_len must be zero or positive, got {past}")
+    if step < 1:
+        raise ValueError(f"decode_query_len must be positive, got {step}")
+    if explicit is not None:
+        phase = _coerce_phase(explicit)
+        if phase not in {"prefill", "decode"}:
+            raise ValueError(
+                f"Phase routing accepts prefill or decode, got '{phase}'"
+            )
+        if phase == "decode" and query != step:
+            raise ValueError(
+                f"Decode runs {step} token at a time, got query_len {query}"
+            )
+        return phase
+    if query != step or past == 0:
+        return "prefill"
+    return "decode"
+
+
 def infer_component_phase(name: str) -> Optional[str]:
     """
     Read a phase from a component name.
@@ -1667,6 +1708,20 @@ def infer_component_phase(name: str) -> Optional[str]:
 def _step_targets_npu(step: "ExecutionStep") -> bool:
     """True when the step is placed on an ahead-of-time NPU."""
     return step.device_type == "npu" or provider_is_npu(step.provider)
+
+
+@dataclass(frozen=True)
+class PhaseRoute:
+    """The graph the host should run for this token step."""
+
+    phase: str
+    components: Tuple[str, ...]
+    device: str
+    provider: str
+    query_len: int
+    past_len: int
+    static_query_len: int
+    session_loaded: bool
 
 
 @dataclass
@@ -3201,6 +3256,151 @@ class SessionManager:
                 f"{loaded_count} loaded, {len(members)} scheduled"
             )
             return loaded
+
+    def route(
+        self,
+        query_len: int,
+        past_len: int = 0,
+        *,
+        explicit_phase: Any = None,
+    ) -> PhaseRoute:
+        """
+        Load the prefill or decode graph and return the one to run.
+
+        The choice uses the query length and the valid past length. It does
+        not read cache values. Prefill is the static prompt graph. Decode is
+        the single-token graph. A layer series is not a phase graph.
+        """
+        record = self.model_info.get("phase_split") or {}
+        if not isinstance(record, dict):
+            raise ValueError("phase_split must be a dict")
+        decode_query = int(record.get("decode_query_len", 1))
+        phase = select_execution_phase(
+            query_len,
+            past_len,
+            explicit=explicit_phase,
+            decode_query_len=decode_query,
+        )
+        names = self._phase_graph_names(phase, record)
+        self._reject_phase_control_flow(names)
+        static_query = self._static_query_len(phase, names, record)
+        if (
+            phase == "prefill"
+            and static_query is not None
+            and int(query_len) > static_query
+        ):
+            raise ValueError(
+                f"query_len {int(query_len)} exceeds the prefill graph "
+                f"bucket {static_query}"
+            )
+        if phase == "decode" and static_query not in (None, decode_query):
+            raise ValueError(
+                f"Decode graph query length is {static_query}, expected {decode_query}"
+            )
+        self.load_phase(phase)
+        device = self._phase_device(phase, names, record)
+        providers = self._providers_for_preference(device)
+        provider = providers[0] if providers else "CPUExecutionProvider"
+        return PhaseRoute(
+            phase=phase,
+            components=tuple(names),
+            device=device,
+            provider=provider,
+            query_len=int(query_len),
+            past_len=int(past_len),
+            static_query_len=int(query_len) if static_query is None else int(static_query),
+            session_loaded=all(name in self._sessions for name in names),
+        )
+
+    def _phase_graph_names(self, phase: str, record: Dict[str, Any]) -> List[str]:
+        key = "prefill_component" if phase == "prefill" else "decode_component"
+        named = record.get(key)
+        if isinstance(named, str) and named.strip():
+            names = [named.strip()]
+        elif isinstance(named, (list, tuple)) and named:
+            names = [str(item) for item in named]
+        else:
+            names = self._sessions_in_phase(phase)
+        if not names:
+            raise ValueError(
+                f"No {phase} graph is available. Route one static {phase} model, "
+                "not a layer series."
+            )
+        missing = [name for name in names if name not in self._session_info]
+        if missing:
+            raise KeyError(
+                f"Phase '{phase}' names missing components: {', '.join(missing)}"
+            )
+        if is_sequential_layer_split(names):
+            raise RuntimeError(
+                f"Phase '{phase}' is a sequential layer split ({', '.join(names)}). "
+                "Compile one static graph for the phase."
+            )
+        return names
+
+    def _phase_device(self, phase: str, names: Sequence[str], record: Dict[str, Any]) -> str:
+        for name in names:
+            preference = self._session_info[name].device_preference
+            if preference not in (None, "auto"):
+                return preference
+        recorded = record.get(f"{phase}_device")
+        if recorded not in (None, ""):
+            return _coerce_device_preference(recorded)
+        if phase == "prefill" and providers_target_npu(self.config.providers):
+            return "npu"
+        if phase == "decode" and any(
+            provider_is_gpu(provider) for provider in self.config.providers
+        ):
+            return "igpu"
+        if phase == "decode" and providers_target_npu(self.config.providers):
+            return "npu"
+        return "cpu"
+
+    def _static_query_len(
+        self,
+        phase: str,
+        names: Sequence[str],
+        record: Dict[str, Any],
+    ) -> Optional[int]:
+        axis = int(record.get("query_axis", 2))
+        seen: Optional[int] = None
+        for name in names:
+            for tensor_name, shape in self._session_info[name].input_shapes.items():
+                if tensor_name not in {"hidden", "input_ids", "tokens", "hidden_states"}:
+                    continue
+                if len(shape) <= axis:
+                    continue
+                dim = shape[axis]
+                if not isinstance(dim, (int, float)) or isinstance(dim, bool) or int(dim) <= 0:
+                    raise ValueError(
+                        f"{name}.{tensor_name} query axis {axis} is dynamic ({dim}). "
+                        "An NPU phase graph needs a static query length."
+                    )
+                dim = int(dim)
+                if seen is None:
+                    seen = dim
+                elif seen != dim:
+                    raise ValueError(
+                        f"{name}.{tensor_name} query length {dim} disagrees with {seen}"
+                    )
+        if seen is not None:
+            return seen
+        declared = record.get("prefill_query_len" if phase == "prefill" else "decode_query_len")
+        if declared is None:
+            return None
+        return int(declared)
+
+    def _reject_phase_control_flow(self, names: Sequence[str]) -> None:
+        import onnx
+
+        from .phase_graphs import assert_no_control_flow
+
+        for name in names:
+            path = self._session_info[name].file_path
+            if not path or not os.path.exists(path):
+                continue
+            model = onnx.load(path, load_external_data=False)
+            assert_no_control_flow(model)
 
     def placement(self, component_name: str) -> ExecutionStep:
         """Return the plan step for a component."""

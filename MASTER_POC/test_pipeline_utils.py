@@ -17373,6 +17373,14 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"session_manager: FAILED - {e}")
         results.append(("session_manager", False))
+
+    try:
+        from test_phase_split import main as test_phase_split
+        test_phase_split()
+        results.append(("phase_split", True))
+    except Exception as e:
+        print(f"phase_split: FAILED - {e}")
+        results.append(("phase_split", False))
     
     try:
         results.append(("io_binding", test_io_binding()))
