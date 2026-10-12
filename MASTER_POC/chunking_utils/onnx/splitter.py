@@ -31,6 +31,7 @@ from .loader import infer_shapes_with_lazy_fallback, load_onnx_model
 from .metadata_writer import write_execution_contract
 from .npu_policy import extract_execution_policy
 from .quantization import build_quantization_info, extract_quantization_info, extract_quantization_tensors
+from .quark_optimize import QuarkOptimizeConfig, prepare_model_for_split
 from .types import OnnxSplitResult
 from .validator import validate_boundary_contracts, validate_component_io
 from .weight_store import (
@@ -185,6 +186,8 @@ def split_onnx(
     weight_strategy: Any = None,
     weight_size_threshold: Optional[int] = None,
     weight_chunk_size: Optional[int] = None,
+    quark: bool = False,
+    quark_config: Optional[QuarkOptimizeConfig] = None,
     **kwargs
 ) -> OnnxSplitResult:
     """
@@ -209,6 +212,9 @@ def split_onnx(
         weight_strategy: copy, hardlink, manifest, or streaming. Defaults to copy.
         weight_size_threshold: Minimum initializer size stored outside the graph.
         weight_chunk_size: Streaming chunk size. Other strategies ignore it.
+        quark: When True, run AMD Quark on the model before any component file is written.
+            Defaults to False. A missing Quark install raises before the split writes.
+        quark_config: Optional QuarkOptimizeConfig. Ignored when quark is False.
         **kwargs: Additional arguments passed to SplitConfig.
 
     Returns:
@@ -238,6 +244,14 @@ def split_onnx(
         strategy = coerce_weight_strategy(weight_strategy)
     if weight_size_threshold is None:
         weight_size_threshold = SIZE_THRESHOLD
+
+    # Rewrite is caller-supplied. Quark runs only when requested, and before split.
+    config.model = prepare_model_for_split(
+        config.model,
+        config.output,
+        quark=quark,
+        config=quark_config,
+    )
 
     model_path = config.model
     onnx_model = load_onnx_model(model_path)
