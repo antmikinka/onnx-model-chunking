@@ -5,13 +5,16 @@ kv_cache.py - KV Cache Management Module
 This module provides a KVCacheManager class for managing key-value cache state
 during incremental transformer decoding.
 
-CPU storage uses NumPy arrays. When ``max_seq_len`` is set, CPU and every
-device backend preallocate one buffer of shape
-``[batch, num_kv_heads, max_seq_len, head_dim]`` and write new tokens at
+CPU storage uses NumPy arrays. When ``max_seq_len`` is set, CPU, CUDA,
+ROCm, and pinned host preallocate one buffer of shape
+    ``[batch, num_kv_heads, max_seq_len, head_dim]`` and write new tokens at
 ``current_seq_len`` instead of allocating a larger array per token.
-NPU, iGPU, CUDA, pinned host, and hybrid NPU/iGPU storage keep that buffer
-in one ort.OrtValue wrapped by a DeviceBuffer. The attention mask and
-``sequence_length_scalar`` tell the graph how much of the buffer is valid.
+VitisAI, RyzenAI, and hybrid NPU/iGPU do not slot-write that buffer.
+They concatenate the valid prefix with the new tokens into a second
+buffer of the same shape, then swap the two pointers. The sequence axis
+stays ``max_seq_len``, so the XCLBIN is not rebuilt. The attention mask
+and ``sequence_length_scalar`` tell the graph how much of the active
+buffer is valid.
 
 Usage:
     from pipeline_utils.kv_cache import KVCacheManager, KVCacheBackend
@@ -73,6 +76,26 @@ class KVCacheBackend(Enum):
     HYBRID_NPU_IGPU = "hybrid_npu_igpu"
 
 
+class KVUpdateMode(Enum):
+    """How a new token becomes part of the resident cache.
+
+    ``SLOT_WRITE`` stores the token at ``current_seq_len`` inside the live
+    buffer. CPU, CUDA, ROCm, and pinned host can do that.
+
+    ``CONCAT_SWAP`` is the spatial-NPU translation of the append in
+    Stephen Panaro's ``gpt2.py``: ``torch.cat([old_k, new_k], dim=1)``,
+    then install that tensor as the next cache. ``index_copy``,
+    ``scatter``, and a slice assignment at a runtime index do not run on
+    the ANE, and a VitisAI XCLBIN has the same problem. The sequence axis
+    stays ``max_seq_len``. The concatenated prefix is written into the
+    inactive buffer and the two pointers swap. The live buffer is not
+    slot-updated, and past and present are never the same OrtValue.
+    """
+
+    SLOT_WRITE = "slot_write"
+    CONCAT_SWAP = "concat_swap"
+
+
 _BACKEND_ALIASES = {
     "pinned": KVCacheBackend.PINNED_HOST,
     "hip_pinned": KVCacheBackend.PINNED_HOST,
@@ -89,6 +112,22 @@ _BACKEND_DEVICE = {
     KVCacheBackend.RYZENAI: "ryzenai",
     KVCacheBackend.PINNED_HOST: "hip_pinned",
     KVCacheBackend.HYBRID_NPU_IGPU: "vitisai",
+}
+
+_SPATIAL_NPU_BACKENDS = frozenset({
+    KVCacheBackend.VITISAI,
+    KVCacheBackend.RYZENAI,
+    KVCacheBackend.HYBRID_NPU_IGPU,
+})
+
+_UPDATE_MODE_ALIASES = {
+    "slot": KVUpdateMode.SLOT_WRITE,
+    "inplace": KVUpdateMode.SLOT_WRITE,
+    "in_place": KVUpdateMode.SLOT_WRITE,
+    "concat": KVUpdateMode.CONCAT_SWAP,
+    "cat": KVUpdateMode.CONCAT_SWAP,
+    "pointer_swap": KVUpdateMode.CONCAT_SWAP,
+    "swap": KVUpdateMode.CONCAT_SWAP,
 }
 
 _SEQ_AXIS = 2
@@ -119,6 +158,29 @@ def coerce_kv_policy(policy: Any) -> KVCachePolicy:
         allowed = ", ".join(item.value for item in KVCachePolicy)
         raise ValueError(
             f"Unknown KV cache policy '{policy}'. Expected one of: {allowed}"
+        ) from exc
+
+
+def default_kv_update_mode(backend: KVCacheBackend) -> KVUpdateMode:
+    """Spatial NPUs concatenate and swap. Indexed devices slot-write."""
+    if backend in _SPATIAL_NPU_BACKENDS:
+        return KVUpdateMode.CONCAT_SWAP
+    return KVUpdateMode.SLOT_WRITE
+
+
+def coerce_kv_update_mode(mode: Any) -> KVUpdateMode:
+    """Accept the enum or its string value."""
+    if isinstance(mode, KVUpdateMode):
+        return mode
+    text = str(mode).strip().lower().replace("-", "_")
+    if text in _UPDATE_MODE_ALIASES:
+        return _UPDATE_MODE_ALIASES[text]
+    try:
+        return KVUpdateMode(text)
+    except ValueError as exc:
+        allowed = ", ".join(item.value for item in KVUpdateMode)
+        raise ValueError(
+            f"Unknown KV update mode '{mode}'. Expected one of: {allowed}"
         ) from exc
 
 
@@ -377,12 +439,14 @@ class KVCacheManager:
     - Subsequent iterations (decode): Process only new token, use cached keys/values
 
     ``backend`` selects the memory. A cache with ``max_seq_len`` allocates
-    ``[batch, heads, max_seq_len, head_dim]`` once. Decode writes the new
-    token at ``[:, :, current_seq_len, :]`` and advances that length.
-    CPU without ``max_seq_len`` still replaces NumPy arrays as the sequence
-    grows. Device backends store an OrtValue inside a DeviceBuffer. Hybrid
-    NPU/iGPU uses one shared allocation so prefill and decode bind the same
-    pointer.
+    ``[batch, heads, max_seq_len, head_dim]`` once. ``slot_write`` stores
+    the new token at ``[:, :, current_seq_len, :]``. ``concat_swap``
+    concatenates that token onto the valid prefix in the shadow buffer
+    and exchanges the two pointers. CPU without ``max_seq_len`` still
+    replaces NumPy arrays as the sequence grows. Device backends store an
+    OrtValue inside a DeviceBuffer. Hybrid NPU/iGPU uses one shared
+    allocation so prefill and decode bind the same pointer, plus a shadow
+    when the update mode is ``concat_swap``.
 
     Attributes:
         num_layers: Number of transformer layers
@@ -420,6 +484,7 @@ class KVCacheManager:
         layer_policies: Optional[Sequence[Any]] = None,
         cache_dtype: Any = None,
         kv_quantization: Optional[str] = None,
+        update_mode: Any = None,
     ):
         """
         Initialize the KV cache manager.
@@ -455,6 +520,9 @@ class KVCacheManager:
                 from ``kv_quantization``.
             kv_quantization: None, fp16, bf16, int8, fp8, int4, or fp4.
                 None keeps the compute buffer as the stored form.
+            update_mode: ``slot_write`` or ``concat_swap``. Omitted values
+                use ``concat_swap`` for VitisAI, RyzenAI, and hybrid
+                NPU/iGPU, and ``slot_write`` for every other backend.
         """
         dtype = _default_compute_dtype(dtype)
         self.num_layers = num_layers
@@ -463,6 +531,11 @@ class KVCacheManager:
         self.dtype = dtype
         self.batch_size = batch_size
         self.backend = coerce_kv_backend(backend)
+        self.update_mode = (
+            default_kv_update_mode(self.backend)
+            if update_mode is None
+            else coerce_kv_update_mode(update_mode)
+        )
         self.device_id = int(device_id)
         self.policy = coerce_kv_policy(policy)
         self.window_size = None if window_size is None else int(window_size)
@@ -541,6 +614,10 @@ class KVCacheManager:
         """True when the sequence axis is preallocated at ``max_seq_len``."""
         return self._static
 
+    def _concat_swap_active(self) -> bool:
+        """True when publishes go to the shadow buffer instead of a slot write."""
+        return self.update_mode is KVUpdateMode.CONCAT_SWAP and self._static
+
     def reset(self) -> None:
         """
         Reset the cache to empty state.
@@ -594,10 +671,17 @@ class KVCacheManager:
                             "key": np.zeros(shape, dtype=self.dtype),
                             "value": np.zeros(shape, dtype=self.dtype),
                         }
+                        if self._concat_swap_active():
+                            self._cache[i]["key_shadow"] = np.zeros(shape, dtype=self.dtype)
+                            self._cache[i]["value_shadow"] = np.zeros(shape, dtype=self.dtype)
                 else:
                     for i in range(self.num_layers):
                         self._cache[i]["key"].fill(0)
                         self._cache[i]["value"].fill(0)
+                        if self._concat_swap_active():
+                            if "key_shadow" not in self._cache[i]:
+                                self._cache[i]["key_shadow"] = np.zeros(shape, dtype=self.dtype)
+                                self._cache[i]["value_shadow"] = np.zeros(shape, dtype=self.dtype)
                 return
             if not self._cache:
                 self._allocate_device_cache()
@@ -815,6 +899,7 @@ class KVCacheManager:
         self._binder = io_manager
         self.max_seq_len = int(limit)
         self._static = True
+        self._attach_shadows()
 
     def _mask_ort_value(self) -> ort.OrtValue:
         """Attention mask OrtValue owned by the IOBindingManager when one exists."""
@@ -892,6 +977,7 @@ class KVCacheManager:
             if key is None or value is None:
                 raise RuntimeError(f"KV layer {layer} was not allocated")
             self._cache[layer] = {"key": key, "value": value}
+        self._attach_shadows()
 
     def _allocate_hybrid_cache(self) -> None:
         """One shared OrtValue per tensor for NPU prefill and iGPU decode."""
@@ -935,6 +1021,26 @@ class KVCacheManager:
                     static_seq_axis=_SEQ_AXIS,
                     static_max_seq=int(self.max_seq_len),
                 )
+                if self._concat_swap_active():
+                    shadow = self._bridge.allocate_shared_buffer(
+                        f"kv.layer{layer}.{kind}.shadow",
+                        shape,
+                        self.dtype,
+                    )
+                    self._shared.append(shadow)
+                    slots[f"{kind}_shadow"] = DeviceBuffer(
+                        name=shadow.name,
+                        shape=shape,
+                        dtype=np.dtype(self.dtype),
+                        device_type=self.device_type,
+                        device_id=self.device_id,
+                        ort_value=shadow.ort_value,
+                        is_dynamic=False,
+                        ortvalue_device=shadow.bind_device_type,
+                        memory_placement=placement,
+                        static_seq_axis=_SEQ_AXIS,
+                        static_max_seq=int(self.max_seq_len),
+                    )
             self._cache[layer] = slots
 
     def get_sequence_length(self) -> int:
@@ -1295,6 +1401,203 @@ class KVCacheManager:
             raise RuntimeError(f"Layer {layer_idx} has no resident OrtValue")
         return key_ort, value_ort
 
+    def _attach_shadows(self) -> None:
+        """Pair each active KV buffer with an inactive one of the same shape."""
+        if not self._concat_swap_active():
+            return
+        if self._binder is not None:
+            pool = self._binder.ensure_kv_shadows("kv")
+            for layer in range(self.num_layers):
+                key_shadow = self._binder.get_buffer(pool.shadow_key_names[layer])
+                value_shadow = self._binder.get_buffer(pool.shadow_value_names[layer])
+                if key_shadow is None or value_shadow is None:
+                    raise RuntimeError(f"KV layer {layer} is missing a shadow buffer")
+                self._cache[layer]["key_shadow"] = key_shadow
+                self._cache[layer]["value_shadow"] = value_shadow
+            return
+        for layer in range(self.num_layers):
+            entry = self._cache.get(layer)
+            if entry is None or "key_shadow" in entry:
+                continue
+            shape = _tensor_shape(entry["key"])
+            entry["key_shadow"] = np.zeros(shape, dtype=self.dtype)
+            entry["value_shadow"] = np.zeros(shape, dtype=self.dtype)
+
+    def _shadow_pair(self, layer_idx: int) -> Tuple[Any, Any]:
+        entry = self._cache[layer_idx]
+        key = entry.get("key_shadow")
+        value = entry.get("value_shadow")
+        if key is None or value is None:
+            raise RuntimeError(
+                f"Layer {layer_idx} has no KV shadow buffer. concat_swap keeps "
+                "one active buffer and one inactive buffer at max_seq_len."
+            )
+        return key, value
+
+    def shadow_ort_values(self, layer_idx: int) -> Tuple[Any, Any]:
+        """
+        Return the inactive key and value for one layer.
+
+        ``bind_cache_to_session`` binds these as the present outputs when
+        the update mode is ``concat_swap``. After the step, call
+        ``commit_present_swap`` so the next past input reads them.
+        """
+        key, value = self._shadow_pair(layer_idx)
+        return _ort_value_of(key), _ort_value_of(value)
+
+    def _swap_layer(self, layer_idx: int) -> None:
+        """Exchange the active and shadow storage. The shape does not change."""
+        entry = self._cache[layer_idx]
+        active_key = entry["key"]
+        active_value = entry["value"]
+        shadow_key, shadow_value = self._shadow_pair(layer_idx)
+        if isinstance(active_key, np.ndarray):
+            entry["key"], entry["key_shadow"] = shadow_key, active_key
+            entry["value"], entry["value_shadow"] = shadow_value, active_value
+            return
+        if active_key.ort_value is None or shadow_key.ort_value is None:
+            raise RuntimeError(f"Layer {layer_idx} key buffer is not allocated")
+        if active_value.ort_value is None or shadow_value.ort_value is None:
+            raise RuntimeError(f"Layer {layer_idx} value buffer is not allocated")
+        active_key.ort_value, shadow_key.ort_value = (
+            shadow_key.ort_value,
+            active_key.ort_value,
+        )
+        active_value.ort_value, shadow_value.ort_value = (
+            shadow_value.ort_value,
+            active_value.ort_value,
+        )
+
+    def _publish_prefix(
+        self,
+        layer_idx: int,
+        key: np.ndarray,
+        value: np.ndarray,
+        length: int,
+    ) -> None:
+        """
+        Write a concatenated prefix into the shadow and make it active.
+
+        ``length`` is the valid sequence, not a new allocation. The shadow
+        stays ``[batch, heads, max_seq_len, head_dim]``.
+        """
+        published_key = np.ascontiguousarray(key, dtype=self.dtype)
+        published_value = np.ascontiguousarray(value, dtype=self.dtype)
+        if int(published_key.shape[_SEQ_AXIS]) != int(length):
+            raise ValueError(
+                f"Layer {layer_idx}: concatenated key length "
+                f"{published_key.shape[_SEQ_AXIS]} != {length}"
+            )
+        if int(published_value.shape[_SEQ_AXIS]) != int(length):
+            raise ValueError(
+                f"Layer {layer_idx}: concatenated value length "
+                f"{published_value.shape[_SEQ_AXIS]} != {length}"
+            )
+        if length < 0 or (
+            self.max_seq_len is not None and int(length) > int(self.max_seq_len)
+        ):
+            raise ValueError(
+                f"Layer {layer_idx}: sequence length {length} exceeds "
+                f"max_seq_len {self.max_seq_len}"
+            )
+        shadow_key, shadow_value = self._shadow_pair(layer_idx)
+        if length:
+            _write_window(shadow_key, published_key, 0)
+            _write_window(shadow_value, published_value, 0)
+        self._swap_layer(layer_idx)
+
+    def _concat_swap_dense(
+        self,
+        layer_idx: int,
+        stored_key: Any,
+        stored_value: Any,
+        present_key: Any,
+        present_value: Any,
+        position: int,
+        valid_seq_len: Optional[int],
+    ) -> None:
+        """
+        Publish ``concat(old[:position], new)`` without writing the live buffer.
+
+        A present tensor longer than ``position`` is already the concatenated
+        cache, and its prefix of that length is what becomes active. A shorter
+        tensor is the new tokens only. The shadow OrtValue, which is where
+        ``bind_cache_to_session`` sends the present output, is adopted with
+        ``valid_seq_len`` and no second copy.
+        """
+        shadow_key, shadow_value = self._shadow_pair(layer_idx)
+        if _same_storage(shadow_key, present_key) and _same_storage(shadow_value, present_value):
+            if valid_seq_len is None:
+                raise ValueError(
+                    f"Layer {layer_idx}: the present output is the shadow buffer "
+                    "of max_seq_len. Pass valid_seq_len or call commit_present_swap."
+                )
+            self._swap_layer(layer_idx)
+            new_len = int(valid_seq_len)
+            self._commit_length(layer_idx, new_len)
+            self._seen[layer_idx] = new_len
+            self._seen_published = new_len
+            return
+
+        key_np = _as_numpy(present_key)
+        value_np = _as_numpy(present_value)
+        _, _, new_len = _placement(key_np, position)
+        if new_len < 0 or (
+            self.max_seq_len is not None and new_len > int(self.max_seq_len)
+        ):
+            raise ValueError(
+                f"Layer {layer_idx}: sequence length {new_len} exceeds "
+                f"max_seq_len {self.max_seq_len}"
+            )
+        seq = int(key_np.shape[_SEQ_AXIS])
+        if seq == position:
+            return
+        if seq > position:
+            published_key = np.ascontiguousarray(key_np[:, :, :new_len, :])
+            published_value = np.ascontiguousarray(value_np[:, :, :new_len, :])
+        elif position:
+            published_key = _cat_seq([
+                _read_prefix(stored_key, position),
+                np.ascontiguousarray(key_np),
+            ])
+            published_value = _cat_seq([
+                _read_prefix(stored_value, position),
+                np.ascontiguousarray(value_np),
+            ])
+        else:
+            published_key = np.ascontiguousarray(key_np)
+            published_value = np.ascontiguousarray(value_np)
+        self._publish_prefix(layer_idx, published_key, published_value, new_len)
+        self._commit_length(layer_idx, new_len)
+        self._seen[layer_idx] = int(new_len)
+        self._seen_published = int(new_len)
+
+    def commit_present_swap(self, layer_idx: int, valid_seq_len: int) -> int:
+        """
+        Install the shadow buffer as the next past cache.
+
+        Call this after the NPU writes the concatenated present tensor into
+        the output bound by ``bind_cache_to_session``. The active pointer
+        changes. ``max_seq_len`` does not. ``valid_seq_len`` is the filled
+        prefix, so the padded tail stays masked.
+        """
+        with self._lock:
+            if not self._concat_swap_active():
+                raise RuntimeError(
+                    "commit_present_swap requires concat_swap on a static cache"
+                )
+            if layer_idx not in self._cache:
+                raise KeyError(
+                    f"Layer {layer_idx} not in cache (have {self.num_layers} layers)"
+                )
+            self._invalidate_quant(layer_idx)
+            self._swap_layer(layer_idx)
+            self._commit_length(layer_idx, int(valid_seq_len))
+            if int(valid_seq_len) > int(self._seen[layer_idx]):
+                self._seen[layer_idx] = int(valid_seq_len)
+                self._seen_published = int(self._seen[layer_idx])
+            return int(valid_seq_len)
+
     def bind_cache_to_session(
         self,
         session: Any,
@@ -1304,12 +1607,15 @@ class KVCacheManager:
         """
         Bind one layer's resident cache into an ONNX Runtime session.
 
-        Past key and value inputs and present key and value outputs are
-        bound to the same OrtValues. The static attention mask and a
-        sequence-length scalar are bound when the session has those
-        inputs. A present tensor whose concrete sequence length is not
-        ``max_seq_len`` is rejected so a short output is not aliased
-        onto the preallocated buffer.
+        ``slot_write`` binds past and present to the same OrtValue.
+        ``concat_swap`` binds past to the active OrtValue and present to
+        the shadow OrtValue, so a concatenated present does not overlap
+        the cache the graph is reading. Call ``commit_present_swap`` after
+        the session runs. The static attention mask and a sequence-length
+        scalar are bound when the session has those inputs. A present
+        tensor whose concrete sequence length is not ``max_seq_len`` is
+        rejected so a short output is not written over the preallocated
+        buffer.
 
         Args:
             session: ONNX Runtime session, or any object with
@@ -1350,10 +1656,14 @@ class KVCacheManager:
         for name in (past_key, past_value, present_key, present_value):
             _require_static_shape(nodes[name], cache_shape, int(self.max_seq_len))
 
+        present_key_ort = key_ort
+        present_value_ort = value_ort
+        if self._concat_swap_active():
+            present_key_ort, present_value_ort = self.shadow_ort_values(layer_idx)
         io_binding.bind_ortvalue_input(past_key, key_ort)
         io_binding.bind_ortvalue_input(past_value, value_ort)
-        io_binding.bind_ortvalue_output(present_key, key_ort)
-        io_binding.bind_ortvalue_output(present_value, value_ort)
+        io_binding.bind_ortvalue_output(present_key, present_key_ort)
+        io_binding.bind_ortvalue_output(present_value, present_value_ort)
         bound = {
             "past_key": past_key,
             "past_value": past_value,
@@ -1479,6 +1789,17 @@ class KVCacheManager:
                 return
 
             position = self._layer_len[layer_idx]
+            if self._concat_swap_active():
+                self._concat_swap_dense(
+                    layer_idx,
+                    stored_key,
+                    stored_value,
+                    present_key,
+                    present_value,
+                    position,
+                    valid_seq_len,
+                )
+                return
             key_np = None if key_is_resident else _as_numpy(present_key)
             value_np = None if value_is_resident else _as_numpy(present_value)
             reference = key_np if key_np is not None else value_np
@@ -1644,8 +1965,23 @@ class KVCacheManager:
                     f"Layer {layer_idx}: sequence length {new_len} exceeds "
                     f"max_seq_len {self.max_seq_len}"
                 )
-            _write_window(stored_key, key_np, position)
-            _write_window(stored_value, value_np, position)
+            if self._concat_swap_active():
+                if position:
+                    published_key = _cat_seq([
+                        _read_prefix(stored_key, position),
+                        key_np,
+                    ])
+                    published_value = _cat_seq([
+                        _read_prefix(stored_value, position),
+                        value_np,
+                    ])
+                else:
+                    published_key = key_np
+                    published_value = value_np
+                self._publish_prefix(layer_idx, published_key, published_value, new_len)
+            else:
+                _write_window(stored_key, key_np, position)
+                _write_window(stored_value, value_np, position)
             self._commit_length(layer_idx, new_len)
             self._seen[layer_idx] = int(new_len)
             self._seen_published = int(new_len)
@@ -1714,10 +2050,16 @@ class KVCacheManager:
                 f"Layer {layer_idx}: retained sequence {key.shape[_SEQ_AXIS]} "
                 f"exceeds max_seq_len {self.max_seq_len}"
             )
-        if key.shape[_SEQ_AXIS]:
+        retained = int(key.shape[_SEQ_AXIS])
+        if self._concat_swap_active():
+            if retained:
+                self._publish_prefix(layer_idx, key, value, retained)
+            self._commit_length(layer_idx, retained)
+            return
+        if retained:
             _write_window(stored_key, key, 0)
             _write_window(stored_value, value, 0)
-        self._commit_length(layer_idx, int(key.shape[_SEQ_AXIS]))
+        self._commit_length(layer_idx, retained)
 
     def _retain(
         self,
@@ -1831,6 +2173,32 @@ class KVCacheManager:
         added_key: np.ndarray,
         added_value: np.ndarray,
     ) -> None:
+        if self._concat_swap_active():
+            host_key = np.array(_as_numpy(stored_key), copy=True)
+            host_value = np.array(_as_numpy(stored_value), copy=True)
+            self._paged_fill(layer_idx, host_key, host_value, added_key, added_value)
+            self._publish_prefix(
+                layer_idx,
+                host_key,
+                host_value,
+                int(self.max_seq_len),
+            )
+            self._commit_length(layer_idx, self._pages[layer_idx].resident)
+            self._store_custom_mask(self._physical_mask(layer_idx))
+            return
+        self._paged_fill(layer_idx, stored_key, stored_value, added_key, added_value)
+        self._commit_length(layer_idx, self._pages[layer_idx].resident)
+        self._store_custom_mask(self._physical_mask(layer_idx))
+
+    def _paged_fill(
+        self,
+        layer_idx: int,
+        stored_key: Any,
+        stored_value: Any,
+        added_key: np.ndarray,
+        added_value: np.ndarray,
+    ) -> None:
+        """Scatter new tokens into physical pages of ``stored_key``."""
         state = self._pages[layer_idx]
         remaining = int(added_key.shape[_SEQ_AXIS])
         source = 0
@@ -1850,8 +2218,6 @@ class KVCacheManager:
             source += take
             remaining -= take
         state.write_pos = position
-        self._commit_length(layer_idx, state.resident)
-        self._store_custom_mask(self._physical_mask(layer_idx))
 
     def _physical_mask(self, layer_idx: int) -> np.ndarray:
         width = int(self.max_seq_len)
@@ -2029,10 +2395,16 @@ class KVCacheManager:
         total_bytes = 0
         per_layer = []
 
+        shadow_bytes = 0
         for i in range(self.num_layers):
             key_bytes = _nbytes(self._cache[i]["key"])
             value_bytes = _nbytes(self._cache[i]["value"])
             layer_bytes = key_bytes + value_bytes
+            for extra in ("key_shadow", "value_shadow"):
+                if extra in self._cache[i]:
+                    extra_bytes = _nbytes(self._cache[i][extra])
+                    layer_bytes += extra_bytes
+                    shadow_bytes += extra_bytes
             per_layer.append(layer_bytes)
             total_bytes += layer_bytes
 
@@ -2066,6 +2438,8 @@ class KVCacheManager:
             "sink_size": self.sink_size,
             "seen_tokens": self.seen_tokens,
             "storage": "device_buffer" if self.device_resident else "numpy",
+            "update_mode": self.update_mode.value,
+            "shadow_bytes": shadow_bytes,
             "phase": self.phase,
             "execution_phase": self.execution_phase,
             "role": self.role,

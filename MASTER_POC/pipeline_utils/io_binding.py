@@ -33,7 +33,9 @@ Heterogeneous prefill/decode:
 NPU static KV cache:
 - MemoryMode.NPU_STATIC disables OrtValue reallocation. XDNA XCLBIN
   graphs are compiled for one shape.
-- allocate_static_kv_cache() allocates keys and values at max_seq_len
+- allocate_static_kv_cache() allocates keys and values at max_seq_len.
+  ensure_kv_shadows() adds a second buffer per tensor so a spatial NPU
+  can publish Concat(old, new) by swapping pointers.
   (default 4096). attention_mask(valid_tokens) rewrites a fixed
   (batch, max_seq_len) mask: 1 for the written prefix, 0 for padding.
 
@@ -183,6 +185,8 @@ class StaticKVPool:
     key_names: List[str]
     value_names: List[str]
     mask_name: str
+    shadow_key_names: List[str] = field(default_factory=list)
+    shadow_value_names: List[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if isinstance(self.dtype, str):
@@ -1289,6 +1293,54 @@ class IOBindingManager:
         if name not in self._kv_pools:
             raise KeyError(f"Static KV pool '{name}' is not allocated")
         return self._kv_pools[name]
+
+    def ensure_kv_shadows(self, pool: str = "kv") -> StaticKVPool:
+        """
+        Allocate the inactive KV buffer used by a pointer swap.
+
+        Each key and value gets one extra OrtValue of the same static
+        shape. The active buffer is what the next step reads. The shadow
+        is what this step writes. ``KVCacheManager`` exchanges the two
+        OrtValues after the concatenated prefix is in the shadow. A second
+        call returns the pool that already has shadows.
+        """
+        with self._lock:
+            spec = self.get_static_kv_pool(pool)
+            if spec.shadow_key_names:
+                return spec
+            if len(spec.key_names) != spec.num_layers or len(spec.value_names) != spec.num_layers:
+                raise RuntimeError(
+                    f"Static KV pool '{pool}' is missing a buffer for one of "
+                    f"its {spec.num_layers} layers"
+                )
+            shadow_keys: List[str] = []
+            shadow_values: List[str] = []
+            for layer in range(spec.num_layers):
+                for source_name, bucket in (
+                    (spec.key_names[layer], shadow_keys),
+                    (spec.value_names[layer], shadow_values),
+                ):
+                    source = self._buffers.get(source_name)
+                    if source is None or source.ort_value is None:
+                        raise RuntimeError(
+                            f"Static KV pool '{pool}' has no buffer '{source_name}'"
+                        )
+                    shadow_name = f"{source_name}.shadow"
+                    if shadow_name in self._buffers:
+                        raise ValueError(f"KV shadow '{shadow_name}' already exists")
+                    buffer = self.allocate_buffer(
+                        shadow_name,
+                        source.shape,
+                        source.dtype,
+                        is_dynamic=False,
+                    )
+                    buffer.static_seq_axis = source.static_seq_axis
+                    buffer.static_max_seq = source.static_max_seq
+                    self._buffer_pool[shadow_name] = pool
+                    bucket.append(shadow_name)
+            spec.shadow_key_names = shadow_keys
+            spec.shadow_value_names = shadow_values
+            return spec
     
     def create_binding(self, session: ort.InferenceSession) -> ort.IOBinding:
         """

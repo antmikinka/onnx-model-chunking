@@ -658,7 +658,12 @@ def test_kv_cache():
     print("Testing kv_cache module...")
     print("=" * 50)
     
-    from pipeline_utils.kv_cache import KVCacheManager, KVCacheBackend, KVCachePolicy
+    from pipeline_utils.kv_cache import (
+        KVCacheManager,
+        KVCacheBackend,
+        KVCachePolicy,
+        KVUpdateMode,
+    )
     from pipeline_utils.io_binding import DeviceBuffer
     
     # Create cache manager
@@ -826,10 +831,21 @@ def test_kv_cache():
         assert tuple(key.shape) == (1, 2, 8, 8)
         assert resident.get_sequence_length() == 0
         before = int(key.ort_value.data_ptr())
+        spatial = backend in {
+            KVCacheBackend.VITISAI,
+            KVCacheBackend.RYZENAI,
+            KVCacheBackend.HYBRID_NPU_IGPU,
+        }
         resident.update_from_present(0, present, present.copy())
         resident.update_from_present(1, present, present.copy())
         assert resident.get_sequence_length() == 4
-        assert int(key.ort_value.data_ptr()) == before
+        if spatial:
+            assert resident.update_mode is KVUpdateMode.CONCAT_SWAP
+            assert int(key.ort_value.data_ptr()) != before
+            assert resident.get_memory_usage()["shadow_bytes"] > 0
+        else:
+            assert resident.update_mode is KVUpdateMode.SLOT_WRITE
+            assert int(key.ort_value.data_ptr()) == before
         written = key.to_numpy()[:, :, :4, :]
         assert np.array_equal(written, present)
         assert resident.get_past_tensors(0)[0] is key
@@ -861,8 +877,14 @@ def test_kv_cache():
         bound_io = _Binding()
         resident.bind_cache_to_session(_Session(), bound_io, 0)
         assert bound_io.inputs["past_key_values.0.key"] is device_key
-        assert bound_io.outputs["present.0.key"] is device_key
-        assert bound_io.outputs["present.0.value"] is device_value
+        if spatial:
+            shadow_key, shadow_value = resident.shadow_ort_values(0)
+            assert bound_io.outputs["present.0.key"] is shadow_key
+            assert bound_io.outputs["present.0.value"] is shadow_value
+            assert shadow_key is not device_key
+        else:
+            assert bound_io.outputs["present.0.key"] is device_key
+            assert bound_io.outputs["present.0.value"] is device_value
         assert int(np.asarray(bound_io.inputs["sequence_length"].numpy()).reshape(-1)[0]) == 3
         assert int(device_key.data_ptr()) == before
         resident.reset()
@@ -1914,7 +1936,8 @@ def test_kv_cache():
     assert device_phase.update_prefill(0, device_prefill, device_prefill) == 2
     assert device_phase.update_decode(0, device_token, device_token) == 3
     assert device_phase.update_verify(0, device_draft, device_draft, 2) == 5
-    assert int(device_phase.get_device_tensors(0)[0].data_ptr()) == device_ptr
+    assert device_phase.update_mode is KVUpdateMode.CONCAT_SWAP
+    assert int(device_phase.get_device_tensors(0)[0].data_ptr()) != device_ptr
     assert device_phase.phase == "verify"
     assert np.array_equal(
         device_phase.get_device_tensors(0)[0].numpy()[:, :, :2, :],
@@ -1941,6 +1964,75 @@ def test_kv_cache():
     assert hybrid_phase.draft_cache.execution_phase is None
     assert hybrid_phase.draft_cache.role == "draft"
     print("  phases: update_prefill, update_decode, update_verify")
+
+    swapped = KVCacheManager(
+        num_layers=1,
+        num_kv_heads=2,
+        head_dim=8,
+        dtype=np.float16,
+        backend=KVCacheBackend.VITISAI,
+        max_seq_len=8,
+    )
+    swapped.update_from_present(0, present, present.copy())
+    active_ptr = int(swapped.get_device_tensors(0)[0].data_ptr())
+    shadow_buffer = swapped._cache[0]["key_shadow"]
+    staged = np.zeros((1, 2, 5, 8), dtype=np.float16)
+    staged[:, :, :4, :] = present
+    staged[:, :, 4, :] = 9
+    shadow_host = shadow_buffer.ort_value.numpy()
+    shadow_host[:, :, :5, :] = staged
+    if int(shadow_host.ctypes.data) != int(shadow_buffer.ort_value.data_ptr()):
+        shadow_buffer.ort_value.update_inplace(np.ascontiguousarray(shadow_host))
+    assert swapped.commit_present_swap(0, 5) == 5
+    assert int(swapped.get_device_tensors(0)[0].data_ptr()) != active_ptr
+    assert np.array_equal(swapped.get_past_tensors(0)[0].to_numpy()[:, :, :5, :], staged)
+    assert int(swapped.attention_mask()[0, 4]) == 1
+    assert int(swapped.attention_mask()[0, 5]) == 0
+
+    cpu_swap = KVCacheManager(
+        num_layers=1,
+        num_kv_heads=2,
+        head_dim=8,
+        dtype=np.float16,
+        max_seq_len=8,
+        update_mode="concat_swap",
+    )
+    assert cpu_swap.update_mode is KVUpdateMode.CONCAT_SWAP
+    cpu_key = cpu_swap.get_past_tensors(0)[0]
+    cpu_swap.update_from_present(0, present, present.copy())
+    assert cpu_swap.get_past_tensors(0)[0] is not cpu_key
+    assert np.array_equal(cpu_swap.get_past_tensors(0)[0][:, :, :4, :], present)
+    cpu_token = np.full((1, 2, 1, 8), 7, dtype=np.float16)
+    cpu_swap.update_from_present(0, cpu_token, cpu_token.copy())
+    assert cpu_swap.get_past_tensors(0)[0] is cpu_key
+    assert np.array_equal(cpu_key[:, :, :4, :], present)
+    assert np.array_equal(cpu_key[:, :, 4, :], cpu_token[:, :, 0, :])
+
+    from chunking_utils.onnx.kv_concat import (
+        assert_no_kv_scatter,
+        static_kv_concat_recipe,
+    )
+
+    prefix_recipe = static_kv_concat_recipe(8, 1)
+    assert prefix_recipe["layout"] == "host_prefix"
+    assert prefix_recipe["output_seq"] == 1
+    assert "ScatterND" not in prefix_recipe["op_types"]
+    window_recipe = static_kv_concat_recipe(8, 1, layout="fixed_window")
+    assert window_recipe["op_types"] == ["Slice", "Concat"]
+    assert window_recipe["output_seq"] == 8
+    assert window_recipe["nodes"][0]["begin"][2] == 1
+    assert window_recipe["nodes"][0]["end"][2] == 8
+    try:
+        assert_no_kv_scatter(["Concat", "ScatterND"])
+        raise AssertionError("ScatterND was accepted in a spatial KV update")
+    except ValueError as exc:
+        assert "ScatterND" in str(exc)
+    try:
+        static_kv_concat_recipe(8, 1, layout="scatter")
+        raise AssertionError("unknown concat layout was accepted")
+    except ValueError as exc:
+        assert "scatter" in str(exc)
+    print("  concat_swap: shadow present, pointer swap, static concat recipe")
 
     print("kv_cache module: OK\n")
     return True
