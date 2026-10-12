@@ -106,9 +106,11 @@ class ExecutionPolicy(str, Enum):
     """
     How a split model may be executed.
 
-    AUTO behaves as one monolithic graph. Sequential and persistent layer
-    splits are rejected on the NPU. Hybrid NPU and iGPU, phase split, and
-    MoE routing are the NPU exceptions. Speculative draft and verify is a
+    AUTO behaves as one monolithic graph. The sequential policy unloads each
+    session and is rejected on the NPU because that recompiles every graph.
+    Persistent layer sessions stay loaded and run in order. Hybrid NPU and
+    iGPU, phase split, and MoE routing remain available. lm_head may use a
+    different provider from the layers. Speculative draft and verify is a
     phase schedule, not a layer series.
     """
     AUTO = "auto"
@@ -121,8 +123,8 @@ class ExecutionPolicy(str, Enum):
     SPECULATIVE = "speculative"
 
 
-# Ahead-of-time accelerators. A sequential layer series on these providers
-# recompiles or context-switches between graphs.
+# Ahead-of-time accelerators. Unloading a session on these providers
+# recompiles the graph. Resident layer sessions do not.
 _NPU_PROVIDER_MARKERS = (
     "vitisai",
     "ryzenai",
@@ -981,15 +983,13 @@ class SplitConfig:
 
     def _reject_npu_sequential_split(self) -> None:
         """
-        Refuse sequential and persistent layer splits on an NPU.
+        Refuse the unload/reload policy on an NPU.
 
-        AUTO and monolithic stay valid. Hybrid phase split, MoE routing, and
-        speculative draft and verify are not layer series.
+        Persistent layer sessions stay valid. A component such as lm_head
+        may use another provider. Hybrid phase split, MoE routing, and
+        speculative draft and verify are not this unload path.
         """
-        if self.execution_policy not in (
-            ExecutionPolicy.SEQUENTIAL,
-            ExecutionPolicy.PERSISTENT,
-        ):
+        if self.execution_policy is not ExecutionPolicy.SEQUENTIAL:
             return
         on_npu = (
             self.target_device is DeviceType.NPU
@@ -998,7 +998,8 @@ class SplitConfig:
         if on_npu:
             raise ValueError(
                 f"execution_policy {self.execution_policy.value} is rejected "
-                "on an NPU provider. Sequential layer splitting on NPU is unsafe."
+                "on an NPU provider. Unload/reload recompiles each graph. "
+                "Use persistent sessions and run the layers in order."
             )
 
     def validate(self) -> None:
@@ -1377,6 +1378,14 @@ def _step_uses_npu(step: "ExecutionStep") -> bool:
     return False
 
 
+_LAYER_COMPONENT_NAME = re.compile(r"(^|_)layer_\d+$")
+
+
+def _plan_step_is_layer(step: "ExecutionStep") -> bool:
+    """True when the step is one transformer layer session."""
+    return _LAYER_COMPONENT_NAME.search(step.component_name) is not None
+
+
 def _reject_plan_cycle(steps: List["ExecutionStep"]) -> None:
     """Reject a dependency that is missing or that loops."""
     names = [step.component_name for step in steps]
@@ -1478,9 +1487,11 @@ class ExecutionPlan:
     """
     How a split model runs on AMD hardware.
 
-    Prefill can stay on the NPU while decode stays on the iGPU. ``policy``
-    AUTO with more than one NPU step is rejected, and a sequential or
-    persistent policy is rejected when any step is on the NPU.
+    Prefill can stay on the NPU while decode stays on the iGPU. Several
+    resident layer steps may share the NPU. lm_head may use another
+    provider. The sequential policy is rejected when any step is on the
+    NPU. AUTO or monolithic with more than one non-layer NPU step is
+    rejected.
     """
     steps: List[ExecutionStep] = field(default_factory=list)
     policy: ExecutionPolicy = ExecutionPolicy.AUTO
@@ -1556,20 +1567,23 @@ class ExecutionPlan:
         self._require_policy_phases()
 
     def _reject_unsafe_npu_schedule(self) -> None:
-        """Refuse a sequential layer series on an NPU."""
+        """Refuse an NPU schedule that unloads sessions between steps."""
         npu_steps = [step for step in self.steps if _step_uses_npu(step)]
-        if self.policy in (ExecutionPolicy.SEQUENTIAL, ExecutionPolicy.PERSISTENT) and npu_steps:
+        if self.policy is ExecutionPolicy.SEQUENTIAL and npu_steps:
             raise ValueError(
                 f"execution_policy {self.policy.value} is rejected on an NPU provider. "
-                "Sequential layer splitting on NPU is unsafe."
+                "Unload/reload recompiles each graph. Keep the layer sessions resident."
             )
+        layer_npu = [step for step in npu_steps if _plan_step_is_layer(step)]
         if (
             self.policy in (ExecutionPolicy.AUTO, ExecutionPolicy.MONOLITHIC)
             and len(npu_steps) > 1
+            and len(layer_npu) != len(npu_steps)
         ):
             raise ValueError(
                 f"execution_policy {self.policy.value} is rejected when more than one "
-                "step is on an NPU provider."
+                "non-layer step is on an NPU provider. Resident layer sessions may "
+                "stay on the NPU, and lm_head may use another provider."
             )
 
     def _require_policy_phases(self) -> None:
