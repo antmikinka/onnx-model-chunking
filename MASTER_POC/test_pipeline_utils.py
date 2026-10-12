@@ -17736,6 +17736,13 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"static_shapes: FAILED - {e}")
         results.append(("static_shapes", False))
+
+    try:
+        from test_vocab_sram import main as test_vocab_sram
+        results.append(("vocab_sram", test_vocab_sram()))
+    except Exception as e:
+        print(f"vocab_sram: FAILED - {e}")
+        results.append(("vocab_sram", False))
     
     try:
         results.append(("io_binding", test_io_binding()))

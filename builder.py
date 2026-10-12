@@ -98,6 +98,31 @@ def _as_bool(value) -> bool:
 _ATTENTION_MASK_BIAS = -10000.0
 
 
+_VOCAB_CHUNK_ROWS_FN = None
+
+
+def _vocab_chunk_rows():
+    """Load the SRAM row planner without importing the pipeline package."""
+    global _VOCAB_CHUNK_ROWS_FN
+    if _VOCAB_CHUNK_ROWS_FN is not None:
+        return _VOCAB_CHUNK_ROWS_FN
+    import importlib.util
+
+    path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "MASTER_POC",
+        "pipeline_utils",
+        "vocab_sram.py",
+    )
+    spec = importlib.util.spec_from_file_location("vocab_sram", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load vocabulary SRAM planner from {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    _VOCAB_CHUNK_ROWS_FN = module.vocab_chunk_rows
+    return _VOCAB_CHUNK_ROWS_FN
+
+
 class Model:
     def __init__(self, config, io_dtype, onnx_dtype, ep, cache_dir, extra_options):
         self.context_length = config.seq_length if hasattr(config, "seq_length") else config.max_position_embeddings
@@ -1076,6 +1101,11 @@ class Model:
         self.make_node("Less", inputs=inputs, outputs=[output], name=name)
         self.make_value(output, ir.DataType.BOOL, shape=None)
 
+    def make_and(self, name, inputs, shape):
+        output = f"{name}/output_0"
+        self.make_node("And", inputs=inputs, outputs=[output], name=name)
+        self.make_value(output, ir.DataType.BOOL, shape=shape)
+
     def make_range(self, name, inputs):
         output = f"{name}/output_0"
         self.make_node("Range", inputs=inputs, outputs=[output], name=name)
@@ -1135,7 +1165,167 @@ class Model:
         else:
             raise NotImplementedError(f"The {self.onnx_dtype} precision is not currently supported.")
 
+    def _io_dtype_bytes(self) -> int:
+        if self.io_dtype in {ir.DataType.FLOAT16, ir.DataType.BFLOAT16}:
+            return 2
+        if self.io_dtype == ir.DataType.FLOAT:
+            return 4
+        raise ValueError(f"No SRAM byte width for {self.io_dtype}")
+
+    def _vocab_chunk_rows_for(self, vocab_size: int, hidden_size: int):
+        extra = self.extra_options or {}
+        enabled = extra.get("split_vocab", True)
+        if enabled is False or enabled in {"false", "False", "0", 0}:
+            return [int(vocab_size)]
+        split_rows = extra.get("vocab_split_rows", None)
+        if split_rows is None or split_rows == "":
+            split_rows = None
+        else:
+            split_rows = int(split_rows)
+        return _vocab_chunk_rows()(
+            int(vocab_size),
+            int(hidden_size),
+            self._io_dtype_bytes(),
+            tile_sram_mb=float(extra.get("tile_sram_mb", 16)),
+            headroom=float(extra.get("vocab_sram_headroom", 0.5)),
+            split_rows=split_rows,
+        )
+
+    def _row_slice(self, weight, start: int, rows: int):
+        if isinstance(weight, np.ndarray):
+            chunk = np.ascontiguousarray(weight[start:start + rows])
+            return torch.from_numpy(chunk)
+        return weight[start:start + rows].detach().contiguous()
+
+    def _make_split_embedding(self, basename, embedding, sizes):
+        """Sum masked gathers. The last Add keeps the unsplit Gather name."""
+        running = None
+        start = 0
+        id_shape = ["batch_size", "sequence_length"]
+        out_shape = ["batch_size", "sequence_length", self.hidden_size]
+        mask_shape = ["batch_size", "sequence_length", 1]
+        for index, rows in enumerate(sizes):
+            chunk = self._row_slice(embedding, start, rows)
+            weight_name = f"model.embed_tokens.weight.split_{index}"
+            self.make_initializer(chunk, weight_name, to=self.io_dtype)
+
+            prefix = f"{basename}/Gather/split_{index}"
+            self.make_sub(
+                f"{prefix}/Sub",
+                ["input_ids", f"/model/constants/INT64/{start}"],
+                ir.DataType.INT64,
+                id_shape,
+            )
+            self.make_clip(
+                f"{prefix}/Clip",
+                [
+                    f"{prefix}/Sub/output_0",
+                    "/model/constants/INT64/0",
+                    f"/model/constants/INT64/{rows - 1}",
+                ],
+                ir.DataType.INT64,
+                id_shape,
+            )
+            self.make_gather(
+                f"{prefix}/Gather",
+                [weight_name, f"{prefix}/Clip/output_0"],
+                self.io_dtype,
+                out_shape,
+                axis=0,
+            )
+            self.make_greater_or_equal(
+                f"{prefix}/GreaterOrEqual",
+                ["input_ids", f"/model/constants/INT64/{start}"],
+                id_shape,
+            )
+            self.make_less(
+                f"{prefix}/Less",
+                ["input_ids", f"/model/constants/INT64/{start + rows}"],
+            )
+            self.make_and(
+                f"{prefix}/And",
+                [f"{prefix}/GreaterOrEqual/output_0", f"{prefix}/Less/output_0"],
+                id_shape,
+            )
+            self.make_cast(
+                f"{prefix}/Cast",
+                f"{prefix}/And/output_0",
+                self.io_dtype,
+                id_shape,
+            )
+            self.make_unsqueeze(
+                f"{prefix}/Unsqueeze",
+                [f"{prefix}/Cast/output_0", "/model/constants/INT64/[-1]"],
+                self.io_dtype,
+                mask_shape,
+            )
+            self.make_mul(
+                f"{prefix}/Mul",
+                [f"{prefix}/Gather/output_0", f"{prefix}/Unsqueeze/output_0"],
+                self.io_dtype,
+                out_shape,
+            )
+            term = f"{prefix}/Mul/output_0"
+            if running is None:
+                running = term
+            else:
+                add_name = f"{basename}/Gather" if index == len(sizes) - 1 else f"{prefix}/Add"
+                self.make_add(add_name, [running, term], self.io_dtype, out_shape)
+                running = f"{add_name}/output_0"
+            start += rows
+        return running
+
+    def _should_split_vocab_projection(self, matmul, name) -> bool:
+        # Quantized blocks are not a row slice. int4 falls through to this
+        # float path only when the module has no qweight.
+        if "lm_head" not in name or getattr(matmul, "qweight", None) is not None:
+            return False
+        weight = getattr(matmul, "weight", None)
+        if weight is None or len(getattr(weight, "shape", ())) != 2:
+            return False
+        if int(weight.shape[0]) != int(self.vocab_size):
+            return False
+        sizes = self._vocab_chunk_rows_for(int(weight.shape[0]), int(weight.shape[1]))
+        return len(sizes) > 1
+
+    def _make_split_vocab_matmul(self, matmul, name, root_input, **kwargs):
+        """Matmul each vocab slice and concatenate. einsum bid,jd->bij, then cat."""
+        weight = matmul.weight
+        vocab = int(weight.shape[0])
+        hidden = int(weight.shape[1])
+        sizes = self._vocab_chunk_rows_for(vocab, hidden)
+        if sum(sizes) != vocab:
+            raise ValueError(f"Vocabulary chunks {sizes} do not cover {vocab} rows")
+        print(f"Splitting {name} into {len(sizes)} SRAM chunks of up to {sizes[0]} rows")
+
+        parts = []
+        start = 0
+        base_weight = name[1:].replace("/", ".") + ".weight"
+        for index, rows in enumerate(sizes):
+            chunk = self._row_slice(weight, start, rows).transpose(0, 1).contiguous()
+            weight_name = f"{base_weight}.split_{index}"
+            self.make_initializer(chunk, weight_name, to=self.io_dtype)
+            part_name = f"{name}/split_{index}"
+            part_out = f"{part_name}/output_0"
+            self.make_node(
+                "MatMul", inputs=[root_input, weight_name], outputs=[part_out], name=part_name
+            )
+            self.make_value(
+                part_out, self.io_dtype, shape=["batch_size", "sequence_length", rows]
+            )
+            parts.append(part_out)
+            start += rows
+
+        output = "logits" if kwargs.get("logits", False) else f"{name}/output_0"
+        self.make_node("Concat", inputs=parts, outputs=[output], name=name, axis=-1)
+        self.make_value(
+            output, self.io_dtype, shape=["batch_size", "sequence_length", vocab]
+        )
+        return name
+
     def make_matmul_float(self, matmul, name, root_input, **kwargs):
+        if self._should_split_vocab_projection(matmul, name):
+            return self._make_split_vocab_matmul(matmul, name, root_input, **kwargs)
         weight = name[1:].replace("/", ".") + ".weight"
         self.make_initializer(matmul.weight.T, weight, to=self.io_dtype)
 
@@ -1383,12 +1573,22 @@ class Model:
 
             self.make_node('GatherBlockQuantized', inputs=[weight_reshape_output, 'input_ids', 'lm_head.MatMul.weight_scale', 'lm_head.MatMul.weight_zp'], outputs=[gather_output], name=gather_name, domain="com.microsoft", bits=bits, block_size=int(self.int4_block_size))
         else:
-            weight = "model.embed_tokens.weight"
-            self.make_initializer(embedding, weight, to=self.io_dtype)
+            sizes = self._vocab_chunk_rows_for(int(embedding.shape[0]), int(embedding.shape[1]))
+            if len(sizes) == 1:
+                weight = "model.embed_tokens.weight"
+                self.make_initializer(embedding, weight, to=self.io_dtype)
 
-            gather_name = f"{basename}/Gather"
-            gather_output = f"{gather_name}/output_0"
-            self.make_node('Gather', inputs=[weight, 'input_ids'], outputs=[gather_output], name=gather_name)
+                gather_name = f"{basename}/Gather"
+                gather_output = f"{gather_name}/output_0"
+                self.make_node('Gather', inputs=[weight, 'input_ids'], outputs=[gather_output], name=gather_name)
+            else:
+                # Every chunk runs. The mask zeros the rows that do not own
+                # the token. An If on the id would be a data-dependent branch.
+                print(
+                    f"Splitting embedding into {len(sizes)} SRAM chunks "
+                    f"of up to {sizes[0]} rows"
+                )
+                gather_output = self._make_split_embedding(basename, embedding, sizes)
 
         self.make_value(gather_output, self.io_dtype, shape=['batch_size', 'sequence_length', self.hidden_size])
 
@@ -6137,10 +6337,16 @@ def check_extra_options(kv_pairs, execution_provider):
         "int4_is_symmetric", "exclude_embeds", "exclude_lm_head", "include_hidden_states", "enable_cuda_graph", "enable_webgpu_graph",
         "use_8bits_moe", "use_qdq", "use_webgpu_fp32", "use_cuda_bf16", "int4_tied_embeddings", "hf_remote",
         "static_shapes",
+        "split_vocab",
     ]
     for key in ("static_max_seq_len", "static_query_len"):
         if key in kv_pairs and kv_pairs[key] != "":
             kv_pairs[key] = int(kv_pairs[key])
+    for key in ("tile_sram_mb", "vocab_sram_headroom"):
+        if key in kv_pairs:
+            kv_pairs[key] = float(kv_pairs[key])
+    if "vocab_split_rows" in kv_pairs and kv_pairs["vocab_split_rows"] != "":
+        kv_pairs["vocab_split_rows"] = int(kv_pairs["vocab_split_rows"])
     for key in bools:
         if key in kv_pairs:
             if kv_pairs[key] in {"false", "False", "0"}:
@@ -6453,6 +6659,11 @@ def get_args():
                 static_shapes = Freeze batch and sequence axes and build the attention bias with constant shapes. Default is true for an NPU provider.
                 static_max_seq_len = Preallocated sequence window. Default is the model context length.
                 static_query_len = Static query bucket. Default is static_max_seq_len. One is the decode bucket.
+                split_vocab = Split the float embedding table and the float LM head into SRAM chunks. Default is true.
+                    A table that fits in half of tile_sram_mb stays one Gather or one MatMul.
+                tile_sram_mb = Tile SRAM in megabytes used to size those chunks. Default is 16.
+                vocab_sram_headroom = Fraction of the tile reserved for the chunk. Default is 0.5.
+                vocab_split_rows = Force the chunk width, including 14000. A value below 1 disables the split.
                 exclude_embeds = Remove embedding layer from your ONNX model.
                     Use this option when you want to remove the embedding layer from within your ONNX model.
                     Instead of `input_ids`, you will have `inputs_embeds` as the input to your ONNX model.
