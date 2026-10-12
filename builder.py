@@ -57,6 +57,12 @@ from enhanced_analytics_integration import (
 )
 
 
+# Softmax sink for blocked attention positions. -1e4 is exact in float16.
+# float16 finfo.min (-65504) overflows when a causal mask and a padding mask
+# are added, and -inf is not a spatial-NPU softmax input.
+_ATTENTION_MASK_BIAS = -10000.0
+
+
 class Model:
     def __init__(self, config, io_dtype, onnx_dtype, ep, cache_dir, extra_options):
         self.context_length = config.seq_length if hasattr(config, "seq_length") else config.max_position_embeddings
@@ -895,6 +901,49 @@ class Model:
         output = f"{name}/output_0"
         self.make_node("Where", inputs=inputs, outputs=[output], name=name)
         self.make_value(output, dtype, shape=shape)
+
+    def _attention_bias_constant(self, dtype: ir.DataType) -> str:
+        """Scalar -1e4 in ``dtype``. One constant, not a [T, T] initializer per layer."""
+        return f"/model/constants/{self.to_str_dtype(dtype)}/{_ATTENTION_MASK_BIAS}"
+
+    def make_additive_keep_mask(self, name, keep_condition, dtype, shape):
+        """
+        Turn a boolean keep-mask into an additive bias.
+
+        Visible positions (condition true) become 0. Blocked positions become
+        -1e4. The final node keeps ``name`` so existing consumers of
+        ``{name}/output_0`` stay wired. This replaces Where(keep, 0, finfo.min).
+        """
+        cast_name = f"{name}/to_bias/Cast"
+        self.make_cast(cast_name, keep_condition, dtype=dtype, shape=shape)
+        blocked_name = f"{name}/to_bias/Sub"
+        one = f"/model/constants/{self.to_str_dtype(dtype)}/1"
+        self.make_sub(
+            blocked_name,
+            [one, f"{cast_name}/output_0"],
+            dtype=dtype,
+            shape=shape,
+        )
+        self.make_mul(
+            name,
+            [f"{blocked_name}/output_0", self._attention_bias_constant(dtype)],
+            dtype=dtype,
+            shape=shape,
+        )
+
+    def make_additive_blocked_mask(self, name, blocked, dtype, shape):
+        """
+        Scale a 0/1 blocked indicator by -1e4.
+
+        ``blocked`` is 0 on visible positions and 1 on masked positions.
+        This replaces Where(blocked, finfo.min, blocked).
+        """
+        self.make_mul(
+            name,
+            [blocked, self._attention_bias_constant(dtype)],
+            dtype=dtype,
+            shape=shape,
+        )
 
     def make_expand(self, name, inputs, dtype, shape):
         output = f"{name}/output_0"
@@ -3127,7 +3176,9 @@ class Model:
 
     def make_attention_mask_reformatting_for_mha(self):
         # Make nodes for the attention mask subgraphs that reformat the
-        # 2D attention mask (B, S) to 4D causal attention mask (B, N, S, T)
+        # 2D attention mask (B, S) to 4D causal attention mask (B, N, S, T).
+        # The score fills drawn as Where after Less and after Sub are Mul by
+        # the scalar -1e4. The remaining Where is the int64 shape repair.
         #
         #             input_ids       past_key_values.0.key
         #            /         \               |
@@ -3253,7 +3304,8 @@ class Model:
         self.make_concat(concat_2_name, concat_inputs, dtype=ir.DataType.INT64, shape=[2], axis=0)
         constant_shape_name = f"{basename}/ConstantOfShape_2"
         constant_shape_torch_dtype = to_torch_dtype(self.io_dtype)
-        constant_shape_value = ir.tensor(torch.tensor([torch.finfo(constant_shape_torch_dtype).min], dtype=constant_shape_torch_dtype), name="make_input_ids_subgraph_shape")
+        # Shape carrier only. The mask values are the -1e4 mul below, not this fill.
+        constant_shape_value = ir.tensor(torch.tensor([0], dtype=constant_shape_torch_dtype), name="make_input_ids_subgraph_shape")
         self.make_constant_of_shape(constant_shape_name, f"{concat_2_name}/output_0", value=constant_shape_value, dtype=self.io_dtype, shape=['unk', 'unk'])
 
         # Top path
@@ -3295,9 +3347,14 @@ class Model:
         less_name = f"{basename}/Less"
         less_inputs = [f"{range_name}/output_0", f"{reshape_name}/output_0"]
         self.make_less(less_name, less_inputs)
+        # Keep the Where_2 name. The node is Mul(-1e4), so unsqueeze still reads output_0.
         where_2_name = f"{basename}/Where_2"
-        where_2_inputs = [f"{less_name}/output_0", f"/model/constants/{self.to_str_dtype(self.io_dtype)}/0", f"{constant_shape_name}/output_0"]
-        self.make_where(where_2_name, where_2_inputs, dtype=self.io_dtype, shape=None)
+        self.make_additive_keep_mask(
+            where_2_name,
+            f"{less_name}/output_0",
+            dtype=self.io_dtype,
+            shape=None,
+        )
         unsqueeze_8_name = f"{basename}/Unsqueeze_8"
         unsqueeze_8_inputs = [f"{where_2_name}/output_0", "/model/constants/INT64/[0]"]
         self.make_unsqueeze(unsqueeze_8_name, unsqueeze_8_inputs, dtype=self.io_dtype, shape=None)
@@ -3328,17 +3385,21 @@ class Model:
         # Make the additional subgraph after Expand:
         #                      +-----------------+
         #                      |                 |
-        # Expand --> Cast --> Sub --> Cast --> Where
+        # Expand --> Cast --> Sub --> Mul(-1e4)
+        # Sub is 0 on real tokens and 1 on padding. Scaling by -1e4 is the
+        # additive bias. A Where that selects finfo.min is the op XDNA drops.
         cast_1_name = f"{basename}/Cast_1"
         self.make_cast(cast_1_name, f"{expand_name}/output_0", dtype=self.io_dtype, shape=["unk", "unk", "unk", "unk"])
         sub_name = f"{basename}/Sub"
         sub_inputs = [f"/model/constants/{self.to_str_dtype(self.io_dtype)}/1", f"{cast_1_name}/output_0"]
         self.make_sub(sub_name, sub_inputs, dtype=self.io_dtype, shape=["unk", "unk", "unk", "unk"])
-        cast_2_name = f"{basename}/Cast_2"
-        self.make_cast(cast_2_name, f"{sub_name}/output_0", dtype=ir.DataType.BOOL, shape=["unk", "unk", "unk", "unk"])
         where_2_name = f"{basename}/Where_2"
-        where_2_inputs = [f"{cast_2_name}/output_0", f"/model/constants/{self.to_str_dtype(self.io_dtype)}/{torch.finfo(to_torch_dtype(self.io_dtype)).min}", f"{sub_name}/output_0"]
-        self.make_where(where_2_name, where_2_inputs, dtype=self.io_dtype, shape=["unk", "unk", "unk", "unk"])
+        self.make_additive_blocked_mask(
+            where_2_name,
+            f"{sub_name}/output_0",
+            dtype=self.io_dtype,
+            shape=["unk", "unk", "unk", "unk"],
+        )
 
         return where_2_name
 
