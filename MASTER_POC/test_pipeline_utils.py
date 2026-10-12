@@ -17729,6 +17729,13 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"phase_split: FAILED - {e}")
         results.append(("phase_split", False))
+
+    try:
+        from test_static_shapes import main as test_static_shapes
+        results.append(("static_shapes", test_static_shapes()))
+    except Exception as e:
+        print(f"static_shapes: FAILED - {e}")
+        results.append(("static_shapes", False))
     
     try:
         results.append(("io_binding", test_io_binding()))

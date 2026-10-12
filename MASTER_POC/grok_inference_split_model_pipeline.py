@@ -436,10 +436,13 @@ class SequentialModelPipeline:
         component_prov = self._get_component_providers(component_name)
         self._log(f"  [Pipeline] Using providers: {component_prov}")
 
-        # Create session options to handle dynamic shapes
+        # A dynamic CPU graph may skip the shape check. An AOT NPU provider
+        # keeps it on; the graph itself has to be static.
         sess_options = ort.SessionOptions()
         sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
-        sess_options.add_session_config_entry("session.disable_node_shape_check", "1")
+        from chunking_utils.onnx.static_shapes import allow_shape_check_bypass
+        if allow_shape_check_bypass(component_prov, True, static_kv_cache=False):
+            sess_options.add_session_config_entry("session.disable_node_shape_check", "1")
 
         try:
             session = ort.InferenceSession(
