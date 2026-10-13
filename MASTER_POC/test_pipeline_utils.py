@@ -658,7 +658,12 @@ def test_kv_cache():
     print("Testing kv_cache module...")
     print("=" * 50)
     
-    from pipeline_utils.kv_cache import KVCacheManager, KVCacheBackend, KVCachePolicy
+    from pipeline_utils.kv_cache import (
+        KVCacheManager,
+        KVCacheBackend,
+        KVCachePolicy,
+        KVUpdateMode,
+    )
     from pipeline_utils.io_binding import DeviceBuffer
     
     # Create cache manager
@@ -824,12 +829,25 @@ def test_kv_cache():
         assert isinstance(value, DeviceBuffer)
         assert key.ort_value is not None
         assert tuple(key.shape) == (1, 2, 8, 8)
+        if backend is KVCacheBackend.VITISAI:
+            assert key.host_pages_locked == int(np.dtype(key.dtype).itemsize) * int(np.prod(key.shape))
         assert resident.get_sequence_length() == 0
         before = int(key.ort_value.data_ptr())
+        spatial = backend in {
+            KVCacheBackend.VITISAI,
+            KVCacheBackend.RYZENAI,
+            KVCacheBackend.HYBRID_NPU_IGPU,
+        }
         resident.update_from_present(0, present, present.copy())
         resident.update_from_present(1, present, present.copy())
         assert resident.get_sequence_length() == 4
-        assert int(key.ort_value.data_ptr()) == before
+        if spatial:
+            assert resident.update_mode is KVUpdateMode.CONCAT_SWAP
+            assert int(key.ort_value.data_ptr()) != before
+            assert resident.get_memory_usage()["shadow_bytes"] > 0
+        else:
+            assert resident.update_mode is KVUpdateMode.SLOT_WRITE
+            assert int(key.ort_value.data_ptr()) == before
         written = key.to_numpy()[:, :, :4, :]
         assert np.array_equal(written, present)
         assert resident.get_past_tensors(0)[0] is key
@@ -861,8 +879,14 @@ def test_kv_cache():
         bound_io = _Binding()
         resident.bind_cache_to_session(_Session(), bound_io, 0)
         assert bound_io.inputs["past_key_values.0.key"] is device_key
-        assert bound_io.outputs["present.0.key"] is device_key
-        assert bound_io.outputs["present.0.value"] is device_value
+        if spatial:
+            shadow_key, shadow_value = resident.shadow_ort_values(0)
+            assert bound_io.outputs["present.0.key"] is shadow_key
+            assert bound_io.outputs["present.0.value"] is shadow_value
+            assert shadow_key is not device_key
+        else:
+            assert bound_io.outputs["present.0.key"] is device_key
+            assert bound_io.outputs["present.0.value"] is device_value
         assert int(np.asarray(bound_io.inputs["sequence_length"].numpy()).reshape(-1)[0]) == 3
         assert int(device_key.data_ptr()) == before
         resident.reset()
@@ -1914,7 +1938,8 @@ def test_kv_cache():
     assert device_phase.update_prefill(0, device_prefill, device_prefill) == 2
     assert device_phase.update_decode(0, device_token, device_token) == 3
     assert device_phase.update_verify(0, device_draft, device_draft, 2) == 5
-    assert int(device_phase.get_device_tensors(0)[0].data_ptr()) == device_ptr
+    assert device_phase.update_mode is KVUpdateMode.CONCAT_SWAP
+    assert int(device_phase.get_device_tensors(0)[0].data_ptr()) != device_ptr
     assert device_phase.phase == "verify"
     assert np.array_equal(
         device_phase.get_device_tensors(0)[0].numpy()[:, :, :2, :],
@@ -1941,6 +1966,80 @@ def test_kv_cache():
     assert hybrid_phase.draft_cache.execution_phase is None
     assert hybrid_phase.draft_cache.role == "draft"
     print("  phases: update_prefill, update_decode, update_verify")
+
+    swapped = KVCacheManager(
+        num_layers=1,
+        num_kv_heads=2,
+        head_dim=8,
+        dtype=np.float16,
+        backend=KVCacheBackend.VITISAI,
+        max_seq_len=8,
+    )
+    swapped.update_from_present(0, present, present.copy())
+    active_ptr = int(swapped.get_device_tensors(0)[0].data_ptr())
+    shadow_buffer = swapped._cache[0]["key_shadow"]
+    staged = np.zeros((1, 2, 5, 8), dtype=np.float16)
+    staged[:, :, :4, :] = present
+    staged[:, :, 4, :] = 9
+    shadow_host = shadow_buffer.ort_value.numpy()
+    shadow_host[:, :, :5, :] = staged
+    if int(shadow_host.ctypes.data) != int(shadow_buffer.ort_value.data_ptr()):
+        shadow_buffer.ort_value.update_inplace(np.ascontiguousarray(shadow_host))
+    assert swapped.commit_present_swap(0, 5) == 5
+    assert int(swapped.get_device_tensors(0)[0].data_ptr()) != active_ptr
+    assert np.array_equal(swapped.get_past_tensors(0)[0].to_numpy()[:, :, :5, :], staged)
+    assert int(swapped.attention_mask()[0, 4]) == 1
+    assert int(swapped.attention_mask()[0, 5]) == 0
+
+    cpu_swap = KVCacheManager(
+        num_layers=1,
+        num_kv_heads=2,
+        head_dim=8,
+        dtype=np.float16,
+        max_seq_len=8,
+        update_mode="concat_swap",
+    )
+    assert cpu_swap.update_mode is KVUpdateMode.CONCAT_SWAP
+    cpu_key = cpu_swap.get_past_tensors(0)[0]
+    cpu_swap.update_from_present(0, present, present.copy())
+    assert cpu_swap.get_past_tensors(0)[0] is not cpu_key
+    assert np.array_equal(cpu_swap.get_past_tensors(0)[0][:, :, :4, :], present)
+    cpu_token = np.full((1, 2, 1, 8), 7, dtype=np.float16)
+    cpu_swap.update_from_present(0, cpu_token, cpu_token.copy())
+    assert cpu_swap.get_past_tensors(0)[0] is cpu_key
+    assert np.array_equal(cpu_key[:, :, :4, :], present)
+    assert np.array_equal(cpu_key[:, :, 4, :], cpu_token[:, :, 0, :])
+
+    from chunking_utils.onnx.kv_concat import (
+        assert_no_kv_scatter,
+        static_kv_concat_recipe,
+    )
+
+    prefix_recipe = static_kv_concat_recipe(8, 1)
+    assert prefix_recipe["layout"] == "host_prefix"
+    assert prefix_recipe["output_seq"] == 1
+    assert "ScatterND" not in prefix_recipe["op_types"]
+    window_recipe = static_kv_concat_recipe(8, 1, layout="fixed_window")
+    assert window_recipe["op_types"] == ["Slice", "Concat"]
+    assert window_recipe["output_seq"] == 8
+    assert window_recipe["nodes"][0]["starts"] == [1]
+    assert window_recipe["nodes"][0]["ends"] == [8]
+    assert window_recipe["nodes"][0]["axes"] == [2]
+    assert window_recipe["nodes"][0]["kept"] == 7
+    _assert_fixed_window_slice_keeps_tokens()
+    _assert_golden_attention_matches_reference()
+    _assert_projected_attention_matches_reference()
+    try:
+        assert_no_kv_scatter(["Concat", "ScatterND"])
+        raise AssertionError("ScatterND was accepted in a spatial KV update")
+    except ValueError as exc:
+        assert "ScatterND" in str(exc)
+    try:
+        static_kv_concat_recipe(8, 1, layout="scatter")
+        raise AssertionError("unknown concat layout was accepted")
+    except ValueError as exc:
+        assert "scatter" in str(exc)
+    print("  concat_swap: shadow present, pointer swap, static concat recipe")
 
     print("kv_cache module: OK\n")
     return True
@@ -17337,6 +17436,249 @@ def test_path_manager():
     return True
 
 
+def _assert_projected_attention_matches_reference():
+    """Projected K and V stay in the cache, and context matches float32."""
+    import os
+    import tempfile
+
+    import numpy as np
+    import onnxruntime as ort
+
+    from chunking_utils.onnx.golden_attention_subgraph import (
+        MEASURED_SHAPE,
+        build_projected_attention_model,
+        default_projection,
+        default_token,
+        golden_attention_facts,
+        hostile_attention_ops,
+        reference_projected_attention,
+    )
+
+    model = build_projected_attention_model()
+    facts = golden_attention_facts(model)
+    assert facts["ops"] == facts["projected_ops"]
+    assert facts["opset"] == 17
+    assert facts["ir_version"] == 10
+    assert hostile_attention_ops(facts["ops"]) == []
+    for name in ("starts", "ends", "axes", "steps", "Wq", "Wk", "Wv"):
+        assert name in facts["initializers"]
+    head = MEASURED_SHAPE[-1]
+    count = int(np.prod(MEASURED_SHAPE))
+    past_k = (np.arange(count, dtype=np.float32) / count).reshape(MEASURED_SHAPE)
+    past_v = (np.arange(count, dtype=np.float32) / (count / 2)).reshape(MEASURED_SHAPE)
+    token = default_token(head)
+    expect_k, expect_v, expect_c = reference_projected_attention(
+        past_k,
+        past_v,
+        token,
+        default_projection(1, head, head),
+        default_projection(2, head, head),
+        default_projection(3, head, head),
+    )
+    path = os.path.join(tempfile.gettempdir(), "projected_attention.onnx")
+    with open(path, "wb") as handle:
+        handle.write(model.SerializeToString())
+    session = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+    got_k, got_v, got_c = session.run(
+        None,
+        {
+            "past_key_values.0.key": past_k,
+            "past_key_values.0.value": past_v,
+            "token": token,
+        },
+    )
+    assert np.max(np.abs(got_k - expect_k)) < 1e-5
+    assert np.max(np.abs(got_v - expect_v)) < 1e-5
+    assert np.max(np.abs(got_c - expect_c)) < 1e-5
+    assert got_v.shape == MEASURED_SHAPE
+    assert np.max(np.abs(got_v[:, :, -1:, :] - expect_v[:, :, -1:, :])) < 1e-5
+
+
+def _assert_golden_attention_matches_reference():
+    """The saved NPU graph matches the float32 reference and has no Transpose."""
+    import os
+    import tempfile
+
+    import numpy as np
+    import onnxruntime as ort
+
+    from chunking_utils.onnx.golden_attention_subgraph import (
+        MEASURED_SHAPE,
+        build_golden_attention_model,
+        default_new_key,
+        default_query_column,
+        golden_attention_facts,
+        hostile_attention_ops,
+        reference_attention,
+    )
+
+    model = build_golden_attention_model()
+    facts = golden_attention_facts(model)
+    assert facts["ops"] == facts["measured_ops"]
+    assert facts["opset"] == 17
+    assert facts["ir_version"] == 10
+    assert hostile_attention_ops(facts["ops"]) == []
+    for name in ("starts", "ends", "axes", "steps"):
+        assert name in facts["initializers"]
+    try:
+        build_golden_attention_model(head_dim=4)
+        raise AssertionError("head_dim 4 was accepted")
+    except ValueError as exc:
+        assert "head_dim" in str(exc)
+
+    count = int(np.prod(MEASURED_SHAPE))
+    past_k = (np.arange(count, dtype=np.float32) / count).reshape(MEASURED_SHAPE)
+    past_v = (np.arange(count, dtype=np.float32) / (count / 2)).reshape(MEASURED_SHAPE)
+    expect_k, expect_v = reference_attention(
+        past_k,
+        past_v,
+        default_query_column(MEASURED_SHAPE[-1]),
+        default_new_key(MEASURED_SHAPE[-1]),
+    )
+    path = os.path.join(tempfile.gettempdir(), "golden_attention.onnx")
+    with open(path, "wb") as handle:
+        handle.write(model.SerializeToString())
+    session = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+    got_k, got_v = session.run(
+        None,
+        {"past_key_values.0.key": past_k, "past_key_values.0.value": past_v},
+    )
+    assert np.max(np.abs(got_k - expect_k)) == 0
+    assert np.max(np.abs(got_v - expect_v)) < 1e-6
+
+
+def _assert_fixed_window_slice_keeps_tokens():
+    """The sequence-axis Slice must keep tokens. A rank-4 0:0 range does not."""
+    import os
+    import tempfile
+
+    import numpy as np
+    import onnxruntime as ort
+    from onnx import TensorProto, helper, numpy_helper
+
+    from chunking_utils.onnx.kv_concat import static_kv_concat_recipe
+
+    recipe = static_kv_concat_recipe(8, 1, layout="fixed_window")
+    slice_node = recipe["nodes"][0]
+    past = np.arange(8, dtype=np.float32).reshape(1, 1, 8, 1)
+    new = np.array([[[[9.0]]]], dtype=np.float32)
+    starts = np.array(slice_node["starts"], dtype=np.int64)
+    ends = np.array(slice_node["ends"], dtype=np.int64)
+    axes = np.array(slice_node["axes"], dtype=np.int64)
+    nodes = [
+        helper.make_node("Slice", ["past", "starts", "ends", "axes"], ["kept_past"]),
+        helper.make_node("Concat", ["kept_past", "new"], ["present"], axis=2),
+    ]
+    graph = helper.make_graph(
+        nodes,
+        "fixed_window",
+        [
+            helper.make_tensor_value_info("past", TensorProto.FLOAT, [1, 1, 8, 1]),
+            helper.make_tensor_value_info("new", TensorProto.FLOAT, [1, 1, 1, 1]),
+        ],
+        [helper.make_tensor_value_info("present", TensorProto.FLOAT, [1, 1, 8, 1])],
+        initializer=[
+            numpy_helper.from_array(starts, "starts"),
+            numpy_helper.from_array(ends, "ends"),
+            numpy_helper.from_array(axes, "axes"),
+        ],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    model.ir_version = 10
+    path = os.path.join(tempfile.gettempdir(), "kv_fixed_window.onnx")
+    with open(path, "wb") as handle:
+        handle.write(model.SerializeToString())
+    session = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+    present = session.run(None, {"past": past, "new": new})[0]
+    assert present.shape == (1, 1, 8, 1)
+    assert np.array_equal(
+        present.reshape(-1),
+        np.array([1, 2, 3, 4, 5, 6, 7, 9], dtype=np.float32),
+    )
+
+
+def test_kv_session_swap():
+    """A real session writes the shadow OrtValue, then the pointer swap publishes it."""
+    print("=" * 50)
+    print("Testing KV session pointer swap...")
+    print("=" * 50)
+
+    import os
+    import tempfile
+
+    import numpy as np
+    import onnxruntime as ort
+    from onnx import TensorProto, helper
+
+    from pipeline_utils.kv_cache import KVCacheBackend, KVCacheManager
+
+    max_seq = 4
+    head_dim = 4
+    present = np.arange(2 * head_dim, dtype=np.float32).reshape(1, 1, 2, head_dim)
+    nodes = [
+        helper.make_node("Identity", ["past_key_values.0.key"], ["present.0.key"]),
+        helper.make_node("Identity", ["past_key_values.0.value"], ["present.0.value"]),
+    ]
+    shape = [1, 1, max_seq, head_dim]
+    graph = helper.make_graph(
+        nodes,
+        "kv_identity",
+        [
+            helper.make_tensor_value_info("past_key_values.0.key", TensorProto.FLOAT, shape),
+            helper.make_tensor_value_info("past_key_values.0.value", TensorProto.FLOAT, shape),
+        ],
+        [
+            helper.make_tensor_value_info("present.0.key", TensorProto.FLOAT, shape),
+            helper.make_tensor_value_info("present.0.value", TensorProto.FLOAT, shape),
+        ],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    model.ir_version = 10
+    model_path = os.path.join(tempfile.gettempdir(), "kv_session_swap.onnx")
+    with open(model_path, "wb") as handle:
+        handle.write(model.SerializeToString())
+
+    available = set(ort.get_available_providers())
+    provider_sets = [["CPUExecutionProvider"]]
+    if "DmlExecutionProvider" in available:
+        provider_sets.append(["DmlExecutionProvider", "CPUExecutionProvider"])
+    if "VitisAIExecutionProvider" in available:
+        provider_sets.append(["VitisAIExecutionProvider", "CPUExecutionProvider"])
+
+    for providers in provider_sets:
+        cache = KVCacheManager(
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=head_dim,
+            dtype=np.float32,
+            batch_size=1,
+            backend=KVCacheBackend.VITISAI,
+            max_seq_len=max_seq,
+        )
+        cache.update_from_present(0, present, present + 1)
+        before = int(cache.get_device_tensors(0)[0].data_ptr())
+        try:
+            cache.commit_present_swap(0, max_seq + 1)
+            raise AssertionError("out-of-range commit swapped or returned")
+        except ValueError:
+            pass
+        assert int(cache.get_device_tensors(0)[0].data_ptr()) == before
+
+        options = ort.SessionOptions()
+        options.log_severity_level = 3
+        session = ort.InferenceSession(model_path, sess_options=options, providers=providers)
+        cache.run_bound_session(session, 0, 2)
+        key, value = cache.get_device_tensors(0)
+        assert int(key.data_ptr()) != before
+        assert np.array_equal(key.numpy()[:, :, :2, :], present)
+        assert np.array_equal(value.numpy()[:, :, :2, :], present + 1)
+        assert cache.get_sequence_length() == 2
+        print(f"  {session.get_providers()[0]}: shadow written, pointer swapped")
+
+    print("kv session swap: OK\n")
+    return True
+
+
 if __name__ == "__main__":
     print("\n" + "=" * 60)
     print("Pipeline Utils Module Tests")
@@ -17361,6 +17703,12 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"kv_cache: FAILED - {e}")
         results.append(("kv_cache", False))
+
+    try:
+        results.append(("kv_session_swap", test_kv_session_swap()))
+    except Exception as e:
+        print(f"kv_session_swap: FAILED - {e}")
+        results.append(("kv_session_swap", False))
     
     try:
         results.append(("config_loader", test_config_loader()))
