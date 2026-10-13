@@ -237,6 +237,44 @@ def test_layer_series_is_not_a_phase_graph():
         assert "layer split" in str(exc)
 
 
+def test_prefill_attention_matches_reference():
+    from onnx import TensorProto
+
+    from chunking_utils.onnx.golden_attention_subgraph import default_projection
+    from chunking_utils.onnx.prefill_attention import (
+        PREFILL_OPS,
+        build_prefill_attention_model,
+        causal_bias_f16,
+        default_prompt,
+        prefill_attention_facts,
+        reference_prefill_attention,
+    )
+
+    prompt, head = 8, 64
+    model = build_prefill_attention_model(prompt_len=prompt, head_dim=head)
+    facts = prefill_attention_facts(model)
+    assert facts["ops"] == list(PREFILL_OPS)
+    assert facts["ir_version"] == 10
+    assert facts["bias_dtype"] == TensorProto.FLOAT16
+    assert "Transpose" not in facts["ops"] and "Where" not in facts["ops"]
+    hidden = default_prompt(prompt, head)
+    weights = [default_projection(seed, head, head) for seed in (1, 2, 3, 4)]
+    bias = causal_bias_f16(prompt)
+    expect_k, expect_v, expect_h = reference_prefill_attention(hidden, *weights, bias)
+    plain = np.zeros_like(bias)
+    plain_h = reference_prefill_attention(hidden, *weights, plain)[2]
+    assert np.max(np.abs(expect_h - plain_h)) > 1e-3
+    options = ort.SessionOptions()
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    session = ort.InferenceSession(
+        model.SerializeToString(), sess_options=options, providers=["CPUExecutionProvider"]
+    )
+    key, value, projected = session.run(None, {"hidden_states": np.ascontiguousarray(hidden)})
+    assert np.max(np.abs(key - expect_k)) < 1e-5
+    assert np.max(np.abs(value - expect_v)) < 1e-5
+    assert np.max(np.abs(projected - expect_h)) < 1e-5
+
+
 def main():
     tests = [
         test_select_phase_ignores_cache_values,
@@ -244,6 +282,7 @@ def main():
         test_control_flow_is_rejected,
         test_session_manager_routes_phases,
         test_layer_series_is_not_a_phase_graph,
+        test_prefill_attention_matches_reference,
     ]
     for test in tests:
         test()
