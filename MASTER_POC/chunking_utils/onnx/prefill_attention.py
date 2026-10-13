@@ -15,6 +15,14 @@ and 0.0020 and 0.0022 on the projected output. Thirty later calls took
 0.413 ms and 0.386 ms, both slower than CPU. The log did not print an
 ELF size. The causal mask moves the reference output by 0.121 and 0.130,
 which is larger than the NPU gap.
+
+The same graph at prompts 128, 256, and 512, head 64, also reported
+``VAIML 12``, subgraph ``NPU 1``, and one ``vitis_ai_ep_1`` kernel.
+Output sizes were 98304, 196608, and 393216 bytes. NPU hidden error
+stayed about 0.003, and the mask moved the reference by about 0.138.
+Thirty-call means were CPU 0.129, 0.186, and 0.353 ms against Vitis
+0.433, 0.484, and 0.534 ms. Vitis was still slower at every measured
+length, so there is no prefill length constant.
 """
 
 from typing import Dict, Sequence

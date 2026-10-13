@@ -275,6 +275,28 @@ def test_prefill_attention_matches_reference():
     assert np.max(np.abs(projected - expect_h)) < 1e-5
 
 
+def test_prefill_decode_handoff_matches_reference():
+    from chunking_utils.onnx.phase_handoff import (
+        reference_prefill_decode_handoff,
+        run_prefill_decode_handoff,
+    )
+
+    got = run_prefill_decode_handoff(
+        prompt_len=8,
+        head_dim=64,
+        steps=5,
+        providers=["CPUExecutionProvider"],
+    )
+    expect = reference_prefill_decode_handoff(prompt_len=8, head_dim=64, steps=5)
+    assert len(got["decode_hidden"]) == 5
+    assert all(got["ptr_moved"])
+    assert np.max(np.abs(got["prefill_hidden"] - expect["prefill_hidden"])) < 1e-4
+    for left, right in zip(got["decode_hidden"], expect["decode_hidden"]):
+        assert np.max(np.abs(left - right)) < 1e-4
+    assert np.max(np.abs(got["final_key"] - expect["final_key"])) < 1e-4
+    assert np.max(np.abs(got["final_value"] - expect["final_value"])) < 1e-4
+
+
 def main():
     tests = [
         test_select_phase_ignores_cache_values,
@@ -283,6 +305,7 @@ def main():
         test_session_manager_routes_phases,
         test_layer_series_is_not_a_phase_graph,
         test_prefill_attention_matches_reference,
+        test_prefill_decode_handoff_matches_reference,
     ]
     for test in tests:
         test()
