@@ -38,6 +38,7 @@ NPU static KV cache:
   can publish Concat(old, new) by swapping pointers.
   (default 4096). attention_mask(valid_tokens) rewrites a fixed
   (batch, max_seq_len) mask: 1 for the written prefix, 0 for padding.
+  attention_bias() is the same window as an additive -10000 tail.
 
 Weight streaming:
 - AsyncIOBindingManager preallocates an active buffer and a shadow buffer.
@@ -1344,6 +1345,19 @@ class IOBindingManager:
         Zeros tell the NPU to ignore the rest of the preallocated KV cache.
         """
         return self.set_valid_sequence_length(valid_seq_len, pool)
+
+    def attention_bias(self, valid_seq_len: int, pool: str = "kv") -> np.ndarray:
+        """
+        Additive bias for the same preallocated window.
+
+        Valid positions are 0. The unused tail is -10000, exact in float16.
+        The KV OrtValue is not resized. A runtime slice of the cache is not
+        required: the bias hides the tail.
+        """
+        mask = self.attention_mask(valid_seq_len, pool)
+        bias = np.zeros(mask.shape, dtype=np.float16)
+        bias[np.asarray(mask) == 0] = np.float16(-10000.0)
+        return bias
 
     def get_static_kv_pool(self, name: str = "kv") -> StaticKVPool:
         """Return a previously allocated static KV pool."""
