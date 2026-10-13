@@ -2028,6 +2028,7 @@ def test_kv_cache():
     assert window_recipe["nodes"][0]["kept"] == 7
     _assert_fixed_window_slice_keeps_tokens()
     _assert_golden_attention_matches_reference()
+    _assert_projected_attention_matches_reference()
     try:
         assert_no_kv_scatter(["Concat", "ScatterND"])
         raise AssertionError("ScatterND was accepted in a spatial KV update")
@@ -17433,6 +17434,64 @@ def test_path_manager():
     print("  npu cache: .npu_cache provider folder, same path on second call")
     print("path manager: OK\n")
     return True
+
+
+def _assert_projected_attention_matches_reference():
+    """Projected K and V stay in the cache, and context matches float32."""
+    import os
+    import tempfile
+
+    import numpy as np
+    import onnxruntime as ort
+
+    from chunking_utils.onnx.golden_attention_subgraph import (
+        MEASURED_SHAPE,
+        build_projected_attention_model,
+        default_projection,
+        default_token,
+        golden_attention_facts,
+        hostile_attention_ops,
+        reference_projected_attention,
+    )
+
+    model = build_projected_attention_model()
+    facts = golden_attention_facts(model)
+    assert facts["ops"] == facts["projected_ops"]
+    assert facts["opset"] == 17
+    assert facts["ir_version"] == 10
+    assert hostile_attention_ops(facts["ops"]) == []
+    for name in ("starts", "ends", "axes", "steps", "Wq", "Wk", "Wv"):
+        assert name in facts["initializers"]
+    head = MEASURED_SHAPE[-1]
+    count = int(np.prod(MEASURED_SHAPE))
+    past_k = (np.arange(count, dtype=np.float32) / count).reshape(MEASURED_SHAPE)
+    past_v = (np.arange(count, dtype=np.float32) / (count / 2)).reshape(MEASURED_SHAPE)
+    token = default_token(head)
+    expect_k, expect_v, expect_c = reference_projected_attention(
+        past_k,
+        past_v,
+        token,
+        default_projection(1, head, head),
+        default_projection(2, head, head),
+        default_projection(3, head, head),
+    )
+    path = os.path.join(tempfile.gettempdir(), "projected_attention.onnx")
+    with open(path, "wb") as handle:
+        handle.write(model.SerializeToString())
+    session = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+    got_k, got_v, got_c = session.run(
+        None,
+        {
+            "past_key_values.0.key": past_k,
+            "past_key_values.0.value": past_v,
+            "token": token,
+        },
+    )
+    assert np.max(np.abs(got_k - expect_k)) < 1e-5
+    assert np.max(np.abs(got_v - expect_v)) < 1e-5
+    assert np.max(np.abs(got_c - expect_c)) < 1e-5
+    assert got_v.shape == MEASURED_SHAPE
+    assert np.max(np.abs(got_v[:, :, -1:, :] - expect_v[:, :, -1:, :])) < 1e-5
 
 
 def _assert_golden_attention_matches_reference():
