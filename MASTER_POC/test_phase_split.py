@@ -17,6 +17,7 @@ from pipeline_utils.session_manager import (
     SessionConfig,
     SessionManager,
     select_execution_phase,
+    select_prefill_device,
 )
 
 
@@ -275,6 +276,38 @@ def test_prefill_attention_matches_reference():
     assert np.max(np.abs(projected - expect_h)) < 1e-5
 
 
+def test_prefill_device_uses_measured_layout_only():
+    assert select_prefill_device(255, 8, 128) == "cpu"
+    assert select_prefill_device(256, 8, 128) == "npu"
+    assert select_prefill_device(512, 8, 128) == "npu"
+    assert select_prefill_device(512, 1, 64) == "unmeasured"
+    assert select_execution_phase(1, 5) == "decode"
+
+
+def test_multihead_handoff_matches_reference():
+    from chunking_utils.onnx.phase_handoff import (
+        reference_prefill_decode_handoff,
+        run_prefill_decode_handoff,
+    )
+
+    got = run_prefill_decode_handoff(
+        prompt_len=8,
+        head_dim=128,
+        steps=5,
+        num_heads=8,
+        providers=["CPUExecutionProvider"],
+    )
+    expect = reference_prefill_decode_handoff(
+        prompt_len=8, head_dim=128, steps=5, num_heads=8
+    )
+    assert all(got["ptr_moved"])
+    assert np.max(np.abs(got["prefill_hidden"] - expect["prefill_hidden"])) < 1e-4
+    for left, right in zip(got["decode_hidden"], expect["decode_hidden"]):
+        assert np.max(np.abs(left - right)) < 1e-4
+    assert np.max(np.abs(got["final_key"] - expect["final_key"])) < 1e-4
+    assert np.max(np.abs(got["final_value"] - expect["final_value"])) < 1e-4
+
+
 def test_multihead_prefill_matches_reference():
     from onnx import TensorProto
 
@@ -341,6 +374,8 @@ def main():
         test_session_manager_routes_phases,
         test_layer_series_is_not_a_phase_graph,
         test_prefill_attention_matches_reference,
+        test_prefill_device_uses_measured_layout_only,
+        test_multihead_handoff_matches_reference,
         test_multihead_prefill_matches_reference,
         test_prefill_decode_handoff_matches_reference,
     ]

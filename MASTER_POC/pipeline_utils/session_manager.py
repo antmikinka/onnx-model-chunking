@@ -1689,6 +1689,28 @@ def select_execution_phase(
     return "decode"
 
 
+def select_prefill_device(prompt_len: int, num_heads: int = 1, head_dim: int = 64) -> str:
+    """Device for a prefill prompt on the measured head layout.
+
+    ``MEASURED_NPU_FASTER_PREFILL_PROMPT`` is the first prompt where heads
+    8 and head 128 were faster on Vitis. Shorter prompts on that layout
+    stay on CPU. Every other layout returns ``unmeasured``. This does not
+    choose prefill versus decode.
+    """
+    prompt = int(prompt_len)
+    if prompt < 1:
+        raise ValueError(f"prompt_len must be positive, got {prompt}")
+    if int(num_heads) == 8 and int(head_dim) == 128:
+        from chunking_utils.onnx.prefill_attention import (
+            MEASURED_NPU_FASTER_PREFILL_PROMPT,
+        )
+
+        if prompt >= int(MEASURED_NPU_FASTER_PREFILL_PROMPT):
+            return "npu"
+        return "cpu"
+    return "unmeasured"
+
+
 def infer_component_phase(name: str) -> Optional[str]:
     """
     Read a phase from a component name.

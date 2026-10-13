@@ -6,7 +6,9 @@ decode past. Each decode step drops index 0, appends one token, and
 ``commit_present_swap`` installs that full window. The decode bias still
 blocks score index 0 only. These graphs return a projected hidden vector,
 not logits. ``MEASURED_NPU_FASTER_PREFILL_PROMPT`` is 256 for heads 8
-and head 128 only. ``SessionManager`` does not read it.
+and head 128 only. ``select_prefill_device`` returns ``npu`` at that
+prompt and ``cpu`` below it. Every other layout returns ``unmeasured``.
+``select_execution_phase`` does not read the constant.
 
 Measured on 2026-10-13 in conda ``ryzen-ai-1.8.0``, window 8, head 64,
 five decode steps. CPU matched the chained float32 reference within
@@ -16,6 +18,16 @@ five decode steps. CPU matched the chained float32 reference within
 differed from the chain by 0.0020 on the prefill output, at most 0.0012
 on the five decode outputs, 0.0029 on the final key, and 0.0038 on the
 final value. No ELF size was printed.
+
+The same handoff at heads 8, head 128, and window 256 stayed finite.
+Prefill differed from the float32 chain by 0.0077. The five decode
+outputs differed by 0.0046, 0.0048, 0.0052, 0.0055, and 0.0045. The
+final key differed by 0.0083 and the final value by 0.0097. The past
+pointer moved on every step. Prefill reported ``VAIML 10`` and decode
+``VAIML 15``, each subgraph ``NPU 1``, with one ``vitis_ai_ep`` kernel
+each (output sizes 3145728 and 2101248). No ELF size was printed.
+VirtualLock did not page-lock the 1048576-byte KV tensors. Host
+OrtValues stayed on CPU.
 """
 
 import os
@@ -30,7 +42,6 @@ from chunking_utils.onnx.masked_projected_attention import (
     reference_masked_projected_attention,
 )
 from chunking_utils.onnx.prefill_attention import (
-    MEASURED_NPU_FASTER_PREFILL_PROMPT,
     build_prefill_attention_model,
     causal_bias_f16,
     default_prompt,
@@ -38,29 +49,32 @@ from chunking_utils.onnx.prefill_attention import (
 )
 
 
-def decode_tokens(steps: int, head_dim: int) -> np.ndarray:
-    """``steps`` distinct tokens shaped ``[steps, 1, 1, head]``."""
-    count = int(steps) * int(head_dim)
+def decode_tokens(steps: int, head_dim: int, num_heads: int = 1) -> np.ndarray:
+    """``steps`` distinct tokens shaped ``[steps, 1, heads, 1, head]``."""
+    heads = int(num_heads)
+    count = int(steps) * int(head_dim) * heads
     values = np.arange(count, dtype=np.float32) / np.float32(count) - np.float32(0.5)
-    return np.ascontiguousarray(values.reshape(int(steps), 1, 1, 1, int(head_dim)))
+    return np.ascontiguousarray(values.reshape(int(steps), 1, heads, 1, int(head_dim)))
 
 
 def reference_prefill_decode_handoff(
     prompt_len: int = 8,
     head_dim: int = 64,
     steps: int = 5,
+    num_heads: int = 1,
 ) -> Dict[str, object]:
     """Float32 chain: one prefill, then ``steps`` full-window decode rolls."""
     prompt = int(prompt_len)
     head = int(head_dim)
+    heads = int(num_heads)
     weights = [default_projection(seed, head, head) for seed in (1, 2, 3, 4)]
     key, value, prefill_hidden = reference_prefill_attention(
-        default_prompt(prompt, head),
+        default_prompt(prompt, head, heads),
         *weights,
         causal_bias_f16(prompt),
     )
     bias = attention_bias_f16(prompt)
-    tokens = decode_tokens(int(steps), head)
+    tokens = decode_tokens(int(steps), head, heads)
     decode_hidden: List[np.ndarray] = []
     for step in range(int(steps)):
         key, value, projected = reference_masked_projected_attention(
@@ -83,6 +97,7 @@ def run_prefill_decode_handoff(
     prompt_len: int = 8,
     head_dim: int = 64,
     steps: int = 5,
+    num_heads: int = 1,
     providers: Optional[Sequence[str]] = None,
     profile_dir: Optional[str] = None,
 ) -> Dict[str, object]:
@@ -97,18 +112,25 @@ def run_prefill_decode_handoff(
 
     prompt = int(prompt_len)
     head = int(head_dim)
+    heads = int(num_heads)
     step_count = int(steps)
+    if heads < 1:
+        raise ValueError(f"num_heads must be positive, got {heads}")
     if prompt < 2:
         raise ValueError(f"prompt_len must match a full decode window, got {prompt}")
     if step_count < 1:
         raise ValueError(f"steps must be positive, got {step_count}")
     selected = list(providers or ["CPUExecutionProvider"])
-    prefill_model = build_prefill_attention_model(prompt_len=prompt, head_dim=head)
-    decode_model = build_masked_projected_attention_model(seq_len=prompt, head_dim=head)
-    hidden = np.ascontiguousarray(default_prompt(prompt, head))
-    tokens = decode_tokens(step_count, head)
-    window = [1, 1, prompt, head]
-    token_shape = [1, 1, 1, head]
+    prefill_model = build_prefill_attention_model(
+        prompt_len=prompt, head_dim=head, num_heads=heads
+    )
+    decode_model = build_masked_projected_attention_model(
+        seq_len=prompt, head_dim=head, num_heads=heads
+    )
+    hidden = np.ascontiguousarray(default_prompt(prompt, head, heads))
+    tokens = decode_tokens(step_count, head, heads)
+    window = [1, heads, prompt, head]
+    token_shape = [1, heads, 1, head]
 
     def session_options(name: str):
         options = ort.SessionOptions()
@@ -147,7 +169,7 @@ def run_prefill_decode_handoff(
 
     cache = KVCacheManager(
         num_layers=1,
-        num_kv_heads=1,
+        num_kv_heads=heads,
         head_dim=head,
         dtype=np.float32,
         batch_size=1,

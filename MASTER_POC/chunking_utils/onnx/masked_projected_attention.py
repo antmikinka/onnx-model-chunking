@@ -16,7 +16,20 @@ matched this reference within 6e-7. The NPU differed by at most 0.0023
 and 0.0034 on the key, 0.0039 on the value, and 0.018 and 0.016 on the
 projected output. Thirty later calls took 0.575 ms and 0.725 ms. The
 log did not print an ELF size. At sequence 8 the mask moves the
-reference output by 0.079, which is larger than the NPU gap.
+reference output by 0.079, which is larger than the NPU gap. At
+sequence 512 that move is 0.003, smaller than the NPU gap.
+
+Heads stay in the batch axis. There is still no Transpose. At heads 8,
+cache ``[1, 8, 256, 128]``, and query ``[1, 8, 1, 128]`` the log said
+``VAIML 15`` and subgraph ``NPU 1``. The profiler recorded one
+``vitis_ai_ep_1`` kernel, output size 2101248, and the compile
+instantiated ``GemmBfp16``. No ELF size was printed. CPU matched within
+1.2e-6. The NPU differed by 0.0051 on the key, 0.0057 on the value, and
+0.023 on the projected output. The one-position mask moves that
+reference by 0.00096, which is smaller than the NPU gap, so this shape
+does not separately show that the mask survived bfloat16. Thirty later
+calls took 0.617 ms on CPU and 1.762 ms on Vitis. The session load took
+34.0 s. VirtualLock did not page-lock the 1048576-byte cache tensors.
 """
 
 from typing import Dict, Sequence

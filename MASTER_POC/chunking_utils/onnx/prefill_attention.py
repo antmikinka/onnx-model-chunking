@@ -36,6 +36,9 @@ and 0.524; 128 was 0.605 and 0.632; 256 was 2.383 and 1.532; 512 was
 5.201 and 3.312. Vitis was faster at 256 and 512 on this layout.
 ``MEASURED_NPU_FASTER_PREFILL_PROMPT`` is 256 for heads 8 and head 128.
 Prompt 128 was still slower, and the one-head curve did not cross.
+``select_prefill_device`` uses that constant for this layout only.
+Prompts below 256 stay on CPU. Every other layout returns
+``unmeasured``.
 """
 
 from typing import Dict, Sequence
