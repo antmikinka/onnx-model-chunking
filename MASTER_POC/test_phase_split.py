@@ -275,6 +275,42 @@ def test_prefill_attention_matches_reference():
     assert np.max(np.abs(projected - expect_h)) < 1e-5
 
 
+def test_multihead_prefill_matches_reference():
+    from onnx import TensorProto
+
+    from chunking_utils.onnx.golden_attention_subgraph import default_projection
+    from chunking_utils.onnx.prefill_attention import (
+        MEASURED_NPU_FASTER_PREFILL_PROMPT,
+        PREFILL_MULTIHEAD_OPS,
+        build_prefill_attention_model,
+        causal_bias_f16,
+        default_prompt,
+        prefill_attention_facts,
+        reference_prefill_attention,
+    )
+
+    prompt, heads, head = 8, 8, 128
+    model = build_prefill_attention_model(prompt_len=prompt, head_dim=head, num_heads=heads)
+    facts = prefill_attention_facts(model)
+    assert MEASURED_NPU_FASTER_PREFILL_PROMPT == 256
+    assert facts["ops"] == list(PREFILL_MULTIHEAD_OPS)
+    assert facts["ir_version"] == 10
+    assert facts["bias_dtype"] == TensorProto.FLOAT16
+    hidden = default_prompt(prompt, head, heads)
+    weights = [default_projection(seed, head, head) for seed in (1, 2, 3, 4)]
+    bias = causal_bias_f16(prompt)
+    expect_k, expect_v, expect_h = reference_prefill_attention(hidden, *weights, bias)
+    options = ort.SessionOptions()
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    session = ort.InferenceSession(
+        model.SerializeToString(), sess_options=options, providers=["CPUExecutionProvider"]
+    )
+    key, value, projected = session.run(None, {"hidden_states": np.ascontiguousarray(hidden)})
+    assert np.max(np.abs(key - expect_k)) < 1e-5
+    assert np.max(np.abs(value - expect_v)) < 1e-5
+    assert np.max(np.abs(projected - expect_h)) < 1e-5
+
+
 def test_prefill_decode_handoff_matches_reference():
     from chunking_utils.onnx.phase_handoff import (
         reference_prefill_decode_handoff,
@@ -305,6 +341,7 @@ def main():
         test_session_manager_routes_phases,
         test_layer_series_is_not_a_phase_graph,
         test_prefill_attention_matches_reference,
+        test_multihead_prefill_matches_reference,
         test_prefill_decode_handoff_matches_reference,
     ]
     for test in tests:

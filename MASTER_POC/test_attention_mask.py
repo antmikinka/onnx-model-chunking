@@ -360,6 +360,47 @@ def test_masked_projected_graph_matches_reference():
     assert np.max(np.abs(projected - expect_h)) < 1e-5
 
 
+def test_masked_projected_multihead_matches_reference():
+    from chunking_utils.onnx.golden_attention_subgraph import default_projection
+    from chunking_utils.onnx.masked_projected_attention import (
+        MASKED_PROJECTED_OPS,
+        attention_bias_f16,
+        build_masked_projected_attention_model,
+        masked_projected_facts,
+        reference_masked_projected_attention,
+    )
+
+    seq, heads, head = 8, 8, 128
+    model = build_masked_projected_attention_model(seq_len=seq, head_dim=head, num_heads=heads)
+    facts = masked_projected_facts(model)
+    assert facts["ops"] == list(MASKED_PROJECTED_OPS)
+    assert "Transpose" not in facts["ops"]
+    shape = (1, heads, seq, head)
+    count = int(np.prod(shape))
+    past_k = (np.arange(count, dtype=np.float32) / np.float32(count)).reshape(shape)
+    past_v = (np.arange(count, dtype=np.float32) / np.float32(count / 2)).reshape(shape)
+    token_count = heads * head
+    hidden = (
+        np.arange(token_count, dtype=np.float32) / np.float32(token_count) - np.float32(0.5)
+    ).reshape(1, heads, 1, head)
+    weights = [default_projection(seed, head, head) for seed in (1, 2, 3, 4)]
+    bias = attention_bias_f16(seq)
+    expect_k, expect_v, expect_h = reference_masked_projected_attention(
+        past_k, past_v, hidden, *weights, bias
+    )
+    key, value, projected = _run(
+        model,
+        {
+            "past_key_values.0.key": past_k,
+            "past_key_values.0.value": past_v,
+            "hidden_states": np.ascontiguousarray(hidden),
+        },
+    )
+    assert np.max(np.abs(key - expect_k)) < 1e-5
+    assert np.max(np.abs(value - expect_v)) < 1e-5
+    assert np.max(np.abs(projected - expect_h)) < 1e-5
+
+
 def main():
     tests = [
         test_keep_mask_becomes_scalar_bias,
@@ -372,6 +413,7 @@ def main():
         test_unrelated_initializer_and_shared_fill_stay,
         test_split_onnx_rewrites_before_shape_inference,
         test_masked_projected_graph_matches_reference,
+        test_masked_projected_multihead_matches_reference,
     ]
     for test in tests:
         test()

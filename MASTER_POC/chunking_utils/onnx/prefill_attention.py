@@ -22,7 +22,20 @@ Output sizes were 98304, 196608, and 393216 bytes. NPU hidden error
 stayed about 0.003, and the mask moved the reference by about 0.138.
 Thirty-call means were CPU 0.129, 0.186, and 0.353 ms against Vitis
 0.433, 0.484, and 0.534 ms. Vitis was still slower at every measured
-length, so there is no prefill length constant.
+length on that one-head layout.
+
+Heads above 1 cannot use that 2D ``Gemm``. ``K`` is transposed on its
+last two axes and the scores are a batched ``MatMul``. At heads 8 and
+head 128 the log said ``VAIML 10`` and subgraph ``NPU 1`` for prompts
+8, 64, 128, 256, and 512. Each profiler row was one ``vitis_ai_ep_1``
+kernel. The compile instantiated ``GemmBfp16``. No ELF size was printed.
+CPU matched within 2e-7. NPU hidden error stayed about 0.006 to 0.008,
+and the mask moved the reference by about 0.041 to 0.046. Thirty-call
+means, CPU then Vitis: prompt 8 was 0.143 and 0.431 ms; 64 was 0.407
+and 0.524; 128 was 0.605 and 0.632; 256 was 2.383 and 1.532; 512 was
+5.201 and 3.312. Vitis was faster at 256 and 512 on this layout.
+``MEASURED_NPU_FASTER_PREFILL_PROMPT`` is 256 for heads 8 and head 128.
+Prompt 128 was still slower, and the one-head curve did not cross.
 """
 
 from typing import Dict, Sequence
@@ -36,6 +49,11 @@ from chunking_utils.onnx.golden_attention_subgraph import (
     OPSET,
     default_projection,
 )
+
+# First measured prompt, heads 8 and head_dim 128, where the 30-call
+# Vitis mean was below CPU. Prompt 128 on that layout was still slower.
+# The one-head curve through prompt 512 did not cross.
+MEASURED_NPU_FASTER_PREFILL_PROMPT = 256
 
 PREFILL_OPS = (
     "MatMul",
@@ -53,11 +71,12 @@ PREFILL_OPS = (
 )
 
 
-def default_prompt(prompt_len: int, head_dim: int) -> np.ndarray:
-    """Distinct tokens in ``[-0.5, 0.5)``, shaped ``[1, 1, prompt, head]``."""
-    count = int(prompt_len) * int(head_dim)
+def default_prompt(prompt_len: int, head_dim: int, num_heads: int = 1) -> np.ndarray:
+    """Distinct tokens in ``[-0.5, 0.5)``, shaped ``[1, heads, prompt, head]``."""
+    heads = int(num_heads)
+    count = int(prompt_len) * int(head_dim) * heads
     values = np.arange(count, dtype=np.float32) / np.float32(count) - np.float32(0.5)
-    return values.reshape(1, 1, int(prompt_len), int(head_dim))
+    return values.reshape(1, heads, int(prompt_len), int(head_dim))
 
 
 def causal_bias_f16(prompt_len: int) -> np.ndarray:
@@ -92,14 +111,23 @@ def reference_prefill_attention(
     return key, value, projected
 
 
-def build_prefill_attention_model(prompt_len: int = 8, head_dim: int = 64) -> ModelProto:
+def build_prefill_attention_model(
+    prompt_len: int = 8,
+    head_dim: int = 64,
+    num_heads: int = 1,
+) -> ModelProto:
     """Project one static prompt and apply a lower-triangular mask."""
     prompt = int(prompt_len)
     head = int(head_dim)
+    heads = int(num_heads)
+    if heads < 1:
+        raise ValueError(f"num_heads must be positive, got {heads}")
     if prompt < 2:
         raise ValueError(f"prompt_len must cover more than one token, got {prompt}")
     if head < 16 or head % 16 != 0:
         raise ValueError(f"head_dim must be a multiple of 16, got {head}")
+    if heads != 1:
+        return _build_multihead_prefill(prompt, head, heads)
     hidden_shape = [1, 1, prompt, head]
     score_shape = [1, 1, prompt, prompt]
     flat = [prompt, head]
@@ -172,6 +200,87 @@ def build_prefill_attention_model(prompt_len: int = 8, head_dim: int = 64) -> Mo
     hostile = [op for op in op_types if op in {"Transpose", "Where", "If", "Loop", "Scan", "Gather"}]
     if hostile:
         raise RuntimeError(f"prefill attention graph contains {hostile}")
+    return model
+
+
+PREFILL_MULTIHEAD_OPS = (
+    "MatMul",
+    "MatMul",
+    "MatMul",
+    "Transpose",
+    "MatMul",
+    "Cast",
+    "Add",
+    "Softmax",
+    "MatMul",
+    "MatMul",
+)
+
+
+def _build_multihead_prefill(prompt: int, head: int, heads: int) -> ModelProto:
+    """Batched scores. ``Gemm`` is 2D, so ``K`` is transposed on its last two axes."""
+    hidden_shape = [1, heads, prompt, head]
+    key_t_shape = [1, heads, head, prompt]
+    score_shape = [1, heads, prompt, prompt]
+    bias_shape = [1, 1, prompt, prompt]
+    weight_q = default_projection(1, head, head)
+    weight_k = default_projection(2, head, head)
+    weight_v = default_projection(3, head, head)
+    weight_o = default_projection(4, head, head)
+    nodes = [
+        helper.make_node("MatMul", ["hidden_states", "Wq"], ["q"], name="MatMul_q"),
+        helper.make_node("MatMul", ["hidden_states", "Wk"], ["present.0.key"], name="MatMul_k"),
+        helper.make_node("MatMul", ["hidden_states", "Wv"], ["present.0.value"], name="MatMul_v"),
+        helper.make_node(
+            "Transpose",
+            ["present.0.key"],
+            ["k_t"],
+            perm=[0, 1, 3, 2],
+            name="Transpose_k",
+        ),
+        helper.make_node("MatMul", ["q", "k_t"], ["scores"], name="MatMul_scores"),
+        helper.make_node(
+            "Cast", ["attn_bias_f16"], ["attn_bias"], to=TensorProto.FLOAT, name="Cast_bias"
+        ),
+        helper.make_node("Add", ["scores", "attn_bias"], ["biased"], name="Add_bias"),
+        helper.make_node("Softmax", ["biased"], ["probs"], axis=-1, name="Softmax_probs"),
+        helper.make_node(
+            "MatMul", ["probs", "present.0.value"], ["context"], name="MatMul_context"
+        ),
+        helper.make_node("MatMul", ["context", "Wo"], ["hidden_out"], name="MatMul_output"),
+    ]
+    graph = helper.make_graph(
+        nodes,
+        "prefill_attention_heads",
+        [helper.make_tensor_value_info("hidden_states", TensorProto.FLOAT, hidden_shape)],
+        [
+            helper.make_tensor_value_info("present.0.key", TensorProto.FLOAT, hidden_shape),
+            helper.make_tensor_value_info("present.0.value", TensorProto.FLOAT, hidden_shape),
+            helper.make_tensor_value_info("hidden_out", TensorProto.FLOAT, hidden_shape),
+        ],
+        initializer=[
+            numpy_helper.from_array(weight_q, "Wq"),
+            numpy_helper.from_array(weight_k, "Wk"),
+            numpy_helper.from_array(weight_v, "Wv"),
+            numpy_helper.from_array(weight_o, "Wo"),
+            numpy_helper.from_array(causal_bias_f16(prompt), "attn_bias_f16"),
+        ],
+        value_info=[
+            helper.make_tensor_value_info("q", TensorProto.FLOAT, hidden_shape),
+            helper.make_tensor_value_info("k_t", TensorProto.FLOAT, key_t_shape),
+            helper.make_tensor_value_info("scores", TensorProto.FLOAT, score_shape),
+            helper.make_tensor_value_info("attn_bias", TensorProto.FLOAT, bias_shape),
+            helper.make_tensor_value_info("biased", TensorProto.FLOAT, score_shape),
+            helper.make_tensor_value_info("probs", TensorProto.FLOAT, score_shape),
+            helper.make_tensor_value_info("context", TensorProto.FLOAT, hidden_shape),
+        ],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", OPSET)])
+    model.ir_version = IR_VERSION
+    op_types = [node.op_type for node in model.graph.node]
+    hostile = [op for op in op_types if op in {"Where", "If", "Loop", "Scan", "Gather"}]
+    if hostile or op_types != list(PREFILL_MULTIHEAD_OPS):
+        raise RuntimeError(f"multi-head prefill graph is {op_types}")
     return model
 
 

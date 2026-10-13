@@ -70,12 +70,13 @@ def reference_masked_projected_attention(
 ) -> tuple:
     """Float32 reference. The float16 bias is cast before the add."""
     query_row = np.matmul(hidden_states, weight_q)
-    query_column = query_row.reshape(1, 1, query_row.shape[-1], 1)
+    query_column = query_row.reshape(query_row.shape[:-2] + (query_row.shape[-1], 1))
     new_key = np.matmul(hidden_states, weight_k)
     new_value = np.matmul(hidden_states, weight_v)
     present_key = np.concatenate([past_key[:, :, 1:, :], new_key], axis=2)
     present_value = np.concatenate([past_value[:, :, 1:, :], new_value], axis=2)
-    scores = np.matmul(present_key, query_column).reshape(1, 1, 1, past_key.shape[2])
+    raw_scores = np.matmul(present_key, query_column)
+    scores = raw_scores.reshape(raw_scores.shape[0], raw_scores.shape[1], 1, raw_scores.shape[2])
     biased = scores.astype(np.float64) + bias_f16.astype(np.float64)
     biased = biased - np.max(biased, axis=-1, keepdims=True)
     weights = np.exp(biased)
@@ -89,22 +90,31 @@ def build_masked_projected_attention_model(
     seq_len: int = 8,
     head_dim: int = 64,
     query_len: int = 1,
+    num_heads: int = 1,
 ) -> ModelProto:
-    """One-head decode block with weights, a static mask, and ``Wo``."""
+    """Decode block with weights, a static mask, and ``Wo``.
+
+    Query length stays 1, so scores are a column ``MatMul``. Extra heads
+    use that same layout and do not add a Transpose.
+    """
     if int(query_len) != 1:
         raise ValueError(f"query_len 1 is the measured layout, got {query_len}")
     if int(seq_len) < 2:
         raise ValueError(f"seq_len must leave one token to drop, got {seq_len}")
     if int(head_dim) < 16 or int(head_dim) % 16 != 0:
         raise ValueError(f"head_dim must be a multiple of 16, got {head_dim}")
+    heads = int(num_heads)
+    if heads < 1:
+        raise ValueError(f"num_heads must be positive, got {heads}")
     head = int(head_dim)
     seq = int(seq_len)
-    shape = [1, 1, seq, head]
-    hidden_shape = [1, 1, 1, head]
-    kept = [1, 1, seq - 1, head]
-    column = [1, 1, head, 1]
-    score_column = [1, 1, seq, 1]
-    score_row = [1, 1, 1, seq]
+    shape = [1, heads, seq, head]
+    hidden_shape = [1, heads, 1, head]
+    kept = [1, heads, seq - 1, head]
+    column = [1, heads, head, 1]
+    score_column = [1, heads, seq, 1]
+    score_row = [1, heads, 1, seq]
+    bias_shape = [1, 1, 1, seq]
     weight_q = default_projection(1, head, head)
     weight_k = default_projection(2, head, head)
     weight_v = default_projection(3, head, head)
@@ -198,7 +208,7 @@ def build_masked_projected_attention_model(
             helper.make_tensor_value_info("kept_k", TensorProto.FLOAT, kept),
             helper.make_tensor_value_info("scores_col", TensorProto.FLOAT, score_column),
             helper.make_tensor_value_info("scores", TensorProto.FLOAT, score_row),
-            helper.make_tensor_value_info("attn_bias", TensorProto.FLOAT, score_row),
+            helper.make_tensor_value_info("attn_bias", TensorProto.FLOAT, bias_shape),
             helper.make_tensor_value_info("biased", TensorProto.FLOAT, score_row),
             helper.make_tensor_value_info("probs", TensorProto.FLOAT, score_row),
             helper.make_tensor_value_info("kept_v", TensorProto.FLOAT, kept),

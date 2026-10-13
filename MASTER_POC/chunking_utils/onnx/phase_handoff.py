@@ -5,7 +5,8 @@ and value for that whole window. The host copies those tensors into the
 decode past. Each decode step drops index 0, appends one token, and
 ``commit_present_swap`` installs that full window. The decode bias still
 blocks score index 0 only. These graphs return a projected hidden vector,
-not logits.
+not logits. ``MEASURED_NPU_FASTER_PREFILL_PROMPT`` is 256 for heads 8
+and head 128 only. ``SessionManager`` does not read it.
 
 Measured on 2026-10-13 in conda ``ryzen-ai-1.8.0``, window 8, head 64,
 five decode steps. CPU matched the chained float32 reference within
@@ -29,6 +30,7 @@ from chunking_utils.onnx.masked_projected_attention import (
     reference_masked_projected_attention,
 )
 from chunking_utils.onnx.prefill_attention import (
+    MEASURED_NPU_FASTER_PREFILL_PROMPT,
     build_prefill_attention_model,
     causal_bias_f16,
     default_prompt,
