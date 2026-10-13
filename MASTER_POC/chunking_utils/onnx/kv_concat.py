@@ -32,6 +32,10 @@ two static shapes that stay legal.
     ``past``. This roll is valid only when the buffer is already full.
     A short prefix uses ``host_prefix``. The host only swaps the present
     pointer onto the next past input.
+
+The attention graph that ran as one NPU kernel is
+``golden_attention_subgraph``. It uses this fixed-window slice and adds
+the two matmuls. This module does not build that graph.
 """
 
 from typing import Dict, Sequence

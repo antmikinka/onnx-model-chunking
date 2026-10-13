@@ -2027,6 +2027,7 @@ def test_kv_cache():
     assert window_recipe["nodes"][0]["axes"] == [2]
     assert window_recipe["nodes"][0]["kept"] == 7
     _assert_fixed_window_slice_keeps_tokens()
+    _assert_golden_attention_matches_reference()
     try:
         assert_no_kv_scatter(["Concat", "ScatterND"])
         raise AssertionError("ScatterND was accepted in a spatial KV update")
@@ -17432,6 +17433,59 @@ def test_path_manager():
     print("  npu cache: .npu_cache provider folder, same path on second call")
     print("path manager: OK\n")
     return True
+
+
+def _assert_golden_attention_matches_reference():
+    """The saved NPU graph matches the float32 reference and has no Transpose."""
+    import os
+    import tempfile
+
+    import numpy as np
+    import onnxruntime as ort
+
+    from chunking_utils.onnx.golden_attention_subgraph import (
+        MEASURED_SHAPE,
+        build_golden_attention_model,
+        default_new_key,
+        default_query_column,
+        golden_attention_facts,
+        hostile_attention_ops,
+        reference_attention,
+    )
+
+    model = build_golden_attention_model()
+    facts = golden_attention_facts(model)
+    assert facts["ops"] == facts["measured_ops"]
+    assert facts["opset"] == 17
+    assert facts["ir_version"] == 10
+    assert hostile_attention_ops(facts["ops"]) == []
+    for name in ("starts", "ends", "axes", "steps"):
+        assert name in facts["initializers"]
+    try:
+        build_golden_attention_model(head_dim=4)
+        raise AssertionError("head_dim 4 was accepted")
+    except ValueError as exc:
+        assert "head_dim" in str(exc)
+
+    count = int(np.prod(MEASURED_SHAPE))
+    past_k = (np.arange(count, dtype=np.float32) / count).reshape(MEASURED_SHAPE)
+    past_v = (np.arange(count, dtype=np.float32) / (count / 2)).reshape(MEASURED_SHAPE)
+    expect_k, expect_v = reference_attention(
+        past_k,
+        past_v,
+        default_query_column(MEASURED_SHAPE[-1]),
+        default_new_key(MEASURED_SHAPE[-1]),
+    )
+    path = os.path.join(tempfile.gettempdir(), "golden_attention.onnx")
+    with open(path, "wb") as handle:
+        handle.write(model.SerializeToString())
+    session = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+    got_k, got_v = session.run(
+        None,
+        {"past_key_values.0.key": past_k, "past_key_values.0.value": past_v},
+    )
+    assert np.max(np.abs(got_k - expect_k)) == 0
+    assert np.max(np.abs(got_v - expect_v)) < 1e-6
 
 
 def _assert_fixed_window_slice_keeps_tokens():
