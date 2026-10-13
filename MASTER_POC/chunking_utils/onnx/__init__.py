@@ -44,6 +44,11 @@ from .merger import merge_onnx
 from .loader import load_onnx_model, resolve_model_path
 from .types import ComponentInfo, OnnxSplitResult
 from .inference import run_inference
+from .golden_attention_subgraph import (
+    build_golden_attention_model,
+    build_projected_attention_model,
+    golden_attention_facts,
+)
 
 __all__ = [
     # Main operations
@@ -78,4 +83,7 @@ __all__ = [
     "OnnxSplitResult",
     # Inference
     "run_inference",
+    "build_golden_attention_model",
+    "build_projected_attention_model",
+    "golden_attention_facts",
 ]
