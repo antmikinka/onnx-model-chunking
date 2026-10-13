@@ -17429,6 +17429,88 @@ def test_path_manager():
     return True
 
 
+def test_kv_session_swap():
+    """A real session writes the shadow OrtValue, then the pointer swap publishes it."""
+    print("=" * 50)
+    print("Testing KV session pointer swap...")
+    print("=" * 50)
+
+    import os
+    import tempfile
+
+    import numpy as np
+    import onnxruntime as ort
+    from onnx import TensorProto, helper
+
+    from pipeline_utils.kv_cache import KVCacheBackend, KVCacheManager
+
+    max_seq = 4
+    head_dim = 4
+    present = np.arange(2 * head_dim, dtype=np.float32).reshape(1, 1, 2, head_dim)
+    nodes = [
+        helper.make_node("Identity", ["past_key_values.0.key"], ["present.0.key"]),
+        helper.make_node("Identity", ["past_key_values.0.value"], ["present.0.value"]),
+    ]
+    shape = [1, 1, max_seq, head_dim]
+    graph = helper.make_graph(
+        nodes,
+        "kv_identity",
+        [
+            helper.make_tensor_value_info("past_key_values.0.key", TensorProto.FLOAT, shape),
+            helper.make_tensor_value_info("past_key_values.0.value", TensorProto.FLOAT, shape),
+        ],
+        [
+            helper.make_tensor_value_info("present.0.key", TensorProto.FLOAT, shape),
+            helper.make_tensor_value_info("present.0.value", TensorProto.FLOAT, shape),
+        ],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    model.ir_version = 10
+    model_path = os.path.join(tempfile.gettempdir(), "kv_session_swap.onnx")
+    with open(model_path, "wb") as handle:
+        handle.write(model.SerializeToString())
+
+    available = set(ort.get_available_providers())
+    provider_sets = [["CPUExecutionProvider"]]
+    if "DmlExecutionProvider" in available:
+        provider_sets.append(["DmlExecutionProvider", "CPUExecutionProvider"])
+    if "VitisAIExecutionProvider" in available:
+        provider_sets.append(["VitisAIExecutionProvider", "CPUExecutionProvider"])
+
+    for providers in provider_sets:
+        cache = KVCacheManager(
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=head_dim,
+            dtype=np.float32,
+            batch_size=1,
+            backend=KVCacheBackend.VITISAI,
+            max_seq_len=max_seq,
+        )
+        cache.update_from_present(0, present, present + 1)
+        before = int(cache.get_device_tensors(0)[0].data_ptr())
+        try:
+            cache.commit_present_swap(0, max_seq + 1)
+            raise AssertionError("out-of-range commit swapped or returned")
+        except ValueError:
+            pass
+        assert int(cache.get_device_tensors(0)[0].data_ptr()) == before
+
+        options = ort.SessionOptions()
+        options.log_severity_level = 3
+        session = ort.InferenceSession(model_path, sess_options=options, providers=providers)
+        cache.run_bound_session(session, 0, 2)
+        key, value = cache.get_device_tensors(0)
+        assert int(key.data_ptr()) != before
+        assert np.array_equal(key.numpy()[:, :, :2, :], present)
+        assert np.array_equal(value.numpy()[:, :, :2, :], present + 1)
+        assert cache.get_sequence_length() == 2
+        print(f"  {session.get_providers()[0]}: shadow written, pointer swapped")
+
+    print("kv session swap: OK\n")
+    return True
+
+
 if __name__ == "__main__":
     print("\n" + "=" * 60)
     print("Pipeline Utils Module Tests")
@@ -17453,6 +17535,12 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"kv_cache: FAILED - {e}")
         results.append(("kv_cache", False))
+
+    try:
+        results.append(("kv_session_swap", test_kv_session_swap()))
+    except Exception as e:
+        print(f"kv_session_swap: FAILED - {e}")
+        results.append(("kv_session_swap", False))
     
     try:
         results.append(("config_loader", test_config_loader()))

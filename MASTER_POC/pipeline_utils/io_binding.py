@@ -372,6 +372,8 @@ def ort_memory_candidates(device_type: str) -> List[OrtMemoryTarget]:
         return _dedupe_targets(direct + pinned + cpu)
 
     if key in AMD_NPU_DEVICES:
+        # "vitisai" is not an OrtDevice in onnxruntime-vitisai 1.27. The
+        # execution provider copies these host buffers during session.Run.
         direct = [
             OrtMemoryTarget(MemoryPlacement.DEVICE, key),
             OrtMemoryTarget(MemoryPlacement.DEVICE, "npu", vendor_id=amd),

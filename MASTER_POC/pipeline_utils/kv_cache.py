@@ -1590,13 +1590,37 @@ class KVCacheManager:
                 raise KeyError(
                     f"Layer {layer_idx} not in cache (have {self.num_layers} layers)"
                 )
+            length = int(valid_seq_len)
+            if length < 0 or (
+                self.max_seq_len is not None and length > int(self.max_seq_len)
+            ):
+                raise ValueError(
+                    f"Layer {layer_idx}: sequence length {length} exceeds "
+                    f"max_seq_len {self.max_seq_len}"
+                )
             self._invalidate_quant(layer_idx)
             self._swap_layer(layer_idx)
-            self._commit_length(layer_idx, int(valid_seq_len))
-            if int(valid_seq_len) > int(self._seen[layer_idx]):
-                self._seen[layer_idx] = int(valid_seq_len)
+            self._commit_length(layer_idx, length)
+            if length > int(self._seen[layer_idx]):
+                self._seen[layer_idx] = length
                 self._seen_published = int(self._seen[layer_idx])
-            return int(valid_seq_len)
+            return length
+
+    def run_bound_session(self, session: Any, layer_idx: int, valid_seq_len: int) -> Dict[str, str]:
+        """Run one layer and install the present buffer as the next past.
+
+        ``VitisAIExecutionProvider`` in the Ryzen AI 1.8 wheel has no NPU
+        OrtValue device. The session reads and writes the host OrtValues
+        from ``bind_cache_to_session``. ``concat_swap`` binds present to
+        the shadow buffer, so this commits the swap only after the run
+        returns.
+        """
+        binding = session.io_binding()
+        bound = self.bind_cache_to_session(session, binding, layer_idx)
+        session.run_with_iobinding(binding)
+        if self._concat_swap_active():
+            self.commit_present_swap(layer_idx, valid_seq_len)
+        return bound
 
     def bind_cache_to_session(
         self,
