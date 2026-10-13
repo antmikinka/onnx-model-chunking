@@ -25,6 +25,16 @@ a separate output. On the same machine and day, Vitis reported
 The NPU differed by at most 0.0023 on the key, 0.0039 on the value, and
 0.011 on the context. One hundred later calls took 0.556 ms on that
 session and 0.101 ms on CPU. The log did not print an ELF size.
+
+The same projected graph, still one head and query length 1, stayed one
+``vitis_ai_ep_1`` kernel at sequence lengths 32, 128, 512, and 1024.
+Head dimension was 64 through sequence 128 and 128 after that. Each log
+said ``VAIML 12`` and subgraph ``NPU 1``. Thirty later calls at sequence
+1024 took 0.719 ms on that session and 0.251 ms on CPU. A float32 fill
+at sequence 512 and head 128 matched CPU within 7e-7. The NPU differed
+by at most 0.0034 on the key, 0.0039 on the value, and 0.015 on the
+context. ``VirtualLock`` failed at 256 KB, and the kernel still ran.
+The log did not print an ELF size.
 """
 
 from typing import Dict, List, Sequence
