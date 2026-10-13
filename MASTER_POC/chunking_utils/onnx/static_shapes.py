@@ -6,6 +6,15 @@ compiled onto a spatial array. The cache is allocated at ``max_seq_len``.
 Positions past the valid prefix are an additive -10000 bias, not a shorter
 view of the cache. ``session.disable_node_shape_check`` is left for a CPU
 graph that is still dynamic.
+
+A Qwen layer that still contains ``GroupQueryAttention`` is not the
+decomposed MatMul graph measured on the NPU. ``apply_static_contract``
+freezes that layer's symbolic axes, including ``kv_cache_dim`` when a
+q_norm or k_norm weight declares the head size. It replaces the runtime
+seqlens and total-sequence inputs with constants of the window and adds
+an ``attention_bias`` input for the -10000 tail. That rewrite was checked
+on the local Qwen3-8B ``layer_0_of_36.onnx``. No Vitis compile of that
+layer was run.
 """
 
 from typing import Dict, List, Optional, Sequence
@@ -33,13 +42,13 @@ _STRUCTURAL = {
     "num_kv_heads",
     "num_heads",
     "num_attention_heads",
-    "head_dim",
     "hidden",
     "hidden_size",
     "vocab",
     "vocab_size",
     "unk",
 }
+_HEAD = {"kv_cache_dim", "head_dim", "head_size"}
 _AOT_PROVIDERS = ("vitisai", "ryzenai", "openvino", "coreml")
 
 
@@ -114,10 +123,21 @@ def _role(name: str) -> str:
     return "query"
 
 
-def _size_for(param: str, role: str, batch_size: int, query_len: int, max_seq_len: int) -> int:
+def _size_for(
+    param: str,
+    role: str,
+    batch_size: int,
+    query_len: int,
+    max_seq_len: int,
+    head_dim: Optional[int],
+) -> int:
     text = param.strip().lower()
     if text in _STRUCTURAL or text == "":
         raise StaticShapeError(f"Cannot freeze symbolic dimension '{param}'")
+    if text in _HEAD:
+        if head_dim is None:
+            raise StaticShapeError(f"Cannot freeze '{param}' without a concrete head dim")
+        return int(head_dim)
     if text in _BATCH:
         return int(batch_size)
     if role == "kv" and (text in _QUERY or text in _WINDOW or "seq" in text):
@@ -131,14 +151,23 @@ def _size_for(param: str, role: str, batch_size: int, query_len: int, max_seq_le
     raise StaticShapeError(f"Cannot freeze symbolic dimension '{param}'")
 
 
-def _freeze_value(value, *, batch_size: int, query_len: int, max_seq_len: int) -> int:
+def _freeze_value(
+    value,
+    *,
+    batch_size: int,
+    query_len: int,
+    max_seq_len: int,
+    head_dim: Optional[int],
+) -> int:
     if not value.type.HasField("tensor_type"):
         return 0
     changed = 0
     role = _role(value.name)
     for dim in value.type.tensor_type.shape.dim:
         if dim.dim_param:
-            size = _size_for(dim.dim_param, role, batch_size, query_len, max_seq_len)
+            size = _size_for(
+                dim.dim_param, role, batch_size, query_len, max_seq_len, head_dim
+            )
             dim.ClearField("dim_param")
             dim.dim_value = int(size)
             changed += 1
@@ -151,14 +180,42 @@ def _freeze_value(value, *, batch_size: int, query_len: int, max_seq_len: int) -
     return changed
 
 
+def infer_head_dim(model) -> int:
+    """Head size declared by a Qwen q_norm or k_norm weight."""
+    for item in model.graph.initializer:
+        lower = item.name.lower()
+        if not (
+            lower.endswith("q_norm.layernorm.weight")
+            or lower.endswith("k_norm.layernorm.weight")
+        ):
+            continue
+        if len(item.dims) == 1 and int(item.dims[0]) >= 16:
+            return int(item.dims[0])
+    raise StaticShapeError(
+        "kv_cache_dim needs head_dim, and no q_norm or k_norm weight declared it"
+    )
+
+
+def _graph_needs_head(model) -> bool:
+    values = list(model.graph.input) + list(model.graph.value_info) + list(model.graph.output)
+    for value in values:
+        if not value.type.HasField("tensor_type"):
+            continue
+        for dim in value.type.tensor_type.shape.dim:
+            if dim.dim_param and dim.dim_param.strip().lower() in _HEAD:
+                return True
+    return False
+
+
 def freeze_graph_io(
     model,
     *,
     batch_size: int,
     query_len: int,
     max_seq_len: int,
+    head_dim: Optional[int] = None,
 ) -> int:
-    """Replace symbolic input and output axes with the static window."""
+    """Replace symbolic input, value, and output axes with the static window."""
     if batch_size < 1 or query_len < 1 or max_seq_len < 1:
         raise StaticShapeError(
             f"batch, query, and max_seq must be positive, "
@@ -168,14 +225,17 @@ def freeze_graph_io(
         raise StaticShapeError(
             f"query length {query_len} is longer than max_seq_len {max_seq_len}"
         )
+    if head_dim is None and _graph_needs_head(model):
+        head_dim = infer_head_dim(model)
     graph = model.graph
     changed = 0
-    for value in list(graph.input) + list(graph.output):
+    for value in list(graph.input) + list(graph.value_info) + list(graph.output):
         changed += _freeze_value(
             value,
             batch_size=batch_size,
             query_len=query_len,
             max_seq_len=max_seq_len,
+            head_dim=head_dim,
         )
     return changed
 
@@ -297,6 +357,89 @@ def rewrite_runtime_kv_slices(model, max_seq_len: int, seq_axis: int = 2) -> Lis
     return rewritten
 
 
+def _drop_unused_inputs(graph, detached: Sequence[str]) -> None:
+    if not detached:
+        return
+    used = set()
+    for node in graph.node:
+        used.update(item for item in node.input if item)
+    removed = set(detached)
+    kept = [value for value in graph.input if value.name not in removed or value.name in used]
+    del graph.input[:]
+    graph.input.extend(kept)
+
+
+def rewrite_gqa_to_static_window(
+    model,
+    *,
+    batch_size: int,
+    query_len: int,
+    max_seq_len: int,
+) -> List[str]:
+    """
+    Point GroupQueryAttention at the static window.
+
+    ``seqlens_k`` and ``total_sequence_length`` become constants of
+    ``max_seq_len``. An empty ``attention_bias`` slot becomes a graph input
+    of shape ``[1, 1, query_len, max_seq_len]``. The host fills that tensor
+    with ``static_attention_bias``. The fused op is left in the graph.
+    """
+    from onnx import TensorProto, helper, numpy_helper
+
+    graph = model.graph
+    constants = _constant_names(graph)
+    rewritten = []
+    detached = []
+    bias_name = "attention_bias"
+    for node in graph.node:
+        if node.op_type != "GroupQueryAttention":
+            continue
+        while len(node.input) <= 10:
+            node.input.append("")
+        seqlens_name = f"{node.name}/static_seqlens_k"
+        total_name = f"{node.name}/static_total_seq_len"
+        if node.input[5] not in constants:
+            graph.initializer.append(
+                numpy_helper.from_array(
+                    np.full((int(batch_size),), int(max_seq_len), dtype=np.int32),
+                    seqlens_name,
+                )
+            )
+            if node.input[5]:
+                detached.append(node.input[5])
+            node.input[5] = seqlens_name
+            constants.add(seqlens_name)
+        if node.input[6] not in constants:
+            graph.initializer.append(
+                numpy_helper.from_array(
+                    np.asarray(int(max_seq_len), dtype=np.int32),
+                    total_name,
+                )
+            )
+            if node.input[6]:
+                detached.append(node.input[6])
+            node.input[6] = total_name
+            constants.add(total_name)
+        if not node.input[10]:
+            node.input[10] = bias_name
+        rewritten.append(node.name or node.output[0])
+    needs_bias = any(
+        node.op_type == "GroupQueryAttention" and len(node.input) > 10 and node.input[10] == bias_name
+        for node in graph.node
+    )
+    already = any(value.name == bias_name for value in graph.input) or bias_name in constants
+    if needs_bias and not already:
+        graph.input.append(
+            helper.make_tensor_value_info(
+                bias_name,
+                TensorProto.FLOAT,
+                [1, 1, int(query_len), int(max_seq_len)],
+            )
+        )
+    _drop_unused_inputs(graph, detached)
+    return rewritten
+
+
 def apply_static_contract(
     model,
     *,
@@ -304,19 +447,42 @@ def apply_static_contract(
     max_seq_len: int,
     query_len: int,
     seq_axis: int = 2,
+    head_dim: Optional[int] = None,
 ) -> Dict[str, object]:
-    """Freeze IO shapes and widen a KV prefix slice to the same window."""
+    """Freeze IO shapes, widen a KV prefix slice, and pin a Qwen GQA window."""
+    if head_dim is None and _graph_needs_head(model):
+        head_dim = infer_head_dim(model)
     frozen = freeze_graph_io(
         model,
         batch_size=batch_size,
         query_len=query_len,
         max_seq_len=max_seq_len,
+        head_dim=head_dim,
     )
     rewritten = rewrite_runtime_kv_slices(model, max_seq_len, seq_axis=seq_axis)
+    attention = rewrite_gqa_to_static_window(
+        model,
+        batch_size=batch_size,
+        query_len=query_len,
+        max_seq_len=max_seq_len,
+    )
     leftover = runtime_slices(model)
     if leftover:
         raise StaticShapeError(f"runtime slices remain: {leftover}")
-    return {"frozen_dims": frozen, "rewritten_slices": rewritten}
+    symbolic = []
+    for value in list(model.graph.input) + list(model.graph.output):
+        if not value.type.HasField("tensor_type"):
+            continue
+        for dim in value.type.tensor_type.shape.dim:
+            if dim.dim_param:
+                symbolic.append(f"{value.name}:{dim.dim_param}")
+    if symbolic:
+        raise StaticShapeError(f"symbolic axes remain: {symbolic}")
+    return {
+        "frozen_dims": frozen,
+        "rewritten_slices": rewritten,
+        "rewritten_attention": attention,
+    }
 
 
 def additive_length_bias(

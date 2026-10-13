@@ -253,6 +253,52 @@ def test_attention_bias_does_not_resize_the_pool():
     assert int(key.ort_value.data_ptr()) == pointer
 
 
+def _dims(value):
+    return [dim.dim_value for dim in value.type.tensor_type.shape.dim]
+
+
+def test_qwen_layer_freezes_to_the_static_window():
+    path = os.environ.get(
+        "QWEN_ATTENTION_LAYER",
+        r"C:\Users\antmi\qwen3-work\qwen3-8b-split\model.onnx\layer_0_of_36.onnx",
+    )
+    if not os.path.exists(path):
+        raise AssertionError(f"Qwen attention layer was not found at {path}")
+    model = onnx.load(path, load_external_data=False)
+    report = apply_static_contract(model, batch_size=1, query_len=1, max_seq_len=16)
+    assert report["rewritten_attention"] == ["/model/layers.0/attn/GroupQueryAttention"]
+    assert report["rewritten_slices"] == []
+    by_name = {value.name: value for value in list(model.graph.input) + list(model.graph.output)}
+    assert _dims(by_name["past_key_values.0.key"]) == [1, 8, 16, 128]
+    assert _dims(by_name["past_key_values.0.value"]) == [1, 8, 16, 128]
+    assert _dims(by_name["present.0.key"]) == [1, 8, 16, 128]
+    assert _dims(by_name["present.0.value"]) == [1, 8, 16, 128]
+    assert _dims(by_name["/model/embed_tokens/Gather/output_0"]) == [1, 1, 4096]
+    assert _dims(by_name["attention_bias"]) == [1, 1, 1, 16]
+    assert "output_mask" not in by_name
+    removed = {
+        "/model/attn_mask_reformat/attn_mask_subgraph/Sub/Cast/output_0",
+        "/model/attn_mask_reformat/attn_mask_subgraph/Gather/Cast/output_0",
+    }
+    assert removed.isdisjoint(by_name)
+    gqa = next(node for node in model.graph.node if node.op_type == "GroupQueryAttention")
+    constants = {item.name for item in model.graph.initializer}
+    assert gqa.input[5] in constants
+    assert gqa.input[6] in constants
+    seqlens = numpy_helper.to_array(
+        next(item for item in model.graph.initializer if item.name == gqa.input[5])
+    )
+    total = numpy_helper.to_array(
+        next(item for item in model.graph.initializer if item.name == gqa.input[6])
+    )
+    assert seqlens.tolist() == [16]
+    assert int(total) == 16
+    assert runtime_slices(model) == []
+    bias = static_attention_bias(4, 1, 16)[0, 0, 0]
+    assert bias[:4].tolist() == [0, 0, 0, 0]
+    assert np.all(bias[4:] == np.float32(-10000))
+
+
 def test_builder_static_mask_has_no_shape_or_slice():
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "builder.py")
     source = open(path, encoding="utf-8").read()
@@ -295,6 +341,7 @@ def main():
         ("additive_tail", test_additive_tail_matches_the_short_softmax),
         ("shape_check_bypass", test_shape_check_bypass_skips_aot_providers),
         ("attention_bias", test_attention_bias_does_not_resize_the_pool),
+        ("qwen_layer", test_qwen_layer_freezes_to_the_static_window),
         ("builder_static_mask", test_builder_static_mask_has_no_shape_or_slice),
     ]
     return all(_check(name, fn) for name, fn in checks)
