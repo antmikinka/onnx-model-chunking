@@ -829,6 +829,8 @@ def test_kv_cache():
         assert isinstance(value, DeviceBuffer)
         assert key.ort_value is not None
         assert tuple(key.shape) == (1, 2, 8, 8)
+        if backend is KVCacheBackend.VITISAI:
+            assert key.host_pages_locked == int(np.dtype(key.dtype).itemsize) * int(np.prod(key.shape))
         assert resident.get_sequence_length() == 0
         before = int(key.ort_value.data_ptr())
         spatial = backend in {
@@ -2020,8 +2022,11 @@ def test_kv_cache():
     window_recipe = static_kv_concat_recipe(8, 1, layout="fixed_window")
     assert window_recipe["op_types"] == ["Slice", "Concat"]
     assert window_recipe["output_seq"] == 8
-    assert window_recipe["nodes"][0]["begin"][2] == 1
-    assert window_recipe["nodes"][0]["end"][2] == 8
+    assert window_recipe["nodes"][0]["starts"] == [1]
+    assert window_recipe["nodes"][0]["ends"] == [8]
+    assert window_recipe["nodes"][0]["axes"] == [2]
+    assert window_recipe["nodes"][0]["kept"] == 7
+    _assert_fixed_window_slice_keeps_tokens()
     try:
         assert_no_kv_scatter(["Concat", "ScatterND"])
         raise AssertionError("ScatterND was accepted in a spatial KV update")
@@ -17427,6 +17432,56 @@ def test_path_manager():
     print("  npu cache: .npu_cache provider folder, same path on second call")
     print("path manager: OK\n")
     return True
+
+
+def _assert_fixed_window_slice_keeps_tokens():
+    """The sequence-axis Slice must keep tokens. A rank-4 0:0 range does not."""
+    import os
+    import tempfile
+
+    import numpy as np
+    import onnxruntime as ort
+    from onnx import TensorProto, helper, numpy_helper
+
+    from chunking_utils.onnx.kv_concat import static_kv_concat_recipe
+
+    recipe = static_kv_concat_recipe(8, 1, layout="fixed_window")
+    slice_node = recipe["nodes"][0]
+    past = np.arange(8, dtype=np.float32).reshape(1, 1, 8, 1)
+    new = np.array([[[[9.0]]]], dtype=np.float32)
+    starts = np.array(slice_node["starts"], dtype=np.int64)
+    ends = np.array(slice_node["ends"], dtype=np.int64)
+    axes = np.array(slice_node["axes"], dtype=np.int64)
+    nodes = [
+        helper.make_node("Slice", ["past", "starts", "ends", "axes"], ["kept_past"]),
+        helper.make_node("Concat", ["kept_past", "new"], ["present"], axis=2),
+    ]
+    graph = helper.make_graph(
+        nodes,
+        "fixed_window",
+        [
+            helper.make_tensor_value_info("past", TensorProto.FLOAT, [1, 1, 8, 1]),
+            helper.make_tensor_value_info("new", TensorProto.FLOAT, [1, 1, 1, 1]),
+        ],
+        [helper.make_tensor_value_info("present", TensorProto.FLOAT, [1, 1, 8, 1])],
+        initializer=[
+            numpy_helper.from_array(starts, "starts"),
+            numpy_helper.from_array(ends, "ends"),
+            numpy_helper.from_array(axes, "axes"),
+        ],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    model.ir_version = 10
+    path = os.path.join(tempfile.gettempdir(), "kv_fixed_window.onnx")
+    with open(path, "wb") as handle:
+        handle.write(model.SerializeToString())
+    session = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+    present = session.run(None, {"past": past, "new": new})[0]
+    assert present.shape == (1, 1, 8, 1)
+    assert np.array_equal(
+        present.reshape(-1),
+        np.array([1, 2, 3, 4, 5, 6, 7, 9], dtype=np.float32),
+    )
 
 
 def test_kv_session_swap():

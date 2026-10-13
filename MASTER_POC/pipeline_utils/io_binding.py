@@ -247,6 +247,44 @@ class _CapabilityGap(Exception):
     """The installed wheel cannot place an OrtValue with this memory info."""
 
 
+_host_lock_warned = False
+
+
+def _try_lock_host_pages(address: int, nbytes: int) -> int:
+    """Page-lock a host allocation. Returns the locked byte count, or 0.
+
+    onnxruntime-vitisai 1.27 cannot allocate a HipPinned OrtValue.
+    VirtualLock keeps the existing CPU OrtValue in RAM. It is not an
+    XRT buffer object and it does not register the pages with the NPU DMA
+    engine.
+    """
+    global _host_lock_warned
+    if os.name != "nt" or address <= 0 or nbytes <= 0:
+        return 0
+    locked = ctypes.windll.kernel32.VirtualLock(
+        ctypes.c_void_p(address), ctypes.c_size_t(nbytes)
+    )
+    if locked:
+        return int(nbytes)
+    if not _host_lock_warned:
+        _host_lock_warned = True
+        warnings.warn(
+            "VirtualLock could not page-lock the host OrtValue. "
+            "The buffer stays pageable.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    return 0
+
+
+def _unlock_host_pages(address: int, nbytes: int) -> None:
+    if os.name != "nt" or address <= 0 or nbytes <= 0:
+        return
+    ctypes.windll.kernel32.VirtualUnlock(
+        ctypes.c_void_p(address), ctypes.c_size_t(nbytes)
+    )
+
+
 def _amd_vendor_id() -> int:
     """Return AMD's PCI vendor id from the installed wheel when it exposes one."""
     enum = getattr(ort, "OrtDeviceVendorId", None)
@@ -496,6 +534,8 @@ class DeviceBuffer:
     vendor_id: Optional[int] = None
     static_seq_axis: Optional[int] = None
     static_max_seq: Optional[int] = None
+    locked_address: int = 0
+    host_pages_locked: int = 0
     
     def __post_init__(self):
         """Convert dtype to numpy dtype if string."""
@@ -1007,6 +1047,19 @@ class IOBindingManager:
                 ort_value = self._create_ort_value(data)
             else:
                 ort_value = self._create_empty_ort_value(shape, dtype)
+
+            locked_address = 0
+            host_pages_locked = 0
+            if (
+                self.device_type in AMD_NPU_DEVICES
+                and self._memory_placement is MemoryPlacement.CPU
+                and ort_value is not None
+            ):
+                nbytes = int(np.dtype(dtype).itemsize) * int(np.prod(tuple(shape)))
+                address = int(ort_value.data_ptr())
+                host_pages_locked = _try_lock_host_pages(address, nbytes)
+                if host_pages_locked:
+                    locked_address = address
             
             # Create buffer wrapper
             buffer = DeviceBuffer(
@@ -1020,6 +1073,8 @@ class IOBindingManager:
                 ortvalue_device=self._ortvalue_device,
                 memory_placement=self._memory_placement,
                 vendor_id=self._ortvalue_vendor_id,
+                locked_address=locked_address,
+                host_pages_locked=host_pages_locked,
             )
             
             self._buffers[name] = buffer
@@ -1551,11 +1606,12 @@ class IOBindingManager:
             True if buffer was deallocated
         """
         with self._lock:
-            if name in self._buffers:
-                del self._buffers[name]
-                self._buffer_pool.pop(name, None)
-                return True
-            return False
+            buffer = self._buffers.pop(name, None)
+            if buffer is None:
+                return False
+            _unlock_host_pages(buffer.locked_address, buffer.host_pages_locked)
+            self._buffer_pool.pop(name, None)
+            return True
     
     def deallocate_all(self) -> int:
         """
@@ -1565,6 +1621,8 @@ class IOBindingManager:
             Number of buffers deallocated
         """
         with self._lock:
+            for buffer in self._buffers.values():
+                _unlock_host_pages(buffer.locked_address, buffer.host_pages_locked)
             count = len(self._buffers)
             self._buffers.clear()
             self._kv_pools.clear()

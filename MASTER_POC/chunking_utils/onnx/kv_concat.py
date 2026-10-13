@@ -25,14 +25,16 @@ two static shapes that stay legal.
     ``max_seq_len`` and swaps pointers. This is the masked dense cache.
 
 ``fixed_window``
-    The graph itself emits the concatenated tensor. ``Slice`` begin and end
-    are initializers, ``Q`` and ``max_seq_len``, never a runtime offset.
+    The graph itself emits the concatenated tensor. ``Slice`` uses one
+    axis, the sequence axis: ``starts=[query_len]``, ``ends=[max_seq_len]``,
+    ``axes=[seq_axis]``. Those are initializers, never a runtime offset.
     ``present = Concat(past[:, :, Q:, :], new)`` has the same length as
-    ``past``. The host only swaps the present pointer onto the next past
-    input.
+    ``past``. This roll is valid only when the buffer is already full.
+    A short prefix uses ``host_prefix``. The host only swaps the present
+    pointer onto the next past input.
 """
 
-from typing import Dict, List, Sequence
+from typing import Dict, Sequence
 
 
 FORBIDDEN_KV_MUTATION_OPS = ("Scatter", "ScatterND", "ScatterElements")
@@ -49,13 +51,6 @@ def assert_no_kv_scatter(op_types: Sequence[str]) -> None:
             f"Spatial NPU KV update cannot contain {names}. "
             "Concatenate the new tokens and swap cache pointers instead."
         )
-
-
-def _constant_index(seq_axis: int, seq_value: int) -> List[int]:
-    """A 4D index whose sequence component is a compile-time constant."""
-    index = [0, 0, 0, 0]
-    index[seq_axis] = int(seq_value)
-    return index
 
 
 def static_kv_concat_recipe(
@@ -94,14 +89,16 @@ def static_kv_concat_recipe(
         nodes = [
             {
                 "op_type": "Slice",
-                "inputs": ["past", "begin", "end"],
+                "inputs": ["past", "starts", "ends", "axes"],
                 "output": "kept_past",
-                "begin": _constant_index(axis, query),
-                "end": _constant_index(axis, limit),
+                "starts": [query],
+                "ends": [limit],
+                "axes": [axis],
+                "kept": kept,
                 "seq_axis": axis,
                 "note": (
-                    "Drop the oldest query_len tokens. begin and end are "
-                    "initializers, not position_ids."
+                    "Drop the oldest query_len tokens on the sequence axis "
+                    "only. starts, ends, and axes are initializers."
                 ),
             },
             {
@@ -114,8 +111,9 @@ def static_kv_concat_recipe(
         ]
         output_seq = limit
         host = (
-            "Bind past to the active OrtValue and present to the shadow. "
-            "commit_present_swap installs present as the next past input."
+            "Use this only when the cache is full. Bind past to the active "
+            "OrtValue and present to the shadow. commit_present_swap installs "
+            "present as the next past input."
         )
     else:
         nodes = [
