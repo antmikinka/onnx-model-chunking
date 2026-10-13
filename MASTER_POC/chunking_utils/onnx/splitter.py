@@ -27,6 +27,7 @@ from .graph_analysis import (
     resolve_tensor_type,
 )
 from .kv_contract import extract_kv_cache_info
+from .attention_mask import rewrite_attention_mask_ops
 from .loader import infer_shapes_with_lazy_fallback, load_onnx_model
 from .metadata_writer import write_execution_contract
 from .npu_policy import extract_execution_policy
@@ -241,6 +242,14 @@ def split_onnx(
 
     model_path = config.model
     onnx_model = load_onnx_model(model_path)
+    # Attention Where/MaskedFill lowers to a scalar -1e4 add. Shape inference
+    # then sees the Cast/Sub/Mul/Add nodes. A graph with no such fill is unchanged.
+    replaced_masks = rewrite_attention_mask_ops(onnx_model)
+    if replaced_masks:
+        print(
+            f"Rewrote {replaced_masks} attention mask Where/MaskedFill ops "
+            "into an additive -1e4 bias"
+        )
 
     print("Running static shape inference on the master model...")
     # Resolve infer_shapes at call time so a test patch still applies, and so a
