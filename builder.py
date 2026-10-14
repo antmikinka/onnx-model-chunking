@@ -98,14 +98,14 @@ def _as_bool(value) -> bool:
 _ATTENTION_MASK_BIAS = -10000.0
 
 
-_VOCAB_CHUNK_ROWS_FN = None
+_VOCAB_SRAM_MODULE = None
 
 
-def _vocab_chunk_rows():
-    """Load the SRAM row planner without importing the pipeline package."""
-    global _VOCAB_CHUNK_ROWS_FN
-    if _VOCAB_CHUNK_ROWS_FN is not None:
-        return _VOCAB_CHUNK_ROWS_FN
+def _vocab_sram():
+    """Load the SRAM planner without importing the pipeline package."""
+    global _VOCAB_SRAM_MODULE
+    if _VOCAB_SRAM_MODULE is not None:
+        return _VOCAB_SRAM_MODULE
     import importlib.util
 
     path = os.path.join(
@@ -119,8 +119,12 @@ def _vocab_chunk_rows():
         raise ImportError(f"Cannot load vocabulary SRAM planner from {path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    _VOCAB_CHUNK_ROWS_FN = module.vocab_chunk_rows
-    return _VOCAB_CHUNK_ROWS_FN
+    _VOCAB_SRAM_MODULE = module
+    return module
+
+
+def _vocab_chunk_rows():
+    return _vocab_sram().vocab_chunk_rows
 
 
 class Model:
@@ -1197,6 +1201,75 @@ class Model:
             return torch.from_numpy(chunk)
         return weight[start:start + rows].detach().contiguous()
 
+    def _pad_vocab_rows(self, weight, pad_rows: int):
+        """Zero-fill the LM-head remainder. The Slice drops those rows.
+
+        See ``uniform_lm_head_rows`` for the 9032 probe on identical tiles.
+        """
+        if pad_rows <= 0:
+            return weight
+        if isinstance(weight, np.ndarray):
+            pad = [(0, int(pad_rows))] + [(0, 0)] * (weight.ndim - 1)
+            return np.pad(weight, pad, mode="constant")
+        return torch.nn.functional.pad(weight.detach(), (0, 0, 0, int(pad_rows)))
+
+    def _slice_lm_head_token(self, name, root_input, hidden: int):
+        """Keep the last sequence position. The MatMul value shape uses a literal 1."""
+        sliced = f"{name}/last_hidden"
+        if self.static_shapes:
+            start = int(self.static_query_len) - 1
+            end = int(self.static_query_len)
+            self.make_node(
+                "Slice",
+                inputs=[
+                    root_input,
+                    f"/model/constants/INT64/[{start}]",
+                    f"/model/constants/INT64/[{end}]",
+                    "/model/constants/INT64/[1]",
+                ],
+                outputs=[sliced],
+                name=f"{name}/last_token",
+            )
+        else:
+            self.make_shape(f"{name}/Shape", root_input, shape=[3])
+            self.make_gather(
+                f"{name}/Seq",
+                [f"{name}/Shape/output_0", "/model/constants/INT64/1"],
+                ir.DataType.INT64,
+                shape=[],
+            )
+            self.make_sub(
+                f"{name}/SeqStart",
+                [f"{name}/Seq/output_0", "/model/constants/INT64/1"],
+                ir.DataType.INT64,
+                shape=[],
+            )
+            self.make_unsqueeze(
+                f"{name}/SeqStart1",
+                [f"{name}/SeqStart/output_0", "/model/constants/INT64/[0]"],
+                ir.DataType.INT64,
+                shape=[1],
+            )
+            self.make_unsqueeze(
+                f"{name}/SeqEnd1",
+                [f"{name}/Seq/output_0", "/model/constants/INT64/[0]"],
+                ir.DataType.INT64,
+                shape=[1],
+            )
+            self.make_node(
+                "Slice",
+                inputs=[
+                    root_input,
+                    f"{name}/SeqStart1/output_0",
+                    f"{name}/SeqEnd1/output_0",
+                    "/model/constants/INT64/[1]",
+                ],
+                outputs=[sliced],
+                name=f"{name}/last_token",
+            )
+        self.make_value(sliced, self.io_dtype, shape=["batch_size", 1, hidden])
+        return sliced
+
     def _make_split_embedding(self, basename, embedding, sizes):
         """Sum masked gathers. The last Add keeps the unsplit Gather name."""
         running = None
@@ -1289,38 +1362,59 @@ class Model:
         return len(sizes) > 1
 
     def _make_split_vocab_matmul(self, matmul, name, root_input, **kwargs):
-        """Matmul each vocab slice and concatenate. einsum bid,jd->bij, then cat."""
+        """Equal vocab tiles, concatenated, then sliced back to the real vocab.
+
+        The weight is ``[vocab, hidden]``. Each MatMul B tensor is the
+        transpose, ``[hidden, rows]``. A short tail is zero-padded so every
+        tile has the same row count. The slice drops those columns.
+        """
         weight = matmul.weight
         vocab = int(weight.shape[0])
         hidden = int(weight.shape[1])
-        sizes = self._vocab_chunk_rows_for(vocab, hidden)
-        if sum(sizes) != vocab:
-            raise ValueError(f"Vocabulary chunks {sizes} do not cover {vocab} rows")
-        print(f"Splitting {name} into {len(sizes)} SRAM chunks of up to {sizes[0]} rows")
+        planned = self._vocab_chunk_rows_for(vocab, hidden)
+        sizes = _vocab_sram().uniform_lm_head_rows(vocab, int(planned[0]))
+        padded = int(sum(sizes))
+        if padded < vocab or any(int(rows) != int(sizes[0]) for rows in sizes):
+            raise ValueError(f"Vocabulary tiles {sizes} are not an equal cover of {vocab}")
+        print(
+            f"Splitting {name} into {len(sizes)} equal SRAM chunks of {sizes[0]} rows "
+            f"(padded vocab {padded}, trim {vocab})"
+        )
+        token = self._slice_lm_head_token(name, root_input, hidden)
+        table = self._pad_vocab_rows(weight, padded - vocab)
 
         parts = []
         start = 0
         base_weight = name[1:].replace("/", ".") + ".weight"
         for index, rows in enumerate(sizes):
-            chunk = self._row_slice(weight, start, rows).transpose(0, 1).contiguous()
+            chunk = self._row_slice(table, start, rows).transpose(0, 1).contiguous()
             weight_name = f"{base_weight}.split_{index}"
             self.make_initializer(chunk, weight_name, to=self.io_dtype)
             part_name = f"{name}/split_{index}"
             part_out = f"{part_name}/output_0"
             self.make_node(
-                "MatMul", inputs=[root_input, weight_name], outputs=[part_out], name=part_name
+                "MatMul", inputs=[token, weight_name], outputs=[part_out], name=part_name
             )
-            self.make_value(
-                part_out, self.io_dtype, shape=["batch_size", "sequence_length", rows]
-            )
+            self.make_value(part_out, self.io_dtype, shape=["batch_size", 1, rows])
             parts.append(part_out)
             start += rows
 
+        concat_out = f"{name}/concat/output_0"
+        self.make_node("Concat", inputs=parts, outputs=[concat_out], name=f"{name}/concat", axis=-1)
+        self.make_value(concat_out, self.io_dtype, shape=["batch_size", 1, padded])
         output = "logits" if kwargs.get("logits", False) else f"{name}/output_0"
-        self.make_node("Concat", inputs=parts, outputs=[output], name=name, axis=-1)
-        self.make_value(
-            output, self.io_dtype, shape=["batch_size", "sequence_length", vocab]
+        self.make_node(
+            "Slice",
+            inputs=[
+                concat_out,
+                "/model/constants/INT64/[0]",
+                f"/model/constants/INT64/[{vocab}]",
+                "/model/constants/INT64/[-1]",
+            ],
+            outputs=[output],
+            name=f"{name}/trim",
         )
+        self.make_value(output, self.io_dtype, shape=["batch_size", 1, vocab])
         return name
 
     def make_matmul_float(self, matmul, name, root_input, **kwargs):
@@ -1534,12 +1628,12 @@ class Model:
 
         return new_name
 
-    def make_add_bias(self, add, name, root_input, **kwargs):
+    def make_add_bias(self, add, name, root_input, sequence_dim="sequence_length", **kwargs):
         bias = name[1:].replace("/", ".") + ".bias"
         self.make_initializer(add, bias, to=self.io_dtype)
 
         add_bias_inputs = [root_input, bias]
-        shape = ['batch_size', 'sequence_length', add.shape[0]]
+        shape = ['batch_size', sequence_dim, add.shape[0]]
 
         if kwargs.get("logits", False):
             output = "logits"
@@ -3215,12 +3309,19 @@ class Model:
 
         matmul_basename = "/lm_head/MatMul"
         root_input = self.layernorm_attrs["output_0"]
+        seq_dim = 1 if self._should_split_vocab_projection(lm_head, matmul_basename) else "sequence_length"
         matmul_name = self.make_matmul(lm_head, matmul_basename, root_input, logits=not any(exists_checks))
         lm_name = matmul_name
 
         if bias_exists:
             add_name = "/lm_head/Add"
-            self.make_add_bias(lm_head.bias, add_name, root_input=f"{lm_name}/output_0", logits=not any(exists_checks[1:]))
+            self.make_add_bias(
+                lm_head.bias,
+                add_name,
+                root_input=f"{lm_name}/output_0",
+                sequence_dim=seq_dim,
+                logits=not any(exists_checks[1:]),
+            )
             lm_name = add_name
 
         if scale_exists:
@@ -3228,7 +3329,7 @@ class Model:
             mul_inputs = [f"{lm_name}/output_0", f"/model/constants/{self.to_str_dtype(self.io_dtype)}/{self.lm_head_attrs['scale']}"]
             mul_output = "logits" if not any(exists_checks[2:]) else f"{mul_name}/output_0"
             self.make_node('Mul', inputs=mul_inputs, outputs=[mul_output], name=mul_name)
-            self.make_value(mul_output, self.io_dtype, shape=['batch_size', 'sequence_length', self.vocab_size])
+            self.make_value(mul_output, self.io_dtype, shape=['batch_size', seq_dim, self.vocab_size])
             lm_name = mul_name
 
         if mask_exists:
@@ -3240,23 +3341,23 @@ class Model:
             where_inputs = [logits_mask_name, f"/model/constants/{self.to_str_dtype(self.io_dtype)}/{torch.finfo(to_torch_dtype(self.io_dtype)).min}", f"{lm_name}/output_0"]
             where_output = "logits" if not any(exists_checks[3:]) else f"{where_name}/output_0"
             self.make_node('Where', inputs=where_inputs, outputs=[where_output], name=where_name)
-            self.make_value(where_output, self.io_dtype, shape=['batch_size', 'sequence_length', self.vocab_size])
+            self.make_value(where_output, self.io_dtype, shape=['batch_size', seq_dim, self.vocab_size])
             lm_name = where_name
 
         if softcap_exists:
             # Add final logit softcapping (Div --> Tanh --> Mul)
             div_name = "/lm_head/softcap/Div"
             div_inputs = [f"{lm_name}/output_0", f"/model/constants/{self.to_str_dtype(self.io_dtype)}/{self.lm_head_attrs['softcap']}"]
-            self.make_div(div_name, div_inputs, dtype=self.io_dtype, shape=['batch_size', 'sequence_length', self.vocab_size])
+            self.make_div(div_name, div_inputs, dtype=self.io_dtype, shape=['batch_size', seq_dim, self.vocab_size])
 
             tanh_name = "/lm_head/softcap/Tanh"
-            self.make_tanh(tanh_name, f"{div_name}/output_0", dtype=self.io_dtype, shape=['batch_size', 'sequence_length', self.vocab_size])
+            self.make_tanh(tanh_name, f"{div_name}/output_0", dtype=self.io_dtype, shape=['batch_size', seq_dim, self.vocab_size])
 
             mul_name = "/lm_head/softcap/Mul"
             mul_inputs = [f"{tanh_name}/output_0", f"/model/constants/{self.to_str_dtype(self.io_dtype)}/{self.lm_head_attrs['softcap']}"]
             mul_output = "logits" if not any(exists_checks[4:]) else f"{mul_name}/output_0"
             self.make_node('Mul', inputs=mul_inputs, outputs=[mul_output], name=mul_name)
-            self.make_value(mul_output, self.io_dtype, shape=['batch_size', 'sequence_length', self.vocab_size])
+            self.make_value(mul_output, self.io_dtype, shape=['batch_size', seq_dim, self.vocab_size])
             lm_name = mul_name
 
         if cast_exists:
@@ -3264,7 +3365,7 @@ class Model:
             cast_name = "/lm_head/Cast"
             cast_output = "logits"
             self.make_node('Cast', inputs=[f"{lm_name}/output_0"], outputs=[cast_output], name=cast_name, to=self.output_types['logits'])
-            self.make_value(cast_output, self.output_types['logits'], shape=['batch_size', 'sequence_length', self.vocab_size])
+            self.make_value(cast_output, self.output_types['logits'], shape=['batch_size', seq_dim, self.vocab_size])
 
         # End tracking lm_head component
         if self.enable_chunking:
@@ -6661,6 +6762,7 @@ def get_args():
                 static_query_len = Static query bucket. Default is static_max_seq_len. One is the decode bucket.
                 split_vocab = Split the float embedding table and the float LM head into SRAM chunks. Default is true.
                     A table that fits in half of tile_sram_mb stays one Gather or one MatMul.
+                    The LM head pads its last tile so every MatMul has the same row count, then slices the logits back to the vocabulary. Embeddings keep the short tail.
                 tile_sram_mb = Tile SRAM in megabytes used to size those chunks. Default is 16.
                 vocab_sram_headroom = Fraction of the tile reserved for the chunk. Default is 0.5.
                 vocab_split_rows = Force the chunk width, including 14000. A value below 1 disables the split.

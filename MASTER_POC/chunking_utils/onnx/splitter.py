@@ -63,6 +63,10 @@ def save_components(
     strategy,
     size_threshold,
     chunk_size,
+    split_lm_head: bool = False,
+    npu_bf16_fallback: bool = False,
+    external_data_dir: Optional[str] = None,
+    lm_head_chunk_rows: Optional[int] = None,
 ):
     """
     Create component graphs, validate them, store weights, and save files.
@@ -92,6 +96,22 @@ def save_components(
             filename = f"{comp_name}.onnx"
         filepath = os.path.join(output_dir, filename)
         component_model = create_component_onnx(model, comp_info, comp_name)
+        if split_lm_head and comp_info.component_type == "lm_head":
+            from .lm_head_uniform import rewrite_uniform_lm_head
+
+            # Bake only this component when the flag is set. The master model
+            # is not baked here. An already-baked MatMul is chunked as [K, N].
+            lm_report = rewrite_uniform_lm_head(
+                component_model,
+                chunk_rows=lm_head_chunk_rows,
+                npu_bf16_fallback=bool(npu_bf16_fallback),
+                external_data_dir=external_data_dir,
+            )
+            print(
+                f"  LM head uniform split: {lm_report['chunks']} x {lm_report['chunk_rows']} "
+                f"mode={lm_report['mode']} padded={lm_report['padded_vocab']} "
+                f"vocab={lm_report['vocab']}"
+            )
         comp_info.input_names = [item.name for item in component_model.graph.input]
         comp_info.output_names = [item.name for item in component_model.graph.output]
         prepared.append((comp_name, comp_info, filename, filepath, component_model))
@@ -191,6 +211,8 @@ def split_onnx(
     static_max_seq_len: Optional[int] = None,
     static_query_len: Optional[int] = None,
     npu_bf16_fallback: bool = False,
+    split_lm_head: bool = False,
+    lm_head_chunk_rows: Optional[int] = None,
     **kwargs
 ) -> OnnxSplitResult:
     """
@@ -220,6 +242,14 @@ def split_onnx(
             Set it on one component graph. The unsplit multi-GB model is
             not baked here. Ryzen AI 1.8.0 aborts in superkernel_GemmBf16Int4
             (https://github.com/amd/RyzenAI-SW/issues/407).
+        split_lm_head: Pad the LM-head vocabulary into equal tiles and slice
+            the pad off. Default False. Only the lm_head component is
+            rewritten. When this flag and npu_bf16_fallback are both set,
+            that component is baked before it is tiled. Static shapes still
+            pass npu_bf16_fallback through to the master graph, so leave
+            the master flag off for the unsplit model.
+        lm_head_chunk_rows: Tile width for split_lm_head. The default is the
+            first SRAM tile from the vocabulary planner.
         **kwargs: Additional arguments passed to SplitConfig.
 
     Returns:
@@ -317,6 +347,7 @@ def split_onnx(
     output_dir = os.path.join(config.output, model_folder_name)
     os.makedirs(output_dir, exist_ok=True)
 
+    model_dir = model_path if os.path.isdir(model_path) else os.path.dirname(model_path)
     component_files, weight_storage, num_layers = save_components(
         onnx_model,
         components,
@@ -325,6 +356,10 @@ def split_onnx(
         strategy=strategy,
         size_threshold=weight_size_threshold,
         chunk_size=weight_chunk_size,
+        split_lm_head=bool(split_lm_head),
+        npu_bf16_fallback=bool(npu_bf16_fallback),
+        external_data_dir=model_dir,
+        lm_head_chunk_rows=lm_head_chunk_rows,
     )
 
     model_info = {

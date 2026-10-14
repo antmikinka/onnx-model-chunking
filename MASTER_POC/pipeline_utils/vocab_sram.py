@@ -12,8 +12,19 @@ count here comes from the byte budget. ``split_rows`` forces a width,
 including 14000, when the tile size is known to be larger.
 
 Embedding chunks are exclusive, so the graph adds masked gathers.
-LM head chunks partition the vocabulary, so the graph concatenates
-matmuls. Neither graph selects a chunk with an If.
+Those gathers keep the short tail from ``vocab_chunk_rows``.
+
+LM-head MatMuls use ``uniform_lm_head_rows``. A short tail is padded
+with zeros to the same row count as the other tiles, the MatMuls are
+concatenated, and a slice drops the padded columns. Neither graph
+selects a chunk with an If.
+
+A 149-tile chain of byte-identical one-hot weights plus a 640-zero
+tail raised VAIML-BE-TPGEN 9032. The same shapes with a different
+constant on each tile, including that zero tail, returned a finite
+tensor: VAIML 153, NPU 1, ELF 5328344 bytes, no 9032. That probe was
+one nonzero row per tile, not a dense vocabulary table. The kept
+columns matched the unpadded matmul at gap 0.0 on CPU.
 """
 
 from typing import List, Optional, Sequence
@@ -100,3 +111,48 @@ def apply_split_lm_head(weight, hidden_states, sizes: Sequence[int]):
         parts.append(states @ np.swapaxes(chunk, -1, -2))
         start += rows
     return np.concatenate(parts, axis=-1)
+
+
+def uniform_lm_head_rows(vocab_size: int, chunk_rows: int) -> List[int]:
+    """Equal LM-head tiles. The short tail is padded, then sliced off.
+
+    ``vocab_chunk_rows`` still returns the short tail for embeddings.
+    A chunk below 1, or a chunk that already covers the table, returns
+    one entry of ``vocab_size``.
+    """
+    vocab = int(vocab_size)
+    chunk = int(chunk_rows)
+    if vocab < 1:
+        raise ValueError(f"vocab_size must be positive, got {vocab_size}")
+    if chunk < 1 or chunk >= vocab:
+        return [vocab]
+    count = (vocab + chunk - 1) // chunk
+    return [chunk] * count
+
+
+def apply_uniform_lm_head(weight, hidden_states, chunk_rows: int, *, last_token: bool = False):
+    """Pad vocabulary rows, matmul equal slices, and drop the padded columns.
+
+    ``weight`` is ``[vocab, hidden]``. ``last_token`` keeps the last
+    sequence position before the matmul. The weight layout stored in
+    ONNX is the transpose of each slice, ``[hidden, rows]``.
+    """
+    import numpy as np
+
+    table = np.asarray(weight)
+    states = np.asarray(hidden_states)
+    if last_token:
+        if states.ndim < 2:
+            raise ValueError("last_token needs a sequence axis")
+        states = states[..., -1:, :]
+    vocab = int(table.shape[0])
+    sizes = uniform_lm_head_rows(vocab, int(chunk_rows))
+    padded = int(sum(sizes))
+    if padded == vocab and len(sizes) == 1:
+        return states @ np.swapaxes(table, -1, -2)
+    pad_rows = padded - vocab
+    if pad_rows:
+        pad = [(0, pad_rows)] + [(0, 0)] * (table.ndim - 1)
+        table = np.pad(table, pad, mode="constant")
+    full = apply_split_lm_head(table, states, sizes)
+    return full[..., :vocab]

@@ -264,6 +264,222 @@ def test_onnx_lm_head_matches_numpy():
     assert logits.output == ["logits"]
 
 
+def _dense_model(weight, shape):
+    k, n = weight.shape
+    node = helper.make_node("MatMul", ["hidden", "lm_head.weight"], ["logits"], name="/lm_head/MatMul")
+    graph = helper.make_graph(
+        [node],
+        "lm",
+        [helper.make_tensor_value_info("hidden", TensorProto.FLOAT, shape)],
+        [helper.make_tensor_value_info("logits", TensorProto.FLOAT, list(shape[:-1]) + [int(n)])],
+        [numpy_helper.from_array(np.ascontiguousarray(weight), "lm_head.weight")],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)])
+    model.ir_version = 10
+    return model
+
+
+def _nbits_model(k, n, weight, scales, zp=None, g_idx=False, shape=None):
+    if shape is None:
+        shape = [2, 3, int(k)]
+    inputs = ["hidden", "weight", "scales"]
+    initializers = [
+        numpy_helper.from_array(np.ascontiguousarray(weight), "weight"),
+        numpy_helper.from_array(np.ascontiguousarray(scales), "scales"),
+    ]
+    if zp is not None or g_idx:
+        inputs.append("zp" if zp is not None else "")
+    if g_idx:
+        inputs.append("g_idx")
+        initializers.append(numpy_helper.from_array(np.zeros((int(k),), dtype=np.int32), "g_idx"))
+    if zp is not None:
+        initializers.append(numpy_helper.from_array(np.ascontiguousarray(zp), "zp"))
+    node = helper.make_node(
+        "MatMulNBits",
+        inputs,
+        ["logits"],
+        name="/lm_head/MatMul_Q4",
+        domain="com.microsoft",
+        K=int(k),
+        N=int(n),
+        bits=4,
+        block_size=32,
+    )
+    graph = helper.make_graph(
+        [node],
+        "lm",
+        [helper.make_tensor_value_info("hidden", TensorProto.FLOAT, shape)],
+        [helper.make_tensor_value_info("logits", TensorProto.FLOAT, list(shape[:-1]) + [int(n)])],
+        initializers,
+    )
+    model = helper.make_model(
+        graph,
+        opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("com.microsoft", 1)],
+    )
+    model.ir_version = 10
+    return model
+
+
+def test_uniform_rows_pad_qwen_and_keep_the_embedding_tail():
+    short = PLANNER.vocab_chunk_rows(151936, 4096, 2)
+    assert short[-1] == 384, short[-1]
+    assert sum(short) == 151936
+    sizes = PLANNER.uniform_lm_head_rows(151936, short[0])
+    assert sizes == [1024] * 149, (len(sizes), sizes[0], sizes[-1])
+    assert sum(sizes) == 152576
+    assert PLANNER.uniform_lm_head_rows(10, 4) == [4, 4, 4]
+    assert PLANNER.uniform_lm_head_rows(8, 4) == [4, 4]
+    assert PLANNER.uniform_lm_head_rows(10, 10) == [10]
+    assert PLANNER.uniform_lm_head_rows(10, 0) == [10]
+
+
+def test_uniform_numpy_matches_unpadded_matmul():
+    rng = np.random.default_rng(3)
+    weight = rng.standard_normal((10, 4)).astype(np.float32)
+    hidden = rng.standard_normal((2, 3, 4)).astype(np.float32)
+    got = PLANNER.apply_uniform_lm_head(weight, hidden, 4)
+    reference = hidden @ weight.T
+    gap = float(np.max(np.abs(got - reference)))
+    assert got.shape == reference.shape
+    assert gap == 0.0, gap
+    last = PLANNER.apply_uniform_lm_head(weight, hidden, 4, last_token=True)
+    last_ref = hidden[:, -1:, :] @ weight.T
+    last_gap = float(np.max(np.abs(last - last_ref)))
+    assert last.shape == (2, 1, 10)
+    assert last_gap == 0.0, last_gap
+
+
+def test_onnx_uniform_float_matches_unpadded():
+    from chunking_utils.onnx.lm_head_uniform import rewrite_uniform_lm_head
+
+    rng = np.random.default_rng(4)
+    weight = rng.standard_normal((4, 10)).astype(np.float32)
+    hidden = rng.standard_normal((2, 3, 4)).astype(np.float32)
+    model = _dense_model(weight, [2, 3, 4])
+    report = rewrite_uniform_lm_head(model, chunk_rows=4, npu_bf16_fallback=False, last_token=False)
+    assert report["mode"] == "dense"
+    assert report["chunks"] == 3
+    assert report["padded_vocab"] == 12
+    assert report["last_token"] is False
+    matmuls = [node for node in model.graph.node if node.op_type == "MatMul"]
+    assert len(matmuls) == 3
+    stored = {item.name: item for item in model.graph.initializer}
+    for node in matmuls:
+        dims = list(stored[node.input[1]].dims)
+        assert dims == [4, 4], dims
+    reference = hidden @ weight
+    (got,) = _run(model, {"hidden": hidden})
+    gap = float(np.max(np.abs(got - reference)))
+    assert got.shape == (2, 3, 10)
+    assert gap == 0.0, gap
+
+    symbolic = _dense_model(weight, ["batch", "seq", 4])
+    rewrite_uniform_lm_head(symbolic, chunk_rows=4, last_token=True)
+    dims = symbolic.graph.output[0].type.tensor_type.shape.dim
+    assert dims[1].dim_value == 1
+    assert dims[2].dim_value == 10
+    (last,) = _run(symbolic, {"hidden": hidden})
+    last_gap = float(np.max(np.abs(last - reference[:, -1:, :])))
+    assert last.shape == (2, 1, 10)
+    assert last_gap == 0.0, last_gap
+    assert any(node.op_type == "Slice" for node in symbolic.graph.node)
+
+
+def test_onnx_packed_uniform_matches_unpadded():
+    from chunking_utils.onnx.lm_head_uniform import rewrite_uniform_lm_head
+
+    rng = np.random.default_rng(5)
+    k, n = 32, 10
+    weight = rng.integers(0, 256, size=(n, 1, 16), dtype=np.uint8)
+    scales = (rng.normal(size=(n, 1)) * 0.05).astype(np.float32)
+    zp = rng.integers(0, 16, size=(n, 1), dtype=np.uint8)
+    hidden = rng.standard_normal((2, 3, k)).astype(np.float32)
+    original = _nbits_model(k, n, weight, scales)
+    reference = _run(original, {"hidden": hidden})[0]
+    packed = _nbits_model(k, n, weight, scales)
+    report = rewrite_uniform_lm_head(packed, chunk_rows=4, npu_bf16_fallback=False, last_token=False)
+    assert report == {
+        "mode": "matmul_nbits",
+        "chunks": 3,
+        "chunk_rows": 4,
+        "vocab": 10,
+        "padded_vocab": 12,
+        "last_token": False,
+    }
+    pieces = [node for node in packed.graph.node if node.op_type == "MatMulNBits"]
+    assert len(pieces) == 3
+    assert all(len(node.input) == 3 for node in pieces)
+    assert all(any(attr.name == "N" and attr.i == 4 for attr in node.attribute) for node in pieces)
+    (got,) = _run(packed, {"hidden": hidden})
+    gap = float(np.max(np.abs(got.astype(np.float64) - reference.astype(np.float64))))
+    assert got.shape == reference.shape
+    assert gap <= 1e-7, gap
+
+    zipped = _nbits_model(k, n, weight, scales, zp=zp)
+    zref = _run(_nbits_model(k, n, weight, scales, zp=zp), {"hidden": hidden})[0]
+    rewrite_uniform_lm_head(zipped, chunk_rows=4, npu_bf16_fallback=False, last_token=True)
+    pieces = [node for node in zipped.graph.node if node.op_type == "MatMulNBits"]
+    assert len(pieces) == 3
+    assert all(len(node.input) == 4 for node in pieces)
+    (last,) = _run(zipped, {"hidden": hidden})
+    zgap = float(np.max(np.abs(last.astype(np.float64) - zref[:, -1:, :].astype(np.float64))))
+    assert last.shape == (2, 1, 10)
+    assert zgap <= 1e-7, zgap
+
+
+def test_fallback_bakes_then_chunks_equal_bf16_tiles():
+    from chunking_utils.onnx.lm_head_uniform import rewrite_uniform_lm_head
+    from chunking_utils.onnx.static_shapes import _dequant_matmul_nbits, _f32_to_bf16_raw
+
+    rng = np.random.default_rng(6)
+    k, n = 32, 10
+    weight = rng.integers(0, 256, size=(n, 1, 16), dtype=np.uint8)
+    scales = (rng.normal(size=(n, 1)) * 0.05).astype(np.float32)
+    hidden = rng.standard_normal((2, 3, k)).astype(np.float32)
+    model = _nbits_model(k, n, weight, scales)
+    report = rewrite_uniform_lm_head(model, chunk_rows=4, npu_bf16_fallback=True, last_token=False)
+    assert report["mode"] == "bf16_fallback"
+    assert report["chunks"] == 3
+    assert not any(node.op_type == "MatMulNBits" for node in model.graph.node)
+    assert not any(node.op_type == "DequantizeLinear" for node in model.graph.node)
+    matmuls = [node for node in model.graph.node if node.op_type == "MatMul"]
+    assert len(matmuls) == 3
+    stored = {item.name: item for item in model.graph.initializer}
+    tiles = []
+    for node in matmuls:
+        item = stored[node.input[1]]
+        assert int(item.data_type) == int(TensorProto.BFLOAT16)
+        assert list(item.dims) == [k, 4]
+        assert len(node.input) == 2
+        tiles.append(np.frombuffer(item.raw_data, dtype=np.uint16).reshape(k, 4).copy())
+    kept = np.concatenate(tiles, axis=1)[:, :n]
+    exact = _dequant_matmul_nbits(weight, scales, None, k, n, 32, "lm")
+    rounded_u16 = np.frombuffer(_f32_to_bf16_raw(exact), dtype=np.uint16).copy().reshape(exact.shape)
+    assert np.array_equal(kept, rounded_u16)
+    decoded = (kept.astype(np.uint32) << np.uint32(16)).view(np.float32)
+    rounded = (rounded_u16.astype(np.uint32) << np.uint32(16)).view(np.float32)
+    got = hidden @ decoded
+    reference = hidden @ rounded
+    gap = float(np.max(np.abs(got - reference)))
+    assert gap == 0.0, gap
+    blocked = _nbits_model(k, n, weight, scales, g_idx=True)
+    try:
+        rewrite_uniform_lm_head(blocked, chunk_rows=4, npu_bf16_fallback=True)
+    except Exception as exc:
+        assert "g_idx" in str(exc)
+        return
+    raise AssertionError("g_idx was baked")
+
+
+def test_split_lm_head_stays_off():
+    import inspect
+
+    from chunking_utils.onnx.splitter import split_onnx
+
+    assert inspect.signature(split_onnx).parameters["split_lm_head"].default is False
+    assert inspect.signature(split_onnx).parameters["npu_bf16_fallback"].default is False
+
+
 def test_builder_wires_the_split():
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "builder.py")
     source = open(path, encoding="utf-8").read()
@@ -293,6 +509,9 @@ def test_builder_wires_the_split():
     head_src = ast.get_source_segment(source, head)
     assert 'kwargs.get("logits", False)' in head_src
     assert 'axis=-1' in head_src
+    assert "uniform_lm_head_rows" in head_src
+    assert "Slice" in head_src
+    assert 'shape=["batch_size", 1, vocab]' in head_src
     assert "qweight" in ast.get_source_segment(
         source,
         next(node for node in model.body if isinstance(node, ast.FunctionDef) and node.name == "_should_split_vocab_projection"),
@@ -306,8 +525,14 @@ def main():
         ("split_rows_override", test_split_rows_override),
         ("numpy_embedding", test_numpy_embedding_matches_lookup),
         ("numpy_lm_head", test_numpy_lm_head_matches_matmul),
+        ("uniform_rows", test_uniform_rows_pad_qwen_and_keep_the_embedding_tail),
+        ("uniform_numpy", test_uniform_numpy_matches_unpadded_matmul),
         ("onnx_embedding", test_onnx_embedding_matches_numpy),
         ("onnx_lm_head", test_onnx_lm_head_matches_numpy),
+        ("onnx_uniform_float", test_onnx_uniform_float_matches_unpadded),
+        ("onnx_packed_uniform", test_onnx_packed_uniform_matches_unpadded),
+        ("fallback_uniform", test_fallback_bakes_then_chunks_equal_bf16_tiles),
+        ("split_lm_head_off", test_split_lm_head_stays_off),
         ("builder_wires_split", test_builder_wires_the_split),
     ]
     return all(_check(name, fn) for name, fn in checks)
