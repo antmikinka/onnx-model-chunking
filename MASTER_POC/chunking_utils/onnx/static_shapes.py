@@ -10,11 +10,15 @@ graph that is still dynamic.
 A Qwen layer that still contains ``GroupQueryAttention`` is not the
 decomposed MatMul graph measured on the NPU. ``apply_static_contract``
 freezes that layer's symbolic axes, including ``kv_cache_dim`` when a
-q_norm or k_norm weight declares the head size. It replaces the runtime
-seqlens and total-sequence inputs with constants of the window and adds
-an ``attention_bias`` input for the -10000 tail. That rewrite was checked
-on the local Qwen3-8B ``layer_0_of_36.onnx``. No Vitis compile of that
-layer was run.
+q_norm or k_norm weight declares the head size. Fused attention appends
+the query onto the past, so ``total_sequence_length`` is
+``max_seq_len + query_len`` and a constant Slice on axis 2 returns the
+graph boundary to ``max_seq_len``. ``seqlens`` stays the past window.
+``attention_bias`` has length ``total_sequence_length``.
+``SkipSimplifiedLayerNormalization`` and ``SimplifiedLayerNormalization``
+become Add (for the skip) plus the primitive RMSNorm chain. A default
+Vitis compile of the earlier window, with total frozen at ``max_seq_len``,
+reported CPU 18.
 """
 
 from typing import Dict, List, Optional, Sequence
@@ -369,6 +373,79 @@ def _drop_unused_inputs(graph, detached: Sequence[str]) -> None:
     graph.input.extend(kept)
 
 
+def _int_attr(node, name: str, default: int = 0) -> int:
+    for attr in node.attribute:
+        if attr.name == name:
+            return int(attr.i)
+    return int(default)
+
+
+def _float_attr(node, name: str, default: float) -> float:
+    for attr in node.attribute:
+        if attr.name == name:
+            return float(attr.f)
+    return float(default)
+
+
+def _elem_type(graph, name: str, default: int) -> int:
+    from onnx import TensorProto
+
+    for value in list(graph.input) + list(graph.value_info) + list(graph.output):
+        if value.name == name and value.type.HasField("tensor_type"):
+            kind = value.type.tensor_type.elem_type
+            if kind:
+                return int(kind)
+    for item in graph.initializer:
+        if item.name == name and item.data_type:
+            return int(item.data_type)
+    return int(default if default else TensorProto.FLOAT)
+
+
+def _numpy_dtype(elem_type: int):
+    from onnx import TensorProto
+
+    mapping = {
+        TensorProto.FLOAT: np.float32,
+        TensorProto.FLOAT16: np.float16,
+        TensorProto.DOUBLE: np.float64,
+    }
+    if elem_type not in mapping:
+        raise StaticShapeError(f"RMSNorm rewrite does not support elem_type {elem_type}")
+    return mapping[elem_type]
+
+
+def _put_initializer(graph, name: str, array) -> None:
+    from onnx import numpy_helper
+
+    kept = [item for item in graph.initializer if item.name != name]
+    del graph.initializer[:]
+    graph.initializer.extend(kept)
+    graph.initializer.append(numpy_helper.from_array(np.asarray(array), name))
+
+
+def _value_by_name(graph, name: str):
+    for value in list(graph.output) + list(graph.input) + list(graph.value_info):
+        if value.name == name:
+            return value
+    return None
+
+
+def _set_value_info(graph, name: str, elem_type: int, dims: Sequence[int]) -> None:
+    from onnx import helper
+
+    info = helper.make_tensor_value_info(name, elem_type, [int(dim) for dim in dims])
+    for value in graph.value_info:
+        if value.name == name:
+            value.CopyFrom(info)
+            return
+    graph.value_info.append(info)
+
+
+def _i64_initializer(graph, name: str, values: Sequence[int]) -> str:
+    _put_initializer(graph, name, np.asarray(list(values), dtype=np.int64))
+    return name
+
+
 def rewrite_gqa_to_static_window(
     model,
     *,
@@ -379,65 +456,346 @@ def rewrite_gqa_to_static_window(
     """
     Point GroupQueryAttention at the static window.
 
-    ``seqlens_k`` and ``total_sequence_length`` become constants of
-    ``max_seq_len``. An empty ``attention_bias`` slot becomes a graph input
-    of shape ``[1, 1, query_len, max_seq_len]``. The host fills that tensor
-    with ``static_attention_bias``. The fused op is left in the graph.
+    ``seqlens_k`` is the past window. ``total_sequence_length`` is that
+    window plus ``query_len``, which is the present length the fused op
+    writes. A constant Slice on axis 2 then keeps the newest
+    ``max_seq_len`` tokens at the graph boundary. ``attention_bias`` has
+    length ``total_sequence_length``.
     """
-    from onnx import TensorProto, helper, numpy_helper
+    from onnx import TensorProto, helper
 
+    if query_len < 1:
+        raise StaticShapeError(f"query_len must be positive, got {query_len}")
     graph = model.graph
     constants = _constant_names(graph)
     rewritten = []
     detached = []
     bias_name = "attention_bias"
+    bias_len = None
+    rebuilt = []
     for node in graph.node:
+        rebuilt.append(node)
         if node.op_type != "GroupQueryAttention":
             continue
         while len(node.input) <= 10:
             node.input.append("")
-        seqlens_name = f"{node.name}/static_seqlens_k"
-        total_name = f"{node.name}/static_total_seq_len"
+        shared = _int_attr(node, "past_present_share_buffer", 0) == 1
+        total_len = int(max_seq_len) if shared else int(max_seq_len) + int(query_len)
+        if bias_len is None:
+            bias_len = total_len
+        elif bias_len != total_len:
+            raise StaticShapeError("GroupQueryAttention nodes disagree on the static window")
+        label = node.name or node.output[0] or "GroupQueryAttention"
+        seqlens_name = f"{label}/static_seqlens_k"
+        total_name = f"{label}/static_total_seq_len"
         if node.input[5] not in constants:
-            graph.initializer.append(
-                numpy_helper.from_array(
-                    np.full((int(batch_size),), int(max_seq_len), dtype=np.int32),
-                    seqlens_name,
-                )
+            _put_initializer(
+                graph,
+                seqlens_name,
+                np.full((int(batch_size),), int(max_seq_len), dtype=np.int32),
             )
             if node.input[5]:
                 detached.append(node.input[5])
             node.input[5] = seqlens_name
             constants.add(seqlens_name)
         if node.input[6] not in constants:
-            graph.initializer.append(
-                numpy_helper.from_array(
-                    np.asarray(int(max_seq_len), dtype=np.int32),
-                    total_name,
-                )
-            )
+            _put_initializer(graph, total_name, np.asarray(int(total_len), dtype=np.int32))
             if node.input[6]:
                 detached.append(node.input[6])
             node.input[6] = total_name
             constants.add(total_name)
         if not node.input[10]:
             node.input[10] = bias_name
-        rewritten.append(node.name or node.output[0])
-    needs_bias = any(
-        node.op_type == "GroupQueryAttention" and len(node.input) > 10 and node.input[10] == bias_name
-        for node in graph.node
-    )
-    already = any(value.name == bias_name for value in graph.input) or bias_name in constants
-    if needs_bias and not already:
-        graph.input.append(
-            helper.make_tensor_value_info(
-                bias_name,
-                TensorProto.FLOAT,
-                [1, 1, int(query_len), int(max_seq_len)],
+        if not shared and len(node.output) >= 3 and node.output[1] and node.output[2]:
+            rebuilt.extend(
+                _trim_present_outputs(
+                    graph,
+                    node,
+                    label=label,
+                    query_len=int(query_len),
+                    total_len=int(total_len),
+                    max_seq_len=int(max_seq_len),
+                )
             )
-        )
+        rewritten.append(label)
+    del graph.node[:]
+    graph.node.extend(rebuilt)
+    if bias_len is not None:
+        _ensure_attention_bias(graph, bias_name, int(query_len), int(bias_len), constants)
     _drop_unused_inputs(graph, detached)
     return rewritten
+
+
+def _ensure_attention_bias(graph, bias_name: str, query_len: int, bias_len: int, constants: set) -> None:
+    from onnx import TensorProto, helper
+
+    shape = [1, 1, int(query_len), int(bias_len)]
+    for value in graph.input:
+        if value.name != bias_name:
+            continue
+        dims = value.type.tensor_type.shape.dim
+        if len(dims) == 4:
+            dims[2].dim_value = int(query_len)
+            dims[3].dim_value = int(bias_len)
+            return
+        value.CopyFrom(helper.make_tensor_value_info(bias_name, TensorProto.FLOAT, shape))
+        return
+    if bias_name in constants:
+        return
+    if not any(
+        node.op_type == "GroupQueryAttention" and len(node.input) > 10 and node.input[10] == bias_name
+        for node in graph.node
+    ):
+        return
+    graph.input.append(helper.make_tensor_value_info(bias_name, TensorProto.FLOAT, shape))
+
+
+def _trim_present_outputs(graph, node, *, label: str, query_len: int, total_len: int, max_seq_len: int):
+    """Slice present key and value from total_len back to max_seq_len on axis 2."""
+    from onnx import helper
+
+    starts = _i64_initializer(graph, f"{label}/present_slice_starts", [int(query_len)])
+    ends = _i64_initializer(graph, f"{label}/present_slice_ends", [int(total_len)])
+    axes = _i64_initializer(graph, f"{label}/present_slice_axes", [2])
+    steps = _i64_initializer(graph, f"{label}/present_slice_steps", [1])
+    slices = []
+    for slot, suffix in ((1, "key"), (2, "value")):
+        boundary_name = node.output[slot]
+        boundary = _value_by_name(graph, boundary_name)
+        if boundary is None or not boundary.type.HasField("tensor_type"):
+            raise StaticShapeError(f"{label} present output {boundary_name} has no static shape")
+        dims = [int(dim.dim_value) for dim in boundary.type.tensor_type.shape.dim]
+        if len(dims) != 4 or dims[2] != int(max_seq_len):
+            raise StaticShapeError(
+                f"{label} present {boundary_name} shape {dims} is not a rank-4 window of {max_seq_len}"
+            )
+        full_dims = list(dims)
+        full_dims[2] = int(total_len)
+        full_name = f"{label}/present_{suffix}_untrimmed"
+        elem = boundary.type.tensor_type.elem_type
+        _set_value_info(graph, full_name, elem, full_dims)
+        node.output[slot] = full_name
+        slices.append(
+            helper.make_node(
+                "Slice",
+                [full_name, starts, ends, axes, steps],
+                [boundary_name],
+                name=f"{label}/Slice_present_{suffix}",
+            )
+        )
+    return slices
+
+
+def _model_opset(model, domain: str = "") -> int:
+    for item in model.opset_import:
+        if item.domain == domain:
+            return int(item.version)
+    return 0
+
+
+def _reduce_mean(opset: int, *, mean_input: str, mean_output: str, axes_name: str, axis: int, name: str):
+    """ReduceMean uses an axes input from opset 18 onward."""
+    from onnx import helper
+
+    if int(opset) >= 18:
+        return helper.make_node(
+            "ReduceMean",
+            [mean_input, axes_name],
+            [mean_output],
+            name=name,
+            keepdims=1,
+        )
+    return helper.make_node(
+        "ReduceMean",
+        [mean_input],
+        [mean_output],
+        name=name,
+        axes=[int(axis)],
+        keepdims=1,
+    )
+
+
+def _rms_nodes(
+    graph,
+    *,
+    label: str,
+    source: str,
+    weight: str,
+    output: str,
+    epsilon: float,
+    axis: int,
+    elem_type: int,
+    opset: int,
+    mean_name: str = "",
+    inv_name: str = "",
+):
+    """Primitive RMSNorm: x * rsqrt(mean(x^2) + eps) * weight.
+
+    VAIML re-fused both this Pow chain and a Mul(x, x) square into
+    SinglePassRMSNorm, then failed L1 placement on the 4096-wide norms.
+    """
+    from onnx import helper
+
+    dtype = _numpy_dtype(elem_type)
+    two = f"{label}/rms_two"
+    one = f"{label}/rms_one"
+    eps = f"{label}/rms_epsilon"
+    axes = f"{label}/rms_axes"
+    _put_initializer(graph, two, np.asarray(2, dtype=dtype))
+    _put_initializer(graph, one, np.asarray(1, dtype=dtype))
+    _put_initializer(graph, eps, np.asarray(epsilon, dtype=dtype))
+    if int(opset) >= 18:
+        _put_initializer(graph, axes, np.asarray([int(axis)], dtype=np.int64))
+    squared = f"{label}/rms_squared"
+    mean = mean_name or f"{label}/rms_mean"
+    shifted = f"{label}/rms_shifted"
+    std = f"{label}/rms_std"
+    inv = inv_name or f"{label}/rms_inv"
+    scaled = f"{label}/rms_scaled"
+    nodes = [
+        helper.make_node("Pow", [source, two], [squared], name=f"{label}/Pow"),
+        _reduce_mean(
+            opset,
+            mean_input=squared,
+            mean_output=mean,
+            axes_name=axes,
+            axis=int(axis),
+            name=f"{label}/ReduceMean",
+        ),
+        helper.make_node("Add", [mean, eps], [shifted], name=f"{label}/Add_epsilon"),
+        helper.make_node("Sqrt", [shifted], [std], name=f"{label}/Sqrt"),
+        helper.make_node("Div", [one, std], [inv], name=f"{label}/Div"),
+        helper.make_node("Mul", [source, inv], [scaled], name=f"{label}/Mul_inv"),
+    ]
+    if weight:
+        nodes.append(helper.make_node("Mul", [scaled, weight], [output], name=f"{label}/Mul_weight"))
+    else:
+        nodes[-1].output[0] = output
+    return nodes
+
+
+def _input_at(node, index: int) -> str:
+    if len(node.input) <= index:
+        return ""
+    return node.input[index]
+
+
+def _output_at(node, index: int) -> str:
+    if len(node.output) <= index:
+        return ""
+    return node.output[index]
+
+
+def rewrite_fused_norms(model) -> List[str]:
+    """
+    Replace fused RMSNorm ops with primitive ONNX nodes.
+
+    ``SkipSimplifiedLayerNormalization`` output 0 is the normalized sum and
+    output 3 is that sum before normalization. ``SimplifiedLayerNormalization``
+    is the same chain without the residual add. Qwen's input norm is hidden
+    4096, the same width as the skip norm that failed SinglePassRMSNorm tiling.
+    """
+    opset = _model_opset(model, "")
+    graph = model.graph
+    rewritten = []
+    rebuilt = []
+    for node in list(graph.node):
+        if node.op_type == "SkipSimplifiedLayerNormalization":
+            rebuilt.extend(_decompose_skip_norm(graph, node, opset))
+            rewritten.append(node.name or _output_at(node, 0) or "SkipSimplifiedLayerNormalization")
+            continue
+        if node.op_type == "SimplifiedLayerNormalization":
+            rebuilt.extend(_decompose_simple_norm(graph, node, opset))
+            rewritten.append(node.name or _output_at(node, 0) or "SimplifiedLayerNormalization")
+            continue
+        rebuilt.append(node)
+    del graph.node[:]
+    graph.node.extend(rebuilt)
+    return rewritten
+
+
+def _residual_nodes(node, label: str):
+    """Add the skip, and a bias when the fused node has one."""
+    from onnx import helper
+
+    data = _input_at(node, 0)
+    skip = _input_at(node, 1)
+    bias = _input_at(node, 3)
+    residual_name = _output_at(node, 3) or f"{label}/residual"
+    nodes = []
+    source = data
+    if skip and bias:
+        partial = f"{label}/skip_sum"
+        nodes.append(helper.make_node("Add", [data, skip], [partial], name=f"{label}/Add_skip"))
+        nodes.append(helper.make_node("Add", [partial, bias], [residual_name], name=f"{label}/Add_bias"))
+        source = residual_name
+    elif skip:
+        nodes.append(helper.make_node("Add", [data, skip], [residual_name], name=f"{label}/Add_skip"))
+        source = residual_name
+    elif bias:
+        nodes.append(helper.make_node("Add", [data, bias], [residual_name], name=f"{label}/Add_bias"))
+        source = residual_name
+    return nodes, source
+
+
+def _decompose_skip_norm(graph, node, opset: int):
+    from onnx import TensorProto
+
+    label = node.name or "SkipSimplifiedLayerNormalization"
+    nodes, source = _residual_nodes(node, label)
+    output = _output_at(node, 0)
+    if not output:
+        return nodes
+    weight = _input_at(node, 2)
+    epsilon = _float_attr(node, "epsilon", 1e-5)
+    axis = _int_attr(node, "axis", -1)
+    elem = _elem_type(graph, _input_at(node, 0), TensorProto.FLOAT)
+    nodes.extend(
+        _rms_nodes(
+            graph,
+            label=label,
+            source=source,
+            weight=weight,
+            output=output,
+            epsilon=epsilon,
+            axis=axis,
+            elem_type=elem,
+            opset=opset,
+            mean_name=_output_at(node, 1),
+            inv_name=_output_at(node, 2),
+        )
+    )
+    return nodes
+
+
+def _decompose_simple_norm(graph, node, opset: int):
+    from onnx import TensorProto, helper
+
+    label = node.name or "SimplifiedLayerNormalization"
+    source = _input_at(node, 0)
+    weight = _input_at(node, 1)
+    bias = _input_at(node, 2)
+    output = _output_at(node, 0)
+    if not output:
+        return []
+    epsilon = _float_attr(node, "epsilon", 1e-5)
+    axis = _int_attr(node, "axis", -1)
+    elem = _elem_type(graph, source, TensorProto.FLOAT)
+    normalized = f"{label}/normalized" if bias else output
+    nodes = _rms_nodes(
+        graph,
+        label=label,
+        source=source,
+        weight=weight,
+        output=normalized,
+        epsilon=epsilon,
+        axis=axis,
+        elem_type=elem,
+        opset=opset,
+    )
+    if bias:
+        nodes.append(helper.make_node("Add", [normalized, bias], [output], name=f"{label}/Add_bias"))
+    return nodes
 
 
 def apply_static_contract(
@@ -466,6 +824,7 @@ def apply_static_contract(
         query_len=query_len,
         max_seq_len=max_seq_len,
     )
+    norms = rewrite_fused_norms(model)
     leftover = runtime_slices(model)
     if leftover:
         raise StaticShapeError(f"runtime slices remain: {leftover}")
@@ -482,6 +841,7 @@ def apply_static_contract(
         "frozen_dims": frozen,
         "rewritten_slices": rewritten,
         "rewritten_attention": attention,
+        "decomposed_norms": norms,
     }
 
 

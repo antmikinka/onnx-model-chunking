@@ -15,6 +15,7 @@ from chunking_utils.onnx.static_shapes import (
     apply_static_contract,
     causal_additive_bias,
     freeze_graph_io,
+    rewrite_fused_norms,
     runtime_slices,
     static_attention_bias,
 )
@@ -274,7 +275,7 @@ def test_qwen_layer_freezes_to_the_static_window():
     assert _dims(by_name["present.0.key"]) == [1, 8, 16, 128]
     assert _dims(by_name["present.0.value"]) == [1, 8, 16, 128]
     assert _dims(by_name["/model/embed_tokens/Gather/output_0"]) == [1, 1, 4096]
-    assert _dims(by_name["attention_bias"]) == [1, 1, 1, 16]
+    assert _dims(by_name["attention_bias"]) == [1, 1, 1, 17]
     assert "output_mask" not in by_name
     removed = {
         "/model/attn_mask_reformat/attn_mask_subgraph/Sub/Cast/output_0",
@@ -292,8 +293,23 @@ def test_qwen_layer_freezes_to_the_static_window():
         next(item for item in model.graph.initializer if item.name == gqa.input[6])
     )
     assert seqlens.tolist() == [16]
-    assert int(total) == 16
+    assert int(total) == 17
     assert runtime_slices(model) == []
+    slices = [node for node in model.graph.node if node.op_type == "Slice"]
+    assert [node.output[0] for node in slices] == ["present.0.key", "present.0.value"]
+    starts = numpy_helper.to_array(
+        next(item for item in model.graph.initializer if item.name.endswith("present_slice_starts"))
+    )
+    ends = numpy_helper.to_array(
+        next(item for item in model.graph.initializer if item.name.endswith("present_slice_ends"))
+    )
+    assert starts.tolist() == [1]
+    assert ends.tolist() == [17]
+    assert not any(
+        node.op_type in {"SkipSimplifiedLayerNormalization", "SimplifiedLayerNormalization"}
+        for node in model.graph.node
+    )
+    assert "/model/layers.0/post_attention_layernorm/SkipLayerNorm" in report["decomposed_norms"]
     bias = static_attention_bias(4, 1, 16)[0, 0, 0]
     assert bias[:4].tolist() == [0, 0, 0, 0]
     assert np.all(bias[4:] == np.float32(-10000))
@@ -331,6 +347,143 @@ def test_builder_static_mask_has_no_shape_or_slice():
     ).read()
 
 
+def _session(model):
+    options = ort.SessionOptions()
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    return ort.InferenceSession(
+        model.SerializeToString(),
+        sess_options=options,
+        providers=["CPUExecutionProvider"],
+    )
+
+
+def test_gqa_slice_keeps_the_newest_window():
+    past = 16
+    total = past + 1
+    heads = 1
+    head = 16
+    hidden_q = 32
+    hidden_kv = 16
+
+    def symbolic():
+        q = _value("q", [_dim(0, "batch_size"), _dim(0, "sequence_length"), _dim(hidden_q, "")])
+        k = _value("k", [_dim(0, "batch_size"), _dim(0, "sequence_length"), _dim(hidden_kv, "")])
+        v = _value("v", [_dim(0, "batch_size"), _dim(0, "sequence_length"), _dim(hidden_kv, "")])
+        past_k = _value(
+            "past_key_values.0.key",
+            [_dim(0, "batch_size"), _dim(heads, ""), _dim(0, "past_sequence_length"), _dim(head, "")],
+        )
+        past_v = _value(
+            "past_key_values.0.value",
+            [_dim(0, "batch_size"), _dim(heads, ""), _dim(0, "past_sequence_length"), _dim(head, "")],
+        )
+        seqlens = _value("seqlens", [_dim(0, "batch_size")], TensorProto.INT32)
+        total_in = _value("total", [], TensorProto.INT32)
+        present_k = _value(
+            "present.0.key",
+            [_dim(0, "batch_size"), _dim(heads, ""), _dim(0, "total_sequence_length"), _dim(head, "")],
+        )
+        present_v = _value(
+            "present.0.value",
+            [_dim(0, "batch_size"), _dim(heads, ""), _dim(0, "total_sequence_length"), _dim(head, "")],
+        )
+        context = _value("context", [_dim(0, "batch_size"), _dim(0, "sequence_length"), _dim(hidden_q, "")])
+        node = helper.make_node(
+            "GroupQueryAttention",
+            ["q", "k", "v", "past_key_values.0.key", "past_key_values.0.value", "seqlens", "total", "", "", "", ""],
+            ["context", "present.0.key", "present.0.value"],
+            name="gqa",
+            domain="com.microsoft",
+            num_heads=2,
+            kv_num_heads=heads,
+            scale=float(head) ** -0.5,
+            do_rotary=0,
+        )
+        graph = helper.make_graph(
+            [node],
+            "gqa_window",
+            [q, k, v, past_k, past_v, seqlens, total_in],
+            [context, present_k, present_v],
+        )
+        model = helper.make_model(
+            graph,
+            opset_imports=[helper.make_opsetid("", 17), helper.make_opsetid("com.microsoft", 1)],
+        )
+        model.ir_version = 10
+        return model
+
+    reference = symbolic()
+    freeze_graph_io(reference, batch_size=1, query_len=1, max_seq_len=past)
+    for value in reference.graph.output:
+        if value.name.startswith("present."):
+            value.type.tensor_type.shape.dim[2].dim_value = total
+    rewritten = symbolic()
+    report = apply_static_contract(rewritten, batch_size=1, query_len=1, max_seq_len=past)
+    assert report["rewritten_attention"] == ["gqa"]
+    rng = np.random.default_rng(0)
+    feeds = {
+        "q": rng.normal(size=(1, 1, hidden_q)).astype(np.float32),
+        "k": rng.normal(size=(1, 1, hidden_kv)).astype(np.float32),
+        "v": rng.normal(size=(1, 1, hidden_kv)).astype(np.float32),
+        "past_key_values.0.key": rng.normal(size=(1, heads, past, head)).astype(np.float32),
+        "past_key_values.0.value": rng.normal(size=(1, heads, past, head)).astype(np.float32),
+        "seqlens": np.asarray([past], dtype=np.int32),
+        "total": np.asarray(total, dtype=np.int32),
+    }
+    ref_out = _session(reference).run(None, feeds)
+    got_feeds = dict(feeds)
+    del got_feeds["seqlens"]
+    del got_feeds["total"]
+    got_feeds["attention_bias"] = np.zeros((1, 1, 1, total), dtype=np.float32)
+    got = _session(rewritten).run(None, got_feeds)
+    np.testing.assert_allclose(got[0], ref_out[0], atol=1e-6, rtol=1e-6)
+    np.testing.assert_allclose(got[1], ref_out[1][:, :, 1:, :], atol=1e-6, rtol=1e-6)
+    np.testing.assert_allclose(got[2], ref_out[2][:, :, 1:, :], atol=1e-6, rtol=1e-6)
+
+
+def test_skip_norm_matches_the_fused_op():
+    weight = np.linspace(0.5, 1.5, 32, dtype=np.float32)
+    node = helper.make_node(
+        "SkipSimplifiedLayerNormalization",
+        ["x", "skip", "weight"],
+        ["y", "", "", "residual"],
+        name="skip_norm",
+        domain="com.microsoft",
+        epsilon=1e-6,
+    )
+    graph = helper.make_graph(
+        [node],
+        "skip_norm",
+        [
+            helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 1, 32]),
+            helper.make_tensor_value_info("skip", TensorProto.FLOAT, [1, 1, 32]),
+        ],
+        [
+            helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 1, 32]),
+            helper.make_tensor_value_info("residual", TensorProto.FLOAT, [1, 1, 32]),
+        ],
+        [numpy_helper.from_array(weight, "weight")],
+    )
+    fused = helper.make_model(
+        graph,
+        opset_imports=[helper.make_opsetid("", 17), helper.make_opsetid("com.microsoft", 1)],
+    )
+    fused.ir_version = 10
+    primitive = onnx.ModelProto()
+    primitive.CopyFrom(fused)
+    assert rewrite_fused_norms(primitive) == ["skip_norm"]
+    assert not any(node.op_type == "SkipSimplifiedLayerNormalization" for node in primitive.graph.node)
+    rng = np.random.default_rng(1)
+    feeds = {
+        "x": rng.normal(size=(1, 1, 32)).astype(np.float32),
+        "skip": rng.normal(size=(1, 1, 32)).astype(np.float32),
+    }
+    ref = _session(fused).run(None, feeds)
+    got = _session(primitive).run(None, feeds)
+    np.testing.assert_allclose(got[0], ref[0], atol=1e-5, rtol=1e-5)
+    np.testing.assert_allclose(got[1], ref[1], atol=1e-6, rtol=1e-6)
+
+
 def main():
     checks = [
         ("freeze_window", test_freeze_past_and_present_match),
@@ -342,6 +495,8 @@ def main():
         ("shape_check_bypass", test_shape_check_bypass_skips_aot_providers),
         ("attention_bias", test_attention_bias_does_not_resize_the_pool),
         ("qwen_layer", test_qwen_layer_freezes_to_the_static_window),
+        ("gqa_slice", test_gqa_slice_keeps_the_newest_window),
+        ("skip_norm", test_skip_norm_matches_the_fused_op),
         ("builder_static_mask", test_builder_static_mask_has_no_shape_or_slice),
     ]
     return all(_check(name, fn) for name, fn in checks)
