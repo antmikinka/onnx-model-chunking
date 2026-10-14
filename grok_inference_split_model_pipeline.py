@@ -30,6 +30,13 @@ import onnxruntime as ort
 from transformers import AutoTokenizer
 
 
+def keep_last_position(tensor):
+    """Keep the last sequence row of a [batch, seq, hidden] activation."""
+    if not isinstance(tensor, np.ndarray) or tensor.ndim != 3 or int(tensor.shape[1]) <= 1:
+        return tensor
+    return np.ascontiguousarray(tensor[:, -1:, :])
+
+
 class SequentialModelPipeline:
     """
     Inference pipeline that loads and unloads ONNX components sequentially.
@@ -174,6 +181,13 @@ class SequentialModelPipeline:
         
         print(f"  [Pipeline] {component_name} finished in {elapsed:.3f}s")
         
+    def _keep_last_hidden(self, component_name: str) -> None:
+        info = self.model_info["components"].get(component_name) or {}
+        for name in info.get("input_names", []):
+            if name not in self.tensor_registry:
+                continue
+            self.tensor_registry[name] = keep_last_position(self.tensor_registry[name])
+
     def generate(self, prompt: str, max_new_tokens: int = 20) -> str:
         """
         Generate text using the sequential pipeline.
@@ -234,10 +248,14 @@ class SequentialModelPipeline:
                 if f"present.{i}.value" in self.tensor_registry:
                     self.tensor_registry[f"past_key_values.{i}.value"] = self.tensor_registry[f"present.{i}.value"]
                 
-            # 3. Final Norm
+            # Layers have already published the KV cache. The next token
+            # depends only on the last hidden state.
             if "norm" in self.model_info["components"]:
+                self._keep_last_hidden("norm")
                 self._run_component("norm")
-                
+            elif "lm_head" in self.model_info["components"]:
+                self._keep_last_hidden("lm_head")
+
             # 4. LM Head
             self._run_component("lm_head")
             

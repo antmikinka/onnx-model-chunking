@@ -56,6 +56,8 @@ try:
 except ImportError:
     HAS_ORT = False
 
+from .static_shapes import allow_shape_check_bypass
+
 try:
     from transformers import AutoTokenizer
     HAS_TOKENIZER = True
@@ -779,7 +781,11 @@ class SplitModelInferenceEngine:
             "EXTENDED": ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED,
             "ALL": ort.GraphOptimizationLevel.ORT_ENABLE_ALL,
         }[self.config.optimization_level]
-        if self.config.disable_shape_check:
+        if allow_shape_check_bypass(
+            chosen,
+            self.config.disable_shape_check,
+            static_kv_cache=self.config.static_kv_cache,
+        ):
             options.add_session_config_entry("session.disable_node_shape_check", "1")
         try:
             return ort.InferenceSession(

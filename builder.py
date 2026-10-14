@@ -56,6 +56,41 @@ from enhanced_analytics_integration import (
     create_enhanced_analytics_integration
 )
 
+_STATIC_SHAPE_API = None
+
+
+def _static_shape_api():
+    """Load the static-shape contract without importing the pipeline package."""
+    global _STATIC_SHAPE_API
+    if _STATIC_SHAPE_API is not None:
+        return _STATIC_SHAPE_API
+    import importlib.util
+
+    path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "MASTER_POC",
+        "chunking_utils",
+        "onnx",
+        "static_shapes.py",
+    )
+    spec = importlib.util.spec_from_file_location("static_shapes", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load static shape contract from {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    _STATIC_SHAPE_API = module
+    return module
+
+
+def _as_bool(value) -> bool:
+    if value is True or value is False:
+        return bool(value)
+    if value in {"false", "False", "0", 0}:
+        return False
+    if value in {"true", "True", "1", 1}:
+        return True
+    raise ValueError(f"Expected a boolean, got {value!r}")
+
 
 # Softmax sink for blocked attention positions. -1e4 is exact in float16.
 # float16 finfo.min (-65504) overflows when a causal mask and a padding mask
@@ -141,6 +176,23 @@ class Model:
 
         # EP-specific variables
         self.ep = ep
+        self.static_shapes = self._wants_static_shapes()
+        self.static_batch = int(extra_options.get("batch_size", 1) or 1)
+        self.static_max_seq = int(extra_options.get("static_max_seq_len", self.context_length) or self.context_length)
+        self.static_query_len = int(extra_options.get("static_query_len", self.static_max_seq) or self.static_max_seq)
+        if self.static_shapes and (
+            self.static_batch < 1 or self.static_query_len < 1 or self.static_max_seq < 1
+            or self.static_query_len > self.static_max_seq
+        ):
+            raise ValueError(
+                f"static batch {self.static_batch}, query {self.static_query_len}, "
+                f"and max_seq {self.static_max_seq} are not a valid window"
+            )
+        if self.static_shapes:
+            print(
+                f"Static shapes: batch {self.static_batch}, "
+                f"query {self.static_query_len}, max_seq {self.static_max_seq}"
+            )
         self.ep_attrs = {
             "cpu": {},
             "cuda": {
@@ -189,6 +241,13 @@ class Model:
             "present.key": ["batch_size", self.num_kv_heads, "total_sequence_length", self.head_size],           # For standard models (note that `present.key` is written this way to match Hugging Face format)
             "present.value": ["batch_size", self.num_kv_heads, "total_sequence_length", self.head_size],         # For standard models (note that `present.value` is written this way to match Hugging Face format)
         }
+        if self.static_shapes:
+            self.input_shapes = {
+                name: self._freeze_declared_shape(shape) for name, shape in self.input_shapes.items()
+            }
+            self.output_shapes = {
+                name: self._freeze_declared_shape(shape) for name, shape in self.output_shapes.items()
+            }
         self.make_outputs_init()
 
         # Store names of nodes already created
@@ -786,8 +845,35 @@ class Model:
         if dtype is not None:
             value.dtype = ir.DataType(dtype)
         if shape is not None:
+            if self.static_shapes:
+                shape = self._freeze_declared_shape(shape)
             value.shape = ir.Shape(shape)
         return value
+
+    def _wants_static_shapes(self) -> bool:
+        if "static_shapes" in self.extra_options:
+            return _as_bool(self.extra_options["static_shapes"])
+        ep = str(self.ep).lower()
+        return any(token in ep for token in ("vitis", "ryzen", "npu", "openvino", "coreml"))
+
+    def _freeze_declared_shape(self, shape):
+        if shape is None or not self.static_shapes:
+            return shape
+        frozen = []
+        freeze = _static_shape_api().freeze_dim_name
+        for dim in shape:
+            if isinstance(dim, str):
+                size = freeze(
+                    dim,
+                    batch_size=self.static_batch,
+                    query_len=self.static_query_len,
+                    max_seq_len=self.static_max_seq,
+                    head_size=self.head_size,
+                )
+                frozen.append(dim if size is None else size)
+            else:
+                frozen.append(dim)
+        return frozen
 
     def make_inputs_and_outputs(self):
         # Add model-specific inputs to list of model inputs
@@ -3149,7 +3235,132 @@ class Model:
     def make_preprocessing_nodes(self):
         self.make_attention_mask_reformatting()
 
+    def make_static_attention_bias(self):
+        """
+        Turn a static keep-mask into an additive bias.
+
+        The mask is ``[batch, max_seq]``. Valid positions stay 0 and the
+        tail becomes -10000. Expand uses a constant shape, so the graph
+        has no Shape op and no runtime Slice. A query longer than one
+        token also adds a left-aligned causal table. One token does not:
+        that step must still see the valid prefix.
+        """
+        basename = "/model/attn_mask_reformat"
+        batch = self.static_batch
+        query = self.static_query_len
+        window = self.static_max_seq
+        dtype_name = self.to_str_dtype(self.io_dtype)
+        cast_name = f"{basename}/Cast"
+        self.make_cast(cast_name, "attention_mask", self.io_dtype, shape=[batch, window])
+        sub_name = f"{basename}/Sub"
+        self.make_sub(
+            sub_name,
+            [f"/model/constants/{dtype_name}/1.0", f"{cast_name}/output_0"],
+            self.io_dtype,
+            [batch, window],
+        )
+        mul_name = f"{basename}/Mul"
+        self.make_mul(
+            mul_name,
+            [f"{sub_name}/output_0", f"/model/constants/{dtype_name}/-10000.0"],
+            self.io_dtype,
+            [batch, window],
+        )
+        unsqueeze_1 = f"{basename}/Unsqueeze_1"
+        self.make_unsqueeze(
+            unsqueeze_1,
+            [f"{mul_name}/output_0", "/model/constants/INT64/[1]"],
+            self.io_dtype,
+            [batch, 1, window],
+        )
+        unsqueeze_2 = f"{basename}/Unsqueeze_2"
+        self.make_unsqueeze(
+            unsqueeze_2,
+            [f"{unsqueeze_1}/output_0", "/model/constants/INT64/[2]"],
+            self.io_dtype,
+            [batch, 1, 1, window],
+        )
+        expand_name = f"{basename}/Expand"
+        expand_shape = f"/model/constants/INT64/[{batch}, 1, {query}, {window}]"
+        self.make_expand(
+            expand_name,
+            [f"{unsqueeze_2}/output_0", expand_shape],
+            self.io_dtype,
+            [batch, 1, query, window],
+        )
+        bias_name = expand_name
+        if query > 1:
+            causal = _static_shape_api().causal_additive_bias(query, window, dtype=np.float32)
+            causal_name = "model.attn_mask.causal"
+            self.make_initializer(
+                torch.from_numpy(np.ascontiguousarray(causal)),
+                causal_name,
+                to=self.io_dtype,
+            )
+            add_name = f"{basename}/Add"
+            self.make_add(
+                add_name,
+                [f"{expand_name}/output_0", causal_name],
+                self.io_dtype,
+                [batch, 1, query, window],
+            )
+            bias_name = add_name
+        tile_name = f"{basename}/Tile"
+        self.make_tile(
+            tile_name,
+            [f"{bias_name}/output_0", f"/model/constants/INT64/[1, {self.num_attn_heads}, 1, 1]"],
+            self.io_dtype,
+            [batch, self.num_attn_heads, query, window],
+        )
+        self.mask_attrs["mask_name"] = tile_name
+
+    def make_static_gqa_lengths(self):
+        """seqlens from the mask sum. total_seq_len is the constant window, not a Shape."""
+        basename = "/model/attn_mask_reformat/attn_mask_subgraph"
+        batch = self.static_batch
+        window = self.static_max_seq
+        cast_name = f"{basename}/Cast"
+        self.make_cast(cast_name, "attention_mask", ir.DataType.INT32, shape=[batch, window])
+        reduce_name = f"{basename}/ReduceSum"
+        self.make_reduce_sum(
+            reduce_name,
+            [f"{cast_name}/output_0", "/model/constants/INT64/[1]"],
+            ir.DataType.INT32,
+            [batch, 1],
+        )
+        sub_name = f"{basename}/Sub"
+        self.make_sub(
+            sub_name,
+            [f"{reduce_name}/output_0", "/model/constants/INT32/1"],
+            ir.DataType.INT32,
+            [batch, 1],
+        )
+        const_name = f"{basename}/total_seq_len"
+        const_out = f"{const_name}/output_0"
+        self.make_node(
+            "Constant",
+            inputs=[],
+            outputs=[const_out],
+            name=const_name,
+            value=ir.tensor(int(window), dtype=ir.DataType.INT32, name=const_out),
+        )
+        self.make_value(const_out, ir.DataType.INT32, shape=[])
+        self.mask_attrs["seqlens_k"] = sub_name
+        self.mask_attrs["total_seq_len"] = const_name
+
     def make_attention_mask_reformatting(self):
+        if self.static_shapes:
+            if self.attention_attrs["block_sparse"]["sparse_block_size"] != 0:
+                raise ValueError("static_shapes does not build SparseAttention lengths from Shape")
+            if self.attention_attrs["op_type"] == "MultiHeadAttention":
+                self.make_static_attention_bias()
+                return
+            if self.attention_attrs["op_type"] == "GroupQueryAttention":
+                self.make_static_gqa_lengths()
+                return
+            raise ValueError(
+                f"static_shapes does not rewrite {self.attention_attrs['op_type']}"
+            )
         if self.extra_options.get("enable_cuda_graph", False) or self.extra_options.get("enable_webgpu_graph", False) or self.ep == "dml":
             # ORT does not allow nodes to be placed on mulitple execution providers
             # with graph capture enabled. We've only verified it works with GQA and with
@@ -5925,7 +6136,11 @@ def check_extra_options(kv_pairs, execution_provider):
     bools = [
         "int4_is_symmetric", "exclude_embeds", "exclude_lm_head", "include_hidden_states", "enable_cuda_graph", "enable_webgpu_graph",
         "use_8bits_moe", "use_qdq", "use_webgpu_fp32", "use_cuda_bf16", "int4_tied_embeddings", "hf_remote",
+        "static_shapes",
     ]
+    for key in ("static_max_seq_len", "static_query_len"):
+        if key in kv_pairs and kv_pairs[key] != "":
+            kv_pairs[key] = int(kv_pairs[key])
     for key in bools:
         if key in kv_pairs:
             if kv_pairs[key] in {"false", "False", "0"}:
@@ -6235,6 +6450,9 @@ def get_args():
                     If you have already authenticated via `huggingface-cli login`, you do not need to use this flag because Hugging Face has already stored your authentication token for you.
                 hf_remote = Use this to manage trusting remote code in Hugging Face repos.
                     Default behavior is set to true. If false, remote code stored in Hugging Face repos will not be used.
+                static_shapes = Freeze batch and sequence axes and build the attention bias with constant shapes. Default is true for an NPU provider.
+                static_max_seq_len = Preallocated sequence window. Default is the model context length.
+                static_query_len = Static query bucket. Default is static_max_seq_len. One is the decode bucket.
                 exclude_embeds = Remove embedding layer from your ONNX model.
                     Use this option when you want to remove the embedding layer from within your ONNX model.
                     Instead of `input_ids`, you will have `inputs_embeds` as the input to your ONNX model.
