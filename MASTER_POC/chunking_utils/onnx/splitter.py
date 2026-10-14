@@ -17,7 +17,7 @@ from onnx import shape_inference
 
 from ..common.path_utils import sanitize_model_name
 from ..common.architecture_detector import detect_architecture
-from ..common.types import BoundaryTensor, DeviceType, ModelFormat, SplitConfig
+from ..common.types import BoundaryTensor, ModelFormat, SplitConfig
 from .boundary_contract import collect_boundary_tensors
 from .component_builder import create_component_onnx, extract_components
 from .graph_analysis import (
@@ -29,7 +29,6 @@ from .graph_analysis import (
 from .kv_contract import extract_kv_cache_info
 from .attention_mask import rewrite_attention_mask_ops
 from .loader import infer_shapes_with_lazy_fallback, load_onnx_model
-from .static_shapes import apply_static_contract
 from .metadata_writer import write_execution_contract
 from .npu_policy import extract_execution_policy
 from .quantization import build_quantization_info, extract_quantization_info, extract_quantization_tensors
@@ -187,9 +186,6 @@ def split_onnx(
     weight_strategy: Any = None,
     weight_size_threshold: Optional[int] = None,
     weight_chunk_size: Optional[int] = None,
-    static_shapes: Optional[bool] = None,
-    static_max_seq_len: Optional[int] = None,
-    static_query_len: Optional[int] = None,
     **kwargs
 ) -> OnnxSplitResult:
     """
@@ -253,23 +249,6 @@ def split_onnx(
         print(
             f"Rewrote {replaced_masks} attention mask Where/MaskedFill ops "
             "into an additive -1e4 bias"
-        )
-
-    use_static = static_shapes
-    if use_static is None:
-        use_static = config.target_device == DeviceType.NPU
-    if use_static:
-        max_seq = int(static_max_seq_len or config.kv_cache.max_seq_len or config.context)
-        query = int(static_query_len or max_seq)
-        apply_static_contract(
-            onnx_model,
-            batch_size=int(config.batch_size),
-            max_seq_len=max_seq,
-            query_len=query,
-        )
-        print(
-            f"Froze static shapes at batch {config.batch_size}, "
-            f"query {query}, max_seq {max_seq}"
         )
 
     print("Running static shape inference on the master model...")
