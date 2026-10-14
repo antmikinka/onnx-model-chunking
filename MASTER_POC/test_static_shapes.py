@@ -8,9 +8,13 @@ import onnx
 import onnxruntime as ort
 from onnx import TensorProto, helper, numpy_helper
 
+import inspect
+
+from chunking_utils.onnx.splitter import split_onnx
 from chunking_utils.onnx.static_shapes import (
     StaticShapeError,
     _choose_chunk_k,
+    _f32_to_bf16_raw,
     _initializer_array,
     _split_large_matmul_nbits,
     additive_length_bias,
@@ -726,6 +730,167 @@ def test_down_proj_k_split_matches_unsplit():
     print(f"  down_proj_gap {real_delta:.3e} ref_abs {real_scale:.3e}")
 
 
+def _dequant_pair(weight, scales, zp_packed, k, n, block):
+    """Float32 ``[K, N]`` and the same product with zero point 0."""
+    n_blocks = int(k) // int(block)
+    flat = np.ascontiguousarray(weight, dtype=np.uint8).reshape(int(n), -1)
+    nib = np.empty((int(n), flat.shape[1] * 2), dtype=np.float32)
+    nib[:, 0::2] = flat & np.uint8(0x0F)
+    nib[:, 1::2] = (flat >> np.uint8(4)) & np.uint8(0x0F)
+    nibbles = np.ascontiguousarray(nib[:, : int(k)].T)
+    if zp_packed is None:
+        zp = np.full((n_blocks, int(n)), 8.0, dtype=np.float32)
+    else:
+        zflat = np.ascontiguousarray(zp_packed, dtype=np.uint8).reshape(int(n), -1)
+        packed = np.empty((int(n), zflat.shape[1] * 2), dtype=np.float32)
+        packed[:, 0::2] = zflat & np.uint8(0x0F)
+        packed[:, 1::2] = (zflat >> np.uint8(4)) & np.uint8(0x0F)
+        zp = np.ascontiguousarray(packed[:, :n_blocks].T)
+    scale_full = np.repeat(np.ascontiguousarray(scales, dtype=np.float32).T, int(block), axis=0)
+    zp_full = np.repeat(zp, int(block), axis=0)
+    return (nibbles - zp_full) * scale_full, nibbles * scale_full
+
+
+def _bf16_matrix(raw, shape):
+    bits = np.frombuffer(raw, dtype=np.uint16).astype(np.uint32)
+    return (bits << np.uint32(16)).view(np.float32).reshape(shape).copy()
+
+
+def _nbits_zp_model(k, n, block, weight, scales, zp):
+    shape = [2, 3, int(k)]
+    node = helper.make_node(
+        "MatMulNBits",
+        ["activation", "weight", "scales", "zp"],
+        ["output"],
+        name="down",
+        domain="com.microsoft",
+        K=int(k),
+        N=int(n),
+        bits=4,
+        block_size=int(block),
+    )
+    graph = helper.make_graph(
+        [node],
+        "down",
+        [helper.make_tensor_value_info("activation", TensorProto.FLOAT, shape)],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [2, 3, int(n)])],
+        [
+            numpy_helper.from_array(np.ascontiguousarray(weight), "weight"),
+            numpy_helper.from_array(np.ascontiguousarray(scales), "scales"),
+            numpy_helper.from_array(np.ascontiguousarray(zp), "zp"),
+        ],
+    )
+    model = helper.make_model(
+        graph,
+        opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("com.microsoft", 1)],
+    )
+    model.ir_version = 10
+    return model
+
+
+def _assert_baked_matches_ort(model, feed, exact, zp0, bias=None):
+    ref = _session(model).run(None, {"activation": feed})[0]
+    got_exact = np.matmul(feed, exact)
+    got_zp0 = np.matmul(feed, zp0)
+    if bias is not None:
+        got_exact = got_exact + bias
+        got_zp0 = got_zp0 + bias
+    np.testing.assert_allclose(got_exact, ref, atol=1e-5, rtol=1e-5)
+    baked = onnx.ModelProto()
+    baked.CopyFrom(model)
+    report = apply_static_contract(
+        baked,
+        batch_size=1,
+        query_len=1,
+        max_seq_len=16,
+        npu_bf16_fallback=True,
+    )
+    assert report["bf16_fallback"] is True
+    assert report["activation"] == "float32"
+    assert report["bf16_fallback_matmuls"] == ["down"]
+    assert not any(node.op_type in {"MatMulNBits", "DequantizeLinear"} for node in baked.graph.node)
+    assert baked.graph.output[0].type.tensor_type.elem_type == int(TensorProto.FLOAT)
+    item = next(tensor for tensor in baked.graph.initializer if tensor.name == "down/bf16_weight")
+    assert list(item.dims) == [exact.shape[0], exact.shape[1]]
+    assert int(item.data_type) == int(TensorProto.BFLOAT16)
+    assert bytes(item.raw_data) == _f32_to_bf16_raw(exact)
+    decoded = _bf16_matrix(bytes(item.raw_data), tuple(exact.shape))
+    got = np.matmul(feed, decoded)
+    if bias is not None:
+        got = got + bias
+    gap, scale = _gap(got, ref)
+    wrong, _ = _gap(got_zp0, ref)
+    assert gap < wrong
+    assert gap <= 5e-2 * scale, f"baked gap {gap} scale {scale} zp0 {wrong}"
+    print(f"  baked_gap {gap:.3e} zp0_gap {wrong:.3e} ref_abs {scale:.3e}")
+
+
+def test_bf16_fallback_matches_matmul_nbits_and_stays_off():
+    assert inspect.signature(split_onnx).parameters["npu_bf16_fallback"].default is False
+    splitter_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "chunking_utils",
+        "onnx",
+        "splitter.py",
+    )
+    source = open(splitter_path, encoding="utf-8").read()
+    assert "npu_bf16_fallback=bool(npu_bf16_fallback)" in source
+    assert "npu_bf16_fallback=True" not in source
+    assert "npu_bf16_fallback = True" not in source
+    rng = np.random.default_rng(7)
+    k, n, block = 32, 4, 32
+    weight = rng.integers(0, 256, size=(n, 1, 16), dtype=np.uint8)
+    scales = (rng.normal(size=(n, 1)) * 0.05).astype(np.float32)
+    bias = rng.normal(size=(n,)).astype(np.float32)
+    # accuracy_level 4 selects the int8 MatMulNBits kernel. The bake stores
+    # the float weight (nibble - zp) * scale, which is what the kernel does
+    # when that attribute is omitted.
+    omitted = _nbits_model(k, n, block, weight, scales, bias=bias)
+    for node in omitted.graph.node:
+        kept = [attr for attr in node.attribute if attr.name != "accuracy_level"]
+        del node.attribute[:]
+        node.attribute.extend(kept)
+    parked = onnx.ModelProto()
+    parked.CopyFrom(omitted)
+    off = apply_static_contract(parked, batch_size=1, query_len=1, max_seq_len=16)
+    assert off["bf16_fallback"] is False
+    assert off["bf16_fallback_matmuls"] == []
+    assert off["activation"] == "bfloat16"
+    assert sum(node.op_type == "MatMulNBits" for node in parked.graph.node) == 1
+    assert parked.graph.output[0].type.tensor_type.elem_type == int(TensorProto.BFLOAT16)
+    exact, zp0 = _dequant_pair(weight, scales, None, k, n, block)
+    feed = rng.normal(size=(2, 3, k)).astype(np.float32)
+    _assert_baked_matches_ort(omitted, feed, exact, zp0, bias=bias)
+    packed_k, packed_n = 64, 2
+    packed_weight = rng.integers(0, 256, size=(packed_n, 2, 16), dtype=np.uint8)
+    packed_scales = (rng.normal(size=(packed_n, 2)) * 0.05).astype(np.float32)
+    zp = np.asarray([[3 | (9 << 4)], [1 | (12 << 4)]], dtype=np.uint8)
+    packed = _nbits_zp_model(packed_k, packed_n, 32, packed_weight, packed_scales, zp)
+    packed_exact, packed_zp0 = _dequant_pair(packed_weight, packed_scales, zp, packed_k, packed_n, 32)
+    packed_feed = rng.normal(size=(2, 3, packed_k)).astype(np.float32)
+    _assert_baked_matches_ort(packed, packed_feed, packed_exact, packed_zp0)
+    blocked = _nbits_model(
+        128,
+        4,
+        32,
+        rng.integers(0, 256, size=(4, 4, 16), dtype=np.uint8),
+        np.zeros((4, 4), dtype=np.float32),
+        g_idx=True,
+    )
+    try:
+        apply_static_contract(
+            blocked,
+            batch_size=1,
+            query_len=1,
+            max_seq_len=16,
+            npu_bf16_fallback=True,
+        )
+    except StaticShapeError as exc:
+        assert "g_idx" in str(exc)
+    else:
+        raise AssertionError("g_idx MatMulNBits was baked")
+
+
 def main():
     checks = [
         ("freeze_window", test_freeze_past_and_present_match),
@@ -738,6 +903,7 @@ def main():
         ("attention_bias", test_attention_bias_does_not_resize_the_pool),
         ("qwen_layer", test_qwen_layer_freezes_to_the_static_window),
         ("down_split", test_down_proj_k_split_matches_unsplit),
+        ("bf16_fallback", test_bf16_fallback_matches_matmul_nbits_and_stays_off),
         ("gqa_slice", test_gqa_slice_keeps_the_newest_window),
         ("skip_norm", test_skip_norm_matches_the_fused_op),
         ("builder_static_mask", test_builder_static_mask_has_no_shape_or_slice),

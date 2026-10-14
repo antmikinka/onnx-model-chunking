@@ -65,6 +65,19 @@ and the following Vitis compile failed in superkernel_GemmBf16Int4. The
 unsplit constant-epsilon chain reported CPU 45. An epsilon product
 reported CPU 49. The earlier window, with total frozen at ``max_seq_len``,
 reported CPU 18.
+
+``npu_bf16_fallback`` defaults off. When it is on, each 4-bit
+``MatMulNBits`` is replaced by a Python-baked bfloat16 initializer and a
+``MatMul``. The float32 norm body stays float32. An omitted zero point is
+8, which is the value the CPU EP subtracts. ``DequantizeLinear`` is not
+inserted. Ryzen AI 1.8.0 aborts in ``superkernel_GemmBf16Int4`` on the
+packed op (https://github.com/amd/RyzenAI-SW/issues/407). A one-layer
+probe of this node pattern, cache key ``pr9_bf16dense_fresh``, produced
+two Vitis kernels and left ``GroupQueryAttention`` and two present slices
+on CPU. That probe's weights omitted the zero point and its feeds were
+zeros. Turn the flag off to keep ``MatMulNBits``. ``split_onnx`` leaves
+the flag off, including when the target device is the NPU. Baking the
+unsplit model is not this path.
 """
 
 import os
@@ -1243,6 +1256,180 @@ def _split_large_matmul_nbits(
     return split
 
 
+def _unpack_uint4(packed: np.ndarray, count: int) -> np.ndarray:
+    """Return ``[count, rows]`` nibbles, low nibble first."""
+    rows = int(packed.shape[0])
+    flat = np.ascontiguousarray(packed, dtype=np.uint8).reshape(rows, -1)
+    vals = np.empty((rows, flat.shape[1] * 2), dtype=np.uint8)
+    vals[:, 0::2] = flat & np.uint8(0x0F)
+    vals[:, 1::2] = (flat >> np.uint8(4)) & np.uint8(0x0F)
+    if int(vals.shape[1]) < int(count):
+        raise StaticShapeError(
+            f"uint4 packing has {vals.shape[1]} nibbles, need {count}"
+        )
+    return np.ascontiguousarray(vals[:, : int(count)].T)
+
+
+def _block_zero_points(zp_array, n: int, n_blocks: int, label: str) -> np.ndarray:
+    """Per-block zero points as ``[n_blocks, N]``. An absent input is 8."""
+    if zp_array is None:
+        return np.full((n_blocks, n), 8.0, dtype=np.float32)
+    shape = tuple(int(dim) for dim in zp_array.shape)
+    if shape == (n, n_blocks):
+        per_block = np.ascontiguousarray(zp_array.T)
+    elif shape == (n, (n_blocks + 1) // 2):
+        per_block = _unpack_uint4(zp_array, n_blocks)
+    else:
+        raise StaticShapeError(f"{label} zero-point shape {shape} is not a 4-bit layout")
+    return per_block.astype(np.float32)
+
+
+def _dequant_matmul_nbits(weight, scales, zp, k: int, n: int, block: int, label: str) -> np.ndarray:
+    """Float32 ``[K, N]`` matrix matching CPU ``MatMulNBits``."""
+    n_blocks = int(k) // int(block)
+    blob = int(block) * 4 // 8
+    if tuple(int(dim) for dim in weight.shape) != (int(n), n_blocks, blob):
+        raise StaticShapeError(f"{label} packed weight shape {tuple(weight.shape)}")
+    if tuple(int(dim) for dim in scales.shape) != (int(n), n_blocks):
+        raise StaticShapeError(f"{label} scale shape {tuple(scales.shape)}")
+    if scales.dtype != np.float32:
+        raise StaticShapeError(f"{label} scales are {scales.dtype}, expected float32")
+    nibbles = _unpack_uint4(weight, int(k)).astype(np.float32)
+    scale_full = np.repeat(np.ascontiguousarray(scales.T), int(block), axis=0)
+    zp_full = np.repeat(_block_zero_points(zp, int(n), n_blocks, label), int(block), axis=0)
+    return (nibbles - zp_full) * scale_full
+
+
+def _bake_one_matmul_nbits(graph, node, by_name, external_data_dir: Optional[str]):
+    """Replace one MatMulNBits with Cast, baked MatMul, Cast, and an optional Add."""
+    from onnx import TensorProto, helper
+
+    output = _output_at(node, 0)
+    activation = _input_at(node, 0)
+    weight_name = _input_at(node, 1)
+    scale_name = _input_at(node, 2)
+    label = node.name or output or "MatMulNBits"
+    if not output or not activation or not weight_name or not scale_name:
+        raise StaticShapeError(f"{label} is missing an activation, weight, or scale")
+    if _input_at(node, 4):
+        raise StaticShapeError(f"{label} has g_idx, which this fallback does not bake")
+    k = _required_int_attr(node, "K")
+    n = _required_int_attr(node, "N")
+    bits = _required_int_attr(node, "bits")
+    block = _required_int_attr(node, "block_size")
+    if None in (k, n, bits, block) or int(bits) != 4 or int(block) < 1 or int(k) % int(block) != 0:
+        raise StaticShapeError(f"{label} is not a 4-bit block-aligned MatMulNBits")
+    weight_item = by_name.get(weight_name)
+    scale_item = by_name.get(scale_name)
+    if weight_item is None or scale_item is None:
+        raise StaticShapeError(f"{label} weight or scale initializer is missing")
+    if int(weight_item.data_type) != int(TensorProto.UINT8):
+        raise StaticShapeError(f"{label} packed weight is not uint8")
+    weight = _initializer_array(weight_item, external_data_dir)
+    scales = _initializer_array(scale_item, external_data_dir)
+    if weight is None or scales is None:
+        raise StaticShapeError(f"{label} weight or scale bytes could not be read")
+    zp_name = _input_at(node, 3)
+    zp = None
+    if zp_name:
+        zp_item = by_name.get(zp_name)
+        if zp_item is None:
+            raise StaticShapeError(f"{label} zero-point initializer is missing")
+        zp = _initializer_array(zp_item, external_data_dir)
+        if zp is None:
+            raise StaticShapeError(f"{label} zero-point bytes could not be read")
+    values = _dequant_matmul_nbits(weight, scales, zp, int(k), int(n), int(block), label)
+    weight_out = f"{label}/bf16_weight"
+    tensor = helper.make_tensor(
+        weight_out,
+        TensorProto.BFLOAT16,
+        [int(k), int(n)],
+        _f32_to_bf16_raw(values),
+        raw=True,
+    )
+    act_bf = f"{label}/act_bf16"
+    mm_bf = f"{label}/mm_bf16"
+    # WORKAROUND: Ryzen AI 1.8.0 Vitis EP aborts in superkernel_GemmBf16Int4
+    # on MatMulNBits (https://github.com/amd/RyzenAI-SW/issues/407). The
+    # uint4 weights are baked here. Disable npu_bf16_fallback to keep the
+    # packed op when a later release accepts it.
+    nodes = [
+        helper.make_node(
+            "Cast",
+            [activation],
+            [act_bf],
+            name=f"{label}/Cast_act_bf16",
+            to=TensorProto.BFLOAT16,
+        ),
+        helper.make_node(
+            "MatMul",
+            [act_bf, weight_out],
+            [mm_bf],
+            name=f"{label}/MatMul",
+        ),
+    ]
+    bias_name = _input_at(node, 5)
+    if bias_name:
+        cast_out = f"{label}/cast_f32"
+        nodes.append(
+            helper.make_node(
+                "Cast",
+                [mm_bf],
+                [cast_out],
+                name=f"{label}/Cast_out_f32",
+                to=TensorProto.FLOAT,
+            )
+        )
+        nodes.append(helper.make_node("Add", [cast_out, bias_name], [output], name=f"{label}/Add_bias"))
+    else:
+        nodes.append(
+            helper.make_node(
+                "Cast",
+                [mm_bf],
+                [output],
+                name=f"{label}/Cast_out_f32",
+                to=TensorProto.FLOAT,
+            )
+        )
+    dropped = [weight_name, scale_name]
+    if zp_name:
+        dropped.append(zp_name)
+    return nodes, [tensor], dropped
+
+
+def _bake_matmul_nbits(model, external_data_dir: Optional[str]) -> List[str]:
+    """Bake every 4-bit MatMulNBits. The external data file is not rewritten."""
+    graph = model.graph
+    by_name = {item.name: item for item in graph.initializer}
+    rebuilt = []
+    made = []
+    dropped = []
+    baked = []
+    for node in list(graph.node):
+        if node.op_type != "MatMulNBits" or node.domain != "com.microsoft":
+            rebuilt.append(node)
+            continue
+        nodes, tensors, names = _bake_one_matmul_nbits(graph, node, by_name, external_data_dir)
+        rebuilt.extend(nodes)
+        made.extend(tensors)
+        dropped.extend(names)
+        baked.append(node.name or _output_at(node, 0) or "MatMulNBits")
+    if not baked:
+        return []
+    del graph.node[:]
+    graph.node.extend(rebuilt)
+    graph.initializer.extend(made)
+    used = set()
+    for node in graph.node:
+        used.update(item for item in node.input if item)
+    unused = {name for name in dropped if name and name not in used}
+    if unused:
+        kept = [item for item in graph.initializer if item.name not in unused]
+        del graph.initializer[:]
+        graph.initializer.extend(kept)
+    return baked
+
+
 def _apply_bf16_activation_contract(model, external_data_dir: Optional[str] = None) -> List[str]:
     """Cast float activations to bfloat16 ahead of MatMulNBits.
 
@@ -1375,11 +1562,16 @@ def apply_static_contract(
     seq_axis: int = 2,
     head_dim: Optional[int] = None,
     external_data_dir: Optional[str] = None,
+    npu_bf16_fallback: bool = False,
 ) -> Dict[str, object]:
     """Freeze IO shapes, widen a KV prefix slice, and pin a Qwen GQA window.
 
-    A long ``MatMulNBits`` K axis is split before the bfloat16 scale casts,
-    so each chunk scale is still a float initializer when that cast runs.
+    A long ``MatMulNBits`` K axis is split before either the bfloat16 scale
+    casts or the dense fallback, so each chunk is still a float initializer.
+    ``npu_bf16_fallback`` defaults off. When it is on, each remaining 4-bit
+    ``MatMulNBits`` becomes a baked bfloat16 ``MatMul`` and the norm body
+    stays float32. Ryzen AI 1.8.0 aborts in ``superkernel_GemmBf16Int4``
+    (https://github.com/amd/RyzenAI-SW/issues/407).
     """
     from onnx import TensorProto
 
@@ -1401,10 +1593,18 @@ def apply_static_contract(
     )
     split = _split_large_matmul_nbits(model, external_data_dir)
     bf16_weights: List[str] = []
+    baked: List[str] = []
     activation = None
-    if any(node.op_type == "MatMulNBits" for node in model.graph.node):
+    activation_name = "float32"
+    if npu_bf16_fallback:
+        baked = _bake_matmul_nbits(model, external_data_dir)
+        if any(node.op_type == "MatMulNBits" for node in model.graph.node):
+            raise StaticShapeError("MatMulNBits remains after npu_bf16_fallback")
+        activation = TensorProto.FLOAT
+    elif any(node.op_type == "MatMulNBits" for node in model.graph.node):
         bf16_weights = _apply_bf16_activation_contract(model, external_data_dir)
         activation = TensorProto.BFLOAT16
+        activation_name = "bfloat16"
     norms = rewrite_fused_norms(model, activation_type=activation)
     leftover = runtime_slices(model)
     if leftover:
@@ -1423,9 +1623,11 @@ def apply_static_contract(
         "rewritten_slices": rewritten,
         "rewritten_attention": attention,
         "decomposed_norms": norms,
-        "activation": "bfloat16" if activation else "float32",
+        "activation": activation_name,
         "bf16_norm_weights": bf16_weights,
         "split_matmuls": split,
+        "bf16_fallback": bool(npu_bf16_fallback),
+        "bf16_fallback_matmuls": baked,
     }
 
 

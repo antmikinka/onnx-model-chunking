@@ -190,6 +190,7 @@ def split_onnx(
     static_shapes: Optional[bool] = None,
     static_max_seq_len: Optional[int] = None,
     static_query_len: Optional[int] = None,
+    npu_bf16_fallback: bool = False,
     **kwargs
 ) -> OnnxSplitResult:
     """
@@ -214,6 +215,11 @@ def split_onnx(
         weight_strategy: copy, hardlink, manifest, or streaming. Defaults to copy.
         weight_size_threshold: Minimum initializer size stored outside the graph.
         weight_chunk_size: Streaming chunk size. Other strategies ignore it.
+        npu_bf16_fallback: Bake each 4-bit MatMulNBits into an inline bfloat16
+            MatMul. Default False. An NPU target does not turn this on.
+            Set it on one component graph. The unsplit multi-GB model is
+            not baked here. Ryzen AI 1.8.0 aborts in superkernel_GemmBf16Int4
+            (https://github.com/amd/RyzenAI-SW/issues/407).
         **kwargs: Additional arguments passed to SplitConfig.
 
     Returns:
@@ -266,10 +272,12 @@ def split_onnx(
             batch_size=int(config.batch_size),
             max_seq_len=max_seq,
             query_len=query,
+            npu_bf16_fallback=bool(npu_bf16_fallback),
         )
         print(
             f"Froze static shapes at batch {config.batch_size}, "
-            f"query {query}, max_seq {max_seq}"
+            f"query {query}, max_seq {max_seq}, "
+            f"bf16_fallback {bool(npu_bf16_fallback)}"
         )
 
     print("Running static shape inference on the master model...")
