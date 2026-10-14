@@ -16,11 +16,58 @@ the query onto the past, so ``total_sequence_length`` is
 graph boundary to ``max_seq_len``. ``seqlens`` stays the past window.
 ``attention_bias`` has length ``total_sequence_length``.
 ``SkipSimplifiedLayerNormalization`` and ``SimplifiedLayerNormalization``
-become Add (for the skip) plus the primitive RMSNorm chain. A default
-Vitis compile of the earlier window, with total frozen at ``max_seq_len``,
+become Add (for the skip) plus a full-width RMSNorm chain. The square is
+cast to float32. ``ReduceSum`` divided by the weight length replaces
+``ReduceMean``. That length is 4096 on the hidden norms and 128 on
+``q_norm`` and ``k_norm``. The reciprocal is cast back to the activation
+dtype. A ``ReduceMean`` chain with the same casts was re-fused into
+SinglePassRMSNorm and reported CPU 53. The ``ReduceSum`` form kept the
+CPU gaps at present key 6.104e-5, value 7.451e-8, residual 1.192e-7, and
+down projection 7.749e-7. Its Vitis compile did not print the
+SinglePassRMSNorm L1 line. aiecompiler then failed in
+superkernel_GemmBf16Int4 because the generated weight buffer was bfloat16
+where the kernel expects int8. The activation argument of that kernel is
+already bfloat16. Algorithm-B node count was 57. No operator stat, no NPU
+line, and no ELF line.
+A graph that contains ``MatMulNBits`` keeps that ``ReduceSum`` path and
+casts float graph inputs to bfloat16. Float graph outputs stay bfloat16.
+The variance squares a float32 cast of the bfloat16 activation. Norm
+scales are stored as bfloat16 initializers. Packed ``MatMulNBits``
+weights stay on the external file. Their scales share the activation
+type, so those scales are cast to bfloat16. ``GroupQueryAttention`` is
+left in place; its float inputs are the bfloat16 casts. The CPU EP in
+onnxruntime-vitisai 1.27 has no bfloat16 Mul kernel, so the
+rewrite-versus-fused gaps were not measured. The Vitis compile of that
+graph, file base ``3e42dccfc6c889d7ff6e67de7a73c9b2``, Algorithm-A
+``1f7be0485299550546890a2e1bae8f60``, Algorithm-B
+``a1873bce31449893f313510140258dc8``, node count 68, did not print
+SinglePassRMSNorm or superkernel_GemmBf16Int4. It reported a StarNode
+legalization error and ``WTS size greater than max wts memtile size``
+on ``down_proj``. Operator stat CPU 68. No NPU line and no ELF line.
+``GroupQueryAttention`` stays one node. A ``MatMulNBits`` whose ``K``
+exceeds 4096, whose ``block_size`` divides that chunk, and whose packed
+uint8 weight and float scales can be read, is split along ``K``. Partial
+products are added. The live ``down_proj`` node is ``K`` 12288, ``N``
+4096, ``bits`` 4, ``block_size`` 32, weight ``[4096, 384, 16]``, so the
+chunk is 4096. The other four ``MatMulNBits`` stay one node. The external
+data file is not rewritten. A float32 ORT session of that split matched
+the unsplit ``down_proj`` with max absolute gap 2.122e-05 against a
+reference max absolute value of 11.21. The Vitis compile, file base
+``e671f01e271af234c16d124d6a33387e``, Algorithm-A
+``25eb659ef84bd24baf43e5f815d6ee17``, Algorithm-B
+``a1873bce31449893f313510140258dc8``, node count 77, did not print the
+memtile line. StarNode was still the first legalization error. aiecompiler
+then failed in ``superkernel_GemmBf16Int4`` because the weight buffer was
+bfloat16 where the kernel expects int8. No operator stat, no NPU line, and
+no ELF line. A
+half-width split of the 4096 axis changed the present key by 3.039e-1
+and the following Vitis compile failed in superkernel_GemmBf16Int4. The
+unsplit constant-epsilon chain reported CPU 45. An epsilon product
+reported CPU 49. The earlier window, with total frozen at ``max_seq_len``,
 reported CPU 18.
 """
 
+import os
 from typing import Dict, List, Optional, Sequence
 
 import numpy as np
@@ -401,19 +448,6 @@ def _elem_type(graph, name: str, default: int) -> int:
     return int(default if default else TensorProto.FLOAT)
 
 
-def _numpy_dtype(elem_type: int):
-    from onnx import TensorProto
-
-    mapping = {
-        TensorProto.FLOAT: np.float32,
-        TensorProto.FLOAT16: np.float16,
-        TensorProto.DOUBLE: np.float64,
-    }
-    if elem_type not in mapping:
-        raise StaticShapeError(f"RMSNorm rewrite does not support elem_type {elem_type}")
-    return mapping[elem_type]
-
-
 def _put_initializer(graph, name: str, array) -> None:
     from onnx import numpy_helper
 
@@ -593,26 +627,62 @@ def _model_opset(model, domain: str = "") -> int:
     return 0
 
 
-def _reduce_mean(opset: int, *, mean_input: str, mean_output: str, axes_name: str, axis: int, name: str):
-    """ReduceMean uses an axes input from opset 18 onward."""
+def _reduce_sum(opset: int, *, data: str, reduced: str, axes_name: str, axis: int, name: str):
+    """ReduceSum takes axes as an input from opset 11 onward."""
     from onnx import helper
 
-    if int(opset) >= 18:
+    if int(opset) >= 11:
         return helper.make_node(
-            "ReduceMean",
-            [mean_input, axes_name],
-            [mean_output],
+            "ReduceSum",
+            [data, axes_name],
+            [reduced],
             name=name,
             keepdims=1,
         )
     return helper.make_node(
-        "ReduceMean",
-        [mean_input],
-        [mean_output],
+        "ReduceSum",
+        [data],
+        [reduced],
         name=name,
         axes=[int(axis)],
         keepdims=1,
     )
+
+
+def _rank1_length(graph, weight: str) -> int:
+    """Rank-1 length of a weight, following a Cast back to its initializer."""
+    seen = set()
+    name = weight
+    while name and name not in seen:
+        seen.add(name)
+        for item in graph.initializer:
+            if item.name == name and len(item.dims) == 1 and int(item.dims[0]) > 0:
+                return int(item.dims[0])
+        producer = ""
+        for node in graph.node:
+            if node.op_type == "Cast" and node.output and node.output[0] == name and node.input:
+                producer = node.input[0]
+                break
+        name = producer
+    return 0
+
+
+def _reduction_count(graph, weight: str, source: str, axis: int) -> int:
+    """Length of the RMSNorm axis. A rank-1 weight is that length."""
+    if weight:
+        length = _rank1_length(graph, weight)
+        if length > 0:
+            return length
+    value = _value_by_name(graph, source)
+    if value is not None and value.type.HasField("tensor_type"):
+        dims = list(value.type.tensor_type.shape.dim)
+        if dims:
+            index = int(axis) if int(axis) >= 0 else len(dims) + int(axis)
+            if 0 <= index < len(dims) and dims[index].HasField("dim_value"):
+                count = int(dims[index].dim_value)
+                if count > 0:
+                    return count
+    raise StaticShapeError(f"{weight or source} has no static reduction length")
 
 
 def _rms_nodes(
@@ -629,42 +699,56 @@ def _rms_nodes(
     mean_name: str = "",
     inv_name: str = "",
 ):
-    """Primitive RMSNorm: x * rsqrt(mean(x^2) + eps) * weight.
+    """Full-width RMSNorm. Variance is the sum of squares divided by the count.
 
-    VAIML re-fused both this Pow chain and a Mul(x, x) square into
-    SinglePassRMSNorm, then failed L1 placement on the 4096-wide norms.
+    The source is cast to float32 before the square, so a bfloat16
+    activation is squared in float32. The count is the rank-1 weight
+    length, so a 128-wide q_norm does not divide by 4096. A ReduceMean
+    chain was re-fused into SinglePassRMSNorm.
     """
-    from onnx import helper
+    from onnx import TensorProto, helper
 
-    dtype = _numpy_dtype(elem_type)
-    two = f"{label}/rms_two"
+    count = _reduction_count(graph, weight, source, axis)
     one = f"{label}/rms_one"
     eps = f"{label}/rms_epsilon"
+    width = f"{label}/rms_count"
     axes = f"{label}/rms_axes"
-    _put_initializer(graph, two, np.asarray(2, dtype=dtype))
-    _put_initializer(graph, one, np.asarray(1, dtype=dtype))
-    _put_initializer(graph, eps, np.asarray(epsilon, dtype=dtype))
-    if int(opset) >= 18:
+    _put_initializer(graph, one, np.asarray(1, dtype=np.float32))
+    _put_initializer(graph, eps, np.asarray(epsilon, dtype=np.float32))
+    _put_initializer(graph, width, np.asarray(count, dtype=np.float32))
+    if int(opset) >= 11:
         _put_initializer(graph, axes, np.asarray([int(axis)], dtype=np.int64))
+    x_f32 = f"{label}/rms_x_f32"
     squared = f"{label}/rms_squared"
+    summed = f"{label}/rms_sum"
     mean = mean_name or f"{label}/rms_mean"
     shifted = f"{label}/rms_shifted"
     std = f"{label}/rms_std"
+    inv_f32 = f"{label}/rms_inv_f32"
     inv = inv_name or f"{label}/rms_inv"
     scaled = f"{label}/rms_scaled"
     nodes = [
-        helper.make_node("Pow", [source, two], [squared], name=f"{label}/Pow"),
-        _reduce_mean(
+        helper.make_node("Cast", [source], [x_f32], name=f"{label}/Cast_x", to=TensorProto.FLOAT),
+        helper.make_node("Mul", [x_f32, x_f32], [squared], name=f"{label}/Mul_square"),
+        _reduce_sum(
             opset,
-            mean_input=squared,
-            mean_output=mean,
+            data=squared,
+            reduced=summed,
             axes_name=axes,
             axis=int(axis),
-            name=f"{label}/ReduceMean",
+            name=f"{label}/ReduceSum",
         ),
+        helper.make_node("Div", [summed, width], [mean], name=f"{label}/Div_count"),
         helper.make_node("Add", [mean, eps], [shifted], name=f"{label}/Add_epsilon"),
         helper.make_node("Sqrt", [shifted], [std], name=f"{label}/Sqrt"),
-        helper.make_node("Div", [one, std], [inv], name=f"{label}/Div"),
+        helper.make_node("Div", [one, std], [inv_f32], name=f"{label}/Div"),
+        helper.make_node(
+            "Cast",
+            [inv_f32],
+            [inv],
+            name=f"{label}/Cast_inv",
+            to=int(elem_type),
+        ),
         helper.make_node("Mul", [source, inv], [scaled], name=f"{label}/Mul_inv"),
     ]
     if weight:
@@ -686,14 +770,17 @@ def _output_at(node, index: int) -> str:
     return node.output[index]
 
 
-def rewrite_fused_norms(model) -> List[str]:
+def rewrite_fused_norms(model, activation_type: Optional[int] = None) -> List[str]:
     """
     Replace fused RMSNorm ops with primitive ONNX nodes.
 
     ``SkipSimplifiedLayerNormalization`` output 0 is the normalized sum and
     output 3 is that sum before normalization. ``SimplifiedLayerNormalization``
-    is the same chain without the residual add. Qwen's input norm is hidden
-    4096, the same width as the skip norm that failed SinglePassRMSNorm tiling.
+    is the same chain without the residual add. MatMulNBits and
+    GroupQueryAttention nodes are copied through unchanged. The ReduceSum
+    compile of the Qwen layer did not print the SinglePassRMSNorm L1 line
+    and stopped in superkernel_GemmBf16Int4. ``activation_type`` is the
+    dtype of the reciprocal cast. The variance stays float32.
     """
     opset = _model_opset(model, "")
     graph = model.graph
@@ -701,11 +788,11 @@ def rewrite_fused_norms(model) -> List[str]:
     rebuilt = []
     for node in list(graph.node):
         if node.op_type == "SkipSimplifiedLayerNormalization":
-            rebuilt.extend(_decompose_skip_norm(graph, node, opset))
+            rebuilt.extend(_decompose_skip_norm(graph, node, opset, activation_type))
             rewritten.append(node.name or _output_at(node, 0) or "SkipSimplifiedLayerNormalization")
             continue
         if node.op_type == "SimplifiedLayerNormalization":
-            rebuilt.extend(_decompose_simple_norm(graph, node, opset))
+            rebuilt.extend(_decompose_simple_norm(graph, node, opset, activation_type))
             rewritten.append(node.name or _output_at(node, 0) or "SimplifiedLayerNormalization")
             continue
         rebuilt.append(node)
@@ -738,7 +825,7 @@ def _residual_nodes(node, label: str):
     return nodes, source
 
 
-def _decompose_skip_norm(graph, node, opset: int):
+def _decompose_skip_norm(graph, node, opset: int, activation_type: Optional[int] = None):
     from onnx import TensorProto
 
     label = node.name or "SkipSimplifiedLayerNormalization"
@@ -749,7 +836,7 @@ def _decompose_skip_norm(graph, node, opset: int):
     weight = _input_at(node, 2)
     epsilon = _float_attr(node, "epsilon", 1e-5)
     axis = _int_attr(node, "axis", -1)
-    elem = _elem_type(graph, _input_at(node, 0), TensorProto.FLOAT)
+    elem = int(activation_type) if activation_type else _elem_type(graph, _input_at(node, 0), TensorProto.FLOAT)
     nodes.extend(
         _rms_nodes(
             graph,
@@ -768,7 +855,7 @@ def _decompose_skip_norm(graph, node, opset: int):
     return nodes
 
 
-def _decompose_simple_norm(graph, node, opset: int):
+def _decompose_simple_norm(graph, node, opset: int, activation_type: Optional[int] = None):
     from onnx import TensorProto, helper
 
     label = node.name or "SimplifiedLayerNormalization"
@@ -780,7 +867,7 @@ def _decompose_simple_norm(graph, node, opset: int):
         return []
     epsilon = _float_attr(node, "epsilon", 1e-5)
     axis = _int_attr(node, "axis", -1)
-    elem = _elem_type(graph, source, TensorProto.FLOAT)
+    elem = int(activation_type) if activation_type else _elem_type(graph, source, TensorProto.FLOAT)
     normalized = f"{label}/normalized" if bias else output
     nodes = _rms_nodes(
         graph,
@@ -798,6 +885,487 @@ def _decompose_simple_norm(graph, node, opset: int):
     return nodes
 
 
+def _f32_to_bf16_raw(array: np.ndarray) -> bytes:
+    """Round float32 to bfloat16 bytes, nearest even."""
+    values = np.ascontiguousarray(array, dtype=np.float32)
+    bits = values.view(np.uint32)
+    bias = np.uint32(0x7FFF) + ((bits >> np.uint32(16)) & np.uint32(1))
+    rounded = (bits + bias) >> np.uint32(16)
+    return rounded.astype(np.uint16).tobytes()
+
+
+def _read_f32_initializer(item, external_data_dir: Optional[str]):
+    """Return a float32 copy of an initializer, or None when the file is unknown."""
+    dims = tuple(int(dim) for dim in item.dims)
+    count = 1
+    for dim in dims or (1,):
+        count *= int(dim)
+    if item.raw_data:
+        array = np.frombuffer(item.raw_data, dtype=np.float32).copy()
+        return array.reshape(dims) if dims else array
+    if item.float_data:
+        return np.asarray(list(item.float_data), dtype=np.float32).reshape(dims)
+    location = None
+    offset = 0
+    length = count * 4
+    for entry in item.external_data:
+        if entry.key == "location":
+            location = entry.value
+        elif entry.key == "offset":
+            offset = int(entry.value)
+        elif entry.key == "length":
+            length = int(entry.value)
+    if not location or not external_data_dir:
+        return None
+    path = location if os.path.isabs(location) else os.path.join(external_data_dir, location)
+    with open(path, "rb") as handle:
+        handle.seek(int(offset))
+        raw = handle.read(int(length))
+    array = np.frombuffer(raw, dtype=np.float32).copy()
+    return array.reshape(dims) if dims else array
+
+
+def _replace_initializer(graph, tensor) -> None:
+    kept = [item for item in graph.initializer if item.name != tensor.name]
+    del graph.initializer[:]
+    graph.initializer.extend(kept)
+    graph.initializer.append(tensor)
+
+
+def _norm_weight_names(graph) -> List[str]:
+    names = []
+    for node in graph.node:
+        if node.op_type == "SkipSimplifiedLayerNormalization":
+            weight = _input_at(node, 2)
+        elif node.op_type == "SimplifiedLayerNormalization":
+            weight = _input_at(node, 1)
+        else:
+            continue
+        if weight and weight not in names:
+            names.append(weight)
+    return names
+
+
+_CHUNK_K = 4096
+
+_PROTO_NUMPY = None
+
+
+def _numpy_dtype(data_type: int):
+    """Numpy dtype for a tensor proto type this split can slice. None otherwise."""
+    global _PROTO_NUMPY
+    if _PROTO_NUMPY is None:
+        from onnx import TensorProto
+
+        _PROTO_NUMPY = {
+            int(TensorProto.FLOAT): np.float32,
+            int(TensorProto.UINT8): np.uint8,
+            int(TensorProto.INT8): np.int8,
+            int(TensorProto.INT32): np.int32,
+            int(TensorProto.INT64): np.int64,
+            int(TensorProto.FLOAT16): np.float16,
+        }
+    return _PROTO_NUMPY.get(int(data_type))
+
+
+def _choose_chunk_k(k: int, block_size: int, preferred: int = _CHUNK_K) -> Optional[int]:
+    """Largest block-aligned chunk that divides K and is at most ``preferred``.
+
+    ``K`` of 4096 or less is left whole. 12288 with block 32 uses 4096.
+    14336 with block 128 cannot use 4096; 3584 is the next divisor.
+    """
+    width = int(k)
+    block = int(block_size)
+    target = int(preferred)
+    if block < 1 or target < block or width <= target:
+        return None
+    if target % block == 0 and width % target == 0:
+        return target
+    chunk = (min(target, width // 2) // block) * block
+    while chunk >= block:
+        if width % chunk == 0:
+            return chunk
+        chunk -= block
+    return None
+
+
+def _initializer_array(item, external_data_dir: Optional[str]):
+    """Copy an initializer. None when the storage is missing or the wrong size.
+
+    External bytes are read from ``external_data_dir``. The data file is
+    not opened for writing and is not rewritten.
+    """
+    np_dtype = _numpy_dtype(int(item.data_type))
+    if np_dtype is None:
+        return None
+    dims = tuple(int(dim) for dim in item.dims)
+    count = 1
+    for dim in dims or (1,):
+        count *= int(dim)
+    if count < 1:
+        return None
+    itemsize = int(np.dtype(np_dtype).itemsize)
+    expected = count * itemsize
+    if item.raw_data:
+        if len(item.raw_data) != expected:
+            return None
+        array = np.frombuffer(item.raw_data, dtype=np_dtype).copy()
+        return array.reshape(dims) if dims else array
+    if np_dtype == np.float32 and item.float_data and len(item.float_data) == count:
+        return np.asarray(list(item.float_data), dtype=np.float32).reshape(dims)
+    if np_dtype == np.int32 and item.int32_data and len(item.int32_data) == count:
+        return np.asarray(list(item.int32_data), dtype=np.int32).reshape(dims)
+    if np_dtype == np.int64 and item.int64_data and len(item.int64_data) == count:
+        return np.asarray(list(item.int64_data), dtype=np.int64).reshape(dims)
+    location = None
+    offset = 0
+    for entry in item.external_data:
+        if entry.key == "location":
+            location = entry.value
+        elif entry.key == "offset":
+            offset = int(entry.value)
+        elif entry.key == "length" and int(entry.value) != expected:
+            return None
+    if not location or not external_data_dir:
+        return None
+    path = location if os.path.isabs(location) else os.path.join(external_data_dir, location)
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(int(offset))
+            raw = handle.read(expected)
+    except OSError:
+        return None
+    if len(raw) != expected:
+        return None
+    array = np.frombuffer(raw, dtype=np_dtype).copy()
+    return array.reshape(dims) if dims else array
+
+
+def _required_int_attr(node, name: str) -> Optional[int]:
+    for attr in node.attribute:
+        if attr.name == name:
+            return int(attr.i)
+    return None
+
+
+def _balanced_adds(names: Sequence[str], final_name: str, label: str):
+    """Add partial MatMul outputs. The root keeps the original tensor name."""
+    from onnx import helper
+
+    current = [name for name in names if name]
+    nodes = []
+    level = 0
+    while len(current) > 1:
+        nxt = []
+        pair = 0
+        index = 0
+        while index < len(current):
+            if index + 1 == len(current):
+                nxt.append(current[index])
+                break
+            out = f"{label}/sum_{level}_{pair}"
+            nodes.append(
+                helper.make_node(
+                    "Add",
+                    [current[index], current[index + 1]],
+                    [out],
+                    name=f"{label}/Add_{level}_{pair}",
+                )
+            )
+            nxt.append(out)
+            index += 2
+            pair += 1
+        current = nxt
+        level += 1
+    if nodes:
+        nodes[-1].output[0] = final_name
+    return nodes
+
+
+def _split_one_matmul_nbits(graph, node, external_data_dir: Optional[str], chunk_k: int):
+    """Split one MatMulNBits on K, or return None to leave it unchanged.
+
+    Scales and packed blocks stay aligned because the chunk is a multiple
+    of ``block_size``. A bias is added on the last partial only. A g_idx
+    input is left whole. Zero-points are split only when they have one
+    value per block.
+    """
+    from onnx import TensorProto, helper
+
+    if node.op_type != "MatMulNBits" or node.domain != "com.microsoft":
+        return None
+    output = _output_at(node, 0)
+    activation = _input_at(node, 0)
+    weight_name = _input_at(node, 1)
+    scale_name = _input_at(node, 2)
+    if not output or not activation or not weight_name or not scale_name:
+        return None
+    if _input_at(node, 4):
+        return None
+    k = _required_int_attr(node, "K")
+    n = _required_int_attr(node, "N")
+    bits = _required_int_attr(node, "bits")
+    block = _required_int_attr(node, "block_size")
+    if None in (k, n, bits, block):
+        return None
+    if int(bits) != 4 or int(n) < 1 or (int(block) * int(bits)) % 8 != 0:
+        return None
+    chunk = _choose_chunk_k(int(k), int(block), chunk_k)
+    if chunk is None or int(k) % int(block) != 0:
+        return None
+    blob = int(block) * int(bits) // 8
+    n_blocks = int(k) // int(block)
+    by_name = {item.name: item for item in graph.initializer}
+    weight = by_name.get(weight_name)
+    scales = by_name.get(scale_name)
+    if weight is None or scales is None:
+        return None
+    if int(weight.data_type) != int(TensorProto.UINT8):
+        return None
+    if int(scales.data_type) != int(TensorProto.FLOAT):
+        return None
+    if tuple(int(dim) for dim in weight.dims) != (int(n), n_blocks, blob):
+        return None
+    if tuple(int(dim) for dim in scales.dims) != (int(n), n_blocks):
+        return None
+    zp_name = _input_at(node, 3)
+    bias_name = _input_at(node, 5)
+    zp_item = by_name.get(zp_name) if zp_name else None
+    if zp_name and zp_item is None:
+        return None
+    if bias_name:
+        bias_item = by_name.get(bias_name)
+        if bias_item is not None and tuple(int(dim) for dim in bias_item.dims) != (int(n),):
+            return None
+    weight_array = _initializer_array(weight, external_data_dir)
+    scale_array = _initializer_array(scales, external_data_dir)
+    if weight_array is None or scale_array is None:
+        return None
+    zp_array = None
+    if zp_item is not None:
+        zp_array = _initializer_array(zp_item, external_data_dir)
+        if zp_array is None or tuple(zp_array.shape) != (int(n), n_blocks):
+            return None
+    blocks_per_chunk = chunk // int(block)
+    label = node.name or output
+    parts = []
+    nodes = []
+    dropped = [weight_name, scale_name]
+    if zp_name:
+        dropped.append(zp_name)
+    accuracy = _required_int_attr(node, "accuracy_level")
+    for block_start in range(0, n_blocks, blocks_per_chunk):
+        block_end = block_start + blocks_per_chunk
+        k_start = block_start * int(block)
+        k_end = block_end * int(block)
+        piece = f"{label}/k{k_start}"
+        _put_initializer(graph, f"{piece}_starts", np.asarray([k_start], dtype=np.int64))
+        _put_initializer(graph, f"{piece}_ends", np.asarray([k_end], dtype=np.int64))
+        _put_initializer(graph, f"{piece}_axes", np.asarray([-1], dtype=np.int64))
+        _put_initializer(graph, f"{piece}_steps", np.asarray([1], dtype=np.int64))
+        activation_out = f"{piece}/activation"
+        nodes.append(
+            helper.make_node(
+                "Slice",
+                [activation, f"{piece}_starts", f"{piece}_ends", f"{piece}_axes", f"{piece}_steps"],
+                [activation_out],
+                name=f"{piece}/Slice",
+            )
+        )
+        packed_name = f"{weight_name}/k{k_start}"
+        scale_chunk = f"{scale_name}/k{k_start}"
+        _put_initializer(graph, packed_name, np.ascontiguousarray(weight_array[:, block_start:block_end, :]))
+        _put_initializer(graph, scale_chunk, np.ascontiguousarray(scale_array[:, block_start:block_end]))
+        inputs = [activation_out, packed_name, scale_chunk]
+        if zp_array is not None:
+            zp_chunk = f"{zp_name}/k{k_start}"
+            _put_initializer(graph, zp_chunk, np.ascontiguousarray(zp_array[:, block_start:block_end]))
+            inputs.append(zp_chunk)
+        last = block_end == n_blocks
+        if bias_name:
+            if zp_array is None:
+                inputs.append("")
+            inputs.append("")
+            inputs.append(bias_name if last else "")
+        kwargs = {"K": int(chunk), "N": int(n), "bits": int(bits), "block_size": int(block)}
+        if accuracy is not None:
+            kwargs["accuracy_level"] = int(accuracy)
+        partial = f"{piece}/output"
+        nodes.append(
+            helper.make_node(
+                "MatMulNBits",
+                inputs,
+                [partial],
+                name=piece,
+                domain="com.microsoft",
+                **kwargs,
+            )
+        )
+        parts.append(partial)
+    nodes.extend(_balanced_adds(parts, output, label))
+    return nodes, dropped
+
+
+def _split_large_matmul_nbits(
+    model,
+    external_data_dir: Optional[str],
+    chunk_k: int = _CHUNK_K,
+) -> List[str]:
+    """Split long MatMulNBits reductions. No readable bytes means no split."""
+    if not external_data_dir or _model_opset(model, "") < 10:
+        return []
+    graph = model.graph
+    rebuilt = []
+    dropped = []
+    split = []
+    for node in list(graph.node):
+        pieces = _split_one_matmul_nbits(graph, node, external_data_dir, int(chunk_k))
+        if pieces is None:
+            rebuilt.append(node)
+            continue
+        nodes, names = pieces
+        rebuilt.extend(nodes)
+        dropped.extend(names)
+        split.append(node.name or _output_at(node, 0) or "MatMulNBits")
+    if not split:
+        return []
+    del graph.node[:]
+    graph.node.extend(rebuilt)
+    used = set()
+    for node in graph.node:
+        used.update(item for item in node.input if item)
+    unused = {name for name in dropped if name and name not in used}
+    if unused:
+        kept = [item for item in graph.initializer if item.name not in unused]
+        del graph.initializer[:]
+        graph.initializer.extend(kept)
+        _drop_unused_inputs(graph, list(unused))
+    return split
+
+
+def _apply_bf16_activation_contract(model, external_data_dir: Optional[str] = None) -> List[str]:
+    """Cast float activations to bfloat16 ahead of MatMulNBits.
+
+    Graph inputs stay float32. The hidden state is also the skip residual,
+    so one entry cast feeds both. Norm scales become inline bfloat16
+    initializers when their bytes can be read. Packed MatMulNBits weights
+    stay on the external file. Scales share that op's activation type, so
+    they are cast to bfloat16. Float graph outputs stay bfloat16.
+    """
+    from onnx import TensorProto, helper
+
+    graph = model.graph
+    casts = []
+    converted = []
+    by_name = {item.name: item for item in graph.initializer}
+    for weight in _norm_weight_names(graph):
+        item = by_name.get(weight)
+        if item is None or int(item.data_type) != int(TensorProto.FLOAT):
+            continue
+        values = _read_f32_initializer(item, external_data_dir)
+        if values is None:
+            cast_out = f"{weight}/bf16"
+            casts.append(
+                helper.make_node(
+                    "Cast",
+                    [weight],
+                    [cast_out],
+                    name=f"Cast_{weight}_bf16",
+                    to=TensorProto.BFLOAT16,
+                )
+            )
+            for node in graph.node:
+                for index, name in enumerate(node.input):
+                    if name == weight:
+                        node.input[index] = cast_out
+            continue
+        tensor = helper.make_tensor(
+            weight,
+            TensorProto.BFLOAT16,
+            list(np.ascontiguousarray(values, dtype=np.float32).shape),
+            _f32_to_bf16_raw(values),
+            raw=True,
+        )
+        _replace_initializer(graph, tensor)
+        converted.append(weight)
+    by_name = {item.name: item for item in graph.initializer}
+    for value in list(graph.input):
+        if not value.type.HasField("tensor_type"):
+            continue
+        if int(value.type.tensor_type.elem_type) != int(TensorProto.FLOAT):
+            continue
+        dims = []
+        for dim in value.type.tensor_type.shape.dim:
+            if not dim.HasField("dim_value") or int(dim.dim_value) < 1:
+                raise StaticShapeError(f"{value.name} has no static shape for the bfloat16 cast")
+            dims.append(int(dim.dim_value))
+        cast_out = f"{value.name}/bf16"
+        casts.append(
+            helper.make_node(
+                "Cast",
+                [value.name],
+                [cast_out],
+                name=f"Cast_{value.name}_bf16",
+                to=TensorProto.BFLOAT16,
+            )
+        )
+        _set_value_info(graph, cast_out, TensorProto.BFLOAT16, dims)
+        for node in graph.node:
+            for index, name in enumerate(node.input):
+                if name == value.name:
+                    node.input[index] = cast_out
+    for node in graph.node:
+        if node.op_type != "GroupQueryAttention":
+            continue
+        for index, name in enumerate(list(node.input)):
+            item = by_name.get(name)
+            if item is None or int(item.data_type) != int(TensorProto.FLOAT):
+                continue
+            cast_out = f"{name}/bf16"
+            if not any(cast.output[0] == cast_out for cast in casts):
+                casts.append(
+                    helper.make_node(
+                        "Cast",
+                        [name],
+                        [cast_out],
+                        name=f"Cast_{name}_bf16",
+                        to=TensorProto.BFLOAT16,
+                    )
+                )
+            node.input[index] = cast_out
+    for node in graph.node:
+        if node.op_type != "MatMulNBits":
+            continue
+        for index, name in enumerate(list(node.input)):
+            if index <= 1 or not name:
+                continue
+            item = by_name.get(name)
+            if item is None or int(item.data_type) != int(TensorProto.FLOAT):
+                continue
+            cast_out = f"{name}/bf16"
+            if not any(cast.output[0] == cast_out for cast in casts):
+                casts.append(
+                    helper.make_node(
+                        "Cast",
+                        [name],
+                        [cast_out],
+                        name=f"Cast_{name}_bf16",
+                        to=TensorProto.BFLOAT16,
+                    )
+                )
+            node.input[index] = cast_out
+    for value in list(graph.output) + list(graph.value_info):
+        if not value.type.HasField("tensor_type"):
+            continue
+        if int(value.type.tensor_type.elem_type) == int(TensorProto.FLOAT):
+            value.type.tensor_type.elem_type = int(TensorProto.BFLOAT16)
+    if casts:
+        rebuilt = list(casts) + list(graph.node)
+        del graph.node[:]
+        graph.node.extend(rebuilt)
+    return converted
+
+
 def apply_static_contract(
     model,
     *,
@@ -806,8 +1374,15 @@ def apply_static_contract(
     query_len: int,
     seq_axis: int = 2,
     head_dim: Optional[int] = None,
+    external_data_dir: Optional[str] = None,
 ) -> Dict[str, object]:
-    """Freeze IO shapes, widen a KV prefix slice, and pin a Qwen GQA window."""
+    """Freeze IO shapes, widen a KV prefix slice, and pin a Qwen GQA window.
+
+    A long ``MatMulNBits`` K axis is split before the bfloat16 scale casts,
+    so each chunk scale is still a float initializer when that cast runs.
+    """
+    from onnx import TensorProto
+
     if head_dim is None and _graph_needs_head(model):
         head_dim = infer_head_dim(model)
     frozen = freeze_graph_io(
@@ -824,7 +1399,13 @@ def apply_static_contract(
         query_len=query_len,
         max_seq_len=max_seq_len,
     )
-    norms = rewrite_fused_norms(model)
+    split = _split_large_matmul_nbits(model, external_data_dir)
+    bf16_weights: List[str] = []
+    activation = None
+    if any(node.op_type == "MatMulNBits" for node in model.graph.node):
+        bf16_weights = _apply_bf16_activation_contract(model, external_data_dir)
+        activation = TensorProto.BFLOAT16
+    norms = rewrite_fused_norms(model, activation_type=activation)
     leftover = runtime_slices(model)
     if leftover:
         raise StaticShapeError(f"runtime slices remain: {leftover}")
@@ -842,6 +1423,9 @@ def apply_static_contract(
         "rewritten_slices": rewritten,
         "rewritten_attention": attention,
         "decomposed_norms": norms,
+        "activation": "bfloat16" if activation else "float32",
+        "bf16_norm_weights": bf16_weights,
+        "split_matmuls": split,
     }
 
 

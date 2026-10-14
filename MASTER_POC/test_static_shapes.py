@@ -10,6 +10,9 @@ from onnx import TensorProto, helper, numpy_helper
 
 from chunking_utils.onnx.static_shapes import (
     StaticShapeError,
+    _choose_chunk_k,
+    _initializer_array,
+    _split_large_matmul_nbits,
     additive_length_bias,
     allow_shape_check_bypass,
     apply_static_contract,
@@ -266,7 +269,26 @@ def test_qwen_layer_freezes_to_the_static_window():
     if not os.path.exists(path):
         raise AssertionError(f"Qwen attention layer was not found at {path}")
     model = onnx.load(path, load_external_data=False)
-    report = apply_static_contract(model, batch_size=1, query_len=1, max_seq_len=16)
+    directory = os.path.dirname(path)
+    stored_before = {item.name: item for item in model.graph.initializer}
+    down = next(node for node in model.graph.node if node.name == "/model/layers.0/mlp/down_proj/MatMul_Q4")
+    orig_w = _initializer_array(stored_before[down.input[1]], directory)
+    orig_s = _initializer_array(stored_before[down.input[2]], directory)
+    assert orig_w.shape == (4096, 384, 16)
+    assert orig_s.shape == (4096, 384)
+    matmul_nbits = sum(node.op_type == "MatMulNBits" for node in model.graph.node)
+    report = apply_static_contract(
+        model,
+        batch_size=1,
+        query_len=1,
+        max_seq_len=16,
+        external_data_dir=directory,
+    )
+    assert report["activation"] == "bfloat16"
+    assert matmul_nbits == 5
+    assert report["split_matmuls"] == ["/model/layers.0/mlp/down_proj/MatMul_Q4"]
+    assert sum(node.op_type == "MatMulNBits" for node in model.graph.node) == 7
+    assert sum(node.op_type == "GroupQueryAttention" for node in model.graph.node) == 1
     assert report["rewritten_attention"] == ["/model/layers.0/attn/GroupQueryAttention"]
     assert report["rewritten_slices"] == []
     by_name = {value.name: value for value in list(model.graph.input) + list(model.graph.output)}
@@ -296,7 +318,117 @@ def test_qwen_layer_freezes_to_the_static_window():
     assert int(total) == 17
     assert runtime_slices(model) == []
     slices = [node for node in model.graph.node if node.op_type == "Slice"]
-    assert [node.output[0] for node in slices] == ["present.0.key", "present.0.value"]
+    assert [node.output[0] for node in slices if node.output[0].startswith("present.")] == [
+        "present.0.key",
+        "present.0.value",
+    ]
+    down_slices = [node for node in slices if "down_proj" in node.name]
+    assert len(down_slices) == 3
+    assert sum(node.op_type == "Concat" for node in model.graph.node) == 0
+    bf16_casts = [
+        node for node in model.graph.node
+        if node.op_type == "Cast" and node.attribute[0].i == TensorProto.BFLOAT16
+    ]
+    fp32_casts = [
+        node for node in model.graph.node
+        if node.op_type == "Cast" and node.attribute[0].i == TensorProto.FLOAT
+    ]
+    assert sorted(node.name for node in bf16_casts if node.name.startswith("Cast_")) == [
+        "Cast_/model/embed_tokens/Gather/output_0_bf16",
+        "Cast_attention_bias_bf16",
+        "Cast_cos_cache_bf16",
+        "Cast_model.layers.0.attn.o_proj.MatMul.weight_scales_bf16",
+        "Cast_model.layers.0.attn.qkv_proj.MatMul.weight_scales_bf16",
+        "Cast_model.layers.0.mlp.down_proj.MatMul.weight_scales/k0_bf16",
+        "Cast_model.layers.0.mlp.down_proj.MatMul.weight_scales/k4096_bf16",
+        "Cast_model.layers.0.mlp.down_proj.MatMul.weight_scales/k8192_bf16",
+        "Cast_model.layers.0.mlp.gate_proj.MatMul.weight_scales_bf16",
+        "Cast_model.layers.0.mlp.up_proj.MatMul.weight_scales_bf16",
+        "Cast_past_key_values.0.key_bf16",
+        "Cast_past_key_values.0.value_bf16",
+        "Cast_sin_cache_bf16",
+    ]
+    assert sum(node.name.endswith("/Cast_inv") for node in bf16_casts) == 4
+    assert [node.name.endswith("/Cast_x") for node in fp32_casts] == [True, True, True, True]
+    assert sum(node.op_type == "ReduceMean" for node in model.graph.node) == 0
+    assert sum(node.op_type == "ReduceSum" for node in model.graph.node) == 4
+    counts = sorted(
+        float(numpy_helper.to_array(item))
+        for item in model.graph.initializer
+        if item.name.endswith("/rms_count")
+    )
+    assert counts == [128.0, 128.0, 4096.0, 4096.0]
+    hidden = "/model/embed_tokens/Gather/output_0"
+    assert by_name[hidden].type.tensor_type.elem_type == TensorProto.FLOAT
+    assert by_name["past_key_values.0.key"].type.tensor_type.elem_type == TensorProto.FLOAT
+    assert by_name["past_key_values.0.value"].type.tensor_type.elem_type == TensorProto.FLOAT
+    for value in model.graph.output:
+        assert value.type.tensor_type.elem_type == TensorProto.BFLOAT16
+    gqa_inputs = list(gqa.input)
+    assert gqa_inputs[3] == "past_key_values.0.key/bf16"
+    assert gqa_inputs[4] == "past_key_values.0.value/bf16"
+    assert gqa_inputs[7] == "cos_cache/bf16"
+    assert gqa_inputs[8] == "sin_cache/bf16"
+    assert gqa_inputs[10] == "attention_bias/bf16"
+    norm_weights = [
+        "model.layers.0.input_layernorm.weight",
+        "model.layers.0.attn.q_norm.layernorm.weight",
+        "model.layers.0.attn.k_norm.layernorm.weight",
+        "model.layers.0.post_attention_layernorm.weight",
+    ]
+    assert sorted(report["bf16_norm_weights"]) == sorted(norm_weights)
+    stored = {item.name: item for item in model.graph.initializer}
+    for name in norm_weights:
+        item = stored[name]
+        assert item.data_type == TensorProto.BFLOAT16
+        assert len(item.raw_data) == int(item.dims[0]) * 2
+        assert not item.external_data
+    packed = stored["model.layers.0.attn.qkv_proj.MatMul.weight_Q4"]
+    assert packed.data_type == TensorProto.UINT8
+    assert packed.data_location == 1
+    assert "model.layers.0.mlp.down_proj.MatMul.weight_Q4" not in stored
+    assert "model.layers.0.mlp.down_proj.MatMul.weight_scales" not in stored
+    down_nodes = [
+        node for node in model.graph.node
+        if node.op_type == "MatMulNBits" and "down_proj" in node.name
+    ]
+    assert [node.name for node in down_nodes] == [
+        "/model/layers.0/mlp/down_proj/MatMul_Q4/k0",
+        "/model/layers.0/mlp/down_proj/MatMul_Q4/k4096",
+        "/model/layers.0/mlp/down_proj/MatMul_Q4/k8192",
+    ]
+    chunk_w = []
+    chunk_s = []
+    for node in down_nodes:
+        attrs = {attr.name: int(attr.i) for attr in node.attribute}
+        assert attrs["K"] == 4096
+        assert attrs["N"] == 4096
+        assert attrs["bits"] == 4
+        assert attrs["block_size"] == 32
+        assert attrs["accuracy_level"] == 4
+        weight = stored[node.input[1]]
+        assert list(weight.dims) == [4096, 128, 16]
+        assert weight.data_location != 1
+        chunk_w.append(numpy_helper.to_array(weight))
+        scale_name = node.input[2][: -len("/bf16")]
+        scale = stored[scale_name]
+        assert list(scale.dims) == [4096, 128]
+        assert scale.data_type == TensorProto.FLOAT
+        chunk_s.append(numpy_helper.to_array(scale))
+    assert np.array_equal(np.concatenate(chunk_w, axis=1), orig_w)
+    assert np.array_equal(np.concatenate(chunk_s, axis=1), orig_s)
+    down_out = "/model/layers.0/mlp/down_proj/MatMul/output_0"
+    producer = next(node for node in model.graph.node if down_out in node.output)
+    assert producer.op_type == "Add"
+    for node in model.graph.node:
+        if node.op_type != "MatMulNBits":
+            continue
+        weight = stored[node.input[1]]
+        assert weight.data_type == TensorProto.UINT8
+        assert node.input[2].endswith("/bf16")
+        if "down_proj" not in node.name:
+            assert weight.data_location == 1
+            assert int(next(attr.i for attr in node.attribute if attr.name == "K")) == 4096
     starts = numpy_helper.to_array(
         next(item for item in model.graph.initializer if item.name.endswith("present_slice_starts"))
     )
@@ -473,6 +605,20 @@ def test_skip_norm_matches_the_fused_op():
     primitive.CopyFrom(fused)
     assert rewrite_fused_norms(primitive) == ["skip_norm"]
     assert not any(node.op_type == "SkipSimplifiedLayerNormalization" for node in primitive.graph.node)
+    source_cast = next(node for node in primitive.graph.node if node.name == "skip_norm/Cast_x")
+    inv_cast = next(node for node in primitive.graph.node if node.name == "skip_norm/Cast_inv")
+    square = next(node for node in primitive.graph.node if node.name == "skip_norm/Mul_square")
+    assert source_cast.attribute[0].i == TensorProto.FLOAT
+    assert source_cast.output[0] == square.input[0] == square.input[1]
+    assert inv_cast.attribute[0].i == TensorProto.FLOAT
+    add_eps = next(node for node in primitive.graph.node if node.name == "skip_norm/Add_epsilon")
+    assert add_eps.input[1] in {item.name for item in primitive.graph.initializer}
+    assert not any(node.op_type == "ReduceMean" for node in primitive.graph.node)
+    assert any(node.op_type == "ReduceSum" for node in primitive.graph.node)
+    count = numpy_helper.to_array(
+        next(item for item in primitive.graph.initializer if item.name == "skip_norm/rms_count")
+    )
+    assert float(count) == 32.0
     rng = np.random.default_rng(1)
     feeds = {
         "x": rng.normal(size=(1, 1, 32)).astype(np.float32),
@@ -482,6 +628,102 @@ def test_skip_norm_matches_the_fused_op():
     got = _session(primitive).run(None, feeds)
     np.testing.assert_allclose(got[0], ref[0], atol=1e-5, rtol=1e-5)
     np.testing.assert_allclose(got[1], ref[1], atol=1e-6, rtol=1e-6)
+
+
+def _nbits_model(k, n, block, weight, scales, bias=None, g_idx=False, shape=None):
+    if shape is None:
+        shape = [2, 3, int(k)]
+    out_shape = list(shape[:-1]) + [int(n)]
+    inputs = ["activation", "weight", "scales"]
+    initializers = [
+        numpy_helper.from_array(np.ascontiguousarray(weight), "weight"),
+        numpy_helper.from_array(np.ascontiguousarray(scales), "scales"),
+    ]
+    if bias is not None or g_idx:
+        inputs.append("")
+    if g_idx or bias is not None:
+        inputs.append("g_idx" if g_idx else "")
+    if bias is not None:
+        inputs.append("bias")
+        initializers.append(numpy_helper.from_array(np.ascontiguousarray(bias), "bias"))
+    node = helper.make_node(
+        "MatMulNBits",
+        inputs,
+        ["output"],
+        name="down",
+        domain="com.microsoft",
+        K=int(k),
+        N=int(n),
+        bits=4,
+        block_size=int(block),
+        accuracy_level=4,
+    )
+    graph = helper.make_graph(
+        [node],
+        "down",
+        [helper.make_tensor_value_info("activation", TensorProto.FLOAT, shape)],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, out_shape)],
+        initializers,
+    )
+    model = helper.make_model(
+        graph,
+        opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("com.microsoft", 1)],
+    )
+    model.ir_version = 10
+    return model
+
+
+def _gap(got, ref):
+    delta = float(np.max(np.abs(got.astype(np.float64) - ref.astype(np.float64))))
+    scale = max(float(np.max(np.abs(ref))), 1.0)
+    return delta, scale
+
+
+def test_down_proj_k_split_matches_unsplit():
+    assert _choose_chunk_k(12288, 32) == 4096
+    assert _choose_chunk_k(14336, 128) == 3584
+    assert _choose_chunk_k(4096, 32) is None
+    assert _choose_chunk_k(12288, 32, 3584) == 3072
+    rng = np.random.default_rng(2)
+    weight = rng.integers(0, 256, size=(4, 4, 16), dtype=np.uint8)
+    scales = (rng.normal(size=(4, 4)) * 0.02).astype(np.float32)
+    bias = rng.normal(size=(4,)).astype(np.float32)
+    blocked = _nbits_model(128, 4, 32, weight, scales, g_idx=True)
+    assert _split_large_matmul_nbits(blocked, ".", chunk_k=64) == []
+    assert sum(node.op_type == "MatMulNBits" for node in blocked.graph.node) == 1
+    model = _nbits_model(128, 4, 32, weight, scales, bias=bias)
+    held = onnx.ModelProto()
+    held.CopyFrom(model)
+    assert _split_large_matmul_nbits(held, None, chunk_k=64) == []
+    feed = rng.normal(size=(2, 3, 128)).astype(np.float32)
+    ref = _session(model).run(None, {"activation": feed})[0]
+    assert _split_large_matmul_nbits(model, ".", chunk_k=64) == ["down"]
+    pieces = [node for node in model.graph.node if node.op_type == "MatMulNBits"]
+    assert len(pieces) == 2
+    assert sum(node.input[5] == "bias" for node in pieces) == 1
+    got = _session(model).run(None, {"activation": feed})[0]
+    delta, scale = _gap(got, ref)
+    assert np.isfinite(got).all()
+    assert delta <= 1e-4 * scale, f"synthetic gap {delta} scale {scale}"
+    path = os.environ.get(
+        "QWEN_ATTENTION_LAYER",
+        r"C:\Users\antmi\qwen3-work\qwen3-8b-split\model.onnx\layer_0_of_36.onnx",
+    )
+    source = onnx.load(path, load_external_data=False)
+    directory = os.path.dirname(path)
+    original = next(node for node in source.graph.node if node.name.endswith("down_proj/MatMul_Q4"))
+    stored = {item.name: item for item in source.graph.initializer}
+    real_w = _initializer_array(stored[original.input[1]], directory)
+    real_s = _initializer_array(stored[original.input[2]], directory)
+    real = _nbits_model(12288, 4096, 32, real_w, real_s, shape=[1, 1, 12288])
+    real_feed = rng.normal(size=(1, 1, 12288)).astype(np.float32)
+    real_ref = _session(real).run(None, {"activation": real_feed})[0]
+    assert _split_large_matmul_nbits(real, directory) == ["down"]
+    real_got = _session(real).run(None, {"activation": real_feed})[0]
+    real_delta, real_scale = _gap(real_got, real_ref)
+    assert np.isfinite(real_got).all()
+    assert real_delta <= 1e-4 * real_scale, f"down_proj gap {real_delta} scale {real_scale}"
+    print(f"  down_proj_gap {real_delta:.3e} ref_abs {real_scale:.3e}")
 
 
 def main():
@@ -495,6 +737,7 @@ def main():
         ("shape_check_bypass", test_shape_check_bypass_skips_aot_providers),
         ("attention_bias", test_attention_bias_does_not_resize_the_pool),
         ("qwen_layer", test_qwen_layer_freezes_to_the_static_window),
+        ("down_split", test_down_proj_k_split_matches_unsplit),
         ("gqa_slice", test_gqa_slice_keeps_the_newest_window),
         ("skip_norm", test_skip_norm_matches_the_fused_op),
         ("builder_static_mask", test_builder_static_mask_has_no_shape_or_slice),

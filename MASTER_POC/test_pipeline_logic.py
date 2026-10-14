@@ -7,7 +7,7 @@ import tempfile
 import numpy as np
 import onnx
 from onnx import helper, TensorProto
-from grok_inference_split_model_pipeline import SequentialModelPipeline
+from grok_inference_split_model_pipeline import SequentialModelPipeline, keep_last_position
 from unittest.mock import MagicMock, patch
 
 class TestPipelineLogic(unittest.TestCase):
@@ -81,6 +81,37 @@ class TestPipelineLogic(unittest.TestCase):
         # Verify RuntimeError is raised
         with self.assertRaisesRegex(RuntimeError, "Missing inputs"):
             pipeline.run_component_session("test_comp", mock_session)
+
+    def test_last_position_matches_the_full_logit_row(self):
+        rng = np.random.default_rng(0)
+        hidden = rng.normal(size=(1, 5, 8)).astype(np.float32)
+        weight = rng.normal(size=(8, 13)).astype(np.float32)
+        full = hidden @ weight
+        last = keep_last_position(hidden) @ weight
+        np.testing.assert_allclose(last, full[:, -1:, :], rtol=1e-6, atol=1e-6)
+        self.assertEqual(last.shape, (1, 1, 13))
+        one = hidden[:, :1, :]
+        self.assertIs(keep_last_position(one), one)
+        cache = np.zeros((1, 8, 5, 16), dtype=np.float32)
+        self.assertIs(keep_last_position(cache), cache)
+
+    @patch('grok_inference_split_model_pipeline.AutoTokenizer')
+    @patch('grok_inference_split_model_pipeline.load_model_config')
+    @patch('grok_inference_split_model_pipeline.KVCacheManager')
+    def test_norm_input_keeps_only_the_last_position(self, mock_kv, mock_config, mock_tokenizer):
+        mock_tokenizer.from_pretrained.return_value = MagicMock()
+        pipeline = SequentialModelPipeline(self.model_dir, tokenizer_path="dummy", verbose=False)
+        pipeline.model_info["components"]["norm"] = {
+            "input_names": ["hidden"],
+            "output_names": ["normed"],
+        }
+        hidden = np.zeros((1, 4, 3), dtype=np.float32)
+        hidden[0, -1, :] = 7
+        pipeline.tensor_registry["hidden"] = hidden
+        pipeline._keep_last_hidden("norm")
+        got = pipeline.tensor_registry["hidden"]
+        self.assertEqual(got.shape, (1, 1, 3))
+        self.assertTrue(np.all(got == 7))
 
 if __name__ == '__main__':
     unittest.main()

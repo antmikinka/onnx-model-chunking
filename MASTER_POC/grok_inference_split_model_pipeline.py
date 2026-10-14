@@ -36,7 +36,6 @@ import numpy as np
 import onnxruntime as ort
 from transformers import AutoTokenizer
 
-# Import modular utilities
 from pipeline_utils import (
     KVCacheManager,
     get_numpy_dtype,
@@ -49,6 +48,17 @@ from pipeline_utils import (
     get_provider_for_device,
     PROVIDER_CATEGORIES
 )
+
+
+def keep_last_position(tensor):
+    """Keep the last sequence row of a ``[batch, seq, hidden]`` activation.
+
+    Causal next-token logits depend only on that row. Rank-3 tensors whose
+    sequence length is already 1, and every other rank, are returned as given.
+    """
+    if not isinstance(tensor, np.ndarray) or tensor.ndim != 3 or int(tensor.shape[1]) <= 1:
+        return tensor
+    return np.ascontiguousarray(tensor[:, -1:, :])
 
 
 class SequentialModelPipeline:
@@ -623,6 +633,14 @@ class SequentialModelPipeline:
                 del session
                 gc.collect()
     
+    def _keep_last_hidden(self, component_name: str) -> None:
+        """Slice rank-3 inputs of ``component_name`` down to the last position."""
+        info = self.model_info["components"].get(component_name) or {}
+        for name in info.get("input_names", []):
+            if name not in self.tensor_registry:
+                continue
+            self.tensor_registry[name] = keep_last_position(self.tensor_registry[name])
+
     def _run_layers_with_kv_update(self) -> None:
         """
         Run all transformer layers and update KV cache from present outputs.
@@ -737,10 +755,14 @@ class SequentialModelPipeline:
             # Run all transformer layers with KV cache update
             self._run_layers_with_kv_update()
             
-            # Run final norm if exists
+            # The layers have already written the KV cache. Norm and the LM
+            # head only need the last position to choose the next token.
             if not self.is_monolith and "norm" in self.model_info["components"]:
+                self._keep_last_hidden("norm")
                 self._run_component("norm")
-                
+            elif not self.is_monolith and "lm_head" in self.model_info["components"]:
+                self._keep_last_hidden("lm_head")
+
             # Run LM head
             if not self.is_monolith:
                 self._run_component("lm_head")
