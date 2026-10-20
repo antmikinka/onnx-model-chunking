@@ -2266,6 +2266,46 @@ class KVCacheManager:
             _refresh_ort_contents(buffer.ort_value, mask)
         return mask
 
+    def _injected_past(self, layer_idx: int, stored: Any) -> Any:
+        """
+        Past tensor to feed a graph for one layer.
+
+        A static CPU pool without a binder reserves ``max_seq_len`` rows
+        but only the first ``layer_length`` rows are valid. Concat-style
+        dynamic graphs append new tokens to whatever past they receive,
+        so injecting the full pool makes ``present`` grow to
+        ``max_seq_len + delta`` and overflow the pool on the first step.
+        Slicing the valid prefix keeps ``present`` within capacity while
+        the allocated pool address stays put for later writes.
+
+        Device-resident caches (binder-attached AOT graphs) receive the
+        pool unchanged: those graphs track the valid length through the
+        binder's mask instead of the past shape.
+
+        Args:
+            layer_idx: Layer whose cache entry is being injected
+            stored: Cache entry as held in ``self._cache``
+
+        Returns:
+            Contiguous prefix window, or ``stored`` unchanged when no
+            windowing applies
+        """
+        if not (
+            self._static
+            and self._binder is None
+            and isinstance(stored, np.ndarray)
+        ):
+            return stored
+        length = self.layer_length(layer_idx)
+        if stored.shape[_SEQ_AXIS] <= length:
+            return stored
+        slices: List[slice] = [slice(None)] * stored.ndim
+        slices[_SEQ_AXIS] = slice(0, length)
+        # ascontiguousarray: a partial slice along axis 2 is strided, and
+        # IOBindingManager.bind_inputs creates OrtValues from the numpy
+        # buffer, which requires contiguous memory.
+        return np.ascontiguousarray(stored[tuple(slices)])
+
     def inject_into_registry(
         self,
         registry: Dict[str, Any],
@@ -2278,6 +2318,10 @@ class KVCacheManager:
         CPU entries are NumPy arrays. Device entries are DeviceBuffers.
         Bind ``entry.ort_value`` rather than copying the tensor to host.
 
+        A static pool without a binder injects the valid prefix window
+        (see ``_injected_past``) so dynamic graphs observe a past whose
+        sequence axis equals the committed length, not ``max_seq_len``.
+
         Args:
             registry: Dictionary to inject cache tensors into
             key_format: Format string for key tensor names (use {layer} placeholder)
@@ -2287,8 +2331,8 @@ class KVCacheManager:
             for i in range(self.num_layers):
                 key_name = key_format.format(layer=i)
                 value_name = value_format.format(layer=i)
-                registry[key_name] = self._cache[i]["key"]
-                registry[value_name] = self._cache[i]["value"]
+                registry[key_name] = self._injected_past(i, self._cache[i]["key"])
+                registry[value_name] = self._injected_past(i, self._cache[i]["value"])
 
     def extract_from_registry(
         self,

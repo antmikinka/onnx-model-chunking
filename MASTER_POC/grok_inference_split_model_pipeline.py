@@ -46,6 +46,7 @@ from pipeline_utils import (
     SessionConfig,
     get_available_providers,
     get_provider_for_device,
+    provider_is_npu,
     PROVIDER_CATEGORIES
 )
 
@@ -289,10 +290,18 @@ class SequentialModelPipeline:
         """Initialize and load all sessions for persistent mode (NPU-optimized)."""
         self._log("\n[NPU Mode] Initializing persistent sessions...")
         
+        # Resident NPU sessions compile once. lm_head may still be DirectML
+        # and embeddings may still be CPU; those pins live on the component.
+        policy = "auto"
+        if self.persist_sessions and any(
+            provider_is_npu(provider) for provider in self.providers
+        ):
+            policy = "persistent"
         session_config = SessionConfig(
             providers=self.providers,
             optimization_level="DISABLE",  # For dynamic shapes
-            disable_shape_check=True
+            disable_shape_check=True,
+            execution_policy=policy,
         )
         
         # In monolith mode, model_dir is just the dir, but we need to register the monolith session
@@ -305,7 +314,7 @@ class SequentialModelPipeline:
         self.session_manager = SessionManager(
             model_dir=self.model_dir,
             config=session_config,
-            model_info=self.model_info
+            model_info=self._model_info_with_provider_pins(),
         )
         
         # Load all sessions at startup
@@ -364,6 +373,41 @@ class SequentialModelPipeline:
 
         # Fallback to default providers
         return self.providers
+
+    def _matched_component_providers(self, component_name: str) -> Optional[List[str]]:
+        """
+        Providers pinned to one component.
+
+        An exact name wins over a ``layer_*`` pattern. None means the
+        component keeps the manager provider list.
+        """
+        if component_name in self.component_providers:
+            return list(self.component_providers[component_name])
+        for pattern, providers in self.component_providers.items():
+            if pattern.endswith("*") and component_name.startswith(pattern[:-1]):
+                return list(providers)
+        return None
+
+    def _model_info_with_provider_pins(self) -> Dict[str, Any]:
+        """
+        Copy model info and record an explicit provider where one was pinned.
+
+        ``layer_*`` can stay on VitisAI while ``lm_head`` stays on DirectML.
+        A component with no pin is left unchanged, so embeddings are not
+        forced onto the NPU.
+        """
+        info = dict(self.model_info)
+        components: Dict[str, Any] = {}
+        for name, comp in self.model_info.get("components", {}).items():
+            record = dict(comp)
+            pinned = self._matched_component_providers(name)
+            if pinned:
+                record["provider"] = pinned[0]
+                if len(pinned) > 1:
+                    record["providers"] = list(pinned)
+            components[name] = record
+        info["components"] = components
+        return info
 
     def _get_current_providers(self) -> List[str]:
         """

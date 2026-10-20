@@ -83,15 +83,12 @@ GPU_PROVIDER_MARKERS = (
 _LAYER_COMPONENT = re.compile(r"(^|_)layer_\d+$")
 
 NPU_SEQUENTIAL_SPLIT_ERROR = (
-    "Sequential layer splitting on NPU causes AOT/context-switch penalties. "
-    "Use monolithic, phase-split, or MoE expert-routing mode."
+    "Execution policy 'sequential' unloads each NPU session. "
+    "Ahead-of-time compilation then runs again on the next load. "
+    "Keep layer sessions resident and run them in order. "
+    "A layer can use VitisAI while lm_head stays on DirectML and embeddings stay on CPU."
 )
 
-
-SEQUENTIAL_LAYER_SPLIT_POLICIES = frozenset({
-    ExecutionPolicy.SEQUENTIAL,
-    ExecutionPolicy.PERSISTENT,
-})
 
 HYBRID_NPU_POLICIES = frozenset({
     ExecutionPolicy.HYBRID_NPU_IGPU,
@@ -177,10 +174,12 @@ def validate_npu_execution_policy(
     component_names: Optional[Iterable[str]] = None,
 ) -> ExecutionPolicy:
     """
-    Reject NPU sessions that would compile one graph per layer.
+    Reject an NPU policy that unloads every session between steps.
 
-    Phase-split and MoE routing are allowed. CPU and GPU split policies are
-    allowed. A policy that does not match the selected device warns.
+    A resident layer series is allowed. Layers, embeddings, and lm_head may
+    use different providers. Phase-split and MoE routing stay allowed. CPU
+    and GPU splits stay allowed. A policy that does not match the selected
+    device warns.
     """
     policy = coerce_execution_policy(execution_policy)
     provider_list = list(providers or ())
@@ -188,13 +187,12 @@ def validate_npu_execution_policy(
     targets_npu = providers_target_npu(provider_list)
     targets_gpu = any(provider_is_gpu(provider) for provider in provider_list)
     layer_split = is_sequential_layer_split(names)
-    # SEQUENTIAL and PERSISTENT are explicit layer policies. A layer series
-    # under any other non-hybrid policy is the same shape in practice.
-    sequential_split = policy in SEQUENTIAL_LAYER_SPLIT_POLICIES or (
-        policy not in HYBRID_NPU_POLICIES and layer_split
-    )
-
-    if targets_npu and sequential_split and policy not in HYBRID_NPU_POLICIES:
+    # SEQUENTIAL unloads the session after each step, so the next token
+    # compiles the graph again. PERSISTENT keeps the compiled session.
+    if targets_npu and policy == ExecutionPolicy.SEQUENTIAL:
+        raise RuntimeError(NPU_SEQUENTIAL_SPLIT_ERROR)
+    # Speculative draft and verify is a phase schedule, not a layer series.
+    if targets_npu and layer_split and policy == ExecutionPolicy.SPECULATIVE:
         raise RuntimeError(NPU_SEQUENTIAL_SPLIT_ERROR)
 
     if policy in HYBRID_NPU_POLICIES and not targets_npu:
@@ -205,7 +203,7 @@ def validate_npu_execution_policy(
             RuntimeWarning,
             stacklevel=2,
         )
-    elif policy == ExecutionPolicy.PERSISTENT and not targets_gpu:
+    elif policy == ExecutionPolicy.PERSISTENT and not targets_gpu and not targets_npu:
         warnings.warn(
             "Execution policy 'persistent' expects a GPU provider "
             "(CUDA, ROCm, TensorRT, MIGraphX, or DirectML).",
@@ -892,6 +890,179 @@ def build_provider_assignment(
     )
 
 
+_LLM_EAGER_TARGET = "RyzenAI_llm_eager"
+_EMBEDDING_COMPONENT_NAMES = frozenset({
+    "embedding",
+    "embeddings",
+    "embed",
+    "tok_embeddings",
+})
+
+
+def _is_embedding_component(name: str) -> bool:
+    """True for the token embedding graph. Its table does not fit in VAIP."""
+    text = str(name).strip().lower().replace("-", "_")
+    return text in _EMBEDDING_COMPONENT_NAMES or text.startswith("embed")
+
+
+def _discover_overlay_xclbin() -> str:
+    """
+    Return a Strix overlay path when one is installed.
+
+    The name is still written when the file is absent. Vitis then opens the
+    session and leaves unmatched nodes on CPU.
+    """
+    roots: List[str] = []
+    env_root = os.environ.get("RYZEN_AI_INSTALLATION_PATH", "").strip()
+    if env_root:
+        roots.append(env_root)
+    program = os.environ.get("ProgramFiles", r"C:\Program Files")
+    for version in ("1.8.0", "1.7.0", "1.6.0", "1.5.1"):
+        roots.append(os.path.join(program, "RyzenAI", version))
+    relatives = (
+        os.path.join(
+            "voe-4.0-win_amd64", "xclbins", "strix", "AMD_AIE2P_4x4_Overlay.xclbin"
+        ),
+        os.path.join(
+            "voe-4.0-win_amd64", "xclbins", "strix", "AMD_AIE2P_Nx4_Overlay.xclbin"
+        ),
+    )
+    for root in roots:
+        for relative in relatives:
+            candidate = os.path.join(root, relative)
+            if os.path.isfile(candidate):
+                return candidate
+    return "AMD_AIE2P_4x4_Overlay.xclbin"
+
+
+def llm_vaip_config_document() -> Dict[str, Any]:
+    """VAIP passes that can claim a com.microsoft MatMulNBits node."""
+    return {
+        "passes": [
+            {"name": "init", "plugin": "vaip-pass_init"},
+            {
+                "name": "fuse_MatMulNBits",
+                "plugin": "vaip-pass_matmul_nbits",
+                "enable_gc": True,
+                "disabled": False,
+            },
+            {
+                "name": "fuse_MLP",
+                "plugin": "vaip-pass_mladf_mlp",
+                "enable_gc": True,
+                "disabled": False,
+            },
+            {
+                "name": "fuse_SSMLP",
+                "plugin": "vaip-pass_ssmlp",
+                "enable_gc": True,
+                "disabled": False,
+            },
+        ],
+        "target": _LLM_EAGER_TARGET,
+        "targets": [
+            {
+                "name": _LLM_EAGER_TARGET,
+                "xclbin": _discover_overlay_xclbin().replace("\\", "/"),
+                "pass": ["fuse_MatMulNBits", "fuse_SSMLP", "fuse_MLP"],
+                "provider_options": {
+                    "enable_preemption": "0",
+                    "enable_txn_elf": "1",
+                    "is_preemptible": "0",
+                    "dd_use_elf_flow": "1",
+                    "enable_cache_file_io_in_mem": "0",
+                },
+            }
+        ],
+    }
+
+
+def ensure_llm_vaip_config(directory: str) -> str:
+    """Write the LLM eager VAIP config into ``directory`` and return its path."""
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, "vaip_llm_eager.json")
+    text = json.dumps(llm_vaip_config_document(), indent=2) + "\n"
+    existing = None
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                existing = handle.read()
+        except OSError:
+            existing = None
+    if existing != text:
+        with open(path, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+    return path
+
+
+def _first_explicit_options(
+    provider_options: Optional[Sequence[Any]],
+) -> Dict[str, Any]:
+    """Return the option dict the caller attached to the first provider."""
+    if not provider_options:
+        return {}
+    first = provider_options[0]
+    if isinstance(first, dict):
+        return dict(first)
+    return {}
+
+
+def specialize_component_assignment(
+    name: str,
+    assignment: ProviderAssignment,
+    *,
+    pinned: bool,
+    explicit_options: Optional[Dict[str, Any]] = None,
+    config_dir: Optional[str] = None,
+) -> ProviderAssignment:
+    """
+    Place one component on the provider that can run it.
+
+    An unpinned embedding stays on CPU. The fp32 table exceeds the VAIP
+    protobuf cap. A layer assigned to VitisAI or RyzenAI requests
+    ``RyzenAI_llm_eager`` and the MatMulNBits fuse passes. An explicit
+    target, config file, or cache key is left alone. ``lm_head`` and any
+    other pinned provider, including DirectML, stay as assigned.
+    """
+    explicit = dict(explicit_options or {})
+    providers = list(assignment.providers)
+    if not providers:
+        return assignment
+    if _is_embedding_component(name) and not pinned and provider_is_npu(providers[0]):
+        cpu = provider_profile_for("CPUExecutionProvider")
+        return ProviderAssignment(
+            providers=["CPUExecutionProvider"],
+            provider_options=[{}],
+            profile=cpu,
+            dropped=list(assignment.dropped),
+        )
+    if not _LAYER_COMPONENT.search(str(name)):
+        return assignment
+    if not provider_is_npu(providers[0]):
+        return assignment
+    profile = assignment.profile.copy()
+    if profile.device_type not in {"vitisai", "ryzenai"}:
+        return assignment
+    if "target" not in explicit:
+        profile.provider_options["target"] = _LLM_EAGER_TARGET
+    if "cacheKey" not in explicit:
+        profile.provider_options["cacheKey"] = str(name)
+    if (
+        profile.device_type == "vitisai"
+        and "config_file" not in explicit
+        and config_dir
+    ):
+        profile.provider_options["config_file"] = ensure_llm_vaip_config(config_dir)
+    options = [dict(item) for item in assignment.provider_options]
+    options[0] = ep_provider_options(profile)
+    return ProviderAssignment(
+        providers=providers,
+        provider_options=options,
+        profile=profile,
+        dropped=list(assignment.dropped),
+    )
+
+
 @dataclass
 class WarmupResult:
     """One warmup pass. These runs pay for compilation and are not a benchmark."""
@@ -1339,7 +1510,8 @@ class SessionConfig:
         Return the policy the NPU guard uses.
 
         ``auto`` stays stored as auto and behaves as monolithic execution.
-        A sequential layer split on an NPU is still rejected.
+        The sequential unload policy is still rejected on an NPU. A resident
+        layer series is not.
         """
         policy = coerce_execution_policy(self.execution_policy)
         self.execution_policy = policy
@@ -1367,11 +1539,11 @@ class SessionConfig:
         component_names: Optional[Iterable[str]] = None,
     ) -> ExecutionPolicy:
         """
-        Raise if this config would layer-split an NPU.
+        Raise if this config would unload an NPU session between steps.
 
-        ``component_names`` comes from the discovered model. With no names,
-        an explicit sequential or persistent policy is still rejected on an
-        NPU provider.
+        ``component_names`` comes from the discovered model. A persistent
+        layer series is accepted. The sequential unload policy is rejected
+        on an NPU provider.
         """
         return validate_npu_execution_policy(
             self.resolved_execution_policy(),
@@ -2224,8 +2396,9 @@ class SessionManager:
     - Track memory usage
     - Thread-safe access
     - Provider fallback handling
-    - Reject layer-by-layer loads on VitisAI, RyzenAI, OpenVINO, and CoreML
-      unless the policy is phase-split or MoE expert routing
+    - Reject the sequential unload policy on VitisAI, RyzenAI, OpenVINO,
+      and CoreML. Resident layer sessions stay loaded and run in order.
+      lm_head may use DirectML, and embeddings stay on CPU unless pinned.
     - Select a ProviderProfile from the first execution provider that is
       installed in this ONNX Runtime build
     - Run from an ExecutionPlan: dependency order, device, phase, and residency
@@ -2395,7 +2568,10 @@ class SessionManager:
 
         An explicit ``providers`` argument wins. Otherwise a plan step or the
         component record supplies the device. A component with neither keeps
-        the manager list. The two returned lists have the same length.
+        the manager list. Embeddings on that default list stay on CPU. A
+        layer on VitisAI requests the LLM MatMul passes. ``lm_head`` keeps
+        the provider recorded for it, including DirectML. The two returned
+        lists have the same length.
         """
         if providers is None and name not in self._session_info:
             raise KeyError(f"Session '{name}' is not in this model")
@@ -2406,7 +2582,10 @@ class SessionManager:
         else:
             available = None
         cache_dir = self.provider_profile.cache_dir
+        pinned = True
+        explicit_options: Dict[str, Any] = {}
         if providers is not None:
+            explicit_options = _first_explicit_options(provider_options)
             assignment = build_provider_assignment(
                 providers,
                 provider_options,
@@ -2420,9 +2599,11 @@ class SessionManager:
         else:
             request = self._component_provider_request(name)
             if request is None:
+                pinned = False
                 assignment = self._default_provider_assignment()
             else:
                 requested, options, append_cpu = request
+                explicit_options = _first_explicit_options(options)
                 assignment = build_provider_assignment(
                     requested,
                     options,
@@ -2433,6 +2614,14 @@ class SessionManager:
                     npu_graph_capture=self.config.npu_graph_capture,
                     npu_compilation_mode=self.config.npu_compilation_mode,
                 )
+        config_dir = cache_dir or os.path.join(self.model_dir, ".ort_cache")
+        assignment = specialize_component_assignment(
+            name,
+            assignment,
+            pinned=pinned,
+            explicit_options=explicit_options,
+            config_dir=config_dir,
+        )
         if assignment.dropped:
             warnings.warn(
                 f"Component '{name}' dropped unavailable provider "
@@ -3461,16 +3650,25 @@ class SessionManager:
         """
         Check the plan shape against the configured execution policy.
 
-        Monolithic NPU runs get one NPU step. Hybrid NPU and iGPU and phase
+        The sequential policy cannot unload an NPU step. A monolithic plan
+        can keep several resident layer sessions on the NPU. Two non-layer
+        NPU steps still need their own policy. Hybrid NPU and iGPU and phase
         split need prefill and decode. MoE routing needs a router and an
         expert. Speculative draft and verify needs both of those phases.
         """
         policy = self.config.resolved_execution_policy()
         phases = {step.phase for step in plan.steps}
         npu_steps = [step for step in plan.steps if _step_targets_npu(step)]
-        if policy == ExecutionPolicy.MONOLITHIC and len(npu_steps) > 1:
+        layer_npu = [
+            step for step in npu_steps if _LAYER_COMPONENT.search(step.component_name)
+        ]
+        if policy == ExecutionPolicy.SEQUENTIAL and npu_steps:
             raise RuntimeError(NPU_SEQUENTIAL_SPLIT_ERROR)
-        if policy in SEQUENTIAL_LAYER_SPLIT_POLICIES and npu_steps:
+        if (
+            policy == ExecutionPolicy.MONOLITHIC
+            and len(npu_steps) > 1
+            and len(layer_npu) != len(npu_steps)
+        ):
             raise RuntimeError(NPU_SEQUENTIAL_SPLIT_ERROR)
         if policy in (
             ExecutionPolicy.HYBRID_NPU_IGPU,
@@ -4152,11 +4350,11 @@ class SessionManager:
 
     def _enforce_execution_policy(self) -> None:
         """
-        Reject an NPU layer-by-layer load.
+        Reject an NPU load that would unload each session.
 
         The same provider list and component set is checked once. A later
         change to ``config.providers`` or ``config.execution_policy`` is
-        checked again on the next load.
+        checked again on the next load. A resident layer series passes.
         """
         policy = self.config.resolved_execution_policy()
         signature = (

@@ -3596,14 +3596,14 @@ def test_session_manager():
         ExecutionPolicy.SEQUENTIAL,
         split_layers,
     )
-    _expect_npu_split_rejected(
-        ["RyzenAIExecutionProvider"],
+    validate_npu_execution_policy(
         ExecutionPolicy.PERSISTENT,
+        ["RyzenAIExecutionProvider"],
         split_layers,
     )
-    _expect_npu_split_rejected(
-        ["VitisAIExecutionProvider"],
+    validate_npu_execution_policy(
         ExecutionPolicy.MONOLITHIC,
+        ["VitisAIExecutionProvider"],
         split_layers,
     )
     _expect_npu_split_rejected(
@@ -3654,15 +3654,12 @@ def test_session_manager():
         }
     }
     if "VitisAIExecutionProvider" in get_available_providers():
-        try:
-            SessionManager(
-                ".",
-                SessionConfig(providers=["VitisAIExecutionProvider"]),
-                model_info=split_info,
-            )
-            raise AssertionError("installed VitisAI loaded a layer split")
-        except RuntimeError as exc:
-            assert NPU_SEQUENTIAL_SPLIT_ERROR in str(exc)
+        installed_split = SessionManager(
+            ".",
+            SessionConfig(providers=["VitisAIExecutionProvider"]),
+            model_info=split_info,
+        )
+        assert installed_split.config.providers[0] == "VitisAIExecutionProvider"
     else:
         with warnings.catch_warnings(record=True) as dropped_warnings:
             warnings.simplefilter("always")
@@ -3677,16 +3674,55 @@ def test_session_manager():
             "VitisAIExecutionProvider" in str(item.message)
             for item in dropped_warnings
         )
-    try:
-        SessionManager(
-            ".",
-            SessionConfig(providers=["VitisAIExecutionProvider"]),
-            model_info=split_info,
-            available_providers=["VitisAIExecutionProvider", "CPUExecutionProvider"],
-        )
-        raise AssertionError("VitisAI SessionManager loaded a layer split")
-    except RuntimeError as exc:
-        assert NPU_SEQUENTIAL_SPLIT_ERROR in str(exc)
+    resident_split = SessionManager(
+        ".",
+        SessionConfig(providers=["VitisAIExecutionProvider"]),
+        model_info=split_info,
+        available_providers=["VitisAIExecutionProvider", "CPUExecutionProvider"],
+    )
+    assert resident_split.config.providers[0] == "VitisAIExecutionProvider"
+    assert "layer_0" in resident_split
+    mixed_dir = tempfile.mkdtemp(prefix="npu-mixed-")
+    mixed = SessionManager(
+        mixed_dir,
+        SessionConfig(
+            providers=[
+                "VitisAIExecutionProvider",
+                "DmlExecutionProvider",
+                "CPUExecutionProvider",
+            ],
+            execution_policy=ExecutionPolicy.PERSISTENT,
+        ),
+        model_info={
+            "components": {
+                "embedding": {"file": "embedding.onnx"},
+                "layer_0": {"file": "layer_0.onnx"},
+                "layer_1": {"file": "layer_1.onnx"},
+                "lm_head": {
+                    "file": "lm_head.onnx",
+                    "provider": "DmlExecutionProvider",
+                },
+            }
+        },
+        available_providers=[
+            "VitisAIExecutionProvider",
+            "DmlExecutionProvider",
+            "CPUExecutionProvider",
+        ],
+    )
+    assert mixed.config.resolved_execution_policy() is ExecutionPolicy.PERSISTENT
+    layer_assignment = mixed.provider_assignment("layer_0")
+    assert layer_assignment.providers[0] == "VitisAIExecutionProvider"
+    assert layer_assignment.provider_options[0]["target"] == "RyzenAI_llm_eager"
+    assert layer_assignment.provider_options[0]["cacheKey"] == "layer_0"
+    assert layer_assignment.provider_options[0]["config_file"].endswith("vaip_llm_eager.json")
+    with open(layer_assignment.provider_options[0]["config_file"], "r", encoding="utf-8") as handle:
+        fuse_config = handle.read()
+    assert "fuse_MatMulNBits" in fuse_config
+    assert "RyzenAI_llm_eager" in fuse_config
+    assert mixed.provider_assignment("layer_1").provider_options[0]["cacheKey"] == "layer_1"
+    assert mixed.provider_assignment("lm_head").providers[0] == "DmlExecutionProvider"
+    assert mixed.provider_assignment("embedding").providers == ["CPUExecutionProvider"]
     phase_manager = SessionManager(
         ".",
         SessionConfig(
@@ -3720,7 +3756,7 @@ def test_session_manager():
             split_layers,
         )
     assert caught and issubclass(caught[0].category, RuntimeWarning)
-    print("  NPU sequential split rejected; phase-split and MoE routing allowed")
+    print("  NPU unload rejected; resident layers, DirectML lm_head, and CPU embeddings allowed")
 
     import onnxruntime as ort
     cpu_profile = provider_profile_for("CPUExecutionProvider")
@@ -6379,6 +6415,24 @@ def test_backend():
     assert routed._get_component_providers("layer_0")[0] == "VitisAIExecutionProvider"
     assert routed._get_component_providers("layer_9") == ["CPUExecutionProvider"]
     assert routed._get_component_providers("embedding")[0] == "VitisAIExecutionProvider"
+    pinned_pipeline = pipeline_cls.__new__(pipeline_cls)
+    pinned_pipeline.providers = ["VitisAIExecutionProvider", "CPUExecutionProvider"]
+    pinned_pipeline.component_providers = {
+        "layer_*": ["VitisAIExecutionProvider"],
+        "lm_head": ["DmlExecutionProvider"],
+    }
+    pinned_pipeline.model_info = {
+        "components": {
+            "embedding": {"file": "embedding.onnx"},
+            "layer_0": {"file": "layer_0.onnx"},
+            "lm_head": {"file": "lm_head.onnx"},
+        }
+    }
+    pinned_info = pinned_pipeline._model_info_with_provider_pins()
+    assert pinned_info["components"]["layer_0"]["provider"] == "VitisAIExecutionProvider"
+    assert pinned_info["components"]["lm_head"]["provider"] == "DmlExecutionProvider"
+    assert "provider" not in pinned_info["components"]["embedding"]
+    assert "provider" not in pinned_pipeline.model_info["components"]["layer_0"]
     routed.phase = "decode"
     assert routed._get_component_providers("embedding")[0] == "ROCmExecutionProvider"
     assert routed._get_component_providers("router") == ["CPUExecutionProvider"]
@@ -6549,16 +6603,13 @@ def test_backend():
             raise AssertionError("sequential NPU execution was accepted")
         except ValueError as exc:
             assert "sequential" in str(exc)
-        try:
-            SplitConfig(
-                model="weights",
-                output="out",
-                providers=["VitisAIExecutionProvider"],
-                execution_policy="persistent",
-            )
-            raise AssertionError("persistent NPU execution was accepted")
-        except ValueError as exc:
-            assert "persistent" in str(exc)
+        resident_npu = SplitConfig(
+            model="weights",
+            output="out",
+            providers=["VitisAIExecutionProvider"],
+            execution_policy="persistent",
+        )
+        assert resident_npu.execution_policy is canonical_policy.PERSISTENT
         from chunking_utils.common import ComponentInfo as package_component
         assert package_component is ComponentInfo
         bare = ComponentInfo(component_type="embedding")
@@ -6734,7 +6785,9 @@ def test_backend():
         import types as pytypes
         saved_onnx = sys.modules.get("chunking_utils.onnx")
         saved_onnx_types = sys.modules.get("chunking_utils.onnx.types")
-        onnx_dir = os.path.join("/workspace/MASTER_POC", "chunking_utils", "onnx")
+        onnx_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "chunking_utils", "onnx"
+        )
         onnx_pkg = pytypes.ModuleType("chunking_utils.onnx")
         onnx_pkg.__path__ = [onnx_dir]
         onnx_pkg.__package__ = "chunking_utils.onnx"
@@ -7062,6 +7115,59 @@ def test_backend():
         except ValueError as exc:
             assert "sequential" in str(exc)
             assert "NPU" in str(exc)
+        resident_layers = ExecutionPlan(
+            policy="persistent",
+            steps=[
+                ExecutionStep(
+                    component_name="layer_0",
+                    provider="VitisAIExecutionProvider",
+                    device="npu",
+                    phase="decode",
+                ),
+                ExecutionStep(
+                    component_name="layer_1",
+                    provider="VitisAIExecutionProvider",
+                    device="npu",
+                    phase="decode",
+                    depends_on=["layer_0"],
+                ),
+                ExecutionStep(
+                    component_name="lm_head",
+                    provider="DmlExecutionProvider",
+                    device="igpu",
+                    phase="lm_head",
+                    depends_on=["layer_1"],
+                ),
+            ],
+        )
+        assert [step.component_name for step in resident_layers.steps] == [
+            "layer_0",
+            "layer_1",
+            "lm_head",
+        ]
+        assert resident_layers.steps[2].provider == "DmlExecutionProvider"
+        try:
+            ExecutionPlan(
+                policy="monolithic",
+                steps=[
+                    ExecutionStep(
+                        component_name="prefill",
+                        provider="VitisAIExecutionProvider",
+                        device="npu",
+                        phase="prefill",
+                    ),
+                    ExecutionStep(
+                        component_name="decode",
+                        provider="VitisAIExecutionProvider",
+                        device="npu",
+                        phase="decode",
+                        depends_on=["prefill"],
+                    ),
+                ],
+            )
+            raise AssertionError("two non-layer NPU steps were accepted")
+        except ValueError as exc:
+            assert "non-layer" in str(exc)
         try:
             ExecutionPlan(policy="hybrid_npu_igpu", steps=[prefill])
             raise AssertionError("a hybrid plan without decode was accepted")
@@ -16811,9 +16917,15 @@ def test_split_inference():
         ran.append("layer_0")
         past = np.asarray(feeds["past_key_values.0.key"])
         past_shapes.append(tuple(past.shape))
-        seq = int(np.asarray(feeds["attention_mask"]).shape[-1])
+        new_tokens = int(np.asarray(feeds["hidden"]).shape[1])
+        # Concat semantics: like the GenAI exports, the graph appends the
+        # new tokens to the past it was handed, so the present sequence
+        # axis grows with the injected past shape rather than the mask
+        # width. A static pool injected whole therefore overflows
+        # max_seq_len (pool + delta > pool) unless the cache windows it.
+        seq = int(past.shape[2]) + new_tokens
         present = np.zeros((1, 1, seq, 8), dtype=np.float16)
-        hidden = np.zeros((1, seq, 4), dtype=np.float32)
+        hidden = np.zeros((1, new_tokens, 4), dtype=np.float32)
         values = {
             "hidden": hidden,
             "present.0.key": present,
@@ -16992,7 +17104,31 @@ def test_split_inference():
             )
             assert static_engine.kv_cache.static is True
             assert static_engine.kv_cache.max_seq_len == 32
+
+            # Regression (static pool + concat-style dynamic graph):
+            # prefill must inject an empty past window, not the full
+            # (1, 1, 32, 8) pool. Injecting the pool made the fake graph
+            # return present (1, 1, 34, 8) and update_from_present raised
+            # "sequence length 34 exceeds max_seq_len 32" (in the field:
+            # 4097 > 4096 on Qwen3 IO_BOUND runs).
+            static_engine.tokenizer = Tokenizer()
+            static_text = static_engine.generate("Hello", max_new_tokens=4)
+            assert static_text == "4,6,5,2"
+            assert ran == [
+                "embedding", "layer_0", "lm_head",
+                "embedding", "layer_0", "lm_head",
+            ]
+            assert past_shapes == [(1, 1, 0, 8), (1, 1, 2, 8)]
+            static_result = static_engine.get_result()
+            assert static_result.token_ids == [5, 2]
+            assert static_result.num_tokens_generated == 2
+            assert static_engine.kv_cache.get_sequence_length() == 3
+            assert static_engine.kv_cache.layer_length(0) == 3
             static_engine.cleanup()
+
+            ran.clear()
+            past_shapes.clear()
+            head_calls.clear()
 
             engine = SplitModelInferenceEngine(split_dir, verbose=True)
             assert engine.num_layers == 1
