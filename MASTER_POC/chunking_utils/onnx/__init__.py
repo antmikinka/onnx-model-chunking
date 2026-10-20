@@ -60,6 +60,7 @@ from .quark_optimize import (
 from .static_shapes import (
     apply_static_contract,
     decompose_gqa_to_npu_primitives,
+    homogenize_qdq_weights_and_split_k,
     right_aligned_attention_bias,
     static_attention_bias,
 )
@@ -108,6 +109,7 @@ __all__ = [
     "prepare_model_for_split",
     "apply_static_contract",
     "decompose_gqa_to_npu_primitives",
+    "homogenize_qdq_weights_and_split_k",
     "right_aligned_attention_bias",
     "static_attention_bias",
 ]

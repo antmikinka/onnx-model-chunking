@@ -2058,6 +2058,213 @@ def test_matmul_sub4096_ksplit_and_ozaki_dual_bf16_compensation():
     )
 
 
+def _quantize_bfp16ebs8(array: np.ndarray, axis: int) -> np.ndarray:
+    """Simulate XDNA2 AIE2P ``bfp16ebs8`` (8-element shared exponent + 8-bit signed mantissa)."""
+    arr = np.ascontiguousarray(array, dtype=np.float32)
+    moved = np.moveaxis(arr, axis, -1)
+    orig_shape = moved.shape
+    width = orig_shape[-1]
+    assert width % 8 == 0
+    blocks = moved.reshape(-1, width // 8, 8)
+    max_abs = np.max(np.abs(blocks), axis=-1, keepdims=True)
+    # Shared power-of-two scale per 8-element block (7 fractional mantissa bits in [-127, 127])
+    with np.errstate(divide="ignore"):
+        exp = np.floor(np.log2(np.maximum(max_abs, 1e-38))) - 6.0
+    step = np.where(max_abs > 0.0, np.exp2(exp), 1.0)
+    mant = np.clip(np.round(blocks / step), -127.0, 127.0)
+    dequant = (mant * step).reshape(orig_shape)
+    return np.moveaxis(dequant, -1, axis).astype(np.float32)
+
+
+def test_rmsnorm_equilibration_reduces_bfp16ebs8_swamping_and_qdq_homogenize():
+    from chunking_utils.onnx.static_shapes import homogenize_qdq_weights_and_split_k
+    from benchmark_npu_decode import _parse_layer_spec
+
+    # 1. Verify _parse_layer_spec helper for zero-recompile hybrid bisect
+    assert _parse_layer_spec("", 36) == set()
+    assert _parse_layer_spec("none", 36) == set()
+    assert _parse_layer_spec("all", 36) == set(range(36))
+    assert _parse_layer_spec("0,2,5-7", 36) == {0, 2, 5, 6, 7}
+
+    # 2. Verify RMSNorm-to-MatMul 8-element BFP16 block equilibration (0 extra nodes, 0 extra bytes)
+    rng = np.random.default_rng(1234)
+    k_dim, n_dim, block_size = 64, 16, 32
+    n_blocks = k_dim // block_size
+    packed_w = rng.integers(0, 256, size=(n_dim, n_blocks, 16), dtype=np.uint8)
+    scales = rng.uniform(0.01, 0.05, size=(n_dim, n_blocks)).astype(np.float32)
+    # Create an RMSNorm weight with 10x outlier spikes inside each 8-element block
+    gamma = np.ones((k_dim,), dtype=np.float32)
+    gamma[0::8] = 12.0
+
+    def _make_norm_nbits_model():
+        inits = [
+            numpy_helper.from_array(gamma.copy(), name="norm_w"),
+            numpy_helper.from_array(packed_w.copy(), name="w_q4"),
+            numpy_helper.from_array(scales.copy(), name="w_scales"),
+        ]
+        nodes = [
+            helper.make_node(
+                "SimplifiedLayerNormalization",
+                ["x", "norm_w"],
+                ["norm_out"],
+                name="/layer/input_layernorm/LayerNorm",
+                axis=-1,
+                epsilon=1e-6,
+            ),
+            helper.make_node(
+                "MatMulNBits",
+                ["norm_out", "w_q4", "w_scales"],
+                ["y"],
+                name="/layer/qkv/MatMul_Q4",
+                domain="com.microsoft",
+                K=k_dim,
+                N=n_dim,
+                bits=4,
+                block_size=block_size,
+            ),
+        ]
+        g = helper.make_graph(
+            nodes,
+            "norm_nbits_test",
+            [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 1, k_dim])],
+            [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 1, n_dim])],
+            inits,
+        )
+        m = helper.make_model(
+            g,
+            opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("com.microsoft", 1)],
+        )
+        m.ir_version = 10
+        return m
+
+    x_val = rng.normal(0.0, 1.0, size=(1, 1, k_dim)).astype(np.float32)
+    ref_m = _make_norm_nbits_model()
+    ref_y = _session(ref_m).run(None, {"x": x_val})[0]
+
+    unequil_m = _make_norm_nbits_model()
+    apply_static_contract(
+        unequil_m,
+        batch_size=1,
+        query_len=1,
+        max_seq_len=16,
+        npu_bf16_fallback=True,
+        npu_bf16_equilibrate=False,
+    )
+    equil_m = _make_norm_nbits_model()
+    eq_report = apply_static_contract(
+        equil_m,
+        batch_size=1,
+        query_len=1,
+        max_seq_len=16,
+        npu_bf16_fallback=True,
+        npu_bf16_equilibrate=True,
+    )
+    assert eq_report["bf16_equilibrate"] is True
+    # Zero extra nodes and zero extra weight bytes compared to standard bf16 bake
+    assert len(equil_m.graph.node) == len(unequil_m.graph.node)
+
+    # Simulate GemmBfp16 (bfp16ebs8 along K) on both models:
+    # AIE2P GemmBfp16 converts the input activation vector along K (axis -1)
+    # and EACH OUTPUT COLUMN j of W along K (axis 0) into 8-element shared-exponent
+    # BFP16 blocks. Because W's shared exponent is per (8-row x 1-col) block while
+    # the activation's shared exponent is across the 8 elements of x, absorbing
+    # sqrt(gamma) balances both 8-element BFP16 block conversions.
+    gamma[:] = 1.0
+    gamma[0::8] = 64.0
+    ref_m = _make_norm_nbits_model()
+    ref_y = _session(ref_m).run(None, {"x": x_val})[0]
+    unequil_m = _make_norm_nbits_model()
+    apply_static_contract(
+        unequil_m,
+        batch_size=1,
+        query_len=1,
+        max_seq_len=16,
+        npu_bf16_fallback=True,
+        npu_bf16_equilibrate=False,
+    )
+    equil_m = _make_norm_nbits_model()
+    eq_report = apply_static_contract(
+        equil_m,
+        batch_size=1,
+        query_len=1,
+        max_seq_len=16,
+        npu_bf16_fallback=True,
+        npu_bf16_equilibrate=True,
+    )
+    assert eq_report["bf16_equilibrate"] is True
+    assert len(equil_m.graph.node) == len(unequil_m.graph.node)
+
+    def _eval_simulated_bfp16(baked_model):
+        inits = {t.name: t for t in baked_model.graph.initializer}
+        g_vec = numpy_helper.to_array(inits["norm_w"]).astype(np.float32)
+        w_bf16 = _bf16_matrix(bytes(inits["/layer/qkv/MatMul_Q4/bf16_weight"].raw_data), (k_dim, n_dim))
+        rms = np.sqrt(np.mean(np.square(x_val), axis=-1, keepdims=True) + 1e-6)
+        act = (x_val / rms) * g_vec
+        act_bfp = _quantize_bfp16ebs8(act, axis=-1)
+        w_bfp = _quantize_bfp16ebs8(w_bf16, axis=0)
+        return np.matmul(act_bfp, w_bfp)
+
+    err_unequil = float(np.sqrt(np.mean(np.square(_eval_simulated_bfp16(unequil_m) - ref_y))))
+    err_equil = float(np.sqrt(np.mean(np.square(_eval_simulated_bfp16(equil_m) - ref_y))))
+    assert err_equil < err_unequil, (
+        f"equilibration should reduce bfp16ebs8 RMSE: unequil={err_unequil}, equil={err_equil}"
+    )
+
+    # 3. Verify homogenize_qdq_weights_and_split_k converts int8 -> uint8 (+128) and splits K=96 -> 3x32
+    k_qdq, n_qdq = 96, 12
+    w_i8 = rng.integers(-120, 120, size=(k_qdq, n_qdq), dtype=np.int8)
+    w_scale = rng.uniform(0.005, 0.02, size=(n_qdq,)).astype(np.float32)
+    w_zp_i8 = np.zeros((n_qdq,), dtype=np.int8)
+    act_scale = np.asarray(0.05, dtype=np.float32)
+    act_zp_u8 = np.asarray(128, dtype=np.uint8)
+
+    qdq_inits = [
+        numpy_helper.from_array(act_scale, name="act_s"),
+        numpy_helper.from_array(act_zp_u8, name="act_zp"),
+        numpy_helper.from_array(w_i8, name="down_w_i8"),
+        numpy_helper.from_array(w_scale, name="down_w_s"),
+        numpy_helper.from_array(w_zp_i8, name="down_w_zp"),
+    ]
+    qdq_nodes = [
+        helper.make_node("QuantizeLinear", ["x_in", "act_s", "act_zp"], ["x_q"], name="act_Q"),
+        helper.make_node("DequantizeLinear", ["x_q", "act_s", "act_zp"], ["x_dq"], name="act_DQ"),
+        helper.make_node(
+            "DequantizeLinear",
+            ["down_w_i8", "down_w_s", "down_w_zp"],
+            ["w_dq"],
+            name="weight_DQ",
+            axis=1,
+        ),
+        helper.make_node("MatMul", ["x_dq", "w_dq"], ["y_out"], name="down_proj_MatMul"),
+    ]
+    qdq_model = helper.make_model(
+        helper.make_graph(
+            qdq_nodes,
+            "qdq_test",
+            [helper.make_tensor_value_info("x_in", TensorProto.FLOAT, [1, 1, k_qdq])],
+            [helper.make_tensor_value_info("y_out", TensorProto.FLOAT, [1, 1, n_qdq])],
+            qdq_inits,
+        ),
+        opset_imports=[helper.make_opsetid("", 18)],
+    )
+    qdq_model.ir_version = 10
+
+    x_qdq_feed = rng.uniform(-2.0, 2.0, size=(1, 1, k_qdq)).astype(np.float32)
+    qdq_ref = _session(qdq_model).run(None, {"x_in": x_qdq_feed})[0]
+
+    qdq_rewritten = onnx.ModelProto()
+    qdq_rewritten.CopyFrom(qdq_model)
+    qdq_rep = homogenize_qdq_weights_and_split_k(qdq_rewritten, chunk_k=32)
+    assert qdq_rep["converted_u8_weights"] == ["down_w_i8"]
+    assert qdq_rep["split_qdq_matmuls"] == ["down_proj_MatMul"]
+    # No signed INT8 initializers remain; all 3 split weight chunks are UINT8
+    assert not any(int(t.data_type) == int(TensorProto.INT8) for t in qdq_rewritten.graph.initializer)
+    assert sum(n.op_type == "MatMul" for n in qdq_rewritten.graph.node) == 3
+
+    qdq_got = _session(qdq_rewritten).run(None, {"x_in": x_qdq_feed})[0]
+    np.testing.assert_allclose(qdq_got, qdq_ref, atol=1e-5, rtol=1e-5)
+
+
 def main():
     checks = [
         ("freeze_window", test_freeze_past_and_present_match),
@@ -2082,6 +2289,7 @@ def main():
         ("kv_cache_rolling_and_buckets", test_kv_cache_rolling_swap_position_ids_and_bucket_resize),
         ("split_engine_static_window", test_split_inference_engine_static_window_decode),
         ("matmul_ksplit_and_ozaki_bf16", test_matmul_sub4096_ksplit_and_ozaki_dual_bf16_compensation),
+        ("equilibrate_and_qdq_homogenize", test_rmsnorm_equilibration_reduces_bfp16ebs8_swamping_and_qdq_homogenize),
     ]
     return all(_check(name, fn) for name, fn in checks)
 

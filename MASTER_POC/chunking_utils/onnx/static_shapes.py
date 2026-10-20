@@ -2069,6 +2069,7 @@ def _bake_one_matmul_nbits(
     external_data_dir: Optional[str],
     *,
     compensate: bool = False,
+    row_scale: Optional[np.ndarray] = None,
 ):
     """Replace one MatMulNBits with Cast, baked MatMul, Cast, and an optional Add.
 
@@ -2076,6 +2077,10 @@ def _bake_one_matmul_nbits(
     residual ``values - float32(bf16(values))`` (Ozaki-style dual-bf16 split)
     and sums the two float32 outputs before any bias add, recovering ~15 bits
     of effective weight mantissa precision through standard ``GemmBfp16`` ops.
+    When ``row_scale`` is a length-``K`` float32 vector, multiplies row ``i``
+    of the float32 dequantized weight by ``row_scale[i]`` prior to bfloat16
+    rounding (used to absorb RMSNorm per-channel scale spikes before
+    ``bfp16ebs8`` conversion with zero extra nodes or weight bytes).
     """
     from onnx import TensorProto, helper
 
@@ -2114,6 +2119,9 @@ def _bake_one_matmul_nbits(
         if zp is None:
             raise StaticShapeError(f"{label} zero-point bytes could not be read")
     values = _dequant_matmul_nbits(weight, scales, zp, int(k), int(n), int(block), label)
+    if row_scale is not None:
+        rs = np.ascontiguousarray(row_scale, dtype=np.float32).reshape(int(k), 1)
+        values = np.ascontiguousarray(values * rs, dtype=np.float32)
     raw_hi = _f32_to_bf16_raw(values)
     weight_out = f"{label}/bf16_weight"
     tensor = helper.make_tensor(
@@ -2225,15 +2233,122 @@ def _bake_one_matmul_nbits(
     return nodes, tensors, dropped
 
 
+def _norm_equilibration_scales(
+    graph,
+    by_name,
+    external_data_dir: Optional[str],
+) -> Dict[str, np.ndarray]:
+    """Compute per-channel scale vectors ``s`` to fold from RMSNorm ``gamma`` into consumer ``MatMulNBits`` rows.
+
+    Returns a map ``{norm_output_tensor_name: s_vector}`` and updates the
+    corresponding RMSNorm weight initializer in ``graph`` to ``gamma / s``
+    in float32. Only norms whose output is consumed exclusively by 4-bit
+    ``MatMulNBits`` nodes (with matching ``K == len(gamma)``) are equilibrated.
+    """
+    from onnx import TensorProto, numpy_helper
+
+    # Map every tensor to all consumer nodes and input positions.
+    consumers_by_tensor: Dict[str, List[tuple]] = {}
+    for node in graph.node:
+        for idx, inp in enumerate(node.input):
+            if inp:
+                consumers_by_tensor.setdefault(inp, []).append((node, idx))
+    graph_outputs = {out.name for out in graph.output}
+
+    # Find candidate RMSNorm outputs and their gamma weight initializer names.
+    candidates: List[tuple] = []
+    for node in graph.node:
+        if node.op_type == "SimplifiedLayerNormalization":
+            weight_name = _input_at(node, 1)
+            out_name = _output_at(node, 0)
+            if weight_name and out_name:
+                candidates.append((out_name, weight_name))
+        elif node.op_type == "SkipSimplifiedLayerNormalization":
+            weight_name = _input_at(node, 2)
+            out_name = _output_at(node, 0)
+            if weight_name and out_name:
+                candidates.append((out_name, weight_name))
+        elif node.op_type == "Mul" and node.name.endswith("/Mul_weight"):
+            weight_name = _input_at(node, 1)
+            out_name = _output_at(node, 0)
+            if weight_name and out_name:
+                candidates.append((out_name, weight_name))
+
+    scales_by_activation: Dict[str, np.ndarray] = {}
+    for act_name, weight_name in candidates:
+        if act_name in graph_outputs:
+            continue
+        readers = consumers_by_tensor.get(act_name, [])
+        if not readers:
+            continue
+        if not all(
+            reader.op_type == "MatMulNBits" and reader.domain == "com.microsoft" and pos == 0
+            for reader, pos in readers
+        ):
+            continue
+        gamma_item = by_name.get(weight_name)
+        if gamma_item is None or int(gamma_item.data_type) != int(TensorProto.FLOAT):
+            continue
+        gamma = _read_f32_initializer(gamma_item, external_data_dir)
+        if gamma is None or gamma.ndim != 1 or gamma.size < 1:
+            continue
+        width = int(gamma.size)
+        if any(_required_int_attr(reader, "K") != width for reader, _pos in readers):
+            continue
+        # Compute per-row weight amplitude across consumer MatMulNBits nodes so
+        # s_i balances activation block range against weight block range:
+        # s_i = sqrt(|gamma_i| / w_row_rms_i) normalized per 8-element BFP16 block.
+        row_amp = np.zeros((width,), dtype=np.float32)
+        for reader, _pos in readers:
+            s_name = _input_at(reader, 2)
+            block_sz = _required_int_attr(reader, "block_size") or 32
+            s_item = by_name.get(s_name)
+            s_arr = _initializer_array(s_item, external_data_dir) if s_item is not None else None
+            if s_arr is not None and s_arr.ndim == 2 and s_arr.shape[1] * int(block_sz) == width:
+                # Mean absolute scale across N columns for each K-block, repeated to K
+                col_rms = np.sqrt(np.mean(np.square(s_arr.astype(np.float32)), axis=0))
+                row_amp = np.maximum(row_amp, np.repeat(col_rms, int(block_sz)))
+        if not np.any(row_amp > 1e-8):
+            row_amp = np.ones((width,), dtype=np.float32)
+
+        abs_gamma = np.abs(gamma.astype(np.float32))
+        s = np.ones((width,), dtype=np.float32)
+        # Equilibrate within each 8-element BFP16 block (bfp16ebs8) using
+        # SmoothQuant-style alpha=0.5 so neither activation nor weight has an
+        # 8-element shared-exponent spike.
+        block_len = 8
+        for start in range(0, width, block_len):
+            end = min(start + block_len, width)
+            g_blk = abs_gamma[start:end]
+            w_blk = row_amp[start:end]
+            ratio_raw = np.sqrt(np.maximum(g_blk, 1e-6) / np.maximum(w_blk, 1e-6))
+            g_med = float(np.exp(np.mean(np.log(np.maximum(ratio_raw, 1e-6)))))
+            if g_med <= 1e-6:
+                continue
+            s[start:end] = np.clip(ratio_raw / g_med, 0.125, 8.0).astype(np.float32)
+        new_gamma = np.ascontiguousarray(gamma.astype(np.float32) / s, dtype=np.float32)
+        new_tensor = numpy_helper.from_array(new_gamma, name=weight_name)
+        _replace_initializer(graph, new_tensor)
+        by_name[weight_name] = new_tensor
+        scales_by_activation[act_name] = s
+    return scales_by_activation
+
+
 def _bake_matmul_nbits(
     model,
     external_data_dir: Optional[str],
     *,
     compensate: bool = False,
+    equilibrate: bool = False,
 ) -> List[str]:
     """Bake every 4-bit MatMulNBits. The external data file is not rewritten."""
     graph = model.graph
     by_name = {item.name: item for item in graph.initializer}
+    row_scales = (
+        _norm_equilibration_scales(graph, by_name, external_data_dir)
+        if equilibrate
+        else {}
+    )
     rebuilt = []
     made = []
     dropped = []
@@ -2242,12 +2357,14 @@ def _bake_matmul_nbits(
         if node.op_type != "MatMulNBits" or node.domain != "com.microsoft":
             rebuilt.append(node)
             continue
+        act_name = _input_at(node, 0)
         nodes, tensors, names = _bake_one_matmul_nbits(
             graph,
             node,
             by_name,
             external_data_dir,
             compensate=bool(compensate),
+            row_scale=row_scales.get(act_name),
         )
         rebuilt.extend(nodes)
         made.extend(tensors)
@@ -2392,6 +2509,275 @@ def _apply_bf16_activation_contract(model, external_data_dir: Optional[str] = No
     return converted
 
 
+def homogenize_qdq_weights_and_split_k(
+    model,
+    external_data_dir: Optional[str] = None,
+    *,
+    chunk_k: int = _CHUNK_K,
+) -> Dict[str, List[str]]:
+    """Convert signed ``int8`` weight ``DequantizeLinear`` tensors to unsigned ``uint8`` and split ``K > chunk_k`` QDQ ``MatMul`` nodes.
+
+    Resolves two VAIML / XDNA2 INT8 QDQ obstacles observed on layer 0:
+    1. ``VAIML-FRONTEND 2008`` (``tosa.reshape inferred tensor<...xi8> against
+       return tensor<...xui8>``): when activation QDQ uses ``uint8`` and weight
+       ``DequantizeLinear`` uses signed ``int8``, shifting the weight bytes and
+       its zero-point by ``+128`` into ``uint8`` preserves exact float32
+       dequantized values ``(w_u8 - (zp_i8 + 128)) * scale == (w_i8 - zp_i8) * scale``
+       while making both QDQ branches ``uint8`` (``ui8``).
+    2. ``qlinear-conv2d`` tiling fallback on ``down_proj`` (``K=12288``):
+       splitting any 2D QDQ ``MatMul`` whose ``K`` exceeds ``chunk_k`` (and is
+       divisible by ``chunk_k``) into ``K // chunk_k`` sliced-input QDQ
+       ``MatMul`` chunks summed in ``float32`` via ``_balanced_adds`` reduces
+       ``12288 x 4096`` into three ``4096 x 4096`` QDQ ``MatMul`` blocks.
+    """
+    from onnx import TensorProto, helper, numpy_helper
+
+    graph = model.graph
+    by_name = {item.name: item for item in graph.initializer}
+    dq_by_out = {
+        _output_at(node, 0): node
+        for node in graph.node
+        if node.op_type == "DequantizeLinear" and _output_at(node, 0)
+    }
+
+    converted_weights: List[str] = []
+    # 1. Convert signed int8 weight DequantizeLinear initializers feeding MatMul input[1] to uint8 (+128).
+    for node in list(graph.node):
+        if node.op_type != "MatMul":
+            continue
+        w_dq_out = _input_at(node, 1)
+        dq_node = dq_by_out.get(w_dq_out)
+        if dq_node is None:
+            continue
+        w_name = _input_at(dq_node, 0)
+        s_name = _input_at(dq_node, 1)
+        zp_name = _input_at(dq_node, 2)
+        w_item = by_name.get(w_name)
+        s_item = by_name.get(s_name)
+        if w_item is None or s_item is None:
+            continue
+        if int(w_item.data_type) != int(TensorProto.INT8):
+            continue
+        w_i8 = _initializer_array(w_item, external_data_dir)
+        if w_i8 is None:
+            continue
+        if zp_name:
+            zp_item = by_name.get(zp_name)
+            if zp_item is None:
+                continue
+            zp_arr = _initializer_array(zp_item, external_data_dir)
+            if zp_arr is None:
+                continue
+            zp_u8 = (zp_arr.astype(np.int16) + 128).astype(np.uint8)
+        else:
+            zp_s = _initializer_array(s_item, external_data_dir)
+            zp_shape = () if zp_s is None or zp_s.ndim == 0 else zp_s.shape
+            zp_u8 = np.full(zp_shape, 128, dtype=np.uint8)
+            zp_name = f"{w_name}_u8_zp"
+            while len(dq_node.input) < 3:
+                dq_node.input.append("")
+            dq_node.input[2] = zp_name
+        w_u8 = (w_i8.astype(np.int16) + 128).astype(np.uint8)
+        w_tensor = numpy_helper.from_array(np.ascontiguousarray(w_u8), name=w_name)
+        zp_tensor = numpy_helper.from_array(np.ascontiguousarray(zp_u8), name=zp_name)
+        _replace_initializer(graph, w_tensor)
+        _replace_initializer(graph, zp_tensor)
+        by_name[w_name] = w_tensor
+        by_name[zp_name] = zp_tensor
+        converted_weights.append(w_name)
+
+    # 2. Split QDQ MatMul nodes with K > chunk_k along K.
+    split_nodes: List[str] = []
+    if int(chunk_k) > 0:
+        rebuilt = []
+        removed_dq_ids = set()
+        made_inits = []
+        dropped_names = []
+        for node in list(graph.node):
+            if node.op_type != "MatMul":
+                rebuilt.append(node)
+                continue
+            act_in = _input_at(node, 0)
+            w_dq_out = _input_at(node, 1)
+            out_name = _output_at(node, 0)
+            dq_node = dq_by_out.get(w_dq_out)
+            if not act_in or not out_name or dq_node is None:
+                rebuilt.append(node)
+                continue
+            w_name = _input_at(dq_node, 0)
+            s_name = _input_at(dq_node, 1)
+            zp_name = _input_at(dq_node, 2)
+            w_item = by_name.get(w_name)
+            s_item = by_name.get(s_name)
+            zp_item = by_name.get(zp_name) if zp_name else None
+            if w_item is None or s_item is None or (zp_name and zp_item is None):
+                rebuilt.append(node)
+                continue
+            w_arr = _initializer_array(w_item, external_data_dir)
+            s_arr = _initializer_array(s_item, external_data_dir)
+            zp_arr = _initializer_array(zp_item, external_data_dir) if zp_item is not None else None
+            if w_arr is None or s_arr is None or w_arr.ndim != 2:
+                rebuilt.append(node)
+                continue
+            k_dim, n_dim = int(w_arr.shape[0]), int(w_arr.shape[1])
+            target_k = int(chunk_k)
+            if k_dim <= target_k or k_dim % target_k != 0:
+                rebuilt.append(node)
+                continue
+            # Ensure scale/zp are either scalar, per-column (n_dim,), or per-row (k_dim, ...).
+            dq_axis = _int_attr(dq_node, "axis", 1)
+            if s_arr.ndim not in (0, 1) or (
+                s_arr.ndim == 1 and s_arr.shape[0] not in (1, n_dim, k_dim)
+            ):
+                rebuilt.append(node)
+                continue
+            # Check if activation comes from an activation Q->DQ pair so each K-slice gets its own Q->DQ,
+            # or slice the activation tensor directly before the MatMul.
+            act_dq = dq_by_out.get(act_in)
+            q_by_out = {
+                _output_at(cand, 0): cand
+                for cand in graph.node
+                if cand.op_type == "QuantizeLinear" and _output_at(cand, 0)
+            }
+            act_q = q_by_out.get(_input_at(act_dq, 0)) if act_dq is not None else None
+
+            label = node.name or out_name
+            axis_name = f"{label}/split_axis"
+            step_name = f"{label}/split_step"
+            made_inits.extend(
+                [
+                    numpy_helper.from_array(np.asarray([-1], dtype=np.int64), name=axis_name),
+                    numpy_helper.from_array(np.asarray([1], dtype=np.int64), name=step_name),
+                ]
+            )
+            partials = []
+            for start in range(0, k_dim, target_k):
+                stop = start + target_k
+                tag = f"k{start}"
+                s_lo = f"{label}/{tag}_start"
+                s_hi = f"{label}/{tag}_stop"
+                made_inits.extend(
+                    [
+                        numpy_helper.from_array(np.asarray([start], dtype=np.int64), name=s_lo),
+                        numpy_helper.from_array(np.asarray([stop], dtype=np.int64), name=s_hi),
+                    ]
+                )
+                if act_dq is not None and act_q is not None:
+                    raw_act = _input_at(act_q, 0)
+                    act_s = _input_at(act_q, 1)
+                    act_zp = _input_at(act_q, 2)
+                    sliced_raw = f"{label}/{tag}/act_slice"
+                    q_out = f"{label}/{tag}/act_q"
+                    dq_act_out = f"{label}/{tag}/act_dq"
+                    rebuilt.append(
+                        helper.make_node(
+                            "Slice",
+                            [raw_act, s_lo, s_hi, axis_name, step_name],
+                            [sliced_raw],
+                            name=f"{label}/{tag}/Slice",
+                        )
+                    )
+                    q_inputs = [sliced_raw, act_s] + ([act_zp] if act_zp else [])
+                    rebuilt.append(
+                        helper.make_node(
+                            "QuantizeLinear",
+                            q_inputs,
+                            [q_out],
+                            name=f"{label}/{tag}/QuantizeLinear",
+                        )
+                    )
+                    dq_inputs = [q_out, _input_at(act_dq, 1)] + (
+                        [_input_at(act_dq, 2)] if _input_at(act_dq, 2) else []
+                    )
+                    rebuilt.append(
+                        helper.make_node(
+                            "DequantizeLinear",
+                            dq_inputs,
+                            [dq_act_out],
+                            name=f"{label}/{tag}/ActDequantizeLinear",
+                        )
+                    )
+                    chunk_act = dq_act_out
+                    removed_dq_ids.add(id(act_dq))
+                    removed_dq_ids.add(id(act_q))
+                else:
+                    sliced_act = f"{label}/{tag}/act_slice"
+                    rebuilt.append(
+                        helper.make_node(
+                            "Slice",
+                            [act_in, s_lo, s_hi, axis_name, step_name],
+                            [sliced_act],
+                            name=f"{label}/{tag}/Slice",
+                        )
+                    )
+                    chunk_act = sliced_act
+
+                w_piece = np.ascontiguousarray(w_arr[start:stop, :])
+                w_piece_name = f"{w_name}/{tag}"
+                made_inits.append(numpy_helper.from_array(w_piece, name=w_piece_name))
+                if s_arr.ndim == 1 and s_arr.shape[0] == k_dim and int(dq_axis) == 0:
+                    s_piece = np.ascontiguousarray(s_arr[start:stop])
+                    s_piece_name = f"{s_name}/{tag}"
+                    made_inits.append(numpy_helper.from_array(s_piece, name=s_piece_name))
+                else:
+                    s_piece_name = s_name
+                if zp_arr is not None:
+                    if zp_arr.ndim == 1 and zp_arr.shape[0] == k_dim and int(dq_axis) == 0:
+                        zp_piece = np.ascontiguousarray(zp_arr[start:stop])
+                        zp_piece_name = f"{zp_name}/{tag}"
+                        made_inits.append(numpy_helper.from_array(zp_piece, name=zp_piece_name))
+                    else:
+                        zp_piece_name = zp_name
+                else:
+                    zp_piece_name = ""
+
+                w_dq_piece_out = f"{w_dq_out}/{tag}"
+                w_dq_inputs = [w_piece_name, s_piece_name] + ([zp_piece_name] if zp_piece_name else [])
+                w_dq_kwargs = {}
+                if any(attr.name == "axis" for attr in dq_node.attribute):
+                    w_dq_kwargs["axis"] = int(dq_axis)
+                rebuilt.append(
+                    helper.make_node(
+                        "DequantizeLinear",
+                        w_dq_inputs,
+                        [w_dq_piece_out],
+                        name=f"{dq_node.name or w_dq_out}/{tag}",
+                        **w_dq_kwargs,
+                    )
+                )
+                partial_out = f"{label}/{tag}/out"
+                rebuilt.append(
+                    helper.make_node(
+                        "MatMul",
+                        [chunk_act, w_dq_piece_out],
+                        [partial_out],
+                        name=f"{label}/{tag}/MatMul",
+                    )
+                )
+                partials.append(partial_out)
+            rebuilt.extend(_balanced_adds(partials, out_name, label))
+            removed_dq_ids.add(id(dq_node))
+            dropped_names.extend([w_name, s_name] + ([zp_name] if zp_name else []))
+            split_nodes.append(label)
+
+        if split_nodes:
+            kept_nodes = [n for n in rebuilt if id(n) not in removed_dq_ids]
+            del graph.node[:]
+            graph.node.extend(kept_nodes)
+            graph.initializer.extend(made_inits)
+            used = {inp for n in graph.node for inp in n.input if inp}
+            unused = {name for name in dropped_names if name and name not in used}
+            if unused:
+                kept_inits = [item for item in graph.initializer if item.name not in unused]
+                del graph.initializer[:]
+                graph.initializer.extend(kept_inits)
+
+    return {
+        "converted_u8_weights": converted_weights,
+        "split_qdq_matmuls": split_nodes,
+    }
+
+
 def apply_static_contract(
     model,
     *,
@@ -2403,6 +2789,7 @@ def apply_static_contract(
     external_data_dir: Optional[str] = None,
     npu_bf16_fallback: bool = False,
     npu_bf16_compensate: bool = False,
+    npu_bf16_equilibrate: bool = False,
     defer_matmul_bake: bool = False,
     decompose_gqa: bool = False,
     sink_size: int = 0,
@@ -2461,6 +2848,7 @@ def apply_static_contract(
             model,
             external_data_dir,
             compensate=bool(npu_bf16_compensate),
+            equilibrate=bool(npu_bf16_equilibrate),
         )
         if any(node.op_type == "MatMulNBits" for node in model.graph.node):
             raise StaticShapeError("MatMulNBits remains after npu_bf16_fallback")
@@ -2499,6 +2887,7 @@ def apply_static_contract(
         "matmul_chunk_k": int(matmul_chunk_k),
         "bf16_fallback": bool(npu_bf16_fallback),
         "bf16_compensate": bool(npu_bf16_compensate),
+        "bf16_equilibrate": bool(npu_bf16_equilibrate),
         "bf16_fallback_matmuls": baked,
         "matmul_bake_deferred": bool(defer_matmul_bake),
     }

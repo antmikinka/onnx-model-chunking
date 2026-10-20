@@ -284,6 +284,93 @@ def _cpu_session(path: str, log_severity: int):
     )
 
 
+def _parse_layer_spec(spec: str, n_layers: int = N_LAYERS) -> set[int]:
+    """Parse ``""``, ``"all"``, or comma-separated indices/ranges like ``"0,1,4-7"``."""
+    cleaned = (spec or "").strip().lower()
+    if not cleaned or cleaned == "none":
+        return set()
+    if cleaned == "all":
+        return set(range(int(n_layers)))
+    chosen: set[int] = set()
+    for part in cleaned.split(","):
+        token = part.strip()
+        if not token:
+            continue
+        if "-" in token:
+            lo_str, hi_str = token.split("-", 1)
+            lo, hi = int(lo_str.strip()), int(hi_str.strip())
+            if lo > hi or lo < 0 or hi >= int(n_layers):
+                raise ValueError(f"layer range {token!r} out of 0..{n_layers - 1}")
+            chosen.update(range(lo, hi + 1))
+        else:
+            idx = int(token)
+            if idx < 0 or idx >= int(n_layers):
+                raise ValueError(f"layer index {idx} out of 0..{n_layers - 1}")
+            chosen.add(idx)
+    return chosen
+
+
+def _cpu_upcast_session(split_dir: str, filename: str, log_severity: int):
+    """Load a baked bfloat16 component on CPUExecutionProvider by upcasting its MatMuls to float32."""
+    import onnx
+    import onnxruntime as ort
+    import shutil
+    from onnx import TensorProto
+    from benchmark_cpu_fp32_isolation import upcast_baked_matmuls
+
+    path = os.path.join(split_dir, filename)
+    previous = os.getcwd()
+    os.chdir(split_dir)
+    try:
+        probe = onnx.load(filename, load_external_data=False)
+        has_bf16 = any(
+            int(item.data_type) == int(TensorProto.BFLOAT16)
+            for item in probe.graph.initializer
+        )
+        del probe
+        if not has_bf16:
+            return _cpu_session(path, log_severity)
+        model = onnx.load(filename, load_external_data=True)
+        upcast_baked_matmuls(model)
+        total_bytes = sum(len(item.raw_data) for item in model.graph.initializer)
+        if total_bytes >= 1_500_000_000:
+            tmp_dir = os.path.join(
+                split_dir,
+                ".fp32-cpu-upcast-tmp",
+                os.path.splitext(os.path.basename(filename))[0],
+            )
+            if os.path.isdir(tmp_dir):
+                shutil.rmtree(tmp_dir)
+            os.makedirs(tmp_dir, exist_ok=True)
+            dst = os.path.join(tmp_dir, "model.onnx")
+            onnx.save_model(
+                model,
+                dst,
+                save_as_external_data=True,
+                all_tensors_to_one_file=True,
+                location="weights.data",
+                size_threshold=1024,
+            )
+            del model
+            gc.collect()
+            os.chdir(tmp_dir)
+            return ort.InferenceSession(
+                "model.onnx",
+                sess_options=_session_options(log_severity),
+                providers=["CPUExecutionProvider"],
+            )
+        raw_proto = model.SerializeToString()
+        del model
+        gc.collect()
+        return ort.InferenceSession(
+            raw_proto,
+            sess_options=_session_options(log_severity),
+            providers=["CPUExecutionProvider"],
+        )
+    finally:
+        os.chdir(previous)
+
+
 def _vitis_session(path: str, cache_dir: str, cache_key: str, log_severity: int):
     import onnxruntime as ort
 
@@ -312,11 +399,21 @@ def _hidden_outputs(output_names: List[str], layer_idx: int) -> List[str]:
 class SplitDecode:
     """One resident decode pipeline. Sessions stay loaded for the timed loop."""
 
-    def __init__(self, split_dir: str, cache_root: str, log_severity: int):
+    def __init__(
+        self,
+        split_dir: str,
+        cache_root: str,
+        log_severity: int,
+        *,
+        cpu_lm_head: bool = False,
+        cpu_layers: str = "",
+    ):
         import onnxruntime as ort
 
         self.ort = ort
         self.split_dir = split_dir
+        self.cpu_lm_head = bool(cpu_lm_head)
+        self.cpu_layer_indices = _parse_layer_spec(cpu_layers, N_LAYERS)
         self.components, _origin = _component_map(split_dir)
         os.chdir(split_dir)
         load_started = time.perf_counter()
@@ -328,12 +425,15 @@ class SplitDecode:
         self.layers = []
         for index in range(N_LAYERS):
             comp = self.components[f"layer_{index}"]
-            session = _vitis_session(
-                os.path.join(split_dir, comp["file"]),
-                layer_cache_dir(cache_root, index),
-                layer_cache_key(index),
-                log_severity,
-            )
+            if index in self.cpu_layer_indices:
+                session = _cpu_upcast_session(split_dir, comp["file"], log_severity)
+            else:
+                session = _vitis_session(
+                    os.path.join(split_dir, comp["file"]),
+                    layer_cache_dir(cache_root, index),
+                    layer_cache_key(index),
+                    log_severity,
+                )
             inputs = [item.name for item in session.get_inputs()]
             outputs = [item.name for item in session.get_outputs()]
             self.layers.append(
@@ -355,12 +455,15 @@ class SplitDecode:
         self.norm_inputs = list(norm["input_names"])
         self.norm_output = norm["output_names"][0]
         head = self.components["lm_head"]
-        self.lm_head = _vitis_session(
-            os.path.join(split_dir, head["file"]),
-            os.path.join(cache_root, "lm_head"),
-            "fullbake_lmhead_bf16",
-            log_severity,
-        )
+        if self.cpu_lm_head:
+            self.lm_head = _cpu_upcast_session(split_dir, head["file"], log_severity)
+        else:
+            self.lm_head = _vitis_session(
+                os.path.join(split_dir, head["file"]),
+                os.path.join(cache_root, "lm_head"),
+                "fullbake_lmhead_bf16",
+                log_severity,
+            )
         self.lm_input = head["input_names"][0]
         self.lm_output = head["output_names"][0]
         self.load_s = time.perf_counter() - load_started
@@ -652,7 +755,13 @@ def run_decode(args: argparse.Namespace) -> int:
             del monolith
             gc.collect()
     released_rss = round(_rss_mb(), 2)
-    pipeline = SplitDecode(args.split_dir, args.cache_root, args.log_severity)
+    pipeline = SplitDecode(
+        args.split_dir,
+        args.cache_root,
+        args.log_severity,
+        cpu_lm_head=bool(getattr(args, "cpu_lm_head", False)),
+        cpu_layers=str(getattr(args, "cpu_layers", "") or ""),
+    )
     split_peak = _rss_mb()
     # Session creation is outside the timed loop. Profiling is off.
     step_ms: List[float] = []
@@ -712,6 +821,8 @@ def run_decode(args: argparse.Namespace) -> int:
             "lm_head": list(pipeline.lm_head.get_providers()),
             "layer_0": pipeline.layers[0]["providers"],
             "layer_35": pipeline.layers[35]["providers"],
+            "cpu_lm_head": bool(pipeline.cpu_lm_head),
+            "cpu_layer_indices": sorted(pipeline.cpu_layer_indices),
         },
         "monolith_error": monolith_error,
         "cold_start_gap": cold_gap,
@@ -760,6 +871,16 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--skip-monolith", action="store_true")
     parser.add_argument("--allow-rolling", action="store_true")
     parser.add_argument("--allow-overlap", action="store_true")
+    parser.add_argument(
+        "--cpu-lm-head",
+        action="store_true",
+        help="Run lm_head on CPUExecutionProvider (upcasting baked bf16 weights to float32) while keeping NPU layers on Vitis.",
+    )
+    parser.add_argument(
+        "--cpu-layers",
+        default="",
+        help="Run selected layers on CPUExecutionProvider (e.g. 'all', '0,1', or '0-17') while keeping remaining layers/lm_head on Vitis.",
+    )
     parser.add_argument("--self-check", action="store_true")
     return parser.parse_args(argv)
 

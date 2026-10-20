@@ -123,6 +123,7 @@ def _rewrite_saved_component(
     split_lm_head: bool,
     npu_bf16_fallback: bool,
     npu_bf16_compensate: bool = False,
+    npu_bf16_equilibrate: bool = False,
     matmul_chunk_k: Optional[int] = None,
     external_data_dir: Optional[str],
     lm_head_chunk_rows: Optional[int],
@@ -177,6 +178,7 @@ def _rewrite_saved_component(
             component_model,
             external_data_dir,
             compensate=bool(npu_bf16_compensate),
+            equilibrate=bool(npu_bf16_equilibrate),
         )
         print(f"  Baked {len(baked)} MatMulNBits in this component")
     return component_model
@@ -194,6 +196,7 @@ def save_components(
     split_lm_head: bool = False,
     npu_bf16_fallback: bool = False,
     npu_bf16_compensate: bool = False,
+    npu_bf16_equilibrate: bool = False,
     matmul_chunk_k: Optional[int] = None,
     external_data_dir: Optional[str] = None,
     lm_head_chunk_rows: Optional[int] = None,
@@ -283,6 +286,7 @@ def save_components(
                 split_lm_head=bool(split_lm_head),
                 npu_bf16_fallback=bool(npu_bf16_fallback),
                 npu_bf16_compensate=bool(npu_bf16_compensate),
+                npu_bf16_equilibrate=bool(npu_bf16_equilibrate),
                 matmul_chunk_k=matmul_chunk_k,
                 external_data_dir=external_data_dir,
                 lm_head_chunk_rows=lm_head_chunk_rows,
@@ -460,6 +464,7 @@ def split_onnx(
     static_query_len: Optional[int] = None,
     npu_bf16_fallback: bool = False,
     npu_bf16_compensate: bool = False,
+    npu_bf16_equilibrate: bool = False,
     matmul_chunk_k: Optional[int] = None,
     split_lm_head: bool = False,
     lm_head_chunk_rows: Optional[int] = None,
@@ -654,6 +659,7 @@ def split_onnx(
         split_lm_head=bool(split_lm_head),
         npu_bf16_fallback=bool(npu_bf16_fallback),
         npu_bf16_compensate=bool(npu_bf16_compensate),
+        npu_bf16_equilibrate=bool(npu_bf16_equilibrate),
         matmul_chunk_k=matmul_chunk_k,
         external_data_dir=model_dir,
         lm_head_chunk_rows=lm_head_chunk_rows,
