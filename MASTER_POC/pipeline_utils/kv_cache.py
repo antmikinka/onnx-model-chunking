@@ -485,6 +485,7 @@ class KVCacheManager:
         cache_dtype: Any = None,
         kv_quantization: Optional[str] = None,
         update_mode: Any = None,
+        bucket_sizes: Optional[Sequence[int]] = None,
     ):
         """
         Initialize the KV cache manager.
@@ -556,6 +557,15 @@ class KVCacheManager:
             if limit <= 0:
                 raise ValueError(f"max_seq_len must be positive, got {limit}")
             self.max_seq_len = limit
+        if bucket_sizes is not None:
+            buckets = tuple(sorted({int(b) for b in bucket_sizes}))
+            if not buckets or any(b <= 0 for b in buckets):
+                raise ValueError(f"bucket_sizes must be positive integers, got {bucket_sizes}")
+            self.bucket_sizes: Optional[Tuple[int, ...]] = buckets
+            if self.max_seq_len is None:
+                self.max_seq_len = int(buckets[0])
+        else:
+            self.bucket_sizes = None
         _apply_policy_capacity(self)
         self._static = self.max_seq_len is not None
 
@@ -1572,7 +1582,15 @@ class KVCacheManager:
         self._seen[layer_idx] = int(new_len)
         self._seen_published = int(new_len)
 
-    def commit_present_swap(self, layer_idx: int, valid_seq_len: int) -> int:
+    def commit_present_swap(
+        self,
+        layer_idx: int,
+        valid_seq_len: int,
+        *,
+        total_seen: Optional[int] = None,
+        rolling: bool = False,
+        query_len: int = 1,
+    ) -> int:
         """
         Install the shadow buffer as the next past cache.
 
@@ -1580,6 +1598,15 @@ class KVCacheManager:
         the output bound by ``bind_cache_to_session``. The active pointer
         changes. ``max_seq_len`` does not. ``valid_seq_len`` is the filled
         prefix, so the padded tail stays masked.
+
+        When ``rolling=True`` (or the layer uses ``sliding_window`` /
+        ``hybrid_sparse`` or ``total_seen`` is given), ``valid_seq_len`` may
+        exceed ``max_seq_len`` and is clamped to ``max_seq_len`` while
+        ``seen_tokens`` continues advancing unboundedly. When ``sink_size > 0``
+        is set on a right-aligned static window, tokens crossing index
+        ``sink_size`` as the window fills are promoted into the leading sink
+        slots so the NPU graph's constant ``Slice(0, sink_size)`` preserves
+        the initial prompt sink tokens forever.
         """
         with self._lock:
             if not self._concat_swap_active():
@@ -1590,21 +1617,271 @@ class KVCacheManager:
                 raise KeyError(
                     f"Layer {layer_idx} not in cache (have {self.num_layers} layers)"
                 )
-            length = int(valid_seq_len)
-            if length < 0 or (
-                self.max_seq_len is not None and length > int(self.max_seq_len)
-            ):
+            requested = int(valid_seq_len)
+            if requested < 0:
                 raise ValueError(
-                    f"Layer {layer_idx}: sequence length {length} exceeds "
+                    f"Layer {layer_idx}: sequence length {requested} must be >= 0"
+                )
+            limit = int(self.max_seq_len) if self.max_seq_len is not None else requested
+            allow_roll = (
+                bool(rolling)
+                or total_seen is not None
+                or self.policy_for(layer_idx)
+                in (KVCachePolicy.SLIDING_WINDOW, KVCachePolicy.HYBRID_SPARSE)
+            )
+            if requested > limit and not allow_roll:
+                raise ValueError(
+                    f"Layer {layer_idx}: sequence length {requested} exceeds "
                     f"max_seq_len {self.max_seq_len}"
                 )
+            prev_valid = int(self._layer_len[layer_idx])
+            prev_seen = int(self._seen[layer_idx])
+            length = min(requested, limit)
+            step_delta = max(1, int(query_len))
+            if total_seen is not None:
+                seen = int(total_seen)
+            elif requested > limit:
+                seen = max(prev_seen + step_delta, requested)
+            elif prev_valid == limit and length == limit:
+                seen = max(prev_seen + step_delta, length)
+            else:
+                seen = max(prev_seen, length)
+
+            sink = int(self.sink_size)
+            if (
+                0 < sink < limit
+                and limit - sink < seen <= limit
+                and prev_valid >= limit - sink
+            ):
+                src_lo = limit - prev_valid
+                src_hi = sink + step_delta
+                dst_lo = limit - seen
+                dst_hi = sink
+                if 0 <= src_lo < src_hi <= limit and 0 <= dst_lo < dst_hi <= limit and (src_hi - src_lo) == (dst_hi - dst_lo):
+                    entry = self._cache[layer_idx]
+                    shadow_key, shadow_value = self._shadow_pair(layer_idx)
+                    active_k_np = _as_numpy(entry["key"])
+                    active_v_np = _as_numpy(entry["value"])
+                    _write_window(
+                        shadow_key,
+                        np.array(active_k_np[:, :, src_lo:src_hi, :], copy=True),
+                        dst_lo,
+                    )
+                    _write_window(
+                        shadow_value,
+                        np.array(active_v_np[:, :, src_lo:src_hi, :], copy=True),
+                        dst_lo,
+                    )
+                self._sink_held[layer_idx] = min(sink, seen - (limit - sink))
+            elif sink > 0 and seen > limit:
+                sink_keep = min(sink, limit)
+                entry = self._cache[layer_idx]
+                shadow_key, shadow_value = self._shadow_pair(layer_idx)
+                active_k_np = _as_numpy(entry["key"])
+                active_v_np = _as_numpy(entry["value"])
+                _write_window(
+                    shadow_key,
+                    np.array(active_k_np[:, :, :sink_keep, :], copy=True),
+                    0,
+                )
+                _write_window(
+                    shadow_value,
+                    np.array(active_v_np[:, :, :sink_keep, :], copy=True),
+                    0,
+                )
+                self._sink_held[layer_idx] = sink_keep
+
             self._invalidate_quant(layer_idx)
             self._swap_layer(layer_idx)
             self._commit_length(layer_idx, length)
-            if length > int(self._seen[layer_idx]):
-                self._seen[layer_idx] = length
-                self._seen_published = int(self._seen[layer_idx])
+            self._seen[layer_idx] = int(seen)
+            self._seen_published = max(int(self._seen_published), int(seen))
             return length
+
+    def position_ids(
+        self,
+        query_len: int = 1,
+        *,
+        layer_idx: int = 0,
+        dtype: Any = np.int64,
+    ) -> np.ndarray:
+        """
+        Absolute RoPE ``position_ids`` of shape ``(batch_size, query_len)`` for the next step.
+
+        Uses ``layer_seen_tokens(layer_idx)`` (which continues advancing past
+        ``max_seq_len`` when the window rolls) so RoPE rotation reflects the
+        true token index rather than clamping at ``max_seq_len``.
+        """
+        q_len = int(query_len)
+        if q_len < 1:
+            raise ValueError(f"query_len must be positive, got {query_len}")
+        start = self.layer_seen_tokens(layer_idx) if self.num_layers > 0 else 0
+        row = np.arange(start, start + q_len, dtype=dtype)
+        return np.broadcast_to(row.reshape(1, q_len), (self.batch_size, q_len)).copy()
+
+    def attention_bias(
+        self,
+        query_len: int = 1,
+        *,
+        total_len: Optional[int] = None,
+        align: str = "right",
+        layer_idx: Optional[int] = None,
+        causal: Optional[bool] = None,
+        value: float = -10000.0,
+        dtype: Any = np.float32,
+    ) -> np.ndarray:
+        """
+        Additive attention bias of shape ``(1, 1, query_len, total_len)`` for the active KV window.
+
+        Args:
+            query_len: Query token count for the current step (1 for decode).
+            total_len: Total key axis length (defaults to ``max_seq_len + query_len``
+                for ``align='right'`` or ``max_seq_len`` for ``align='left'``).
+            align: ``'right'`` for static NPU rolling windows where ``present``
+                slices the trailing ``max_seq_len`` slots, or ``'left'`` for
+                prefix-filled caches.
+            layer_idx: Optional layer index to query ``layer_length(layer_idx)``.
+        """
+        from chunking_utils.onnx.static_shapes import (
+            right_aligned_attention_bias,
+            static_attention_bias,
+        )
+
+        q_len = int(query_len)
+        valid = (
+            self.layer_length(int(layer_idx))
+            if layer_idx is not None
+            else self.get_sequence_length()
+        )
+        capacity = int(self.max_seq_len) if self.max_seq_len is not None else max(1, valid + q_len)
+        mode = str(align).strip().lower()
+        if mode == "right":
+            sink_held = (
+                int(self._sink_held[int(layer_idx)])
+                if layer_idx is not None and 0 <= int(layer_idx) < self.num_layers
+                else (min(int(v) for v in self._sink_held) if self._sink_held else 0)
+            )
+            return right_aligned_attention_bias(
+                valid,
+                capacity,
+                q_len,
+                total_len=total_len,
+                sink_size=sink_held,
+                causal=causal,
+                value=float(value),
+                dtype=dtype,
+            )
+        if mode == "left":
+            key_len = int(total_len) if total_len is not None else capacity
+            valid_total = min(key_len, valid + (q_len if key_len > capacity else 0))
+            return static_attention_bias(
+                valid_total,
+                q_len,
+                key_len,
+                causal=causal,
+                value=float(value),
+                dtype=dtype,
+            )
+        raise ValueError(f"align must be 'right' or 'left', got {align!r}")
+
+    def resize_static_window(
+        self,
+        new_max_seq_len: int,
+        *,
+        align: str = "left",
+    ) -> int:
+        """
+        Dynamically resize the static KV cache window to ``new_max_seq_len`` while preserving valid tokens.
+
+        Supports dynamic multi-bucket NPU/CPU KV cache management (e.g., promoting
+        from a 16-token bucket to a 64- or 256-token bucket as sequence length grows).
+        """
+        with self._lock:
+            target = int(new_max_seq_len)
+            if target <= 0:
+                raise ValueError(f"new_max_seq_len must be positive, got {target}")
+            mode = str(align).strip().lower()
+            if mode not in ("left", "right"):
+                raise ValueError(f"align must be 'left' or 'right', got {align!r}")
+            old_cap = int(self.max_seq_len) if self.max_seq_len is not None else 0
+            if self._static and old_cap == target and self._cache:
+                return target
+
+            saved: List[Tuple[int, np.ndarray, np.ndarray, int, int]] = []
+            for layer in range(self.num_layers):
+                if layer not in self._cache:
+                    continue
+                valid = self.layer_length(layer)
+                seen = self.layer_seen_tokens(layer)
+                if valid <= 0:
+                    saved.append((layer, np.zeros((self.batch_size, self.num_kv_heads, 0, self.head_dim), dtype=self.dtype), np.zeros((self.batch_size, self.num_kv_heads, 0, self.head_dim), dtype=self.dtype), 0, seen))
+                    continue
+                k_arr = _as_numpy(self._cache[layer]["key"])
+                v_arr = _as_numpy(self._cache[layer]["value"])
+                seq_cap = int(k_arr.shape[_SEQ_AXIS])
+                if mode == "right" and self._static and valid < seq_cap:
+                    k_valid = np.array(k_arr[:, :, seq_cap - valid : seq_cap, :], copy=True)
+                    v_valid = np.array(v_arr[:, :, seq_cap - valid : seq_cap, :], copy=True)
+                else:
+                    k_valid = np.array(k_arr[:, :, :valid, :], copy=True)
+                    v_valid = np.array(v_arr[:, :, :valid, :], copy=True)
+                if k_valid.shape[_SEQ_AXIS] > target:
+                    k_valid = np.ascontiguousarray(k_valid[:, :, -target:, :])
+                    v_valid = np.ascontiguousarray(v_valid[:, :, -target:, :])
+                saved.append((layer, k_valid, v_valid, int(k_valid.shape[_SEQ_AXIS]), seen))
+
+            self.max_seq_len = target
+            self._static = True
+            self._cache = {}
+            self._shared = []
+            if self.uses_device_memory or self._binder is not None:
+                self._allocate_device_cache()
+            else:
+                shape = (self.batch_size, self.num_kv_heads, target, self.head_dim)
+                for layer in range(self.num_layers):
+                    self._cache[layer] = {
+                        "key": np.zeros(shape, dtype=self.dtype),
+                        "value": np.zeros(shape, dtype=self.dtype),
+                    }
+                    if self._concat_swap_active():
+                        self._cache[layer]["key_shadow"] = np.zeros(shape, dtype=self.dtype)
+                        self._cache[layer]["value_shadow"] = np.zeros(shape, dtype=self.dtype)
+
+            for layer, k_valid, v_valid, valid_n, seen in saved:
+                if valid_n > 0:
+                    start = (target - valid_n) if mode == "right" else 0
+                    _write_window(self._cache[layer]["key"], k_valid, start)
+                    _write_window(self._cache[layer]["value"], v_valid, start)
+                self._commit_length(layer, valid_n)
+                self._seen[layer] = max(int(seen), int(valid_n))
+            self._seen_published = max(self._seen) if self._seen else 0
+            return target
+
+    def ensure_bucket_capacity(
+        self,
+        required_seq_len: int,
+        *,
+        align: str = "left",
+    ) -> int:
+        """
+        Select the smallest configured bucket >= ``required_seq_len`` (or the largest bucket if exceeded)
+        and resize the static KV window when needed.
+        """
+        needed = int(required_seq_len)
+        if needed < 1:
+            raise ValueError(f"required_seq_len must be positive, got {required_seq_len}")
+        if not self.bucket_sizes:
+            if self.max_seq_len is not None and needed > int(self.max_seq_len):
+                return self.resize_static_window(needed, align=align)
+            return int(self.max_seq_len or needed)
+        target = self.bucket_sizes[-1]
+        for bucket in self.bucket_sizes:
+            if bucket >= needed:
+                target = int(bucket)
+                break
+        if self.max_seq_len != target:
+            self.resize_static_window(target, align=align)
+        return int(self.max_seq_len)
 
     def run_bound_session(self, session: Any, layer_idx: int, valid_seq_len: int) -> Dict[str, str]:
         """Run one layer and install the present buffer as the next past.

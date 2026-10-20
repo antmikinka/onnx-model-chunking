@@ -212,3 +212,13 @@ Commit `c11039f` on `experiment/xdna-layout-probe` records a seq-1 float32 GEMM 
 - A distribution-gate rerun. The 17-step result stands.
 - Direct NPU-resident OrtValues on this wheel.
 - Quark on the 8B model. The install is absent and there is no calibration set.
+
+## Split-Model Dynamic KV Cache & NPU Runtime Enhancements
+
+To preserve the 40-component split ONNX model architecture alongside every hardware-aware rewrite discovered in PRs #5-#12, the following capabilities are integrated into `chunking_utils` and `pipeline_utils`:
+
+- `decompose_gqa_to_npu_primitives` and `apply_static_contract(..., decompose_gqa=True, sink_size=...)` in `chunking_utils/onnx/static_shapes.py` lower `com.microsoft::GroupQueryAttention` into transpose-free, scatter-free, where-free ONNX primitives (`Reshape`, `Gather`, `Slice`, `Concat`, `Mul`, `Sub`, `Add`, `MatMul`, `Softmax`) so the attention core and KV window update can compile onto the NPU instead of falling back to CPU.
+- `right_aligned_attention_bias` in `chunking_utils/onnx/static_shapes.py` and `static_kv_concat_recipe(..., layout="sink_window")` in `chunking_utils/onnx/kv_concat.py` provide right-aligned additive `-10000.0` masking and sink-preserving Slice+Concat KV window updates.
+- `KVCacheManager` in `pipeline_utils/kv_cache.py` supports unbounded rolling window swaps (`commit_present_swap(..., rolling=True)`), continuous `seen_tokens` and uncapped `position_ids()`, automatic sink-slot promotion when `sink_size > 0`, `attention_bias(align="right" | "left")`, and dynamic bucket promotion via `resize_static_window()` / `ensure_bucket_capacity()`.
+- `SplitModelInferenceEngine` in `chunking_utils/onnx/inference.py` and `SplitDecode` in `benchmark_npu_decode.py` auto-detect static-window split layers, stream multi-token prompts and unbounded decode steps through `KVUpdateMode.CONCAT_SWAP` shadow buffers, and keep all 36 layer sessions resident on VitisAI EP.
+

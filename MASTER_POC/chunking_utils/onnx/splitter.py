@@ -128,6 +128,8 @@ def _rewrite_saved_component(
     static_batch_size: int,
     static_max_seq_len: int,
     static_query_len: int,
+    decompose_gqa: bool = False,
+    sink_size: int = 0,
 ):
     """Rewrite one owned component graph. The master graph is not an argument."""
     if apply_component_contract:
@@ -139,6 +141,8 @@ def _rewrite_saved_component(
             external_data_dir=external_data_dir,
             npu_bf16_fallback=False,
             defer_matmul_bake=True,
+            decompose_gqa=bool(decompose_gqa),
+            sink_size=int(sink_size),
         )
         print(
             f"  Component static contract: norms {len(report['decomposed_norms'])}, "
@@ -186,6 +190,8 @@ def save_components(
     static_batch_size: int = 1,
     static_max_seq_len: int = 16,
     static_query_len: int = 1,
+    decompose_gqa: bool = False,
+    sink_size: int = 0,
 ):
     """
     Create component graphs, validate them, store weights, and save files.
@@ -228,6 +234,8 @@ def save_components(
                 static_batch_size=static_batch_size,
                 static_max_seq_len=static_max_seq_len,
                 static_query_len=static_query_len,
+                decompose_gqa=bool(decompose_gqa),
+                sink_size=int(sink_size),
             )
         _record_component_io(comp_info, component_model)
         if keep and not npu_bf16_fallback:
@@ -268,6 +276,8 @@ def save_components(
                 static_batch_size=static_batch_size,
                 static_max_seq_len=static_max_seq_len,
                 static_query_len=static_query_len,
+                decompose_gqa=bool(decompose_gqa),
+                sink_size=int(sink_size),
             )
             _record_component_io(comp_info, component_model)
             if external_data_dir:
@@ -329,9 +339,11 @@ def save_components(
     for comp_name, comp_info, filename, filepath, component_model in prepared:
         onnx.save(component_model, filepath)
         component_files[comp_name] = filepath
+        node_count = len(getattr(component_model.graph, "node", comp_info.node_indices))
+        init_count = len(getattr(component_model.graph, "initializer", comp_info.initializer_names))
         print(
-            f"  Saved {filename} ({len(component_model.graph.node)} nodes, "
-            f"{len(component_model.graph.initializer)} initializers)"
+            f"  Saved {filename} ({node_count} nodes, "
+            f"{init_count} initializers)"
         )
     return component_files, weight_storage, num_layers
 
@@ -439,6 +451,8 @@ def split_onnx(
     load_external_data: bool = True,
     quark: bool = False,
     quark_config: Optional[Any] = None,
+    decompose_gqa: bool = False,
+    sink_size: int = 0,
     **kwargs
 ) -> OnnxSplitResult:
     """
@@ -524,10 +538,10 @@ def split_onnx(
         config=quark_config,
     )
     model_path = config.model
-    onnx_model = load_onnx_model(
-        model_path,
-        load_external_data=bool(load_external_data),
-    )
+    if load_external_data:
+        onnx_model = load_onnx_model(model_path)
+    else:
+        onnx_model = load_onnx_model(model_path, load_external_data=False)
     # Attention Where/MaskedFill lowers to a scalar -1e4 add. Shape inference
     # then sees the Cast/Sub/Mul/Add nodes. A graph with no such fill is unchanged.
     replaced_masks = rewrite_attention_mask_ops(onnx_model)
@@ -552,6 +566,8 @@ def split_onnx(
             max_seq_len=max_seq,
             query_len=query,
             npu_bf16_fallback=False,
+            decompose_gqa=bool(decompose_gqa),
+            sink_size=int(sink_size),
         )
         print(
             f"Froze static shapes at batch {config.batch_size}, "
@@ -624,6 +640,8 @@ def split_onnx(
         static_batch_size=int(config.batch_size),
         static_max_seq_len=max_seq,
         static_query_len=query,
+        decompose_gqa=bool(decompose_gqa),
+        sink_size=int(sink_size),
     )
 
     model_info = {

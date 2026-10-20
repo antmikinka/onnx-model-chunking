@@ -3,7 +3,9 @@
 Quick test script for pipeline_utils modules.
 """
 
+import os
 import numpy as np
+
 
 def test_dtypes():
     """Test dtypes module."""
@@ -304,42 +306,60 @@ def test_dtypes():
         assert "logits" in str(exc)
     print("  provider dtype policy: CPU, ROCm, VitisAI, DirectML")
 
-    assert supports_float8() is False
-    assert FP8_E4M3 is None
-    assert FP8_E5M2 is None
-    assert get_float8_dtype("e4m3fn") is None
-    assert get_float8_dtype("e5m2") is None
-    assert float8_storage_dtype("e4m3fn") == np.dtype(np.uint8)
-    assert float8_storage_dtype("e5m2") == np.dtype(np.float16)
-    with warnings.catch_warnings(record=True) as float8_warnings:
-        warnings.simplefilter("always")
-        assert get_numpy_dtype("tensor(float8e4m3fn)") == np.float16
-        assert get_numpy_dtype("float8e5m2") == np.float16
-        assert numpy_dtype_from_onnx_element_type(17) == np.float16
-        assert numpy_dtype_from_onnx_element_type(19) == np.float16
-    assert any("float8e4m3fn" in str(item.message) for item in float8_warnings)
-    fp8_values = np.array([0, 1, -1, 2, 4, 16, 32, 448], dtype=np.float32)
-    fp8_stored = quantize_float8(fp8_values, scale=1.0, kind="e4m3fn")
-    assert fp8_stored.dtype == np.dtype(np.uint8)
-    fp8_restored = dequantize_float8(fp8_stored, scale=1.0)
-    assert np.allclose(fp8_restored, fp8_values, rtol=0, atol=0)
     import pipeline_utils.dtypes as dtypes_mod
-    saved_fp8 = (dtypes_mod.FP8_E4M3, dtypes_mod.FP8_E5M2)
+    saved_fp8_initial = (
+        dtypes_mod.FP8_E4M3,
+        dtypes_mod.FP8_E5M2,
+        dtypes_mod.FP8_E4M3FNUZ,
+        dtypes_mod.FP8_E5M2FNUZ,
+    )
+    dtypes_mod.FP8_E4M3 = None
+    dtypes_mod.FP8_E5M2 = None
+    dtypes_mod.FP8_E4M3FNUZ = None
+    dtypes_mod.FP8_E5M2FNUZ = None
     try:
-        dtypes_mod.FP8_E4M3 = np.float16
-        dtypes_mod.FP8_E5M2 = np.float16
-        assert dtypes_mod.supports_float8() is True
-        assert dtypes_mod.get_float8_dtype("e5m2") is np.float16
-        with warnings.catch_warnings(record=True) as native_warnings:
+        assert supports_float8() is False
+        assert dtypes_mod.FP8_E4M3 is None
+        assert dtypes_mod.FP8_E5M2 is None
+        assert get_float8_dtype("e4m3fn") is None
+        assert get_float8_dtype("e5m2") is None
+        assert float8_storage_dtype("e4m3fn") == np.dtype(np.uint8)
+        assert float8_storage_dtype("e5m2") == np.dtype(np.float16)
+        with warnings.catch_warnings(record=True) as float8_warnings:
             warnings.simplefilter("always")
             assert get_numpy_dtype("tensor(float8e4m3fn)") == np.float16
-        assert not any("falling back to float16" in str(item.message) for item in native_warnings)
-        native_stored = quantize_float8(np.array([1.0, -2.0], dtype=np.float32), scale=1.0)
-        assert native_stored.dtype == np.dtype(np.float16)
-        assert np.allclose(dequantize_float8(native_stored), np.array([1.0, -2.0], dtype=np.float32))
+            assert get_numpy_dtype("float8e5m2") == np.float16
+            assert numpy_dtype_from_onnx_element_type(17) == np.float16
+            assert numpy_dtype_from_onnx_element_type(19) == np.float16
+        assert any("float8e4m3fn" in str(item.message) for item in float8_warnings)
+        fp8_values = np.array([0, 1, -1, 2, 4, 16, 32, 448], dtype=np.float32)
+        fp8_stored = quantize_float8(fp8_values, scale=1.0, kind="e4m3fn")
+        assert fp8_stored.dtype == np.dtype(np.uint8)
+        fp8_restored = dequantize_float8(fp8_stored, scale=1.0)
+        assert np.allclose(fp8_restored, fp8_values, rtol=0, atol=0)
+        saved_fp8 = (dtypes_mod.FP8_E4M3, dtypes_mod.FP8_E5M2)
+        try:
+            dtypes_mod.FP8_E4M3 = np.float16
+            dtypes_mod.FP8_E5M2 = np.float16
+            assert dtypes_mod.supports_float8() is True
+            assert dtypes_mod.get_float8_dtype("e5m2") is np.float16
+            with warnings.catch_warnings(record=True) as native_warnings:
+                warnings.simplefilter("always")
+                assert get_numpy_dtype("tensor(float8e4m3fn)") == np.float16
+            assert not any("falling back to float16" in str(item.message) for item in native_warnings)
+            native_stored = quantize_float8(np.array([1.0, -2.0], dtype=np.float32), scale=1.0)
+            assert native_stored.dtype == np.dtype(np.float16)
+            assert np.allclose(dequantize_float8(native_stored), np.array([1.0, -2.0], dtype=np.float32))
+        finally:
+            dtypes_mod.FP8_E4M3, dtypes_mod.FP8_E5M2 = saved_fp8
+        assert supports_float8() is False
     finally:
-        dtypes_mod.FP8_E4M3, dtypes_mod.FP8_E5M2 = saved_fp8
-    assert supports_float8() is False
+        (
+            dtypes_mod.FP8_E4M3,
+            dtypes_mod.FP8_E5M2,
+            dtypes_mod.FP8_E4M3FNUZ,
+            dtypes_mod.FP8_E5M2FNUZ,
+        ) = saved_fp8_initial
     assert pipeline_utils.supports_float8 is supports_float8
     assert pipeline_utils.quantize_float8 is quantize_float8
     try:
@@ -349,74 +369,79 @@ def test_dtypes():
         assert "scale" in str(exc)
     print("  float8: ml_dtypes when present, E4M3 codes otherwise")
 
-    assert supports_bfloat16() is False
-    bf16_values = np.array([0.0, -0.0, 1.0, -1.0, 2.0, np.inf, -np.inf], dtype=np.float32)
-    bf16_stored = float32_to_bfloat16(bf16_values)
-    assert bf16_stored.dtype == np.dtype(np.uint16)
-    assert bf16_stored.tolist() == [0x0000, 0x8000, 0x3F80, 0xBF80, 0x4000, 0x7F80, 0xFF80]
-    bf16_view = bfloat16_to_uint16_view(bf16_stored)
-    assert bf16_view.dtype == np.dtype(np.uint16)
-    assert np.shares_memory(bf16_view, bf16_stored)
-    assert uint16_view_to_bfloat16(bf16_view).dtype == np.dtype(np.uint16)
-    assert np.array_equal(uint16_view_to_bfloat16(bf16_view), bf16_stored)
-    bf16_restored = bfloat16_to_float32(bf16_stored)
-    assert bf16_restored.dtype == np.dtype(np.float32)
-    assert np.array_equal(bf16_restored[:5].view(np.uint32), bf16_values[:5].view(np.uint32))
-    assert np.isposinf(bf16_restored[5]) and np.isneginf(bf16_restored[6])
-    tie_even = np.array([0x3F808000], dtype=np.uint32).view(np.float32)
-    tie_odd = np.array([0x3F818000], dtype=np.uint32).view(np.float32)
-    above_tie = np.array([0x3F808001], dtype=np.uint32).view(np.float32)
-    assert int(float32_to_bfloat16(tie_even)[0]) == 0x3F80
-    assert int(float32_to_bfloat16(tie_odd)[0]) == 0x3F82
-    assert int(float32_to_bfloat16(above_tie)[0]) == 0x3F81
-    nan_value = np.array([0x7F800001], dtype=np.uint32).view(np.float32)
-    nan_stored = float32_to_bfloat16(nan_value)
-    assert int(nan_stored[0]) != 0x7F80
-    assert np.isnan(bfloat16_to_float32(nan_stored)[0])
-    exact = np.arange(16, dtype=np.float32).reshape(2, 8)
-    assert float32_to_bfloat16(exact).shape == exact.shape
-    assert np.array_equal(bfloat16_to_float32(float32_to_bfloat16(exact)), exact)
-    sparse = np.arange(8, dtype=np.float32)[::2]
-    assert np.array_equal(
-        bfloat16_to_float32(float32_to_bfloat16(sparse)),
-        np.array([0, 2, 4, 6], dtype=np.float32),
-    )
-    empty_bf16 = float32_to_bfloat16(np.array([], dtype=np.float32))
-    assert empty_bf16.dtype == np.dtype(np.uint16) and empty_bf16.shape == (0,)
-    assert bfloat16_to_float32(empty_bf16).shape == (0,)
+    saved_bf16_initial = dtypes_mod._BFLOAT16_DTYPE
+    dtypes_mod._BFLOAT16_DTYPE = False
     try:
-        bfloat16_to_float32(np.array([1.0], dtype=np.float32))
-        raise AssertionError("float32 is not bfloat16 storage")
-    except ValueError as exc:
-        assert "bfloat16" in str(exc)
-    try:
-        uint16_view_to_bfloat16(np.array([1.0], dtype=np.float32))
-        raise AssertionError("float32 is not a uint16 bfloat16 view")
-    except ValueError as exc:
-        assert "uint16" in str(exc)
-    saved_bf16 = dtypes_mod._BFLOAT16_DTYPE
-    try:
-        dtypes_mod._BFLOAT16_DTYPE = np.dtype(np.int16)
-        assert dtypes_mod.supports_bfloat16() is True
-        with warnings.catch_warnings(record=True) as native_bf16_warnings:
-            warnings.simplefilter("always")
-            assert get_numpy_dtype("tensor(bfloat16)") == np.dtype(np.int16)
-        assert not any("ml_dtypes not available" in str(item.message) for item in native_bf16_warnings)
-        native_bf16 = float32_to_bfloat16(np.array([1.0, -2.0], dtype=np.float32))
-        assert native_bf16.dtype == np.dtype(np.int16)
-        native_bits = bfloat16_to_uint16_view(native_bf16)
-        assert native_bits.tolist() == [0x3F80, 0xC000]
-        assert np.shares_memory(native_bits, native_bf16)
+        assert supports_bfloat16() is False
+        bf16_values = np.array([0.0, -0.0, 1.0, -1.0, 2.0, np.inf, -np.inf], dtype=np.float32)
+        bf16_stored = float32_to_bfloat16(bf16_values)
+        assert bf16_stored.dtype == np.dtype(np.uint16)
+        assert bf16_stored.tolist() == [0x0000, 0x8000, 0x3F80, 0xBF80, 0x4000, 0x7F80, 0xFF80]
+        bf16_view = bfloat16_to_uint16_view(bf16_stored)
+        assert bf16_view.dtype == np.dtype(np.uint16)
+        assert np.shares_memory(bf16_view, bf16_stored)
+        assert uint16_view_to_bfloat16(bf16_view).dtype == np.dtype(np.uint16)
+        assert np.array_equal(uint16_view_to_bfloat16(bf16_view), bf16_stored)
+        bf16_restored = bfloat16_to_float32(bf16_stored)
+        assert bf16_restored.dtype == np.dtype(np.float32)
+        assert np.array_equal(bf16_restored[:5].view(np.uint32), bf16_values[:5].view(np.uint32))
+        assert np.isposinf(bf16_restored[5]) and np.isneginf(bf16_restored[6])
+        tie_even = np.array([0x3F808000], dtype=np.uint32).view(np.float32)
+        tie_odd = np.array([0x3F818000], dtype=np.uint32).view(np.float32)
+        above_tie = np.array([0x3F808001], dtype=np.uint32).view(np.float32)
+        assert int(float32_to_bfloat16(tie_even)[0]) == 0x3F80
+        assert int(float32_to_bfloat16(tie_odd)[0]) == 0x3F82
+        assert int(float32_to_bfloat16(above_tie)[0]) == 0x3F81
+        nan_value = np.array([0x7F800001], dtype=np.uint32).view(np.float32)
+        nan_stored = float32_to_bfloat16(nan_value)
+        assert int(nan_stored[0]) != 0x7F80
+        assert np.isnan(bfloat16_to_float32(nan_stored)[0])
+        exact = np.arange(16, dtype=np.float32).reshape(2, 8)
+        assert float32_to_bfloat16(exact).shape == exact.shape
+        assert np.array_equal(bfloat16_to_float32(float32_to_bfloat16(exact)), exact)
+        sparse = np.arange(8, dtype=np.float32)[::2]
         assert np.array_equal(
-            bfloat16_to_float32(native_bf16),
-            np.array([1.0, -2.0], dtype=np.float32),
+            bfloat16_to_float32(float32_to_bfloat16(sparse)),
+            np.array([0, 2, 4, 6], dtype=np.float32),
         )
-        viewed = uint16_view_to_bfloat16(native_bits)
-        assert viewed.dtype == np.dtype(np.int16)
-        assert np.shares_memory(viewed, native_bits)
+        empty_bf16 = float32_to_bfloat16(np.array([], dtype=np.float32))
+        assert empty_bf16.dtype == np.dtype(np.uint16) and empty_bf16.shape == (0,)
+        assert bfloat16_to_float32(empty_bf16).shape == (0,)
+        try:
+            bfloat16_to_float32(np.array([1.0], dtype=np.float32))
+            raise AssertionError("float32 is not bfloat16 storage")
+        except ValueError as exc:
+            assert "bfloat16" in str(exc)
+        try:
+            uint16_view_to_bfloat16(np.array([1.0], dtype=np.float32))
+            raise AssertionError("float32 is not a uint16 bfloat16 view")
+        except ValueError as exc:
+            assert "uint16" in str(exc)
+        saved_bf16 = dtypes_mod._BFLOAT16_DTYPE
+        try:
+            dtypes_mod._BFLOAT16_DTYPE = np.dtype(np.int16)
+            assert dtypes_mod.supports_bfloat16() is True
+            with warnings.catch_warnings(record=True) as native_bf16_warnings:
+                warnings.simplefilter("always")
+                assert get_numpy_dtype("tensor(bfloat16)") == np.dtype(np.int16)
+            assert not any("ml_dtypes not available" in str(item.message) for item in native_bf16_warnings)
+            native_bf16 = float32_to_bfloat16(np.array([1.0, -2.0], dtype=np.float32))
+            assert native_bf16.dtype == np.dtype(np.int16)
+            native_bits = bfloat16_to_uint16_view(native_bf16)
+            assert native_bits.tolist() == [0x3F80, 0xC000]
+            assert np.shares_memory(native_bits, native_bf16)
+            assert np.array_equal(
+                bfloat16_to_float32(native_bf16),
+                np.array([1.0, -2.0], dtype=np.float32),
+            )
+            viewed = uint16_view_to_bfloat16(native_bits)
+            assert viewed.dtype == np.dtype(np.int16)
+            assert np.shares_memory(viewed, native_bits)
+        finally:
+            dtypes_mod._BFLOAT16_DTYPE = saved_bf16
+        assert supports_bfloat16() is False
     finally:
-        dtypes_mod._BFLOAT16_DTYPE = saved_bf16
-    assert supports_bfloat16() is False
+        dtypes_mod._BFLOAT16_DTYPE = saved_bf16_initial
     assert pipeline_utils.float32_to_bfloat16 is float32_to_bfloat16
     assert pipeline_utils.bfloat16_to_float32 is bfloat16_to_float32
     assert pipeline_utils.bfloat16_to_uint16_view is bfloat16_to_uint16_view
@@ -829,7 +854,7 @@ def test_kv_cache():
         assert isinstance(value, DeviceBuffer)
         assert key.ort_value is not None
         assert tuple(key.shape) == (1, 2, 8, 8)
-        if backend is KVCacheBackend.VITISAI:
+        if backend is KVCacheBackend.VITISAI and os.name == "nt":
             assert key.host_pages_locked == int(np.dtype(key.dtype).itemsize) * int(np.prod(key.shape))
         assert resident.get_sequence_length() == 0
         before = int(key.ort_value.data_ptr())

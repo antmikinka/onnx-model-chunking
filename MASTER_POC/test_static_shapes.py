@@ -21,8 +21,10 @@ from chunking_utils.onnx.static_shapes import (
     allow_shape_check_bypass,
     apply_static_contract,
     causal_additive_bias,
+    decompose_gqa_to_npu_primitives,
     freeze_graph_io,
     rewrite_fused_norms,
+    right_aligned_attention_bias,
     runtime_slices,
     static_attention_bias,
 )
@@ -265,13 +267,210 @@ def _dims(value):
     return [dim.dim_value for dim in value.type.tensor_type.shape.dim]
 
 
+def _make_external_tensor(name, data_type, dims, location, offset, length):
+    tensor = TensorProto()
+    tensor.name = name
+    tensor.data_type = data_type
+    tensor.dims.extend(dims)
+    tensor.data_location = TensorProto.EXTERNAL
+    for key, val in (
+        ("location", str(location)),
+        ("offset", str(offset)),
+        ("length", str(length)),
+    ):
+        entry = tensor.external_data.add()
+        entry.key = key
+        entry.value = val
+    return tensor
+
+
+def _build_synthetic_qwen_layer(directory):
+    rng = np.random.default_rng(7)
+    down_w = rng.integers(0, 256, size=(4096, 384, 16), dtype=np.uint8)
+    down_s = rng.normal(size=(4096, 384)).astype(np.float32)
+    data_file = "layer_0_of_36.onnx.data"
+    data_path = os.path.join(directory, data_file)
+    with open(data_path, "wb") as handle:
+        handle.write(down_w.tobytes())
+        s_offset = handle.tell()
+        handle.write(down_s.tobytes())
+
+    initializers = [
+        numpy_helper.from_array(np.ones((4096,), dtype=np.float32), "model.layers.0.input_layernorm.weight"),
+        numpy_helper.from_array(np.ones((128,), dtype=np.float32), "model.layers.0.attn.q_norm.layernorm.weight"),
+        numpy_helper.from_array(np.ones((128,), dtype=np.float32), "model.layers.0.attn.k_norm.layernorm.weight"),
+        numpy_helper.from_array(np.ones((4096,), dtype=np.float32), "model.layers.0.post_attention_layernorm.weight"),
+        numpy_helper.from_array(np.ones((64, 64), dtype=np.float32), "cos_cache"),
+        numpy_helper.from_array(np.zeros((64, 64), dtype=np.float32), "sin_cache"),
+    ]
+    proj_specs = [
+        ("attn/qkv_proj", "model.layers.0.attn.qkv_proj.MatMul", 4096, 6144, "norm0_out", "qkv_out"),
+        ("attn/o_proj", "model.layers.0.attn.o_proj.MatMul", 4096, 4096, "gqa_out", "o_out"),
+        ("mlp/gate_proj", "model.layers.0.mlp.gate_proj.MatMul", 4096, 12288, "post_norm_out", "gate_out"),
+        ("mlp/up_proj", "model.layers.0.mlp.up_proj.MatMul", 4096, 12288, "post_norm_out", "up_out"),
+    ]
+    nodes = [
+        helper.make_node(
+            "SimplifiedLayerNormalization",
+            ["/model/embed_tokens/Gather/output_0", "model.layers.0.input_layernorm.weight"],
+            ["norm0_out"],
+            name="/model/layers.0/input_layernorm/LayerNorm",
+            axis=-1,
+            epsilon=1e-6,
+        ),
+    ]
+    for suffix, prefix, k_dim, n_dim, inp_name, out_name in proj_specs:
+        blocks = k_dim // 32
+        w_name = f"{prefix}.weight_Q4"
+        s_name = f"{prefix}.weight_scales"
+        initializers.append(
+            _make_external_tensor(w_name, TensorProto.UINT8, [n_dim, blocks, 16], data_file, 0, n_dim * blocks * 16)
+        )
+        initializers.append(
+            _make_external_tensor(s_name, TensorProto.FLOAT, [n_dim, blocks], data_file, 0, n_dim * blocks * 4)
+        )
+        nodes.append(
+            helper.make_node(
+                "MatMulNBits",
+                [inp_name, w_name, s_name],
+                [out_name],
+                name=f"/model/layers.0/{suffix}/MatMul_Q4",
+                domain="com.microsoft",
+                K=k_dim,
+                N=n_dim,
+                bits=4,
+                block_size=32,
+                accuracy_level=4,
+            )
+        )
+    initializers.append(
+        _make_external_tensor(
+            "model.layers.0.mlp.down_proj.MatMul.weight_Q4",
+            TensorProto.UINT8,
+            [4096, 384, 16],
+            data_file,
+            0,
+            int(down_w.nbytes),
+        )
+    )
+    initializers.append(
+        _make_external_tensor(
+            "model.layers.0.mlp.down_proj.MatMul.weight_scales",
+            TensorProto.FLOAT,
+            [4096, 384],
+            data_file,
+            s_offset,
+            int(down_s.nbytes),
+        )
+    )
+    nodes.extend([
+        helper.make_node(
+            "SimplifiedLayerNormalization",
+            ["qkv_out", "model.layers.0.attn.q_norm.layernorm.weight"],
+            ["q_norm_out"],
+            name="/model/layers.0/attn/q_norm/LayerNorm",
+            axis=-1,
+            epsilon=1e-6,
+        ),
+        helper.make_node(
+            "SimplifiedLayerNormalization",
+            ["qkv_out", "model.layers.0.attn.k_norm.layernorm.weight"],
+            ["k_norm_out"],
+            name="/model/layers.0/attn/k_norm/LayerNorm",
+            axis=-1,
+            epsilon=1e-6,
+        ),
+        helper.make_node(
+            "GroupQueryAttention",
+            [
+                "q_norm_out",
+                "k_norm_out",
+                "qkv_out",
+                "past_key_values.0.key",
+                "past_key_values.0.value",
+                "/model/attn_mask_reformat/attn_mask_subgraph/Sub/Cast/output_0",
+                "/model/attn_mask_reformat/attn_mask_subgraph/Gather/Cast/output_0",
+                "cos_cache",
+                "sin_cache",
+                "",
+                "attention_bias",
+            ],
+            ["gqa_out", "present.0.key", "present.0.value"],
+            name="/model/layers.0/attn/GroupQueryAttention",
+            domain="com.microsoft",
+            num_heads=32,
+            kv_num_heads=8,
+            do_rotary=1,
+            past_present_share_buffer=0,
+        ),
+        helper.make_node(
+            "SkipSimplifiedLayerNormalization",
+            ["/model/embed_tokens/Gather/output_0", "o_out", "model.layers.0.post_attention_layernorm.weight"],
+            ["post_norm_out", "", "", ""],
+            name="/model/layers.0/post_attention_layernorm/SkipLayerNorm",
+            domain="com.microsoft",
+            epsilon=1e-6,
+        ),
+        helper.make_node("Mul", ["gate_out", "up_out"], ["mlp_hidden"], name="/model/layers.0/mlp/Mul"),
+        helper.make_node(
+            "MatMulNBits",
+            [
+                "mlp_hidden",
+                "model.layers.0.mlp.down_proj.MatMul.weight_Q4",
+                "model.layers.0.mlp.down_proj.MatMul.weight_scales",
+            ],
+            ["/model/layers.0/mlp/down_proj/MatMul/output_0"],
+            name="/model/layers.0/mlp/down_proj/MatMul_Q4",
+            domain="com.microsoft",
+            K=12288,
+            N=4096,
+            bits=4,
+            block_size=32,
+            accuracy_level=4,
+        ),
+    ])
+    inputs = [
+        _value("/model/embed_tokens/Gather/output_0", [_dim(0, "batch_size"), _dim(0, "sequence_length"), _dim(4096, "")]),
+        _value("past_key_values.0.key", [_dim(0, "batch_size"), _dim(8, ""), _dim(0, "past_sequence_length"), _dim(128, "")]),
+        _value("past_key_values.0.value", [_dim(0, "batch_size"), _dim(8, ""), _dim(0, "past_sequence_length"), _dim(128, "")]),
+        _value("/model/attn_mask_reformat/attn_mask_subgraph/Sub/Cast/output_0", [_dim(0, "batch_size")], TensorProto.INT32),
+        _value("/model/attn_mask_reformat/attn_mask_subgraph/Gather/Cast/output_0", [_dim(1, "")], TensorProto.INT32),
+        _value("attention_bias", [_dim(0, "batch_size"), _dim(1, ""), _dim(0, "sequence_length"), _dim(0, "total_sequence_length")]),
+    ]
+    outputs = [
+        _value("/model/layers.0/mlp/down_proj/MatMul/output_0", [_dim(0, "batch_size"), _dim(0, "sequence_length"), _dim(4096, "")]),
+        _value("present.0.key", [_dim(0, "batch_size"), _dim(8, ""), _dim(0, "total_sequence_length"), _dim(128, "")]),
+        _value("present.0.value", [_dim(0, "batch_size"), _dim(8, ""), _dim(0, "total_sequence_length"), _dim(128, "")]),
+    ]
+    model = helper.make_model(
+        helper.make_graph(nodes, "qwen_layer_0", inputs, outputs, initializers),
+        opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("com.microsoft", 1)],
+    )
+    model.ir_version = 10
+    model_path = os.path.join(directory, "layer_0_of_36.onnx")
+    onnx.save_model(model, model_path, save_as_external_data=False)
+    return model_path
+
+
 def test_qwen_layer_freezes_to_the_static_window():
+    import tempfile
+
     path = os.environ.get(
         "QWEN_ATTENTION_LAYER",
         r"C:\Users\antmi\qwen3-work\qwen3-8b-split\model.onnx\layer_0_of_36.onnx",
     )
+    tmp_ctx = None
     if not os.path.exists(path):
-        raise AssertionError(f"Qwen attention layer was not found at {path}")
+        tmp_ctx = tempfile.TemporaryDirectory()
+        path = _build_synthetic_qwen_layer(tmp_ctx.name)
+    try:
+        _run_qwen_layer_freeze_assertions(path)
+    finally:
+        if tmp_ctx is not None:
+            tmp_ctx.cleanup()
+
+
+def _run_qwen_layer_freeze_assertions(path):
     model = onnx.load(path, load_external_data=False)
     directory = os.path.dirname(path)
     stored_before = {item.name: item for item in model.graph.initializer}
@@ -866,25 +1065,35 @@ def test_down_proj_k_split_matches_unsplit():
     delta, scale = _gap(got, ref)
     assert np.isfinite(got).all()
     assert delta <= 1e-4 * scale, f"synthetic gap {delta} scale {scale}"
+    import tempfile
+
     path = os.environ.get(
         "QWEN_ATTENTION_LAYER",
         r"C:\Users\antmi\qwen3-work\qwen3-8b-split\model.onnx\layer_0_of_36.onnx",
     )
-    source = onnx.load(path, load_external_data=False)
-    directory = os.path.dirname(path)
-    original = next(node for node in source.graph.node if node.name.endswith("down_proj/MatMul_Q4"))
-    stored = {item.name: item for item in source.graph.initializer}
-    real_w = _initializer_array(stored[original.input[1]], directory)
-    real_s = _initializer_array(stored[original.input[2]], directory)
-    real = _nbits_model(12288, 4096, 32, real_w, real_s, shape=[1, 1, 12288])
-    real_feed = rng.normal(size=(1, 1, 12288)).astype(np.float32)
-    real_ref = _session(real).run(None, {"activation": real_feed})[0]
-    assert _split_large_matmul_nbits(real, directory) == ["down"]
-    real_got = _session(real).run(None, {"activation": real_feed})[0]
-    real_delta, real_scale = _gap(real_got, real_ref)
-    assert np.isfinite(real_got).all()
-    assert real_delta <= 1e-4 * real_scale, f"down_proj gap {real_delta} scale {real_scale}"
-    print(f"  down_proj_gap {real_delta:.3e} ref_abs {real_scale:.3e}")
+    tmp_ctx = None
+    if not os.path.exists(path):
+        tmp_ctx = tempfile.TemporaryDirectory()
+        path = _build_synthetic_qwen_layer(tmp_ctx.name)
+    try:
+        source = onnx.load(path, load_external_data=False)
+        directory = os.path.dirname(path)
+        original = next(node for node in source.graph.node if node.name.endswith("down_proj/MatMul_Q4"))
+        stored = {item.name: item for item in source.graph.initializer}
+        real_w = _initializer_array(stored[original.input[1]], directory)
+        real_s = _initializer_array(stored[original.input[2]], directory)
+        real = _nbits_model(12288, 4096, 32, real_w, real_s, shape=[1, 1, 12288])
+        real_feed = rng.normal(size=(1, 1, 12288)).astype(np.float32)
+        real_ref = _session(real).run(None, {"activation": real_feed})[0]
+        assert _split_large_matmul_nbits(real, directory) == ["down"]
+        real_got = _session(real).run(None, {"activation": real_feed})[0]
+        real_delta, real_scale = _gap(real_got, real_ref)
+        assert np.isfinite(real_got).all()
+        assert real_delta <= 1e-4 * real_scale, f"down_proj gap {real_delta} scale {real_scale}"
+        print(f"  down_proj_gap {real_delta:.3e} ref_abs {real_scale:.3e}")
+    finally:
+        if tmp_ctx is not None:
+            tmp_ctx.cleanup()
 
 
 def _dequant_pair(weight, scales, zp_packed, k, n, block):
@@ -1254,6 +1463,439 @@ def test_component_bake_copies_master_external_slices():
     assert master_bias.external_data[0].value == "model.onnx.data"
 
 
+def test_decompose_gqa_matches_fused_and_avoids_hostile_ops():
+    rng = np.random.default_rng(42)
+    batch_size = 1
+    query_len = 1
+    max_seq_len = 8
+    num_heads = 4
+    kv_num_heads = 2
+    head_dim = 16
+    q_hidden = num_heads * head_dim
+    kv_hidden = kv_num_heads * head_dim
+    cos_data = rng.normal(size=(64, head_dim // 2)).astype(np.float32)
+    sin_data = rng.normal(size=(64, head_dim // 2)).astype(np.float32)
+
+    for share_buffer in (0, 1):
+        past_seq = max_seq_len + query_len if share_buffer else max_seq_len
+        q_in = _value("q", [_dim(0, "batch_size"), _dim(0, "sequence_length"), _dim(q_hidden, "")])
+        k_in = _value("k", [_dim(0, "batch_size"), _dim(0, "sequence_length"), _dim(kv_hidden, "")])
+        v_in = _value("v", [_dim(0, "batch_size"), _dim(0, "sequence_length"), _dim(kv_hidden, "")])
+        pk_in = _value(
+            "past_key_values.0.key",
+            [_dim(0, "batch_size"), _dim(kv_num_heads, ""), _dim(0, "past_sequence_length"), _dim(head_dim, "")],
+        )
+        pv_in = _value(
+            "past_key_values.0.value",
+            [_dim(0, "batch_size"), _dim(kv_num_heads, ""), _dim(0, "past_sequence_length"), _dim(head_dim, "")],
+        )
+        seqlens_in = _value("seqlens_k", [_dim(0, "batch_size")], TensorProto.INT32)
+        total_in = _value("total_seq_len", [_dim(1, "")], TensorProto.INT32)
+        bias_in = _value(
+            "attention_bias",
+            [_dim(0, "batch_size"), _dim(1, ""), _dim(0, "sequence_length"), _dim(0, "total_sequence_length")],
+        )
+        out_val = _value("attn_out", [_dim(0, "batch_size"), _dim(0, "sequence_length"), _dim(q_hidden, "")])
+        pres_k = _value(
+            "present.0.key",
+            [_dim(0, "batch_size"), _dim(kv_num_heads, ""), _dim(0, "total_sequence_length"), _dim(head_dim, "")],
+        )
+        pres_v = _value(
+            "present.0.value",
+            [_dim(0, "batch_size"), _dim(kv_num_heads, ""), _dim(0, "total_sequence_length"), _dim(head_dim, "")],
+        )
+        gqa_kwargs = dict(
+            name="/model/layers.0/attn/GroupQueryAttention",
+            domain="com.microsoft",
+            num_heads=num_heads,
+            kv_num_heads=kv_num_heads,
+            do_rotary=1,
+        )
+        if share_buffer:
+            gqa_kwargs["past_present_share_buffer"] = 1
+        gqa_node = helper.make_node(
+            "GroupQueryAttention",
+            [
+                "q",
+                "k",
+                "v",
+                "past_key_values.0.key",
+                "past_key_values.0.value",
+                "seqlens_k",
+                "total_seq_len",
+                "cos_cache",
+                "sin_cache",
+                "",
+                "attention_bias",
+            ],
+            ["attn_out", "present.0.key", "present.0.value"],
+            **gqa_kwargs,
+        )
+        inits = [
+            numpy_helper.from_array(cos_data, "cos_cache"),
+            numpy_helper.from_array(sin_data, "sin_cache"),
+        ]
+        base_model = helper.make_model(
+            helper.make_graph(
+                [gqa_node],
+                "gqa_test",
+                [q_in, k_in, v_in, pk_in, pv_in, seqlens_in, total_in, bias_in],
+                [out_val, pres_k, pres_v],
+                inits,
+            ),
+            opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("com.microsoft", 1)],
+        )
+        base_model.ir_version = 10
+
+        decomp_model = onnx.ModelProto()
+        decomp_model.CopyFrom(base_model)
+        report = apply_static_contract(
+            decomp_model,
+            batch_size=batch_size,
+            query_len=query_len,
+            max_seq_len=max_seq_len,
+            decompose_gqa=True,
+        )
+        assert report["rewritten_attention"] == ["/model/layers.0/attn/GroupQueryAttention"]
+        assert report["decomposed_gqa"] is True
+        ops = {node.op_type for node in decomp_model.graph.node}
+        assert "GroupQueryAttention" not in ops
+        for hostile in ("Transpose", "Where", "Scatter", "ScatterND", "ScatterElements"):
+            assert hostile not in ops, f"hostile op {hostile} found in decomposed GQA"
+
+        decomp_sess = _session(decomp_model)
+        q_arr = rng.normal(size=(1, 1, q_hidden)).astype(np.float32)
+        k_arr = rng.normal(size=(1, 1, kv_hidden)).astype(np.float32)
+        v_arr = rng.normal(size=(1, 1, kv_hidden)).astype(np.float32)
+        pk_arr = rng.normal(size=(1, kv_num_heads, max_seq_len, head_dim)).astype(np.float32)
+        pv_arr = rng.normal(size=(1, kv_num_heads, max_seq_len, head_dim)).astype(np.float32)
+
+        if not share_buffer:
+            fused_model = onnx.ModelProto()
+            fused_model.CopyFrom(base_model)
+            apply_static_contract(
+                fused_model,
+                batch_size=batch_size,
+                query_len=query_len,
+                max_seq_len=max_seq_len,
+                decompose_gqa=False,
+            )
+            fused_sess = _session(fused_model)
+            for step_pos, valid_past in ((0, 0), (5, 5), (42, max_seq_len)):
+                bias_arr = right_aligned_attention_bias(valid_past, max_seq_len, query_len=1)
+                feeds = {
+                    "q": q_arr,
+                    "k": k_arr,
+                    "v": v_arr,
+                    "past_key_values.0.key": pk_arr,
+                    "past_key_values.0.value": pv_arr,
+                    "position_ids": np.asarray([[step_pos]], dtype=np.int64),
+                    "attention_bias": bias_arr,
+                }
+                f_out, f_pk, f_pv = fused_sess.run(None, feeds)
+                d_out, d_pk, d_pv = decomp_sess.run(None, feeds)
+                assert np.max(np.abs(f_out - d_out)) < 1e-5
+                assert np.max(np.abs(f_pk - d_pk)) < 1e-5
+                assert np.max(np.abs(f_pv - d_pv)) < 1e-5
+        else:
+            # In-place shared buffer mode (past_seq == max_seq_len, total_len == max_seq_len)
+            bias_arr = right_aligned_attention_bias(
+                max_seq_len - 1, max_seq_len, query_len=1, total_len=max_seq_len
+            )
+            d_out, d_pk, d_pv = decomp_sess.run(
+                None,
+                {
+                    "q": q_arr,
+                    "k": k_arr,
+                    "v": v_arr,
+                    "past_key_values.0.key": pk_arr,
+                    "past_key_values.0.value": pv_arr,
+                    "position_ids": np.asarray([[7]], dtype=np.int64),
+                    "attention_bias": bias_arr,
+                },
+            )
+            assert d_out.shape == (1, 1, q_hidden)
+            assert d_pk.shape == (1, kv_num_heads, max_seq_len, head_dim)
+            assert d_pv.shape == (1, kv_num_heads, max_seq_len, head_dim)
+            np.testing.assert_allclose(d_pk[:, :, :-1, :], pk_arr[:, :, 1:, :])
+            np.testing.assert_allclose(d_pv[:, :, :-1, :], pv_arr[:, :, 1:, :])
+
+    # Also verify sink_size > 0 preserves the leading sink slots in present KV
+    sink_model = onnx.ModelProto()
+    sink_model.CopyFrom(base_model)
+    sink_report = apply_static_contract(
+        sink_model,
+        batch_size=1,
+        query_len=1,
+        max_seq_len=max_seq_len,
+        decompose_gqa=True,
+        sink_size=2,
+    )
+    assert sink_report["rewritten_attention"] == ["/model/layers.0/attn/GroupQueryAttention"]
+    assert sink_report["decomposed_gqa"] is True
+    assert sink_report["sink_size"] == 2
+    sink_sess = _session(sink_model)
+    pk_sink = np.arange(1 * kv_num_heads * max_seq_len * head_dim, dtype=np.float32).reshape(
+        1, kv_num_heads, max_seq_len, head_dim
+    )
+    pv_sink = pk_sink * 0.5
+    _, out_pk, out_pv = sink_sess.run(
+        None,
+        {
+            "q": q_arr,
+            "k": k_arr,
+            "v": v_arr,
+            "past_key_values.0.key": pk_sink,
+            "past_key_values.0.value": pv_sink,
+            "position_ids": np.asarray([[20]], dtype=np.int64),
+            "attention_bias": right_aligned_attention_bias(
+                max_seq_len, max_seq_len, query_len=1, total_len=max_seq_len, sink_size=2
+            ),
+        },
+    )
+    np.testing.assert_allclose(out_pk[:, :, :2, :], pk_sink[:, :, :2, :])
+    np.testing.assert_allclose(out_pk[:, :, 2:-1, :], pk_sink[:, :, 3:, :])
+    np.testing.assert_allclose(out_pv[:, :, :2, :], pv_sink[:, :, :2, :])
+    np.testing.assert_allclose(out_pv[:, :, 2:-1, :], pv_sink[:, :, 3:, :])
+
+
+def test_right_aligned_attention_bias_and_sink_window():
+    from chunking_utils.onnx.kv_concat import static_kv_concat_recipe
+
+    bias0 = right_aligned_attention_bias(0, 8, query_len=1)
+    assert bias0.shape == (1, 1, 1, 9)
+    assert np.all(bias0[0, 0, 0, :8] == np.float32(-10000.0))
+    assert bias0[0, 0, 0, 8] == np.float32(0.0)
+
+    bias3 = right_aligned_attention_bias(3, 8, query_len=1)
+    assert np.all(bias3[0, 0, 0, :5] == np.float32(-10000.0))
+    assert np.all(bias3[0, 0, 0, 5:] == np.float32(0.0))
+
+    bias_sink = right_aligned_attention_bias(4, 8, query_len=1, sink_size=2)
+    assert np.all(bias_sink[0, 0, 0, :2] == np.float32(0.0))
+    assert np.all(bias_sink[0, 0, 0, 2:6] == np.float32(-10000.0))
+    assert np.all(bias_sink[0, 0, 0, 6:] == np.float32(0.0))
+
+    recipe = static_kv_concat_recipe(max_seq_len=8, query_len=1, layout="sink_window", sink_size=2)
+    assert recipe["layout"] == "sink_window"
+    assert recipe["output_seq"] == 8
+    assert recipe["present_shape_is_static"] is True
+    assert recipe["op_types"] == ["Slice", "Slice", "Concat"]
+    assert recipe["nodes"][0]["starts"] == [0]
+    assert recipe["nodes"][0]["ends"] == [2]
+    assert recipe["nodes"][1]["starts"] == [3]
+    assert recipe["nodes"][1]["ends"] == [8]
+
+
+def test_kv_cache_rolling_swap_position_ids_and_bucket_resize():
+    from pipeline_utils.kv_cache import KVCacheManager, KVUpdateMode
+
+    mgr = KVCacheManager(
+        num_layers=2,
+        batch_size=1,
+        num_kv_heads=2,
+        max_seq_len=4,
+        head_dim=8,
+        dtype=np.float32,
+        update_mode=KVUpdateMode.CONCAT_SWAP,
+        sink_size=1,
+        bucket_sizes=(4, 8, 16),
+    )
+    for step in range(10):
+        pos = mgr.position_ids(query_len=1, layer_idx=0)
+        assert int(pos[0, 0]) == step
+        bias = mgr.attention_bias(query_len=1, align="right", layer_idx=0)
+        assert bias.shape == (1, 1, 1, 5)
+        for layer_idx in range(2):
+            pk, pv = mgr.get_past_tensors(layer_idx)
+            sk = mgr._cache[layer_idx]["key_shadow"]
+            sv = mgr._cache[layer_idx]["value_shadow"]
+            sk[:, :, :-1, :] = pk[:, :, 1:, :]
+            sk[:, :, -1, :] = float(step + 1)
+            sv[:, :, :-1, :] = pv[:, :, 1:, :]
+            sv[:, :, -1, :] = float((step + 1) * 10)
+            mgr.commit_present_swap(layer_idx, step + 1, total_seen=step + 1, rolling=True)
+
+    assert mgr.seen_tokens == 10
+    assert mgr.current_seq_len == 4
+    # First token (1.0) was promoted to sink slot 0 when window filled at step 4
+    k0, _ = mgr.get_past_tensors(0)
+    assert float(k0[0, 0, 0, 0]) == 1.0
+    assert float(k0[0, 0, -1, 0]) == 10.0
+
+    # Dynamically resize static window from 4 -> 8 via bucket capacity
+    new_cap = mgr.ensure_bucket_capacity(6, align="right")
+    assert new_cap == 8
+    assert mgr.max_seq_len == 8
+    resized_k0, _ = mgr.get_past_tensors(0)
+    assert resized_k0.shape == (1, 2, 8, 8)
+    assert float(resized_k0[0, 0, -1, 0]) == 10.0
+
+
+def test_split_inference_engine_static_window_decode():
+    import json
+    import tempfile
+    from chunking_utils.onnx.inference import InferenceConfig, SplitModelInferenceEngine
+
+    with tempfile.TemporaryDirectory() as tmp:
+        vocab_size = 16
+        hidden_dim = 8
+        num_heads = 2
+        kv_heads = 2
+        head_dim = 4
+        max_seq = 4
+        rng = np.random.default_rng(99)
+
+        # 1. Embeddings component
+        emb_weight = rng.normal(size=(vocab_size, hidden_dim)).astype(np.float32)
+        emb_graph = helper.make_graph(
+            [helper.make_node("Gather", ["emb_w", "input_ids"], ["hidden_0"], axis=0)],
+            "embeddings",
+            [helper.make_tensor_value_info("input_ids", TensorProto.INT64, [1, 1])],
+            [helper.make_tensor_value_info("hidden_0", TensorProto.FLOAT, [1, 1, hidden_dim])],
+            [numpy_helper.from_array(emb_weight, "emb_w")],
+        )
+        emb_model = helper.make_model(emb_graph, opset_imports=[helper.make_opsetid("", 18)])
+        emb_model.ir_version = 10
+        onnx.save_model(emb_model, os.path.join(tmp, "embeddings.onnx"))
+
+        # 2. Layer 0 component (decomposed GQA static window)
+        cos_data = np.ones((32, head_dim // 2), dtype=np.float32)
+        sin_data = np.zeros((32, head_dim // 2), dtype=np.float32)
+        gqa_node = helper.make_node(
+            "GroupQueryAttention",
+            [
+                "hidden_0",
+                "hidden_0",
+                "hidden_0",
+                "past_key_values.0.key",
+                "past_key_values.0.value",
+                "seqlens_k",
+                "total_seq_len",
+                "cos_cache",
+                "sin_cache",
+                "",
+                "attention_bias",
+            ],
+            ["hidden_1", "present.0.key", "present.0.value"],
+            name="/model/layers.0/attn/GroupQueryAttention",
+            domain="com.microsoft",
+            num_heads=num_heads,
+            kv_num_heads=kv_heads,
+            do_rotary=1,
+            past_present_share_buffer=0,
+        )
+        layer_graph = helper.make_graph(
+            [gqa_node],
+            "layer_0",
+            [
+                _value("hidden_0", [_dim(0, "batch_size"), _dim(0, "sequence_length"), _dim(hidden_dim, "")]),
+                _value("past_key_values.0.key", [_dim(0, "batch_size"), _dim(kv_heads, ""), _dim(0, "past_sequence_length"), _dim(head_dim, "")]),
+                _value("past_key_values.0.value", [_dim(0, "batch_size"), _dim(kv_heads, ""), _dim(0, "past_sequence_length"), _dim(head_dim, "")]),
+                _value("seqlens_k", [_dim(0, "batch_size")], TensorProto.INT32),
+                _value("total_seq_len", [_dim(1, "")], TensorProto.INT32),
+                _value("attention_bias", [_dim(0, "batch_size"), _dim(1, ""), _dim(0, "sequence_length"), _dim(0, "total_sequence_length")]),
+            ],
+            [
+                _value("hidden_1", [_dim(0, "batch_size"), _dim(0, "sequence_length"), _dim(hidden_dim, "")]),
+                _value("present.0.key", [_dim(0, "batch_size"), _dim(kv_heads, ""), _dim(0, "total_sequence_length"), _dim(head_dim, "")]),
+                _value("present.0.value", [_dim(0, "batch_size"), _dim(kv_heads, ""), _dim(0, "total_sequence_length"), _dim(head_dim, "")]),
+            ],
+            [
+                numpy_helper.from_array(cos_data, "cos_cache"),
+                numpy_helper.from_array(sin_data, "sin_cache"),
+            ],
+        )
+        layer_model = helper.make_model(
+            layer_graph,
+            opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("com.microsoft", 1)],
+        )
+        layer_model.ir_version = 10
+        apply_static_contract(
+            layer_model,
+            batch_size=1,
+            query_len=1,
+            max_seq_len=max_seq,
+            decompose_gqa=True,
+        )
+        onnx.save_model(layer_model, os.path.join(tmp, "layer_0_of_1.onnx"))
+
+        # 3. LM Head component
+        lm_w = rng.normal(size=(hidden_dim, vocab_size)).astype(np.float32)
+        lm_graph = helper.make_graph(
+            [helper.make_node("MatMul", ["hidden_1", "lm_w"], ["logits"])],
+            "lm_head",
+            [helper.make_tensor_value_info("hidden_1", TensorProto.FLOAT, [1, 1, hidden_dim])],
+            [helper.make_tensor_value_info("logits", TensorProto.FLOAT, [1, 1, vocab_size])],
+            [numpy_helper.from_array(lm_w, "lm_w")],
+        )
+        lm_model = helper.make_model(lm_graph, opset_imports=[helper.make_opsetid("", 18)])
+        lm_model.ir_version = 10
+        onnx.save_model(lm_model, os.path.join(tmp, "lm_head.onnx"))
+
+        meta = {
+            "num_layers": 1,
+            "components": {
+                "embedding": {
+                    "file": "embeddings.onnx",
+                    "input_names": ["input_ids"],
+                    "output_names": ["hidden_0"],
+                },
+                "layer_0": {
+                    "file": "layer_0_of_1.onnx",
+                    "input_names": [item.name for item in layer_model.graph.input],
+                    "output_names": [item.name for item in layer_model.graph.output],
+                },
+                "lm_head": {
+                    "file": "lm_head.onnx",
+                    "input_names": ["hidden_1"],
+                    "output_names": ["logits"],
+                },
+            },
+            "kv_cache_info": {
+                "num_layers": 1,
+                "num_kv_heads": kv_heads,
+                "head_dim": head_dim,
+                "dtype": "float32",
+                "max_seq_len": max_seq,
+            },
+        }
+        with open(os.path.join(tmp, "model_info.json"), "w", encoding="utf-8") as handle:
+            json.dump(meta, handle)
+        with open(os.path.join(tmp, "config.json"), "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "num_hidden_layers": 1,
+                    "num_attention_heads": num_heads,
+                    "num_key_value_heads": kv_heads,
+                    "head_dim": head_dim,
+                    "hidden_size": hidden_dim,
+                    "torch_dtype": "float32",
+                },
+                handle,
+            )
+
+        class _DummyTokenizer:
+            eos_token_id = None
+
+            def __call__(self, text, return_tensors="np"):
+                return {"input_ids": np.asarray([[1, 2, 3]], dtype=np.int64)}
+
+            def decode(self, ids):
+                return " ".join(str(int(x)) for x in ids)
+
+        cfg = InferenceConfig(max_seq_len=max_seq, kv_cache_dtype="float32", temperature=0.0)
+        engine = SplitModelInferenceEngine(tmp, config=cfg, verbose=False)
+        engine.tokenizer = _DummyTokenizer()
+        assert engine._static_window_layers is True
+        text = engine.generate("hello world", max_new_tokens=6)
+        result = engine.get_result()
+        assert len(result.token_ids) == 6
+        assert isinstance(text, str) and len(text.split()) == 9
+        assert engine.kv_cache.seen_tokens == 8
+        assert engine.kv_cache.current_seq_len == max_seq
+
+
 def main():
     checks = [
         ("freeze_window", test_freeze_past_and_present_match),
@@ -1273,6 +1915,10 @@ def main():
         ("gqa_position", test_gqa_position_ids_selects_the_rope_row),
         ("skip_norm", test_skip_norm_matches_the_fused_op),
         ("builder_static_mask", test_builder_static_mask_has_no_shape_or_slice),
+        ("decompose_gqa", test_decompose_gqa_matches_fused_and_avoids_hostile_ops),
+        ("right_aligned_bias_and_sink", test_right_aligned_attention_bias_and_sink_window),
+        ("kv_cache_rolling_and_buckets", test_kv_cache_rolling_swap_position_ids_and_bucket_resize),
+        ("split_engine_static_window", test_split_inference_engine_static_window_decode),
     ]
     return all(_check(name, fn) for name, fn in checks)
 

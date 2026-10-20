@@ -34,7 +34,10 @@ from typing import Dict, List, Any, Optional, Tuple, Callable
 import numpy as np
 
 import onnxruntime as ort
-from transformers import AutoTokenizer
+try:
+    from transformers import AutoTokenizer
+except ImportError:  # pragma: no cover
+    AutoTokenizer = None
 
 from pipeline_utils import (
     KVCacheManager,

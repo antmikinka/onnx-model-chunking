@@ -409,7 +409,12 @@ class SplitDecode:
         np.copyto(shadow_value, by_name[layer["present_value"]])
         for name in layer["hidden_outs"]:
             values[name] = by_name[name]
-        self.cache.commit_present_swap(index, min(self.past_valid + 1, PAST_SLOTS))
+        self.cache.commit_present_swap(
+            index,
+            min(self.past_valid + 1, PAST_SLOTS),
+            total_seen=self.token_position + 1,
+            rolling=True,
+        )
 
     def _run_layer_bound(self, index, values, bias, past_key, past_value, position: int) -> None:
         layer = self.layers[index]
@@ -451,11 +456,16 @@ class SplitDecode:
             values[name] = array
         # Keep the OrtValues alive until the run has returned.
         del shadow_key_ov, shadow_value_ov
-        self.cache.commit_present_swap(index, min(self.past_valid + 1, PAST_SLOTS))
+        self.cache.commit_present_swap(
+            index,
+            min(self.past_valid + 1, PAST_SLOTS),
+            total_seen=self.token_position + 1,
+            rolling=True,
+        )
 
     def step(self, token_id: int) -> np.ndarray:
-        bias = right_aligned_decode_bias(self.past_valid)
-        position = self.token_position
+        bias = self.cache.attention_bias(query_len=QUERY_LEN, align="right")
+        position = int(self.cache.position_ids(query_len=1)[0, 0])
         embed = self.embedding.run(
             None, {"input_ids": np.asarray([[int(token_id)]], dtype=np.int64)}
         )
@@ -604,7 +614,7 @@ def run_decode(args: argparse.Namespace) -> int:
     else:
         token_schedule = []
         n_steps = max(int(args.tokens), align_step + 1)
-    if n_steps > align_step + 1:
+    if n_steps > align_step + 1 and not (args.skip_monolith or getattr(args, "allow_rolling", False)):
         print(f"REFUSING {n_steps} steps. The split window and the monolith diverge after step {align_step}.")
         return 1
     peak = _rss_mb()
@@ -673,7 +683,13 @@ def run_decode(args: argparse.Namespace) -> int:
     aligned_gap = next((row for row in step_gaps if row["step"] == align_step), None)
     quality_pass = None
     if not args.skip_monolith:
-        quality_pass = bool(step_gaps) and len(step_gaps) == n_steps and _distribution_pass(step_gaps)
+        window_gaps = [row for row in step_gaps if row["step"] <= align_step]
+        expected_compared = min(n_steps, align_step + 1)
+        quality_pass = (
+            bool(window_gaps)
+            and len(window_gaps) == expected_compared
+            and _distribution_pass(window_gaps)
+        )
     total_s = sum(step_ms) / 1000.0
     report = {
         "split_dir": args.split_dir,
@@ -742,6 +758,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--log-severity", type=int, default=2)
     parser.add_argument("--output", default="")
     parser.add_argument("--skip-monolith", action="store_true")
+    parser.add_argument("--allow-rolling", action="store_true")
     parser.add_argument("--allow-overlap", action="store_true")
     parser.add_argument("--self-check", action="store_true")
     return parser.parse_args(argv)

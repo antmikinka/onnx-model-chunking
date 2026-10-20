@@ -630,11 +630,709 @@ def _ensure_attention_bias(graph, bias_name: str, query_len: int, bias_len: int,
     if bias_name in constants:
         return
     if not any(
-        node.op_type == "GroupQueryAttention" and len(node.input) > 10 and node.input[10] == bias_name
+        bias_name in node.input
         for node in graph.node
     ):
         return
     graph.input.append(helper.make_tensor_value_info(bias_name, TensorProto.FLOAT, shape))
+
+
+def _tensor_dims(graph, name: str) -> Optional[List[int]]:
+    value = _value_by_name(graph, name)
+    if value is not None and value.type.HasField("tensor_type"):
+        dims = list(value.type.tensor_type.shape.dim)
+        if dims and all(dim.HasField("dim_value") and int(dim.dim_value) > 0 for dim in dims):
+            return [int(dim.dim_value) for dim in dims]
+    for item in graph.initializer:
+        if item.name == name and item.dims:
+            return [int(dim) for dim in item.dims]
+    return None
+
+
+def _rotary_half_dim(graph, cos_name: str, head_dim: int) -> int:
+    dims = _tensor_dims(graph, cos_name)
+    if dims and len(dims) >= 2 and int(dims[-1]) > 0:
+        return int(dims[-1])
+    return int(head_dim) // 2
+
+
+def _rope_rotate_half_nodes(
+    graph,
+    *,
+    label: str,
+    prefix: str,
+    tensor_in: str,
+    cos_bcast: str,
+    sin_bcast: str,
+    batch_size: int,
+    seq_len: int,
+    heads: int,
+    head_dim: int,
+    rotary_half: int,
+    elem_type: int,
+):
+    """Rotate the leading ``2 * rotary_half`` channels using half-split RoPE without Transpose."""
+    from onnx import helper
+
+    s0 = _i64_initializer(graph, f"{label}/{prefix}_rope_s0", [0])
+    s1 = _i64_initializer(graph, f"{label}/{prefix}_rope_s1", [int(rotary_half)])
+    s2 = _i64_initializer(graph, f"{label}/{prefix}_rope_s2", [int(rotary_half) * 2])
+    ax = _i64_initializer(graph, f"{label}/{prefix}_rope_axis", [3])
+    st = _i64_initializer(graph, f"{label}/{prefix}_rope_step", [1])
+
+    half_shape = [int(batch_size), int(seq_len), int(heads), int(rotary_half)]
+    x1 = f"{label}/{prefix}_x1"
+    x2 = f"{label}/{prefix}_x2"
+    x1_cos = f"{label}/{prefix}_x1_cos"
+    x2_sin = f"{label}/{prefix}_x2_sin"
+    x2_cos = f"{label}/{prefix}_x2_cos"
+    x1_sin = f"{label}/{prefix}_x1_sin"
+    rot1 = f"{label}/{prefix}_rot1"
+    rot2 = f"{label}/{prefix}_rot2"
+    rot_out = f"{label}/{prefix}_rotated"
+
+    for name in (x1, x2, x1_cos, x2_sin, x2_cos, x1_sin, rot1, rot2):
+        _set_value_info(graph, name, elem_type, half_shape)
+
+    nodes = [
+        helper.make_node("Slice", [tensor_in, s0, s1, ax, st], [x1], name=f"{label}/{prefix}_Slice_x1"),
+        helper.make_node("Slice", [tensor_in, s1, s2, ax, st], [x2], name=f"{label}/{prefix}_Slice_x2"),
+        helper.make_node("Mul", [x1, cos_bcast], [x1_cos], name=f"{label}/{prefix}_Mul_x1_cos"),
+        helper.make_node("Mul", [x2, sin_bcast], [x2_sin], name=f"{label}/{prefix}_Mul_x2_sin"),
+        helper.make_node("Sub", [x1_cos, x2_sin], [rot1], name=f"{label}/{prefix}_Sub_rot1"),
+        helper.make_node("Mul", [x2, cos_bcast], [x2_cos], name=f"{label}/{prefix}_Mul_x2_cos"),
+        helper.make_node("Mul", [x1, sin_bcast], [x1_sin], name=f"{label}/{prefix}_Mul_x1_sin"),
+        helper.make_node("Add", [x2_cos, x1_sin], [rot2], name=f"{label}/{prefix}_Add_rot2"),
+    ]
+    concat_inputs = [rot1, rot2]
+    if int(rotary_half) * 2 < int(head_dim):
+        s3 = _i64_initializer(graph, f"{label}/{prefix}_rope_s3", [int(head_dim)])
+        tail = f"{label}/{prefix}_tail"
+        _set_value_info(
+            graph,
+            tail,
+            elem_type,
+            [int(batch_size), int(seq_len), int(heads), int(head_dim) - int(rotary_half) * 2],
+        )
+        nodes.append(
+            helper.make_node("Slice", [tensor_in, s2, s3, ax, st], [tail], name=f"{label}/{prefix}_Slice_tail")
+        )
+        concat_inputs.append(tail)
+    _set_value_info(
+        graph,
+        rot_out,
+        elem_type,
+        [int(batch_size), int(seq_len), int(heads), int(head_dim)],
+    )
+    nodes.append(
+        helper.make_node("Concat", concat_inputs, [rot_out], axis=3, name=f"{label}/{prefix}_Concat_rope")
+    )
+    return nodes, rot_out
+
+
+def _head_major_from_seq_major(
+    graph,
+    *,
+    label: str,
+    prefix: str,
+    source: str,
+    batch_size: int,
+    query_len: int,
+    heads: int,
+    head_dim: int,
+    elem_type: int,
+):
+    """Convert ``[batch, query_len, heads, head_dim]`` to ``[batch, heads, query_len, head_dim]`` without Transpose."""
+    from onnx import helper
+
+    target_shape = [int(batch_size), int(heads), int(query_len), int(head_dim)]
+    out_name = f"{label}/{prefix}_head_major"
+    _set_value_info(graph, out_name, elem_type, target_shape)
+    if int(query_len) == 1 or int(heads) == 1:
+        shape_name = _i64_initializer(graph, f"{label}/{prefix}_hm_shape", target_shape)
+        return [
+            helper.make_node("Reshape", [source, shape_name], [out_name], name=f"{label}/{prefix}_Reshape_hm")
+        ], out_name
+
+    ax = _i64_initializer(graph, f"{label}/{prefix}_hm_axis", [2])
+    st = _i64_initializer(graph, f"{label}/{prefix}_hm_step", [1])
+    one_shape_name = _i64_initializer(
+        graph,
+        f"{label}/{prefix}_hm_one_shape",
+        [int(batch_size), 1, int(query_len), int(head_dim)],
+    )
+    nodes = []
+    parts = []
+    for head_idx in range(int(heads)):
+        s_lo = _i64_initializer(graph, f"{label}/{prefix}_hm_s_{head_idx}", [head_idx])
+        s_hi = _i64_initializer(graph, f"{label}/{prefix}_hm_e_{head_idx}", [head_idx + 1])
+        sliced = f"{label}/{prefix}_hm_slice_{head_idx}"
+        reshaped = f"{label}/{prefix}_hm_part_{head_idx}"
+        _set_value_info(graph, sliced, elem_type, [int(batch_size), int(query_len), 1, int(head_dim)])
+        _set_value_info(graph, reshaped, elem_type, [int(batch_size), 1, int(query_len), int(head_dim)])
+        nodes.append(
+            helper.make_node(
+                "Slice",
+                [source, s_lo, s_hi, ax, st],
+                [sliced],
+                name=f"{label}/{prefix}_Slice_head_{head_idx}",
+            )
+        )
+        nodes.append(
+            helper.make_node(
+                "Reshape",
+                [sliced, one_shape_name],
+                [reshaped],
+                name=f"{label}/{prefix}_Reshape_head_{head_idx}",
+            )
+        )
+        parts.append(reshaped)
+    nodes.append(
+        helper.make_node("Concat", parts, [out_name], axis=1, name=f"{label}/{prefix}_Concat_heads")
+    )
+    return nodes, out_name
+
+
+def _seq_major_from_head_major(
+    graph,
+    *,
+    label: str,
+    prefix: str,
+    source: str,
+    out_name: str,
+    batch_size: int,
+    query_len: int,
+    heads: int,
+    head_dim: int,
+    elem_type: int,
+):
+    """Convert ``[batch, heads, query_len, head_dim]`` to ``[batch, query_len, heads * head_dim]`` without Transpose."""
+    from onnx import helper
+
+    flat_shape = [int(batch_size), int(query_len), int(heads) * int(head_dim)]
+    if int(query_len) == 1 or int(heads) == 1:
+        shape_name = _i64_initializer(graph, f"{label}/{prefix}_flat_shape", flat_shape)
+        return [
+            helper.make_node("Reshape", [source, shape_name], [out_name], name=f"{label}/{prefix}_Reshape_out")
+        ]
+
+    ax = _i64_initializer(graph, f"{label}/{prefix}_q_axis", [2])
+    st = _i64_initializer(graph, f"{label}/{prefix}_q_step", [1])
+    token_shape = _i64_initializer(
+        graph,
+        f"{label}/{prefix}_token_shape",
+        [int(batch_size), 1, int(heads) * int(head_dim)],
+    )
+    nodes = []
+    parts = []
+    for q_idx in range(int(query_len)):
+        s_lo = _i64_initializer(graph, f"{label}/{prefix}_q_s_{q_idx}", [q_idx])
+        s_hi = _i64_initializer(graph, f"{label}/{prefix}_q_e_{q_idx}", [q_idx + 1])
+        sliced = f"{label}/{prefix}_q_slice_{q_idx}"
+        reshaped = f"{label}/{prefix}_q_part_{q_idx}"
+        _set_value_info(graph, sliced, elem_type, [int(batch_size), int(heads), 1, int(head_dim)])
+        _set_value_info(graph, reshaped, elem_type, [int(batch_size), 1, int(heads) * int(head_dim)])
+        nodes.append(
+            helper.make_node(
+                "Slice",
+                [source, s_lo, s_hi, ax, st],
+                [sliced],
+                name=f"{label}/{prefix}_Slice_q_{q_idx}",
+            )
+        )
+        nodes.append(
+            helper.make_node(
+                "Reshape",
+                [sliced, token_shape],
+                [reshaped],
+                name=f"{label}/{prefix}_Reshape_q_{q_idx}",
+            )
+        )
+        parts.append(reshaped)
+    nodes.append(
+        helper.make_node("Concat", parts, [out_name], axis=1, name=f"{label}/{prefix}_Concat_out")
+    )
+    return nodes
+
+
+def decompose_gqa_to_npu_primitives(
+    model,
+    *,
+    batch_size: int,
+    query_len: int,
+    max_seq_len: int,
+    sink_size: int = 0,
+) -> List[str]:
+    """
+    Replace ``com.microsoft::GroupQueryAttention`` with standard NPU-accepted ONNX primitives.
+
+    The replacement subgraph uses only ``Reshape``, ``Gather``, ``Slice``,
+    ``Concat``, ``Mul``, ``Sub``, ``Add``, ``MatMul``, and ``Softmax`` (zero
+    ``Transpose``, ``Where``, ``Scatter``, or contrib ops), so the entire
+    attention block is claimed by VAIML as part of a single NPU subgraph.
+    """
+    from onnx import TensorProto, helper
+
+    if int(query_len) < 1:
+        raise StaticShapeError(f"query_len must be positive, got {query_len}")
+    if int(sink_size) < 0 or int(sink_size) + int(query_len) > int(max_seq_len):
+        raise StaticShapeError(
+            f"sink_size {sink_size} + query_len {query_len} exceeds max_seq_len {max_seq_len}"
+        )
+
+    graph = model.graph
+    constants = _constant_names(graph)
+    rewritten: List[str] = []
+    detached: List[str] = []
+    bias_name = "attention_bias"
+    bias_len: Optional[int] = None
+    rebuilt = []
+
+    for node in list(graph.node):
+        if node.op_type != "GroupQueryAttention":
+            rebuilt.append(node)
+            continue
+
+        label = node.name or _output_at(node, 0) or "GroupQueryAttention"
+        num_heads = _int_attr(node, "num_heads", 0)
+        kv_heads = _int_attr(node, "kv_num_heads", num_heads)
+        if num_heads < 1 or kv_heads < 1 or num_heads % kv_heads != 0:
+            raise StaticShapeError(
+                f"{label} invalid head counts num_heads={num_heads}, kv_num_heads={kv_heads}"
+            )
+        group_size = num_heads // kv_heads
+        q_in = _input_at(node, 0)
+        k_in = _input_at(node, 1)
+        v_in = _input_at(node, 2)
+        past_k_in = _input_at(node, 3)
+        past_v_in = _input_at(node, 4)
+        seqlens_in = _input_at(node, 5)
+        total_in = _input_at(node, 6)
+        cos_in = _input_at(node, 7)
+        sin_in = _input_at(node, 8)
+        pos_in = _input_at(node, 9)
+        node_bias_in = _input_at(node, 10) or bias_name
+        out_attn = _output_at(node, 0)
+        out_present_k = _output_at(node, 1)
+        out_present_v = _output_at(node, 2)
+
+        if seqlens_in and seqlens_in not in constants:
+            detached.append(seqlens_in)
+        if total_in and total_in not in constants:
+            detached.append(total_in)
+
+        past_dims = _tensor_dims(graph, past_k_in)
+        q_dims = _tensor_dims(graph, q_in)
+        if past_dims and len(past_dims) == 4:
+            head_dim = int(past_dims[3])
+        elif q_dims and len(q_dims) == 3 and int(q_dims[2]) % num_heads == 0:
+            head_dim = int(q_dims[2]) // num_heads
+        else:
+            head_dim = infer_head_dim(model)
+
+        elem_type = _elem_type(graph, q_in, TensorProto.FLOAT)
+        scale_val = _float_attr(node, "scale", 0.0)
+        if scale_val <= 0.0:
+            scale_val = float(head_dim) ** -0.5
+
+        shared = _int_attr(node, "past_present_share_buffer", 0) == 1
+        total_len = int(max_seq_len) if shared else int(max_seq_len) + int(query_len)
+        if bias_len is None:
+            bias_len = total_len
+        elif bias_len != total_len:
+            raise StaticShapeError("GroupQueryAttention nodes disagree on the static window")
+
+        q_4d_shape = [int(batch_size), int(query_len), int(num_heads), int(head_dim)]
+        kv_4d_shape = [int(batch_size), int(query_len), int(kv_heads), int(head_dim)]
+        q_4d_shape_name = _i64_initializer(graph, f"{label}/q_4d_shape", q_4d_shape)
+        kv_4d_shape_name = _i64_initializer(graph, f"{label}/kv_4d_shape", kv_4d_shape)
+
+        q_4d = f"{label}/q_4d"
+        k_4d = f"{label}/k_4d"
+        v_4d = f"{label}/v_4d"
+        _set_value_info(graph, q_4d, elem_type, q_4d_shape)
+        _set_value_info(graph, k_4d, elem_type, kv_4d_shape)
+        _set_value_info(graph, v_4d, elem_type, kv_4d_shape)
+
+        rebuilt.append(helper.make_node("Reshape", [q_in, q_4d_shape_name], [q_4d], name=f"{label}/Reshape_q"))
+        rebuilt.append(helper.make_node("Reshape", [k_in, kv_4d_shape_name], [k_4d], name=f"{label}/Reshape_k"))
+        rebuilt.append(helper.make_node("Reshape", [v_in, kv_4d_shape_name], [v_4d], name=f"{label}/Reshape_v"))
+
+        do_rotary = _int_attr(node, "do_rotary", 0) == 1
+        if do_rotary:
+            if _int_attr(node, "rotary_interleaved", 0) != 0:
+                raise StaticShapeError(f"{label} rotary_interleaved=1 is not supported by NPU decomposition")
+            if not cos_in or not sin_in:
+                raise StaticShapeError(f"{label} has do_rotary=1 without cos_cache/sin_cache")
+            pos_name = pos_in or "position_ids"
+            _ensure_position_ids(graph, pos_name, int(batch_size), int(query_len))
+            rotary_half = _rotary_half_dim(graph, cos_in, head_dim)
+            cos_gat = f"{label}/cos_gathered"
+            sin_gat = f"{label}/sin_gathered"
+            cos_bcast = f"{label}/cos_bcast"
+            sin_bcast = f"{label}/sin_bcast"
+            bcast_shape = [int(batch_size), int(query_len), 1, int(rotary_half)]
+            bcast_shape_name = _i64_initializer(graph, f"{label}/rope_bcast_shape", bcast_shape)
+            _set_value_info(graph, cos_gat, elem_type, [int(batch_size), int(query_len), int(rotary_half)])
+            _set_value_info(graph, sin_gat, elem_type, [int(batch_size), int(query_len), int(rotary_half)])
+            _set_value_info(graph, cos_bcast, elem_type, bcast_shape)
+            _set_value_info(graph, sin_bcast, elem_type, bcast_shape)
+            rebuilt.append(
+                helper.make_node("Gather", [cos_in, pos_name], [cos_gat], axis=0, name=f"{label}/Gather_cos")
+            )
+            rebuilt.append(
+                helper.make_node("Gather", [sin_in, pos_name], [sin_gat], axis=0, name=f"{label}/Gather_sin")
+            )
+            rebuilt.append(
+                helper.make_node("Reshape", [cos_gat, bcast_shape_name], [cos_bcast], name=f"{label}/Reshape_cos")
+            )
+            rebuilt.append(
+                helper.make_node("Reshape", [sin_gat, bcast_shape_name], [sin_bcast], name=f"{label}/Reshape_sin")
+            )
+            q_rope_nodes, q_4d = _rope_rotate_half_nodes(
+                graph,
+                label=label,
+                prefix="q",
+                tensor_in=q_4d,
+                cos_bcast=cos_bcast,
+                sin_bcast=sin_bcast,
+                batch_size=int(batch_size),
+                seq_len=int(query_len),
+                heads=int(num_heads),
+                head_dim=int(head_dim),
+                rotary_half=int(rotary_half),
+                elem_type=elem_type,
+            )
+            k_rope_nodes, k_4d = _rope_rotate_half_nodes(
+                graph,
+                label=label,
+                prefix="k",
+                tensor_in=k_4d,
+                cos_bcast=cos_bcast,
+                sin_bcast=sin_bcast,
+                batch_size=int(batch_size),
+                seq_len=int(query_len),
+                heads=int(kv_heads),
+                head_dim=int(head_dim),
+                rotary_half=int(rotary_half),
+                elem_type=elem_type,
+            )
+            rebuilt.extend(q_rope_nodes)
+            rebuilt.extend(k_rope_nodes)
+
+        q_hm_nodes, q_hm = _head_major_from_seq_major(
+            graph,
+            label=label,
+            prefix="q",
+            source=q_4d,
+            batch_size=int(batch_size),
+            query_len=int(query_len),
+            heads=int(num_heads),
+            head_dim=int(head_dim),
+            elem_type=elem_type,
+        )
+        k_hm_nodes, new_k = _head_major_from_seq_major(
+            graph,
+            label=label,
+            prefix="k",
+            source=k_4d,
+            batch_size=int(batch_size),
+            query_len=int(query_len),
+            heads=int(kv_heads),
+            head_dim=int(head_dim),
+            elem_type=elem_type,
+        )
+        v_hm_nodes, new_v = _head_major_from_seq_major(
+            graph,
+            label=label,
+            prefix="v",
+            source=v_4d,
+            batch_size=int(batch_size),
+            query_len=int(query_len),
+            heads=int(kv_heads),
+            head_dim=int(head_dim),
+            elem_type=elem_type,
+        )
+        rebuilt.extend(q_hm_nodes)
+        rebuilt.extend(k_hm_nodes)
+        rebuilt.extend(v_hm_nodes)
+
+        # Build full_k / full_v (for attention scoring) and present_k / present_v (for cache output).
+        total_rows = int(group_size) * int(query_len)
+        needs_kv_slice = bool(shared or int(sink_size) > 0 or total_rows > 1)
+        ax2 = _i64_initializer(graph, f"{label}/kv_axis", [2]) if needs_kv_slice else ""
+        st1 = _i64_initializer(graph, f"{label}/kv_step", [1]) if needs_kv_slice else ""
+        if shared:
+            # In-place window of length max_seq_len.
+            if int(sink_size) > 0:
+                s0 = _i64_initializer(graph, f"{label}/sink_start", [0])
+                s_sink = _i64_initializer(graph, f"{label}/sink_end", [int(sink_size)])
+                s_roll = _i64_initializer(
+                    graph, f"{label}/roll_start", [int(sink_size) + int(query_len)]
+                )
+                s_max = _i64_initializer(graph, f"{label}/roll_end", [int(max_seq_len)])
+                sink_k = f"{label}/sink_k"
+                sink_v = f"{label}/sink_v"
+                kept_k = f"{label}/kept_k"
+                kept_v = f"{label}/kept_v"
+                _set_value_info(
+                    graph, sink_k, elem_type, [int(batch_size), int(kv_heads), int(sink_size), int(head_dim)]
+                )
+                _set_value_info(
+                    graph, sink_v, elem_type, [int(batch_size), int(kv_heads), int(sink_size), int(head_dim)]
+                )
+                kept_len = int(max_seq_len) - int(sink_size) - int(query_len)
+                _set_value_info(
+                    graph, kept_k, elem_type, [int(batch_size), int(kv_heads), kept_len, int(head_dim)]
+                )
+                _set_value_info(
+                    graph, kept_v, elem_type, [int(batch_size), int(kv_heads), kept_len, int(head_dim)]
+                )
+                rebuilt.extend(
+                    [
+                        helper.make_node("Slice", [past_k_in, s0, s_sink, ax2, st1], [sink_k], name=f"{label}/Slice_sink_k"),
+                        helper.make_node("Slice", [past_k_in, s_roll, s_max, ax2, st1], [kept_k], name=f"{label}/Slice_kept_k"),
+                        helper.make_node("Concat", [sink_k, kept_k, new_k], [out_present_k], axis=2, name=f"{label}/Concat_present_k"),
+                        helper.make_node("Slice", [past_v_in, s0, s_sink, ax2, st1], [sink_v], name=f"{label}/Slice_sink_v"),
+                        helper.make_node("Slice", [past_v_in, s_roll, s_max, ax2, st1], [kept_v], name=f"{label}/Slice_kept_v"),
+                        helper.make_node("Concat", [sink_v, kept_v, new_v], [out_present_v], axis=2, name=f"{label}/Concat_present_v"),
+                    ]
+                )
+            else:
+                s_roll = _i64_initializer(graph, f"{label}/roll_start", [int(query_len)])
+                s_max = _i64_initializer(graph, f"{label}/roll_end", [int(max_seq_len)])
+                kept_k = f"{label}/kept_k"
+                kept_v = f"{label}/kept_v"
+                kept_len = int(max_seq_len) - int(query_len)
+                _set_value_info(
+                    graph, kept_k, elem_type, [int(batch_size), int(kv_heads), kept_len, int(head_dim)]
+                )
+                _set_value_info(
+                    graph, kept_v, elem_type, [int(batch_size), int(kv_heads), kept_len, int(head_dim)]
+                )
+                rebuilt.extend(
+                    [
+                        helper.make_node("Slice", [past_k_in, s_roll, s_max, ax2, st1], [kept_k], name=f"{label}/Slice_kept_k"),
+                        helper.make_node("Concat", [kept_k, new_k], [out_present_k], axis=2, name=f"{label}/Concat_present_k"),
+                        helper.make_node("Slice", [past_v_in, s_roll, s_max, ax2, st1], [kept_v], name=f"{label}/Slice_kept_v"),
+                        helper.make_node("Concat", [kept_v, new_v], [out_present_v], axis=2, name=f"{label}/Concat_present_v"),
+                    ]
+                )
+            full_k = out_present_k
+            full_v = out_present_v
+        else:
+            full_k = f"{label}/present_key_untrimmed"
+            full_v = f"{label}/present_value_untrimmed"
+            full_shape = [int(batch_size), int(kv_heads), int(total_len), int(head_dim)]
+            _set_value_info(graph, full_k, elem_type, full_shape)
+            _set_value_info(graph, full_v, elem_type, full_shape)
+            rebuilt.append(
+                helper.make_node("Concat", [past_k_in, new_k], [full_k], axis=2, name=f"{label}/Concat_full_k")
+            )
+            rebuilt.append(
+                helper.make_node("Concat", [past_v_in, new_v], [full_v], axis=2, name=f"{label}/Concat_full_v")
+            )
+            if int(sink_size) > 0:
+                s0 = _i64_initializer(graph, f"{label}/present_sink_start", [0])
+                s_sink = _i64_initializer(graph, f"{label}/present_sink_end", [int(sink_size)])
+                s_roll = _i64_initializer(
+                    graph, f"{label}/present_slice_starts", [int(sink_size) + int(query_len)]
+                )
+                s_end = _i64_initializer(graph, f"{label}/present_slice_ends", [int(total_len)])
+                sink_k = f"{label}/sink_k"
+                sink_v = f"{label}/sink_v"
+                kept_k = f"{label}/kept_k"
+                kept_v = f"{label}/kept_v"
+                recent_len = int(max_seq_len) - int(sink_size)
+                _set_value_info(
+                    graph, sink_k, elem_type, [int(batch_size), int(kv_heads), int(sink_size), int(head_dim)]
+                )
+                _set_value_info(
+                    graph, sink_v, elem_type, [int(batch_size), int(kv_heads), int(sink_size), int(head_dim)]
+                )
+                _set_value_info(
+                    graph, kept_k, elem_type, [int(batch_size), int(kv_heads), recent_len, int(head_dim)]
+                )
+                _set_value_info(
+                    graph, kept_v, elem_type, [int(batch_size), int(kv_heads), recent_len, int(head_dim)]
+                )
+                rebuilt.extend(
+                    [
+                        helper.make_node("Slice", [full_k, s0, s_sink, ax2, st1], [sink_k], name=f"{label}/Slice_sink_key"),
+                        helper.make_node("Slice", [full_k, s_roll, s_end, ax2, st1], [kept_k], name=f"{label}/Slice_recent_key"),
+                        helper.make_node("Concat", [sink_k, kept_k], [out_present_k], axis=2, name=f"{label}/Concat_present_key"),
+                        helper.make_node("Slice", [full_v, s0, s_sink, ax2, st1], [sink_v], name=f"{label}/Slice_sink_value"),
+                        helper.make_node("Slice", [full_v, s_roll, s_end, ax2, st1], [kept_v], name=f"{label}/Slice_recent_value"),
+                        helper.make_node("Concat", [sink_v, kept_v], [out_present_v], axis=2, name=f"{label}/Concat_present_value"),
+                    ]
+                )
+            else:
+                starts = _i64_initializer(graph, f"{label}/present_slice_starts", [int(query_len)])
+                ends = _i64_initializer(graph, f"{label}/present_slice_ends", [int(total_len)])
+                axes = _i64_initializer(graph, f"{label}/present_slice_axes", [2])
+                steps = _i64_initializer(graph, f"{label}/present_slice_steps", [1])
+                rebuilt.append(
+                    helper.make_node(
+                        "Slice",
+                        [full_k, starts, ends, axes, steps],
+                        [out_present_k],
+                        name=f"{label}/Slice_present_key",
+                    )
+                )
+                rebuilt.append(
+                    helper.make_node(
+                        "Slice",
+                        [full_v, starts, ends, axes, steps],
+                        [out_present_v],
+                        name=f"{label}/Slice_present_value",
+                    )
+                )
+
+        # Transpose-free attention scoring using column MatMul (full_k @ q_col).
+        q_grouped_shape = [
+            int(batch_size),
+            int(kv_heads),
+            int(group_size) * int(query_len),
+            int(head_dim),
+        ]
+        q_grouped_shape_name = _i64_initializer(graph, f"{label}/q_grouped_shape", q_grouped_shape)
+        q_grouped = f"{label}/q_grouped"
+        _set_value_info(graph, q_grouped, elem_type, q_grouped_shape)
+        rebuilt.append(
+            helper.make_node("Reshape", [q_hm, q_grouped_shape_name], [q_grouped], name=f"{label}/Reshape_q_grouped")
+        )
+
+        col_shape = [int(batch_size), int(kv_heads), int(head_dim), 1]
+        col_shape_name = _i64_initializer(graph, f"{label}/q_col_shape", col_shape)
+        row_score_shape = [int(batch_size), int(kv_heads), 1, int(total_len)]
+        row_score_shape_name = _i64_initializer(graph, f"{label}/score_row_shape", row_score_shape)
+        total_rows = int(group_size) * int(query_len)
+        score_rows = []
+        for row_idx in range(total_rows):
+            if total_rows == 1:
+                q_row = q_grouped
+            else:
+                r_lo = _i64_initializer(graph, f"{label}/q_row_s_{row_idx}", [row_idx])
+                r_hi = _i64_initializer(graph, f"{label}/q_row_e_{row_idx}", [row_idx + 1])
+                q_row = f"{label}/q_row_{row_idx}"
+                _set_value_info(graph, q_row, elem_type, [int(batch_size), int(kv_heads), 1, int(head_dim)])
+                rebuilt.append(
+                    helper.make_node(
+                        "Slice",
+                        [q_grouped, r_lo, r_hi, ax2, st1],
+                        [q_row],
+                        name=f"{label}/Slice_q_row_{row_idx}",
+                    )
+                )
+            q_col = f"{label}/q_col_{row_idx}"
+            score_col = f"{label}/score_col_{row_idx}"
+            score_row = f"{label}/score_row_{row_idx}"
+            _set_value_info(graph, q_col, elem_type, col_shape)
+            _set_value_info(graph, score_col, elem_type, [int(batch_size), int(kv_heads), int(total_len), 1])
+            _set_value_info(graph, score_row, elem_type, row_score_shape)
+            rebuilt.append(
+                helper.make_node("Reshape", [q_row, col_shape_name], [q_col], name=f"{label}/Reshape_q_col_{row_idx}")
+            )
+            rebuilt.append(
+                helper.make_node("MatMul", [full_k, q_col], [score_col], name=f"{label}/MatMul_scores_{row_idx}")
+            )
+            rebuilt.append(
+                helper.make_node(
+                    "Reshape",
+                    [score_col, row_score_shape_name],
+                    [score_row],
+                    name=f"{label}/Reshape_scores_{row_idx}",
+                )
+            )
+            score_rows.append(score_row)
+
+        if len(score_rows) == 1:
+            scores_grouped = score_rows[0]
+        else:
+            scores_grouped = f"{label}/scores_grouped"
+            _set_value_info(
+                graph,
+                scores_grouped,
+                elem_type,
+                [int(batch_size), int(kv_heads), total_rows, int(total_len)],
+            )
+            rebuilt.append(
+                helper.make_node("Concat", score_rows, [scores_grouped], axis=2, name=f"{label}/Concat_scores")
+            )
+
+        scores_4d_shape = [int(batch_size), int(num_heads), int(query_len), int(total_len)]
+        scores_4d_shape_name = _i64_initializer(graph, f"{label}/scores_4d_shape", scores_4d_shape)
+        scores_4d = f"{label}/scores_4d"
+        _set_value_info(graph, scores_4d, elem_type, scores_4d_shape)
+        rebuilt.append(
+            helper.make_node("Reshape", [scores_grouped, scores_4d_shape_name], [scores_4d], name=f"{label}/Reshape_scores_4d")
+        )
+
+        scale_name = f"{label}/attn_scale"
+        _put_initializer(graph, scale_name, np.asarray(scale_val, dtype=np.float32))
+        scaled_scores = f"{label}/scaled_scores"
+        biased_scores = f"{label}/biased_scores"
+        probs_4d = f"{label}/probs_4d"
+        _set_value_info(graph, scaled_scores, elem_type, scores_4d_shape)
+        _set_value_info(graph, biased_scores, elem_type, scores_4d_shape)
+        _set_value_info(graph, probs_4d, elem_type, scores_4d_shape)
+        rebuilt.append(
+            helper.make_node("Mul", [scores_4d, scale_name], [scaled_scores], name=f"{label}/Mul_scale")
+        )
+        rebuilt.append(
+            helper.make_node("Add", [scaled_scores, node_bias_in], [biased_scores], name=f"{label}/Add_bias")
+        )
+        rebuilt.append(
+            helper.make_node("Softmax", [biased_scores], [probs_4d], axis=-1, name=f"{label}/Softmax_probs")
+        )
+
+        probs_grouped_shape = [int(batch_size), int(kv_heads), total_rows, int(total_len)]
+        probs_grouped_shape_name = _i64_initializer(graph, f"{label}/probs_grouped_shape", probs_grouped_shape)
+        probs_grouped = f"{label}/probs_grouped"
+        context_grouped = f"{label}/context_grouped"
+        context_hm = f"{label}/context_hm"
+        context_hm_shape = [int(batch_size), int(num_heads), int(query_len), int(head_dim)]
+        context_hm_shape_name = _i64_initializer(graph, f"{label}/context_hm_shape", context_hm_shape)
+        _set_value_info(graph, probs_grouped, elem_type, probs_grouped_shape)
+        _set_value_info(
+            graph,
+            context_grouped,
+            elem_type,
+            [int(batch_size), int(kv_heads), total_rows, int(head_dim)],
+        )
+        _set_value_info(graph, context_hm, elem_type, context_hm_shape)
+
+        rebuilt.append(
+            helper.make_node("Reshape", [probs_4d, probs_grouped_shape_name], [probs_grouped], name=f"{label}/Reshape_probs_grouped")
+        )
+        rebuilt.append(
+            helper.make_node("MatMul", [probs_grouped, full_v], [context_grouped], name=f"{label}/MatMul_context")
+        )
+        rebuilt.append(
+            helper.make_node("Reshape", [context_grouped, context_hm_shape_name], [context_hm], name=f"{label}/Reshape_context_hm")
+        )
+        rebuilt.extend(
+            _seq_major_from_head_major(
+                graph,
+                label=label,
+                prefix="context",
+                source=context_hm,
+                out_name=out_attn,
+                batch_size=int(batch_size),
+                query_len=int(query_len),
+                heads=int(num_heads),
+                head_dim=int(head_dim),
+                elem_type=elem_type,
+            )
+        )
+        rewritten.append(label)
+
+    del graph.node[:]
+    graph.node.extend(rebuilt)
+    if bias_len is not None:
+        _ensure_attention_bias(graph, bias_name, int(query_len), int(bias_len), constants)
+    _drop_unused_inputs(graph, detached)
+    return rewritten
 
 
 def _trim_present_outputs(graph, node, *, label: str, query_len: int, total_len: int, max_seq_len: int):
@@ -1604,6 +2302,8 @@ def apply_static_contract(
     external_data_dir: Optional[str] = None,
     npu_bf16_fallback: bool = False,
     defer_matmul_bake: bool = False,
+    decompose_gqa: bool = False,
+    sink_size: int = 0,
 ) -> Dict[str, object]:
     """Freeze IO shapes, widen a KV prefix slice, and pin a Qwen GQA window.
 
@@ -1629,12 +2329,21 @@ def apply_static_contract(
         head_dim=head_dim,
     )
     rewritten = rewrite_runtime_kv_slices(model, max_seq_len, seq_axis=seq_axis)
-    attention = rewrite_gqa_to_static_window(
-        model,
-        batch_size=batch_size,
-        query_len=query_len,
-        max_seq_len=max_seq_len,
-    )
+    if decompose_gqa:
+        attention = decompose_gqa_to_npu_primitives(
+            model,
+            batch_size=batch_size,
+            query_len=query_len,
+            max_seq_len=max_seq_len,
+            sink_size=int(sink_size),
+        )
+    else:
+        attention = rewrite_gqa_to_static_window(
+            model,
+            batch_size=batch_size,
+            query_len=query_len,
+            max_seq_len=max_seq_len,
+        )
     split = _split_large_matmul_nbits(model, external_data_dir)
     bf16_weights: List[str] = []
     baked: List[str] = []
@@ -1674,6 +2383,8 @@ def apply_static_contract(
         "frozen_dims": frozen,
         "rewritten_slices": rewritten,
         "rewritten_attention": attention,
+        "decomposed_gqa": bool(decompose_gqa),
+        "sink_size": int(sink_size),
         "decomposed_norms": norms,
         "activation": activation_name,
         "bf16_norm_weights": bf16_weights,
@@ -1738,3 +2449,66 @@ def static_attention_bias(
     if causal:
         out = out + causal_additive_bias(query_len, key_len, value=value, dtype=dtype)
     return out
+
+
+def right_aligned_attention_bias(
+    past_valid: int,
+    max_seq_len: int,
+    query_len: int = 1,
+    *,
+    total_len: Optional[int] = None,
+    sink_size: int = 0,
+    causal: Optional[bool] = None,
+    value: float = ADDITIVE_BIAS,
+    dtype=np.float32,
+):
+    """
+    Right-aligned additive attention bias of shape ``(1, 1, query_len, total_len)``.
+
+    For static-window NPU decode graphs where ``present`` slices the trailing
+    ``max_seq_len`` slots (or ``[0:sink_size]`` + ``[sink_size+Q:max_seq_len+Q]``),
+    valid past tokens occupy the rightmost ``min(past_valid, max_seq_len)`` slots
+    of the ``max_seq_len`` past window, and the new ``query_len`` tokens occupy
+    the final ``query_len`` columns of ``total_len``.
+    """
+    past_cap = int(max_seq_len)
+    query = int(query_len)
+    if past_cap < 1 or query < 1:
+        raise StaticShapeError(f"max_seq_len {max_seq_len} and query_len {query_len} must be positive")
+    if int(past_valid) < 0:
+        raise StaticShapeError(f"past_valid must be >= 0, got {past_valid}")
+    if int(sink_size) < 0 or int(sink_size) > past_cap:
+        raise StaticShapeError(f"sink_size {sink_size} must be in 0..{past_cap}")
+    key_len = int(total_len) if total_len is not None else past_cap + query
+    if key_len not in (past_cap, past_cap + query):
+        raise StaticShapeError(
+            f"total_len {key_len} must equal max_seq_len ({past_cap}) or max_seq_len + query_len ({past_cap + query})"
+        )
+    valid_past = min(int(past_valid), past_cap)
+    if key_len == past_cap:
+        valid_total = min(past_cap, valid_past + query)
+        empty = past_cap - valid_total
+    else:
+        empty = past_cap - valid_past
+
+    bias = np.zeros((1, 1, query, key_len), dtype=dtype)
+    blocked = np.asarray(value, dtype=dtype)
+    if empty > 0:
+        if int(sink_size) > 0:
+            bias[:, :, :, :past_cap] = blocked
+            sink_keep = min(int(sink_size), valid_past)
+            if sink_keep > 0:
+                bias[:, :, :, :sink_keep] = np.asarray(0.0, dtype=dtype)
+            recent_keep = max(0, valid_past - sink_keep)
+            if recent_keep > 0:
+                bias[:, :, :, past_cap - recent_keep : past_cap] = np.asarray(0.0, dtype=dtype)
+        else:
+            bias[:, :, :, :empty] = blocked
+    if causal is None:
+        causal = query > 1
+    if causal and query > 1:
+        query_start = key_len - query
+        cols = np.arange(key_len)
+        for row in range(query):
+            bias[0, 0, row, cols > (query_start + row)] = blocked
+    return bias

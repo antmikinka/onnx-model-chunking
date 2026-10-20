@@ -57,6 +57,12 @@ from .quark_optimize import (
     pipeline_order,
     prepare_model_for_split,
 )
+from .static_shapes import (
+    apply_static_contract,
+    decompose_gqa_to_npu_primitives,
+    right_aligned_attention_bias,
+    static_attention_bias,
+)
 
 __all__ = [
     # Main operations
@@ -100,4 +106,8 @@ __all__ = [
     "optimize_for_npu",
     "pipeline_order",
     "prepare_model_for_split",
+    "apply_static_contract",
+    "decompose_gqa_to_npu_primitives",
+    "right_aligned_attention_bias",
+    "static_attention_bias",
 ]

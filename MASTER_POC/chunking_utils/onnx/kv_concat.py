@@ -43,7 +43,7 @@ from typing import Dict, Sequence
 
 FORBIDDEN_KV_MUTATION_OPS = ("Scatter", "ScatterND", "ScatterElements")
 
-_LAYOUTS = ("host_prefix", "fixed_window")
+_LAYOUTS = ("host_prefix", "fixed_window", "sink_window")
 
 
 def assert_no_kv_scatter(op_types: Sequence[str]) -> None:
@@ -62,6 +62,7 @@ def static_kv_concat_recipe(
     query_len: int,
     seq_axis: int = 2,
     layout: str = "host_prefix",
+    sink_size: int = 0,
 ) -> Dict[str, object]:
     """
     Describe the KV update a split ONNX component may emit.
@@ -73,6 +74,7 @@ def static_kv_concat_recipe(
     limit = int(max_seq_len)
     query = int(query_len)
     axis = int(seq_axis)
+    sink = int(sink_size)
     if limit < 1:
         raise ValueError(f"max_seq_len must be positive, got {limit}")
     if query < 1 or query > limit:
@@ -87,8 +89,56 @@ def static_kv_concat_recipe(
             f"Unknown KV concat layout '{layout}'. Expected one of: "
             + ", ".join(_LAYOUTS)
         )
+    if chosen == "sink_window":
+        if sink < 1 or sink + query > limit:
+            raise ValueError(
+                f"sink_window requires sink_size in 1..{limit - query}, got {sink}"
+            )
+    elif sink < 0 or sink + query > limit:
+        raise ValueError(
+            f"sink_size must be in 0..{limit - query}, got {sink}"
+        )
 
-    if chosen == "fixed_window":
+    if chosen == "sink_window":
+        recent = limit - sink - query
+        nodes = [
+            {
+                "op_type": "Slice",
+                "inputs": ["past", "sink_starts", "sink_ends", "axes"],
+                "output": "sink_past",
+                "starts": [0],
+                "ends": [sink],
+                "axes": [axis],
+                "kept": sink,
+                "seq_axis": axis,
+                "note": "Preserve the leading sink_size tokens with constant slice bounds.",
+            },
+            {
+                "op_type": "Slice",
+                "inputs": ["past", "recent_starts", "recent_ends", "axes"],
+                "output": "recent_past",
+                "starts": [sink + query],
+                "ends": [limit],
+                "axes": [axis],
+                "kept": recent,
+                "seq_axis": axis,
+                "note": "Drop the oldest non-sink query_len tokens with constant slice bounds.",
+            },
+            {
+                "op_type": "Concat",
+                "inputs": ["sink_past", "recent_past", "new"],
+                "output": "present",
+                "axis": axis,
+                "note": "present length stays max_seq_len with sink prefix intact.",
+            },
+        ]
+        output_seq = limit
+        host = (
+            "Bind past to the active OrtValue and present to the shadow. "
+            "commit_present_swap installs present as the next past input while "
+            "preserving sink_size leading tokens."
+        )
+    elif chosen == "fixed_window":
         kept = limit - query
         nodes = [
             {
@@ -144,6 +194,7 @@ def static_kv_concat_recipe(
         "layout": chosen,
         "max_seq_len": limit,
         "query_len": query,
+        "sink_size": sink,
         "seq_axis": axis,
         "output_seq": output_seq,
         "present_shape_is_static": True,
