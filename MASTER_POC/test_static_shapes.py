@@ -1896,6 +1896,136 @@ def test_split_inference_engine_static_window_decode():
         assert engine.kv_cache.current_seq_len == max_seq
 
 
+def test_matmul_sub4096_ksplit_and_ozaki_dual_bf16_compensation():
+    rng = np.random.default_rng(2026)
+    k_dim = 4096
+    n_dim = 64
+    block_size = 32
+    blocks = k_dim // block_size  # 128 blocks
+
+    packed_w = rng.integers(0, 256, size=(n_dim, blocks, 16), dtype=np.uint8)
+    # Use high-precision float32 scales that do not round cleanly to 7-bit bf16 mantissa
+    scales = (rng.uniform(0.01, 0.08, size=(n_dim, blocks)).astype(np.float32) * np.float32(1.00390625))
+    # Packed 4-bit zero points: shape (N, blocks // 2) = (64, 64)
+    packed_zp = rng.integers(0, 256, size=(n_dim, blocks // 2), dtype=np.uint8)
+    bias = rng.normal(0.0, 0.1, size=(n_dim,)).astype(np.float32)
+
+    def _make_nbits_model(accuracy_level=None):
+        kwargs = {
+            "domain": "com.microsoft",
+            "K": k_dim,
+            "N": n_dim,
+            "bits": 4,
+            "block_size": block_size,
+        }
+        if accuracy_level is not None:
+            kwargs["accuracy_level"] = int(accuracy_level)
+        node = helper.make_node(
+            "MatMulNBits",
+            ["x", "w", "scales", "zp", "", "bias"],
+            ["y"],
+            name="/layer/proj/MatMul_Q4",
+            **kwargs,
+        )
+        graph = helper.make_graph(
+            [node],
+            "nbits_graph",
+            [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 1, k_dim])],
+            [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 1, n_dim])],
+            [
+                numpy_helper.from_array(packed_w, "w"),
+                numpy_helper.from_array(scales, "scales"),
+                numpy_helper.from_array(packed_zp, "zp"),
+                numpy_helper.from_array(bias, "bias"),
+            ],
+        )
+        model = helper.make_model(
+            graph,
+            opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("com.microsoft", 1)],
+        )
+        model.ir_version = 10
+        return model
+
+    # Use float32 activations that are exact in bfloat16 so we isolate weight + accumulation error
+    x_raw = rng.normal(0.0, 1.0, size=(1, 1, k_dim)).astype(np.float32)
+    x_bf16_exact = ((x_raw.view(np.uint32) & np.uint32(0xFFFF0000))).view(np.float32)
+
+    ref_model = _make_nbits_model()
+    ref_out = _session(ref_model).run(None, {"x": x_bf16_exact})[0]
+
+    # 1. Verify sub-4096 K-split (chunk_k=1024) with packed 4-bit zero points matches unsplit in ORT
+    ksplit_only_model = _make_nbits_model()
+    ksplit_report = apply_static_contract(
+        ksplit_only_model,
+        batch_size=1,
+        query_len=1,
+        max_seq_len=16,
+        external_data_dir=".",
+        npu_bf16_fallback=False,
+        defer_matmul_bake=True,
+        matmul_chunk_k=1024,
+    )
+    assert ksplit_report["split_matmuls"] == ["/layer/proj/MatMul_Q4"]
+    ksplit_nodes = [n for n in ksplit_only_model.graph.node if n.op_type == "MatMulNBits"]
+    assert len(ksplit_nodes) == 4
+    ksplit_out = _session(ksplit_only_model).run(None, {"x": x_bf16_exact})[0]
+    np.testing.assert_allclose(ksplit_out, ref_out, atol=1e-4, rtol=1e-4)
+
+    # 2. Uncompensated single-bf16 bake at K=4096
+    single_bf16_model = _make_nbits_model()
+    apply_static_contract(
+        single_bf16_model,
+        batch_size=1,
+        query_len=1,
+        max_seq_len=16,
+        external_data_dir=".",
+        npu_bf16_fallback=True,
+        npu_bf16_compensate=False,
+    )
+    single_inits = {t.name: t for t in single_bf16_model.graph.initializer}
+    w_single = _bf16_matrix(bytes(single_inits["/layer/proj/MatMul_Q4/bf16_weight"].raw_data), (k_dim, n_dim))
+    single_out = np.matmul(x_bf16_exact, w_single) + bias
+
+    # 3. Sub-4096 K-split (chunk_k=1024) + Ozaki dual-bf16 residual compensation
+    comp_model = _make_nbits_model()
+    report = apply_static_contract(
+        comp_model,
+        batch_size=1,
+        query_len=1,
+        max_seq_len=16,
+        external_data_dir=".",
+        npu_bf16_fallback=True,
+        npu_bf16_compensate=True,
+        matmul_chunk_k=1024,
+    )
+    assert report["split_matmuls"] == ["/layer/proj/MatMul_Q4"]
+    # 4 K-chunks * 2 MatMuls per chunk (W_hi + W_lo) = 8 MatMul nodes
+    matmul_nodes = [n for n in comp_model.graph.node if n.op_type == "MatMul"]
+    assert len(matmul_nodes) == 8
+    allowed_ops = {"Cast", "MatMul", "Add", "Slice"}
+    assert {n.op_type for n in comp_model.graph.node} <= allowed_ops
+
+    comp_inits = {t.name: t for t in comp_model.graph.initializer}
+    partial_sums = []
+    for k_idx, k_start in enumerate((0, 1024, 2048, 3072)):
+        prefix = f"/layer/proj/MatMul_Q4/k{k_start}"
+        w_hi = _bf16_matrix(bytes(comp_inits[f"{prefix}/bf16_weight"].raw_data), (1024, n_dim))
+        w_lo = _bf16_matrix(bytes(comp_inits[f"{prefix}/bf16_weight_residual"].raw_data), (1024, n_dim))
+        x_slice = x_bf16_exact[:, :, k_start : k_start + 1024]
+        chunk_out = np.matmul(x_slice, w_hi).astype(np.float32) + np.matmul(x_slice, w_lo).astype(np.float32)
+        if k_idx == 3:
+            chunk_out = chunk_out + bias
+        partial_sums.append(chunk_out)
+    comp_out = (partial_sums[0] + partial_sums[1]) + (partial_sums[2] + partial_sums[3])
+
+    err_single = float(np.max(np.abs(single_out - ref_out)))
+    err_comp = float(np.max(np.abs(comp_out - ref_out)))
+    assert err_single > 1e-3, f"expected noticeable single-bf16 error, got {err_single}"
+    assert err_comp < err_single / 50.0, (
+        f"dual-bf16 compensation should reduce error by >50x: single={err_single}, comp={err_comp}"
+    )
+
+
 def main():
     checks = [
         ("freeze_window", test_freeze_past_and_present_match),
@@ -1919,6 +2049,7 @@ def main():
         ("right_aligned_bias_and_sink", test_right_aligned_attention_bias_and_sink_window),
         ("kv_cache_rolling_and_buckets", test_kv_cache_rolling_swap_position_ids_and_bucket_resize),
         ("split_engine_static_window", test_split_inference_engine_static_window_decode),
+        ("matmul_ksplit_and_ozaki_bf16", test_matmul_sub4096_ksplit_and_ozaki_dual_bf16_compensation),
     ]
     return all(_check(name, fn) for name, fn in checks)
 

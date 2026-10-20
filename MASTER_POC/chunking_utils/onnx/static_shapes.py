@@ -1893,9 +1893,21 @@ def _split_one_matmul_nbits(graph, node, external_data_dir: Optional[str], chunk
     if weight_array is None or scale_array is None:
         return None
     zp_array = None
+    zp_packed_nibbles = False
     if zp_item is not None:
         zp_array = _initializer_array(zp_item, external_data_dir)
-        if zp_array is None or tuple(zp_array.shape) != (int(n), n_blocks):
+        if zp_array is None:
+            return None
+        zp_shape = tuple(int(dim) for dim in zp_array.shape)
+        if zp_shape == (int(n), n_blocks):
+            zp_packed_nibbles = False
+        elif (
+            zp_shape == (int(n), (n_blocks + 1) // 2)
+            and (chunk // int(block)) % 2 == 0
+            and n_blocks % 2 == 0
+        ):
+            zp_packed_nibbles = True
+        else:
             return None
     blocks_per_chunk = chunk // int(block)
     label = node.name or output
@@ -1930,7 +1942,18 @@ def _split_one_matmul_nbits(graph, node, external_data_dir: Optional[str], chunk
         inputs = [activation_out, packed_name, scale_chunk]
         if zp_array is not None:
             zp_chunk = f"{zp_name}/k{k_start}"
-            _put_initializer(graph, zp_chunk, np.ascontiguousarray(zp_array[:, block_start:block_end]))
+            if zp_packed_nibbles:
+                _put_initializer(
+                    graph,
+                    zp_chunk,
+                    np.ascontiguousarray(zp_array[:, block_start // 2 : block_end // 2]),
+                )
+            else:
+                _put_initializer(
+                    graph,
+                    zp_chunk,
+                    np.ascontiguousarray(zp_array[:, block_start:block_end]),
+                )
             inputs.append(zp_chunk)
         last = block_end == n_blocks
         if bias_name:
@@ -2038,8 +2061,21 @@ def _dequant_matmul_nbits(weight, scales, zp, k: int, n: int, block: int, label:
     return (nibbles - zp_full) * scale_full
 
 
-def _bake_one_matmul_nbits(graph, node, by_name, external_data_dir: Optional[str]):
-    """Replace one MatMulNBits with Cast, baked MatMul, Cast, and an optional Add."""
+def _bake_one_matmul_nbits(
+    graph,
+    node,
+    by_name,
+    external_data_dir: Optional[str],
+    *,
+    compensate: bool = False,
+):
+    """Replace one MatMulNBits with Cast, baked MatMul, Cast, and an optional Add.
+
+    When ``compensate`` is True, also emits a second bfloat16 MatMul on the
+    residual ``values - float32(bf16(values))`` (Ozaki-style dual-bf16 split)
+    and sums the two float32 outputs before any bias add, recovering ~15 bits
+    of effective weight mantissa precision through standard ``GemmBfp16`` ops.
+    """
     from onnx import TensorProto, helper
 
     output = _output_at(node, 0)
@@ -2077,14 +2113,16 @@ def _bake_one_matmul_nbits(graph, node, by_name, external_data_dir: Optional[str
         if zp is None:
             raise StaticShapeError(f"{label} zero-point bytes could not be read")
     values = _dequant_matmul_nbits(weight, scales, zp, int(k), int(n), int(block), label)
+    raw_hi = _f32_to_bf16_raw(values)
     weight_out = f"{label}/bf16_weight"
     tensor = helper.make_tensor(
         weight_out,
         TensorProto.BFLOAT16,
         [int(k), int(n)],
-        _f32_to_bf16_raw(values),
+        raw_hi,
         raw=True,
     )
+    tensors = [tensor]
     act_bf = f"{label}/act_bf16"
     mm_bf = f"{label}/mm_bf16"
     # WORKAROUND: Ryzen AI 1.8.0 Vitis EP aborts in superkernel_GemmBf16Int4
@@ -2107,7 +2145,58 @@ def _bake_one_matmul_nbits(graph, node, by_name, external_data_dir: Optional[str
         ),
     ]
     bias_name = _input_at(node, 5)
-    if bias_name:
+    if compensate:
+        hi_bits = np.frombuffer(raw_hi, dtype=np.uint16).astype(np.uint32)
+        hi_f32 = (hi_bits << np.uint32(16)).view(np.float32).reshape(int(k), int(n))
+        residual = np.ascontiguousarray(values - hi_f32, dtype=np.float32)
+        raw_lo = _f32_to_bf16_raw(residual)
+        weight_lo_out = f"{label}/bf16_weight_residual"
+        tensors.append(
+            helper.make_tensor(
+                weight_lo_out,
+                TensorProto.BFLOAT16,
+                [int(k), int(n)],
+                raw_lo,
+                raw=True,
+            )
+        )
+        cast_hi = f"{label}/cast_hi_f32"
+        mm_lo = f"{label}/mm_lo_bf16"
+        cast_lo = f"{label}/cast_lo_f32"
+        comp_out = f"{label}/cast_f32" if bias_name else output
+        nodes.extend(
+            [
+                helper.make_node(
+                    "Cast",
+                    [mm_bf],
+                    [cast_hi],
+                    name=f"{label}/Cast_out_f32",
+                    to=TensorProto.FLOAT,
+                ),
+                helper.make_node(
+                    "MatMul",
+                    [act_bf, weight_lo_out],
+                    [mm_lo],
+                    name=f"{label}/MatMul_residual",
+                ),
+                helper.make_node(
+                    "Cast",
+                    [mm_lo],
+                    [cast_lo],
+                    name=f"{label}/Cast_residual_f32",
+                    to=TensorProto.FLOAT,
+                ),
+                helper.make_node(
+                    "Add",
+                    [cast_hi, cast_lo],
+                    [comp_out],
+                    name=f"{label}/Add_residual",
+                ),
+            ]
+        )
+        if bias_name:
+            nodes.append(helper.make_node("Add", [comp_out, bias_name], [output], name=f"{label}/Add_bias"))
+    elif bias_name:
         cast_out = f"{label}/cast_f32"
         nodes.append(
             helper.make_node(
@@ -2132,10 +2221,15 @@ def _bake_one_matmul_nbits(graph, node, by_name, external_data_dir: Optional[str
     dropped = [weight_name, scale_name]
     if zp_name:
         dropped.append(zp_name)
-    return nodes, [tensor], dropped
+    return nodes, tensors, dropped
 
 
-def _bake_matmul_nbits(model, external_data_dir: Optional[str]) -> List[str]:
+def _bake_matmul_nbits(
+    model,
+    external_data_dir: Optional[str],
+    *,
+    compensate: bool = False,
+) -> List[str]:
     """Bake every 4-bit MatMulNBits. The external data file is not rewritten."""
     graph = model.graph
     by_name = {item.name: item for item in graph.initializer}
@@ -2147,7 +2241,13 @@ def _bake_matmul_nbits(model, external_data_dir: Optional[str]) -> List[str]:
         if node.op_type != "MatMulNBits" or node.domain != "com.microsoft":
             rebuilt.append(node)
             continue
-        nodes, tensors, names = _bake_one_matmul_nbits(graph, node, by_name, external_data_dir)
+        nodes, tensors, names = _bake_one_matmul_nbits(
+            graph,
+            node,
+            by_name,
+            external_data_dir,
+            compensate=bool(compensate),
+        )
         rebuilt.extend(nodes)
         made.extend(tensors)
         dropped.extend(names)
@@ -2301,9 +2401,11 @@ def apply_static_contract(
     head_dim: Optional[int] = None,
     external_data_dir: Optional[str] = None,
     npu_bf16_fallback: bool = False,
+    npu_bf16_compensate: bool = False,
     defer_matmul_bake: bool = False,
     decompose_gqa: bool = False,
     sink_size: int = 0,
+    matmul_chunk_k: int = _CHUNK_K,
 ) -> Dict[str, object]:
     """Freeze IO shapes, widen a KV prefix slice, and pin a Qwen GQA window.
 
@@ -2344,7 +2446,7 @@ def apply_static_contract(
             query_len=query_len,
             max_seq_len=max_seq_len,
         )
-    split = _split_large_matmul_nbits(model, external_data_dir)
+    split = _split_large_matmul_nbits(model, external_data_dir, chunk_k=int(matmul_chunk_k))
     bf16_weights: List[str] = []
     baked: List[str] = []
     activation = None
@@ -2354,7 +2456,11 @@ def apply_static_contract(
             "defer_matmul_bake keeps MatMulNBits packed and cannot bake this graph"
         )
     if npu_bf16_fallback:
-        baked = _bake_matmul_nbits(model, external_data_dir)
+        baked = _bake_matmul_nbits(
+            model,
+            external_data_dir,
+            compensate=bool(npu_bf16_compensate),
+        )
         if any(node.op_type == "MatMulNBits" for node in model.graph.node):
             raise StaticShapeError("MatMulNBits remains after npu_bf16_fallback")
         activation = TensorProto.FLOAT
@@ -2389,7 +2495,9 @@ def apply_static_contract(
         "activation": activation_name,
         "bf16_norm_weights": bf16_weights,
         "split_matmuls": split,
+        "matmul_chunk_k": int(matmul_chunk_k),
         "bf16_fallback": bool(npu_bf16_fallback),
+        "bf16_compensate": bool(npu_bf16_compensate),
         "bf16_fallback_matmuls": baked,
         "matmul_bake_deferred": bool(defer_matmul_bake),
     }

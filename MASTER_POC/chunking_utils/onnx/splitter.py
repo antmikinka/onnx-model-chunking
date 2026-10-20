@@ -122,6 +122,8 @@ def _rewrite_saved_component(
     *,
     split_lm_head: bool,
     npu_bf16_fallback: bool,
+    npu_bf16_compensate: bool = False,
+    matmul_chunk_k: Optional[int] = None,
     external_data_dir: Optional[str],
     lm_head_chunk_rows: Optional[int],
     apply_component_contract: bool,
@@ -133,6 +135,9 @@ def _rewrite_saved_component(
 ):
     """Rewrite one owned component graph. The master graph is not an argument."""
     if apply_component_contract:
+        contract_kwargs = {}
+        if matmul_chunk_k is not None:
+            contract_kwargs["matmul_chunk_k"] = int(matmul_chunk_k)
         report = apply_static_contract(
             component_model,
             batch_size=int(static_batch_size),
@@ -143,6 +148,7 @@ def _rewrite_saved_component(
             defer_matmul_bake=True,
             decompose_gqa=bool(decompose_gqa),
             sink_size=int(sink_size),
+            **contract_kwargs,
         )
         print(
             f"  Component static contract: norms {len(report['decomposed_norms'])}, "
@@ -167,7 +173,11 @@ def _rewrite_saved_component(
         )
         return component_model
     if npu_bf16_fallback:
-        baked = _bake_matmul_nbits(component_model, external_data_dir)
+        baked = _bake_matmul_nbits(
+            component_model,
+            external_data_dir,
+            compensate=bool(npu_bf16_compensate),
+        )
         print(f"  Baked {len(baked)} MatMulNBits in this component")
     return component_model
 
@@ -183,6 +193,8 @@ def save_components(
     chunk_size,
     split_lm_head: bool = False,
     npu_bf16_fallback: bool = False,
+    npu_bf16_compensate: bool = False,
+    matmul_chunk_k: Optional[int] = None,
     external_data_dir: Optional[str] = None,
     lm_head_chunk_rows: Optional[int] = None,
     only_components: Optional[Sequence[str]] = None,
@@ -270,6 +282,8 @@ def save_components(
                 comp_info,
                 split_lm_head=bool(split_lm_head),
                 npu_bf16_fallback=bool(npu_bf16_fallback),
+                npu_bf16_compensate=bool(npu_bf16_compensate),
+                matmul_chunk_k=matmul_chunk_k,
                 external_data_dir=external_data_dir,
                 lm_head_chunk_rows=lm_head_chunk_rows,
                 apply_component_contract=bool(apply_component_contract),
@@ -445,6 +459,8 @@ def split_onnx(
     static_max_seq_len: Optional[int] = None,
     static_query_len: Optional[int] = None,
     npu_bf16_fallback: bool = False,
+    npu_bf16_compensate: bool = False,
+    matmul_chunk_k: Optional[int] = None,
     split_lm_head: bool = False,
     lm_head_chunk_rows: Optional[int] = None,
     only_components: Optional[Sequence[str]] = None,
@@ -560,6 +576,9 @@ def split_onnx(
         # Flag false keeps today's master contract, including the bfloat16
         # activation cast while MatMulNBits remain. The fallback flag must
         # not take this branch: that cast is not the baked graph.
+        master_contract_kwargs = {}
+        if matmul_chunk_k is not None:
+            master_contract_kwargs["matmul_chunk_k"] = int(matmul_chunk_k)
         apply_static_contract(
             onnx_model,
             batch_size=int(config.batch_size),
@@ -568,6 +587,7 @@ def split_onnx(
             npu_bf16_fallback=False,
             decompose_gqa=bool(decompose_gqa),
             sink_size=int(sink_size),
+            **master_contract_kwargs,
         )
         print(
             f"Froze static shapes at batch {config.batch_size}, "
@@ -633,6 +653,8 @@ def split_onnx(
         chunk_size=weight_chunk_size,
         split_lm_head=bool(split_lm_head),
         npu_bf16_fallback=bool(npu_bf16_fallback),
+        npu_bf16_compensate=bool(npu_bf16_compensate),
+        matmul_chunk_k=matmul_chunk_k,
         external_data_dir=model_dir,
         lm_head_chunk_rows=lm_head_chunk_rows,
         only_components=only_components,
