@@ -123,12 +123,3 @@ These were reasonable guesses. The runs contradicted them, and they should not b
 - NPU-resident OrtValues on this wheel.
 - Prefill. The compiled Qwen graphs are query length 1.
 
-## 8. Keeping the Split-Model Architecture: Dynamic KV Cache & NPU-Native Attention
-
-Instead of abandoning the 40-component ONNX split architecture, the codebase extends the split-model contract so that both attention and dynamic KV cache management operate cleanly on the NPU:
-
-- **NPU-Native Decomposed GQA (`decompose_gqa_to_npu_primitives`):** Replaces `com.microsoft::GroupQueryAttention` with 100% NPU-accepted ONNX primitives (`Reshape`, `Gather`, `Slice`, `Concat`, `Mul`, `Sub`, `Add`, `MatMul`, `Softmax`) and zero hostile operators (`Transpose`, `Where`, `Scatter`, `ScatterND`, `ScatterElements`). Head-major permutation is performed via single-head `Slice` + `Reshape` + `Concat`, RoPE rotation uses uncapped int64 `position_ids` with half-split `Gather` + `Slice` + `Mul`/`Sub`/`Add` + `Concat`, and attention scoring uses transpose-free column `MatMul(full_k, q_col)`.
-- **Sink-Preserving & Rolling Static KV Window (`static_kv_concat_recipe(layout="sink_window")`, `right_aligned_attention_bias`):** Supports both pure sliding-window and sink-token-preserving (`[0:sink_size]` + `[sink_size+query_len:max_seq_len+query_len]`) static-shape graphs, paired with right-aligned additive `-10000.0` attention bias that unmasks populated sink and recent slots.
-- **Dynamic KV Cache Management (`KVCacheManager`):** Tracks continuous `seen_tokens` and uncapped RoPE `position_ids` across unbounded rolling decode steps (`commit_present_swap(..., rolling=True)`), promotes initial tokens into pinned sink slots as the static window fills, and supports dynamic multi-bucket window resizing (`resize_static_window`, `ensure_bucket_capacity`).
-- **Static-Window Split Runtime (`SplitModelInferenceEngine` & `benchmark_npu_decode.py`):** Automatically detects static-window split layers, binds active/shadow KV buffers via `KVUpdateMode.CONCAT_SWAP`, streams prompt tokens through `query_len=1` NPU layer graphs, and executes unbounded rolling generation with resident NPU layer sessions.
-

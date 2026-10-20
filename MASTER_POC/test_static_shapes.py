@@ -1598,27 +1598,59 @@ def test_decompose_gqa_matches_fused_and_avoids_hostile_ops():
                 assert np.max(np.abs(f_pk - d_pk)) < 1e-5
                 assert np.max(np.abs(f_pv - d_pv)) < 1e-5
         else:
-            # In-place shared buffer mode (past_seq == max_seq_len, total_len == max_seq_len)
-            bias_arr = right_aligned_attention_bias(
-                max_seq_len - 1, max_seq_len, query_len=1, total_len=max_seq_len
+            # In-place shared buffer mode (past_seq == max_seq_len, total_len == max_seq_len):
+            # Compare against fused GroupQueryAttention on the kept (max_seq_len - 1) past window
+            # plus the new token (total_len == max_seq_len).
+            fused_shared_model = onnx.ModelProto()
+            fused_shared_model.CopyFrom(base_model)
+            for node in fused_shared_model.graph.node:
+                if node.op_type == "GroupQueryAttention":
+                    kept_attrs = [a for a in node.attribute if a.name != "past_present_share_buffer"]
+                    del node.attribute[:]
+                    node.attribute.extend(kept_attrs)
+            apply_static_contract(
+                fused_shared_model,
+                batch_size=batch_size,
+                query_len=query_len,
+                max_seq_len=max_seq_len - 1,
+                decompose_gqa=False,
             )
-            d_out, d_pk, d_pv = decomp_sess.run(
-                None,
-                {
-                    "q": q_arr,
-                    "k": k_arr,
-                    "v": v_arr,
-                    "past_key_values.0.key": pk_arr,
-                    "past_key_values.0.value": pv_arr,
-                    "position_ids": np.asarray([[7]], dtype=np.int64),
-                    "attention_bias": bias_arr,
-                },
-            )
-            assert d_out.shape == (1, 1, q_hidden)
-            assert d_pk.shape == (1, kv_num_heads, max_seq_len, head_dim)
-            assert d_pv.shape == (1, kv_num_heads, max_seq_len, head_dim)
-            np.testing.assert_allclose(d_pk[:, :, :-1, :], pk_arr[:, :, 1:, :])
-            np.testing.assert_allclose(d_pv[:, :, :-1, :], pv_arr[:, :, 1:, :])
+            fused_shared_sess = _session(fused_shared_model)
+            pk_kept = np.ascontiguousarray(pk_arr[:, :, 1:, :])
+            pv_kept = np.ascontiguousarray(pv_arr[:, :, 1:, :])
+            for step_pos, valid_past in ((0, 0), (5, 5), (42, max_seq_len - 1)):
+                bias_arr = right_aligned_attention_bias(
+                    valid_past, max_seq_len - 1, query_len=1, total_len=max_seq_len
+                )
+                d_out, d_pk, d_pv = decomp_sess.run(
+                    None,
+                    {
+                        "q": q_arr,
+                        "k": k_arr,
+                        "v": v_arr,
+                        "past_key_values.0.key": pk_arr,
+                        "past_key_values.0.value": pv_arr,
+                        "position_ids": np.asarray([[step_pos]], dtype=np.int64),
+                        "attention_bias": bias_arr,
+                    },
+                )
+                f_out, f_pk, f_pv = fused_shared_sess.run(
+                    None,
+                    {
+                        "q": q_arr,
+                        "k": k_arr,
+                        "v": v_arr,
+                        "past_key_values.0.key": pk_kept,
+                        "past_key_values.0.value": pv_kept,
+                        "position_ids": np.asarray([[step_pos]], dtype=np.int64),
+                        "attention_bias": bias_arr,
+                    },
+                )
+                assert np.max(np.abs(f_out - d_out)) < 1e-5
+                assert np.max(np.abs(f_pk - d_pk[:, :, 1:, :])) < 1e-5
+                assert np.max(np.abs(f_pv - d_pv[:, :, 1:, :])) < 1e-5
+                np.testing.assert_allclose(d_pk[:, :, :-1, :], pk_kept, atol=1e-6)
+                np.testing.assert_allclose(d_pv[:, :, :-1, :], pv_kept, atol=1e-6)
 
     # Also verify sink_size > 0 preserves the leading sink slots in present KV
     sink_model = onnx.ModelProto()

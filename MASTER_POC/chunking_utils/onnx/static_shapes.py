@@ -864,12 +864,13 @@ def decompose_gqa_to_npu_primitives(
     sink_size: int = 0,
 ) -> List[str]:
     """
-    Replace ``com.microsoft::GroupQueryAttention`` with standard NPU-accepted ONNX primitives.
+    Replace ``com.microsoft::GroupQueryAttention`` with standard ONNX primitives.
 
     The replacement subgraph uses only ``Reshape``, ``Gather``, ``Slice``,
-    ``Concat``, ``Mul``, ``Sub``, ``Add``, ``MatMul``, and ``Softmax`` (zero
-    ``Transpose``, ``Where``, ``Scatter``, or contrib ops), so the entire
-    attention block is claimed by VAIML as part of a single NPU subgraph.
+    ``Concat``, ``Mul``, ``Sub``, ``Add``, ``MatMul``, and ``Softmax`` (no
+    ``Transpose``, ``Where``, ``Scatter``, or contrib ops). Vitis AI
+    compilation and NPU placement of this decomposed Qwen layer have not
+    been measured.
     """
     from onnx import TensorProto, helper
 
