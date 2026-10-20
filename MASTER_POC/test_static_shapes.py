@@ -373,7 +373,10 @@ def test_qwen_layer_freezes_to_the_static_window():
     assert gqa_inputs[4] == "past_key_values.0.value/bf16"
     assert gqa_inputs[7] == "cos_cache/bf16"
     assert gqa_inputs[8] == "sin_cache/bf16"
+    assert gqa_inputs[9] == "position_ids"
     assert gqa_inputs[10] == "attention_bias/bf16"
+    assert _dims(by_name["position_ids"]) == [1, 1]
+    assert by_name["position_ids"].type.tensor_type.elem_type == TensorProto.INT64
     norm_weights = [
         "model.layers.0.input_layernorm.weight",
         "model.layers.0.attn.q_norm.layernorm.weight",
@@ -575,6 +578,160 @@ def test_gqa_slice_keeps_the_newest_window():
     np.testing.assert_allclose(got[0], ref_out[0], atol=1e-6, rtol=1e-6)
     np.testing.assert_allclose(got[1], ref_out[1][:, :, 1:, :], atol=1e-6, rtol=1e-6)
     np.testing.assert_allclose(got[2], ref_out[2][:, :, 1:, :], atol=1e-6, rtol=1e-6)
+    gqa = next(node for node in rewritten.graph.node if node.op_type == "GroupQueryAttention")
+    assert gqa.input[9] == ""
+    assert "position_ids" not in {value.name for value in rewritten.graph.input}
+
+
+def _rotate_half(vec, cos, sin):
+    half = vec.shape[-1] // 2
+    first, second = vec[..., :half], vec[..., half:]
+    out = np.empty_like(vec)
+    out[..., :half] = first * cos - second * sin
+    out[..., half:] = second * cos + first * sin
+    return out
+
+
+def test_gqa_position_ids_selects_the_rope_row():
+    past = 16
+    total = past + 1
+    heads = 1
+    head = 16
+    hidden_q = 32
+    hidden_kv = 16
+
+    def symbolic():
+        q = _value("q", [_dim(0, "batch_size"), _dim(0, "sequence_length"), _dim(hidden_q, "")])
+        k = _value("k", [_dim(0, "batch_size"), _dim(0, "sequence_length"), _dim(hidden_kv, "")])
+        v = _value("v", [_dim(0, "batch_size"), _dim(0, "sequence_length"), _dim(hidden_kv, "")])
+        past_k = _value(
+            "past_key_values.0.key",
+            [_dim(0, "batch_size"), _dim(heads, ""), _dim(0, "past_sequence_length"), _dim(head, "")],
+        )
+        past_v = _value(
+            "past_key_values.0.value",
+            [_dim(0, "batch_size"), _dim(heads, ""), _dim(0, "past_sequence_length"), _dim(head, "")],
+        )
+        seqlens = _value("seqlens", [_dim(0, "batch_size")], TensorProto.INT32)
+        total_in = _value("total", [], TensorProto.INT32)
+        cos = _value("cos_cache", [_dim(32, ""), _dim(head // 2, "")])
+        sin = _value("sin_cache", [_dim(32, ""), _dim(head // 2, "")])
+        present_k = _value(
+            "present.0.key",
+            [_dim(0, "batch_size"), _dim(heads, ""), _dim(0, "total_sequence_length"), _dim(head, "")],
+        )
+        present_v = _value(
+            "present.0.value",
+            [_dim(0, "batch_size"), _dim(heads, ""), _dim(0, "total_sequence_length"), _dim(head, "")],
+        )
+        context = _value("context", [_dim(0, "batch_size"), _dim(0, "sequence_length"), _dim(hidden_q, "")])
+        node = helper.make_node(
+            "GroupQueryAttention",
+            [
+                "q",
+                "k",
+                "v",
+                "past_key_values.0.key",
+                "past_key_values.0.value",
+                "seqlens",
+                "total",
+                "cos_cache",
+                "sin_cache",
+                "",
+                "",
+            ],
+            ["context", "present.0.key", "present.0.value"],
+            name="gqa",
+            domain="com.microsoft",
+            num_heads=2,
+            kv_num_heads=heads,
+            scale=float(head) ** -0.5,
+            do_rotary=1,
+            rotary_interleaved=0,
+        )
+        graph = helper.make_graph(
+            [node],
+            "gqa_rope",
+            [q, k, v, past_k, past_v, seqlens, total_in, cos, sin],
+            [context, present_k, present_v],
+        )
+        model = helper.make_model(
+            graph,
+            opset_imports=[helper.make_opsetid("", 17), helper.make_opsetid("com.microsoft", 1)],
+        )
+        model.ir_version = 10
+        return model
+
+    rng = np.random.default_rng(0)
+    q = rng.normal(size=(1, 1, hidden_q)).astype(np.float32)
+    k = rng.normal(size=(1, 1, hidden_kv)).astype(np.float32)
+    v = rng.normal(size=(1, 1, hidden_kv)).astype(np.float32)
+    past_k = np.zeros((1, heads, past, head), dtype=np.float32)
+    past_v = np.zeros((1, heads, past, head), dtype=np.float32)
+    cos = np.zeros((32, head // 2), dtype=np.float32)
+    sin = np.zeros((32, head // 2), dtype=np.float32)
+    for index in range(32):
+        cos[index] = 0.25 + 0.01 * index
+        sin[index] = -0.15 + 0.02 * index
+    k_heads = k.reshape(1, 1, 1, head)
+    frozen = symbolic()
+    freeze_graph_io(frozen, batch_size=1, query_len=1, max_seq_len=past)
+    for value in frozen.graph.output:
+        if value.name.startswith("present."):
+            value.type.tensor_type.shape.dim[2].dim_value = total
+    frozen_feeds = {
+        "q": q,
+        "k": k,
+        "v": v,
+        "past_key_values.0.key": past_k,
+        "past_key_values.0.value": past_v,
+        "seqlens": np.asarray([past], dtype=np.int32),
+        "total": np.asarray(total, dtype=np.int32),
+        "cos_cache": cos,
+        "sin_cache": sin,
+    }
+    frozen_key = _session(frozen).run(None, frozen_feeds)[1][0, 0, -1]
+    row16 = _rotate_half(k_heads, cos[16], sin[16])[0, 0, 0]
+    row0 = _rotate_half(k_heads, cos[0], sin[0])[0, 0, 0]
+    assert np.max(np.abs(frozen_key - row16)) < 1e-6
+    assert np.max(np.abs(frozen_key - row0)) > 0.5
+
+    rewritten = symbolic()
+    report = apply_static_contract(rewritten, batch_size=1, query_len=1, max_seq_len=past)
+    assert report["rewritten_attention"] == ["gqa"]
+    gqa = next(node for node in rewritten.graph.node if node.op_type == "GroupQueryAttention")
+    assert gqa.input[9] == "position_ids"
+    assert _int_attr_value(gqa, "do_rotary") == 1
+    assert [node.op_type for node in rewritten.graph.node] == ["GroupQueryAttention", "Slice", "Slice"]
+    position = next(value for value in rewritten.graph.input if value.name == "position_ids")
+    assert position.type.tensor_type.elem_type == TensorProto.INT64
+    assert _dims(position) == [1, 1]
+    seqlens = numpy_helper.to_array(next(item for item in rewritten.graph.initializer if item.name == gqa.input[5]))
+    assert seqlens.tolist() == [past]
+    feeds = {
+        "q": q,
+        "k": k,
+        "v": v,
+        "past_key_values.0.key": past_k,
+        "past_key_values.0.value": past_v,
+        "cos_cache": cos,
+        "sin_cache": sin,
+        "attention_bias": np.zeros((1, 1, 1, total), dtype=np.float32),
+    }
+    session = _session(rewritten)
+    for pos in (0, 1, 8, 16, 20):
+        got_feeds = dict(feeds)
+        got_feeds["position_ids"] = np.asarray([[pos]], dtype=np.int64)
+        got = session.run(None, got_feeds)[1][0, 0, -1]
+        expect = _rotate_half(k_heads, cos[pos], sin[pos])[0, 0, 0]
+        assert np.max(np.abs(got - expect)) < 1e-6, pos
+
+
+def _int_attr_value(node, name):
+    for attr in node.attribute:
+        if attr.name == name:
+            return int(attr.i)
+    raise AssertionError(name)
 
 
 def test_skip_norm_matches_the_fused_op():
@@ -837,6 +994,10 @@ def test_bf16_fallback_matches_matmul_nbits_and_stays_off():
     assert "npu_bf16_fallback=bool(npu_bf16_fallback)" in source
     assert "npu_bf16_fallback=True" not in source
     assert "npu_bf16_fallback = True" not in source
+    assert "defer_matmul_bake=True" in source
+    assert "npu_bf16_fallback=False" in source
+    assert inspect.signature(split_onnx).parameters["only_components"].default is None
+    assert inspect.signature(split_onnx).parameters["load_external_data"].default is True
     rng = np.random.default_rng(7)
     k, n, block = 32, 4, 32
     weight = rng.integers(0, 256, size=(n, 1, 16), dtype=np.uint8)
@@ -854,10 +1015,39 @@ def test_bf16_fallback_matches_matmul_nbits_and_stays_off():
     parked.CopyFrom(omitted)
     off = apply_static_contract(parked, batch_size=1, query_len=1, max_seq_len=16)
     assert off["bf16_fallback"] is False
+    assert off["matmul_bake_deferred"] is False
     assert off["bf16_fallback_matmuls"] == []
     assert off["activation"] == "bfloat16"
     assert sum(node.op_type == "MatMulNBits" for node in parked.graph.node) == 1
     assert parked.graph.output[0].type.tensor_type.elem_type == int(TensorProto.BFLOAT16)
+    deferred = onnx.ModelProto()
+    deferred.CopyFrom(omitted)
+    deferred_report = apply_static_contract(
+        deferred,
+        batch_size=1,
+        query_len=1,
+        max_seq_len=16,
+        defer_matmul_bake=True,
+    )
+    assert deferred_report["matmul_bake_deferred"] is True
+    assert deferred_report["bf16_fallback"] is False
+    assert deferred_report["activation"] == "float32"
+    assert deferred_report["bf16_fallback_matmuls"] == []
+    assert sum(node.op_type == "MatMulNBits" for node in deferred.graph.node) == 1
+    assert deferred.graph.output[0].type.tensor_type.elem_type == int(TensorProto.FLOAT)
+    try:
+        apply_static_contract(
+            deferred,
+            batch_size=1,
+            query_len=1,
+            max_seq_len=16,
+            npu_bf16_fallback=True,
+            defer_matmul_bake=True,
+        )
+    except StaticShapeError as exc:
+        assert "defer_matmul_bake" in str(exc)
+    else:
+        raise AssertionError("defer_matmul_bake combined with baking")
     exact, zp0 = _dequant_pair(weight, scales, None, k, n, block)
     feed = rng.normal(size=(2, 3, k)).astype(np.float32)
     _assert_baked_matches_ort(omitted, feed, exact, zp0, bias=bias)
@@ -891,6 +1081,179 @@ def test_bf16_fallback_matches_matmul_nbits_and_stays_off():
         raise AssertionError("g_idx MatMulNBits was baked")
 
 
+def test_component_bake_does_not_expand_the_master():
+    import tempfile
+
+    from chunking_utils.onnx.splitter import save_components
+    from chunking_utils.onnx.types import ComponentInfo
+    from chunking_utils.onnx.weight_store import WeightStrategy
+
+    rng = np.random.default_rng(3)
+    k, n, block = 32, 4, 32
+    nodes = []
+    initializers = []
+    inputs = []
+    outputs = []
+    for index, name in enumerate(("down0", "down1")):
+        weight = rng.integers(0, 256, size=(n, 1, 16), dtype=np.uint8)
+        scales = (rng.normal(size=(n, 1)) * 0.05).astype(np.float32)
+        activation = f"activation_{index}"
+        result = f"output_{index}"
+        nodes.append(helper.make_node(
+            "MatMulNBits",
+            [activation, f"weight_{index}", f"scales_{index}"],
+            [result],
+            name=name,
+            domain="com.microsoft",
+            K=int(k),
+            N=int(n),
+            bits=4,
+            block_size=int(block),
+        ))
+        inputs.append(helper.make_tensor_value_info(activation, TensorProto.FLOAT, [1, 1, int(k)]))
+        outputs.append(helper.make_tensor_value_info(result, TensorProto.FLOAT, [1, 1, int(n)]))
+        initializers.append(numpy_helper.from_array(np.ascontiguousarray(weight), f"weight_{index}"))
+        initializers.append(numpy_helper.from_array(np.ascontiguousarray(scales), f"scales_{index}"))
+    model = helper.make_model(
+        helper.make_graph(nodes, "two", inputs, outputs, initializers),
+        opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("com.microsoft", 1)],
+    )
+    model.ir_version = 10
+    layer = ComponentInfo("layer", 0)
+    layer.node_indices = [0]
+    tail = ComponentInfo("other", None)
+    tail.node_indices = [1]
+    before = [node.op_type for node in model.graph.node]
+    with tempfile.TemporaryDirectory() as tmp:
+        files, _storage, layers = save_components(
+            model,
+            {"layer_0": layer, "tail": tail},
+            [],
+            tmp,
+            strategy=WeightStrategy.COPY,
+            size_threshold=1024 * 1024,
+            chunk_size=None,
+            npu_bf16_fallback=True,
+            only_components=["layer_0"],
+            apply_component_contract=True,
+            static_batch_size=1,
+            static_max_seq_len=16,
+            static_query_len=1,
+        )
+        assert layers == 1
+        assert set(files) == {"layer_0"}
+        saved = onnx.load(files["layer_0"], load_external_data=True)
+        assert any(node.op_type == "MatMul" for node in saved.graph.node)
+        assert not any(node.op_type == "MatMulNBits" for node in saved.graph.node)
+        assert not os.path.exists(os.path.join(tmp, "tail.onnx"))
+    assert [node.op_type for node in model.graph.node] == before == ["MatMulNBits", "MatMulNBits"]
+
+
+def test_component_bake_copies_master_external_slices():
+    import tempfile
+
+    from chunking_utils.onnx.splitter import _materialize_external_initializers, save_components
+    from chunking_utils.onnx.types import ComponentInfo
+    from chunking_utils.onnx.weight_store import WeightStrategy
+
+    rng = np.random.default_rng(4)
+    k, n, block = 32, 4, 32
+    weight = rng.integers(0, 256, size=(n, 1, 16), dtype=np.uint8)
+    scales = (rng.normal(size=(n, 1)) * 0.05).astype(np.float32)
+    bias = rng.normal(size=(64,)).astype(np.float32)
+    nodes = [
+        helper.make_node(
+            "MatMulNBits",
+            ["activation", "weight_0", "scales_0"],
+            ["hidden"],
+            name="down0",
+            domain="com.microsoft",
+            K=int(k),
+            N=int(n),
+            bits=4,
+            block_size=int(block),
+        ),
+        helper.make_node("Add", ["hidden", "bias"], ["output_0"], name="bias_add"),
+    ]
+    bias_init = numpy_helper.from_array(np.ascontiguousarray(bias), "bias")
+    bias_init.ClearField("raw_data")
+    bias_init.data_location = TensorProto.EXTERNAL
+    for key, value in (
+        ("location", "model.onnx.data"),
+        ("offset", "0"),
+        ("length", str(int(bias.nbytes))),
+    ):
+        entry = bias_init.external_data.add()
+        entry.key = key
+        entry.value = value
+    model = helper.make_model(
+        helper.make_graph(
+            nodes,
+            "external",
+            [helper.make_tensor_value_info("activation", TensorProto.FLOAT, [1, 1, int(k)])],
+            [helper.make_tensor_value_info("output_0", TensorProto.FLOAT, [1, 1, int(n)])],
+            [
+                numpy_helper.from_array(np.ascontiguousarray(weight), "weight_0"),
+                numpy_helper.from_array(np.ascontiguousarray(scales), "scales_0"),
+                bias_init,
+            ],
+        ),
+        opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("com.microsoft", 1)],
+    )
+    model.ir_version = 10
+    layer = ComponentInfo("layer", 0)
+    layer.node_indices = [0, 1]
+    with tempfile.TemporaryDirectory() as tmp:
+        master = os.path.join(tmp, "master")
+        out = os.path.join(tmp, "out")
+        os.makedirs(master)
+        with open(os.path.join(master, "model.onnx.data"), "wb") as handle:
+            handle.write(bias.tobytes())
+        unsafe = onnx.ModelProto()
+        unsafe.CopyFrom(model)
+        unsafe.graph.initializer[2].external_data[0].value = "../model.onnx.data"
+        try:
+            _materialize_external_initializers(unsafe, master)
+        except ValueError as exc:
+            assert "unsafe" in str(exc)
+        else:
+            raise AssertionError("parent external location was accepted")
+        files, _storage, layers = save_components(
+            model,
+            {"layer_0": layer},
+            [],
+            out,
+            strategy=WeightStrategy.COPY,
+            size_threshold=16,
+            chunk_size=None,
+            npu_bf16_fallback=True,
+            external_data_dir=master,
+            only_components=["layer_0"],
+            apply_component_contract=False,
+            static_batch_size=1,
+            static_max_seq_len=16,
+            static_query_len=1,
+        )
+        assert layers == 1
+        saved_path = files["layer_0"]
+        shutil = __import__("shutil")
+        shutil.rmtree(master)
+        saved = onnx.load(saved_path, load_external_data=True)
+        locations = []
+        found = None
+        for initializer in saved.graph.initializer:
+            if initializer.data_location == TensorProto.EXTERNAL:
+                locations.extend(entry.value for entry in initializer.external_data if entry.key == "location")
+            if initializer.name == "bias":
+                found = numpy_helper.to_array(initializer)
+        assert "model.onnx.data" not in locations
+        assert found is not None
+        assert np.allclose(found, bias)
+    master_bias = model.graph.initializer[2]
+    assert master_bias.data_location == TensorProto.EXTERNAL
+    assert master_bias.external_data[0].value == "model.onnx.data"
+
+
 def main():
     checks = [
         ("freeze_window", test_freeze_past_and_present_match),
@@ -904,7 +1267,10 @@ def main():
         ("qwen_layer", test_qwen_layer_freezes_to_the_static_window),
         ("down_split", test_down_proj_k_split_matches_unsplit),
         ("bf16_fallback", test_bf16_fallback_matches_matmul_nbits_and_stays_off),
+        ("component_bake", test_component_bake_does_not_expand_the_master),
+        ("external_slice", test_component_bake_copies_master_external_slices),
         ("gqa_slice", test_gqa_slice_keeps_the_newest_window),
+        ("gqa_position", test_gqa_position_ids_selects_the_rope_row),
         ("skip_norm", test_skip_norm_matches_the_fused_op),
         ("builder_static_mask", test_builder_static_mask_has_no_shape_or_slice),
     ]

@@ -14,7 +14,10 @@ q_norm or k_norm weight declares the head size. Fused attention appends
 the query onto the past, so ``total_sequence_length`` is
 ``max_seq_len + query_len`` and a constant Slice on axis 2 returns the
 graph boundary to ``max_seq_len``. ``seqlens`` stays the past window.
-``attention_bias`` has length ``total_sequence_length``.
+``attention_bias`` has length ``total_sequence_length``. When ``do_rotary``
+is 1, the host supplies ``position_ids`` int64 ``[batch, query_len]`` and
+the fused op indexes the existing rotary caches with it. An empty
+position input would use the frozen ``seqlens`` row.
 ``SkipSimplifiedLayerNormalization`` and ``SimplifiedLayerNormalization``
 become Add (for the skip) plus a full-width RMSNorm chain. The square is
 cast to float32. ``ReduceSum`` divided by the weight length replaces
@@ -76,8 +79,10 @@ probe of this node pattern, cache key ``pr9_bf16dense_fresh``, produced
 two Vitis kernels and left ``GroupQueryAttention`` and two present slices
 on CPU. That probe's weights omitted the zero point and its feeds were
 zeros. Turn the flag off to keep ``MatMulNBits``. ``split_onnx`` leaves
-the flag off, including when the target device is the NPU. Baking the
-unsplit model is not this path.
+the flag off, including when the target device is the NPU. When a caller
+sets the flag, the bake runs on each saved component. The loaded master
+graph is not baked. ``defer_matmul_bake`` keeps the packed ops and the
+float32 norm body so that component bake has a graph to rewrite.
 """
 
 import os
@@ -507,7 +512,14 @@ def rewrite_gqa_to_static_window(
     window plus ``query_len``, which is the present length the fused op
     writes. A constant Slice on axis 2 then keeps the newest
     ``max_seq_len`` tokens at the graph boundary. ``attention_bias`` has
-    length ``total_sequence_length``.
+    length ``total_sequence_length``. When ``do_rotary`` is 1, input 9
+    is an int64 ``position_ids`` of shape ``[batch, query_len]``. The
+    fused op indexes the cos and sin caches with that id. ``seqlens_k``
+    stays the window length, so an empty position input rotates every
+    token at ``max_seq_len``. ``do_rotary`` 0 does not add the input.
+    Decode with ``query_len`` 1 feeds ``[[absolute_position]]``, and
+    that index is not capped at ``max_seq_len``. Prefill feeds the
+    whole query axis, ``[[0, 1, ..., query_len - 1]]``, not a scalar.
     """
     from onnx import TensorProto, helper
 
@@ -553,6 +565,10 @@ def rewrite_gqa_to_static_window(
             constants.add(total_name)
         if not node.input[10]:
             node.input[10] = bias_name
+        if _int_attr(node, "do_rotary", 0) == 1:
+            if not node.input[9]:
+                node.input[9] = "position_ids"
+            _ensure_position_ids(graph, node.input[9], int(batch_size), int(query_len))
         if not shared and len(node.output) >= 3 and node.output[1] and node.output[2]:
             rebuilt.extend(
                 _trim_present_outputs(
@@ -571,6 +587,30 @@ def rewrite_gqa_to_static_window(
         _ensure_attention_bias(graph, bias_name, int(query_len), int(bias_len), constants)
     _drop_unused_inputs(graph, detached)
     return rewritten
+
+
+def _ensure_position_ids(graph, name: str, batch_size: int, query_len: int) -> None:
+    """Make ``name`` an int64 ``[batch, query]`` input unless a node already produces it."""
+    from onnx import TensorProto, helper
+
+    shape = [int(batch_size), int(query_len)]
+    for value in graph.input:
+        if value.name != name:
+            continue
+        if not value.type.HasField("tensor_type"):
+            raise StaticShapeError(f"{name} is not a tensor")
+        kind = int(value.type.tensor_type.elem_type)
+        if kind not in (0, int(TensorProto.INT64)):
+            raise StaticShapeError(
+                f"{name} must be int64 so GroupQueryAttention can index RoPE, got {kind}"
+            )
+        value.CopyFrom(helper.make_tensor_value_info(name, TensorProto.INT64, shape))
+        return
+    if any(item.name == name for item in graph.initializer):
+        return
+    if any(name in node.output for node in graph.node):
+        return
+    graph.input.append(helper.make_tensor_value_info(name, TensorProto.INT64, shape))
 
 
 def _ensure_attention_bias(graph, bias_name: str, query_len: int, bias_len: int, constants: set) -> None:
@@ -1563,6 +1603,7 @@ def apply_static_contract(
     head_dim: Optional[int] = None,
     external_data_dir: Optional[str] = None,
     npu_bf16_fallback: bool = False,
+    defer_matmul_bake: bool = False,
 ) -> Dict[str, object]:
     """Freeze IO shapes, widen a KV prefix slice, and pin a Qwen GQA window.
 
@@ -1570,7 +1611,10 @@ def apply_static_contract(
     casts or the dense fallback, so each chunk is still a float initializer.
     ``npu_bf16_fallback`` defaults off. When it is on, each remaining 4-bit
     ``MatMulNBits`` becomes a baked bfloat16 ``MatMul`` and the norm body
-    stays float32. Ryzen AI 1.8.0 aborts in ``superkernel_GemmBf16Int4``
+    stays float32. ``defer_matmul_bake`` performs the same structural
+    rewrites, leaves the packed ops in place, and keeps the norm body in
+    float32. It is not combined with baking this graph. Ryzen AI 1.8.0
+    aborts in ``superkernel_GemmBf16Int4``
     (https://github.com/amd/RyzenAI-SW/issues/407).
     """
     from onnx import TensorProto
@@ -1596,10 +1640,18 @@ def apply_static_contract(
     baked: List[str] = []
     activation = None
     activation_name = "float32"
+    if npu_bf16_fallback and defer_matmul_bake:
+        raise StaticShapeError(
+            "defer_matmul_bake keeps MatMulNBits packed and cannot bake this graph"
+        )
     if npu_bf16_fallback:
         baked = _bake_matmul_nbits(model, external_data_dir)
         if any(node.op_type == "MatMulNBits" for node in model.graph.node):
             raise StaticShapeError("MatMulNBits remains after npu_bf16_fallback")
+        activation = TensorProto.FLOAT
+    elif defer_matmul_bake:
+        # Packed weights stay. The norm body stays float32 so a later
+        # per-component bake does not inherit the bfloat16 activation contract.
         activation = TensorProto.FLOAT
     elif any(node.op_type == "MatMulNBits" for node in model.graph.node):
         bf16_weights = _apply_bf16_activation_contract(model, external_data_dir)
@@ -1628,6 +1680,7 @@ def apply_static_contract(
         "split_matmuls": split,
         "bf16_fallback": bool(npu_bf16_fallback),
         "bf16_fallback_matmuls": baked,
+        "matmul_bake_deferred": bool(defer_matmul_bake),
     }
 
 
