@@ -1,6 +1,6 @@
 # Challenges
 
-This is the account of what blocked the Qwen3-8B split on this Ryzen AI machine, what was tried, and what the measurement actually showed. Figures, commit ids, and log names live in [WORK_RECORD.md](WORK_RECORD.md). A challenge is closed only when a run produced the tensor or the abort it claims.
+A reader who does not know the project should start with [EXPLAINER.md](EXPLAINER.md). This is the account of what blocked the Qwen3-8B split on this Ryzen AI machine, what was tried, and what the measurement actually showed. Figures, commit ids, and log names live in [WORK_RECORD.md](WORK_RECORD.md). A challenge is closed only when a run produced the tensor or the abort it claims.
 
 The goal was one thing: run the existing 40-component Qwen3-8B ONNX split on the Ryzen AI 9 HX 370 NPU (Strix, XDNA2, Ryzen AI 1.8.0, ONNX Runtime 1.27.0) and have decode pass a distribution gate against the packed INT4 monolith. The split stays 40 components. It does not go through AMD's fused Qwen graph, `prefill.pb.bin`, or `com.ryzenai:MatMulNBitsBf`. The weight file `model.onnx.data` (7,241,596,928 bytes) was never rewritten.
 

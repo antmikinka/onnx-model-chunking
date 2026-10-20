@@ -1,6 +1,6 @@
 # Work record
 
-The challenge narrative is [CHALLENGES.md](CHALLENGES.md). This file is the number ledger for the Qwen3-8B split work in this repository through the commit that adds it. Measurements below were taken on one machine. A passing unit test is not an NPU placement. An ELF line is not a placement unless `session.run` returned a finite tensor. A Vitis-versus-CPU gap of 0.0 is lowering fidelity against that CPU session, not agreement with the packed INT4 monolith.
+Start with [EXPLAINER.md](EXPLAINER.md) if you do not already know this repository. The challenge narrative is [CHALLENGES.md](CHALLENGES.md). This file is the number ledger for the Qwen3-8B split work in this repository through the commit that adds it. Measurements below were taken on one machine. A passing unit test is not an NPU placement. An ELF line is not a placement unless `session.run` returned a finite tensor. A Vitis-versus-CPU gap of 0.0 is lowering fidelity against that CPU session, not agreement with the packed INT4 monolith.
 
 Weights file `model.onnx.data` (7,241,596,928 bytes) was not rewritten. `original-info-signature.txt` and `original-model-signature.txt` stay untracked. `C:\Users\antmi\qwen3-work` is not this git repository. Caches, logs, extracted ONNX graphs, and the 7 GB weight file stay there.
 
