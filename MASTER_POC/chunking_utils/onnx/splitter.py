@@ -29,7 +29,11 @@ from .graph_analysis import (
 from .kv_contract import extract_kv_cache_info
 from .attention_mask import rewrite_attention_mask_ops
 from .loader import infer_shapes_with_lazy_fallback, load_onnx_model
-from .static_shapes import _bake_matmul_nbits, apply_static_contract
+from .static_shapes import (
+    _bake_matmul_nbits,
+    apply_static_contract,
+    homogenize_qdq_weights_and_split_k,
+)
 from .metadata_writer import write_execution_contract
 from .npu_policy import extract_execution_policy
 from .quantization import build_quantization_info, extract_quantization_info, extract_quantization_tensors
@@ -124,6 +128,7 @@ def _rewrite_saved_component(
     npu_bf16_fallback: bool,
     npu_bf16_compensate: bool = False,
     npu_bf16_equilibrate: bool = False,
+    homogenize_qdq: bool = False,
     matmul_chunk_k: Optional[int] = None,
     external_data_dir: Optional[str],
     lm_head_chunk_rows: Optional[int],
@@ -146,6 +151,7 @@ def _rewrite_saved_component(
             query_len=int(static_query_len),
             external_data_dir=external_data_dir,
             npu_bf16_fallback=False,
+            homogenize_qdq=bool(homogenize_qdq),
             defer_matmul_bake=True,
             decompose_gqa=bool(decompose_gqa),
             sink_size=int(sink_size),
@@ -155,6 +161,11 @@ def _rewrite_saved_component(
             f"  Component static contract: norms {len(report['decomposed_norms'])}, "
             f"split_matmuls {len(report['split_matmuls'])}, "
             f"bake_deferred {report['matmul_bake_deferred']}"
+        )
+    elif homogenize_qdq:
+        qdq_kwargs = {"chunk_k": int(matmul_chunk_k)} if matmul_chunk_k is not None else {}
+        homogenize_qdq_weights_and_split_k(
+            component_model, external_data_dir, **qdq_kwargs
         )
     if split_lm_head and comp_info.component_type == "lm_head":
         from .lm_head_uniform import rewrite_uniform_lm_head
@@ -174,13 +185,16 @@ def _rewrite_saved_component(
         )
         return component_model
     if npu_bf16_fallback:
-        baked = _bake_matmul_nbits(
+        baked, equilibrated = _bake_matmul_nbits(
             component_model,
             external_data_dir,
             compensate=bool(npu_bf16_compensate),
             equilibrate=bool(npu_bf16_equilibrate),
         )
-        print(f"  Baked {len(baked)} MatMulNBits in this component")
+        print(
+            f"  Baked {len(baked)} MatMulNBits in this component "
+            f"(equilibrated {len(equilibrated)})"
+        )
     return component_model
 
 
@@ -197,6 +211,7 @@ def save_components(
     npu_bf16_fallback: bool = False,
     npu_bf16_compensate: bool = False,
     npu_bf16_equilibrate: bool = False,
+    homogenize_qdq: bool = False,
     matmul_chunk_k: Optional[int] = None,
     external_data_dir: Optional[str] = None,
     lm_head_chunk_rows: Optional[int] = None,
@@ -237,21 +252,41 @@ def save_components(
         keep = selected is None or comp_name in selected
         # The fallback bake happens after validation, one component at a time.
         # The packed LM-head rewrite still runs here when the flag is off.
-        if keep and split_lm_head and comp_info.component_type == "lm_head" and not npu_bf16_fallback:
-            _rewrite_saved_component(
-                component_model,
-                comp_info,
-                split_lm_head=True,
-                npu_bf16_fallback=False,
-                external_data_dir=external_data_dir,
-                lm_head_chunk_rows=lm_head_chunk_rows,
-                apply_component_contract=False,
-                static_batch_size=static_batch_size,
-                static_max_seq_len=static_max_seq_len,
-                static_query_len=static_query_len,
-                decompose_gqa=bool(decompose_gqa),
-                sink_size=int(sink_size),
-            )
+        if keep and not npu_bf16_fallback:
+            if split_lm_head and comp_info.component_type == "lm_head":
+                _rewrite_saved_component(
+                    component_model,
+                    comp_info,
+                    split_lm_head=True,
+                    npu_bf16_fallback=False,
+                    homogenize_qdq=bool(homogenize_qdq),
+                    matmul_chunk_k=matmul_chunk_k,
+                    external_data_dir=external_data_dir,
+                    lm_head_chunk_rows=lm_head_chunk_rows,
+                    apply_component_contract=False,
+                    static_batch_size=static_batch_size,
+                    static_max_seq_len=static_max_seq_len,
+                    static_query_len=static_query_len,
+                    decompose_gqa=bool(decompose_gqa),
+                    sink_size=int(sink_size),
+                )
+            elif homogenize_qdq:
+                _rewrite_saved_component(
+                    component_model,
+                    comp_info,
+                    split_lm_head=False,
+                    npu_bf16_fallback=False,
+                    homogenize_qdq=True,
+                    matmul_chunk_k=matmul_chunk_k,
+                    external_data_dir=external_data_dir,
+                    lm_head_chunk_rows=lm_head_chunk_rows,
+                    apply_component_contract=False,
+                    static_batch_size=static_batch_size,
+                    static_max_seq_len=static_max_seq_len,
+                    static_query_len=static_query_len,
+                    decompose_gqa=bool(decompose_gqa),
+                    sink_size=int(sink_size),
+                )
         _record_component_io(comp_info, component_model)
         if keep and not npu_bf16_fallback:
             prepared.append((comp_name, comp_info, filename, filepath, component_model))
@@ -287,6 +322,7 @@ def save_components(
                 npu_bf16_fallback=bool(npu_bf16_fallback),
                 npu_bf16_compensate=bool(npu_bf16_compensate),
                 npu_bf16_equilibrate=bool(npu_bf16_equilibrate),
+                homogenize_qdq=bool(homogenize_qdq),
                 matmul_chunk_k=matmul_chunk_k,
                 external_data_dir=external_data_dir,
                 lm_head_chunk_rows=lm_head_chunk_rows,
@@ -465,6 +501,7 @@ def split_onnx(
     npu_bf16_fallback: bool = False,
     npu_bf16_compensate: bool = False,
     npu_bf16_equilibrate: bool = False,
+    homogenize_qdq: bool = False,
     matmul_chunk_k: Optional[int] = None,
     split_lm_head: bool = False,
     lm_head_chunk_rows: Optional[int] = None,
@@ -590,6 +627,7 @@ def split_onnx(
             max_seq_len=max_seq,
             query_len=query,
             npu_bf16_fallback=False,
+            homogenize_qdq=bool(homogenize_qdq),
             decompose_gqa=bool(decompose_gqa),
             sink_size=int(sink_size),
             **master_contract_kwargs,
@@ -660,6 +698,7 @@ def split_onnx(
         npu_bf16_fallback=bool(npu_bf16_fallback),
         npu_bf16_compensate=bool(npu_bf16_compensate),
         npu_bf16_equilibrate=bool(npu_bf16_equilibrate),
+        homogenize_qdq=bool(homogenize_qdq),
         matmul_chunk_k=matmul_chunk_k,
         external_data_dir=model_dir,
         lm_head_chunk_rows=lm_head_chunk_rows,

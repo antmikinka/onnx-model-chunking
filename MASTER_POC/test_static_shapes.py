@@ -2264,6 +2264,158 @@ def test_rmsnorm_equilibration_reduces_bfp16ebs8_swamping_and_qdq_homogenize():
     qdq_got = _session(qdq_rewritten).run(None, {"x_in": x_qdq_feed})[0]
     np.testing.assert_allclose(qdq_got, qdq_ref, atol=1e-5, rtol=1e-5)
 
+    # 4. Verify full Qwen-style layer equilibration covers qkv, gate, up, AND down_proj (both at K=64 and K=32)
+    def _build_scaled_qwen_layer(k_hid=64, k_inter=192):
+        inits = [
+            numpy_helper.from_array(np.ones((k_hid,), dtype=np.float32), "in_norm_w"),
+            numpy_helper.from_array(np.ones((k_hid,), dtype=np.float32), "post_norm_w"),
+        ]
+        for prefix, k_d, n_d in (
+            ("qkv_proj", k_hid, k_hid * 2),
+            ("o_proj", k_hid, k_hid),
+            ("gate_proj", k_hid, k_inter),
+            ("up_proj", k_hid, k_inter),
+            ("down_proj", k_inter, k_hid),
+        ):
+            blks = k_d // 32
+            inits.append(
+                numpy_helper.from_array(
+                    rng.integers(0, 256, size=(n_d, blks, 16), dtype=np.uint8),
+                    f"{prefix}.w",
+                )
+            )
+            inits.append(
+                numpy_helper.from_array(
+                    rng.uniform(0.01, 0.05, size=(n_d, blks)).astype(np.float32),
+                    f"{prefix}.s",
+                )
+            )
+        nodes_l = [
+            helper.make_node(
+                "SimplifiedLayerNormalization",
+                ["hidden_in", "in_norm_w"],
+                ["norm0_out"],
+                name="/model/layers.2/input_layernorm/LayerNorm",
+                axis=-1,
+                epsilon=1e-6,
+            ),
+            helper.make_node(
+                "MatMulNBits",
+                ["norm0_out", "qkv_proj.w", "qkv_proj.s"],
+                ["qkv_out"],
+                name="/model/layers.2/attn/qkv_proj/MatMul_Q4",
+                domain="com.microsoft",
+                K=k_hid,
+                N=k_hid * 2,
+                bits=4,
+                block_size=32,
+            ),
+            helper.make_node("Identity", ["qkv_out"], ["attn_ctx"], name="/model/layers.2/attn/Stub"),
+            helper.make_node(
+                "MatMulNBits",
+                ["attn_ctx", "o_proj.w", "o_proj.s"],
+                ["o_out"],
+                name="/model/layers.2/attn/o_proj/MatMul_Q4",
+                domain="com.microsoft",
+                K=k_hid,
+                N=k_hid,
+                bits=4,
+                block_size=32,
+            ),
+            helper.make_node(
+                "SkipSimplifiedLayerNormalization",
+                ["hidden_in", "o_out", "post_norm_w"],
+                ["post_norm_out", "", "", ""],
+                name="/model/layers.2/post_attention_layernorm/SkipLayerNorm",
+                domain="com.microsoft",
+                epsilon=1e-6,
+            ),
+            helper.make_node(
+                "MatMulNBits",
+                ["post_norm_out", "gate_proj.w", "gate_proj.s"],
+                ["gate_out"],
+                name="/model/layers.2/mlp/gate_proj/MatMul_Q4",
+                domain="com.microsoft",
+                K=k_hid,
+                N=k_inter,
+                bits=4,
+                block_size=32,
+            ),
+            helper.make_node(
+                "MatMulNBits",
+                ["post_norm_out", "up_proj.w", "up_proj.s"],
+                ["up_out"],
+                name="/model/layers.2/mlp/up_proj/MatMul_Q4",
+                domain="com.microsoft",
+                K=k_hid,
+                N=k_inter,
+                bits=4,
+                block_size=32,
+            ),
+            helper.make_node("Mul", ["gate_out", "up_out"], ["mlp_hidden"], name="/model/layers.2/mlp/Mul"),
+            helper.make_node(
+                "MatMulNBits",
+                ["mlp_hidden", "down_proj.w", "down_proj.s"],
+                ["hidden_out"],
+                name="/model/layers.2/mlp/down_proj/MatMul_Q4",
+                domain="com.microsoft",
+                K=k_inter,
+                N=k_hid,
+                bits=4,
+                block_size=32,
+            ),
+        ]
+        g_l = helper.make_graph(
+            nodes_l,
+            "scaled_qwen_layer_2",
+            [helper.make_tensor_value_info("hidden_in", TensorProto.FLOAT, [1, 1, k_hid])],
+            [helper.make_tensor_value_info("hidden_out", TensorProto.FLOAT, [1, 1, k_hid])],
+            inits,
+        )
+        m_l = helper.make_model(
+            g_l,
+            opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("com.microsoft", 1)],
+        )
+        m_l.ir_version = 10
+        return m_l
+
+    layer_64 = _build_scaled_qwen_layer(64, 192)
+    rep_64 = apply_static_contract(
+        layer_64,
+        batch_size=1,
+        query_len=1,
+        max_seq_len=16,
+        external_data_dir=".",
+        npu_bf16_fallback=True,
+        npu_bf16_equilibrate=True,
+        matmul_chunk_k=64,
+    )
+    assert rep_64["bf16_equilibrate"] is True
+    expected_eq_64 = [
+        "/model/layers.2/attn/qkv_proj/MatMul_Q4",
+        "/model/layers.2/mlp/gate_proj/MatMul_Q4",
+        "/model/layers.2/mlp/up_proj/MatMul_Q4",
+        "/model/layers.2/mlp/down_proj/MatMul_Q4/k0",
+        "/model/layers.2/mlp/down_proj/MatMul_Q4/k64",
+        "/model/layers.2/mlp/down_proj/MatMul_Q4/k128",
+    ]
+    assert rep_64["equilibrated_matmuls"] == expected_eq_64
+
+    layer_32 = _build_scaled_qwen_layer(64, 192)
+    rep_32 = apply_static_contract(
+        layer_32,
+        batch_size=1,
+        query_len=1,
+        max_seq_len=16,
+        external_data_dir=".",
+        npu_bf16_fallback=True,
+        npu_bf16_equilibrate=True,
+        matmul_chunk_k=32,
+    )
+    assert rep_32["bf16_equilibrate"] is True
+    # At K=32: qkv (2), gate (2), up (2), down_proj (6) = 12 equilibrated MatMuls
+    assert len(rep_32["equilibrated_matmuls"]) == 12
+
 
 def main():
     checks = [

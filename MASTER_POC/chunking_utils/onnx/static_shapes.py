@@ -2070,6 +2070,7 @@ def _bake_one_matmul_nbits(
     *,
     compensate: bool = False,
     row_scale: Optional[np.ndarray] = None,
+    col_scale: Optional[np.ndarray] = None,
 ):
     """Replace one MatMulNBits with Cast, baked MatMul, Cast, and an optional Add.
 
@@ -2077,10 +2078,9 @@ def _bake_one_matmul_nbits(
     residual ``values - float32(bf16(values))`` (Ozaki-style dual-bf16 split)
     and sums the two float32 outputs before any bias add, recovering ~15 bits
     of effective weight mantissa precision through standard ``GemmBfp16`` ops.
-    When ``row_scale`` is a length-``K`` float32 vector, multiplies row ``i``
-    of the float32 dequantized weight by ``row_scale[i]`` prior to bfloat16
-    rounding (used to absorb RMSNorm per-channel scale spikes before
-    ``bfp16ebs8`` conversion with zero extra nodes or weight bytes).
+    When ``row_scale`` (length ``K``) and/or ``col_scale`` (length ``N``) are
+    provided, scales the float32 dequantized weight rows/columns prior to
+    bfloat16 rounding.
     """
     from onnx import TensorProto, helper
 
@@ -2122,6 +2122,9 @@ def _bake_one_matmul_nbits(
     if row_scale is not None:
         rs = np.ascontiguousarray(row_scale, dtype=np.float32).reshape(int(k), 1)
         values = np.ascontiguousarray(values * rs, dtype=np.float32)
+    if col_scale is not None:
+        cs = np.ascontiguousarray(col_scale, dtype=np.float32).reshape(1, int(n))
+        values = np.ascontiguousarray(values * cs, dtype=np.float32)
     raw_hi = _f32_to_bf16_raw(values)
     weight_out = f"{label}/bf16_weight"
     tensor = helper.make_tensor(
@@ -2233,29 +2236,226 @@ def _bake_one_matmul_nbits(
     return nodes, tensors, dropped
 
 
+def _resolve_matmul_nbits_consumers(
+    tensor_name: str,
+    consumers_by_tensor: Dict[str, List[tuple]],
+    by_name: Dict[str, object],
+    external_data_dir: Optional[str],
+    width: int,
+) -> Optional[List[tuple]]:
+    """Trace ``tensor_name`` to consumer ``MatMulNBits`` nodes (directly or via K-axis ``Slice``).
+
+    Returns a list of ``(matmul_node, k_start, k_stop)`` tuples when every
+    consumer of ``tensor_name`` is either a 4-bit ``MatMulNBits`` at input 0
+    or a last-axis ``Slice`` whose output is consumed exclusively by a 4-bit
+    ``MatMulNBits`` at input 0, or ``None`` if any consumer is unsupported.
+    """
+    readers = consumers_by_tensor.get(tensor_name, [])
+    if not readers:
+        return None
+    resolved: List[tuple] = []
+    for reader, pos in readers:
+        if reader.op_type == "MatMulNBits" and reader.domain == "com.microsoft" and pos == 0:
+            k_attr = _required_int_attr(reader, "K")
+            if k_attr != int(width):
+                return None
+            resolved.append((reader, 0, int(width)))
+            continue
+        if reader.op_type == "Slice" and pos == 0:
+            starts_arr = _initializer_array(by_name.get(_input_at(reader, 1)), external_data_dir)
+            ends_arr = _initializer_array(by_name.get(_input_at(reader, 2)), external_data_dir)
+            axes_arr = (
+                _initializer_array(by_name.get(_input_at(reader, 3)), external_data_dir)
+                if _input_at(reader, 3)
+                else None
+            )
+            steps_arr = (
+                _initializer_array(by_name.get(_input_at(reader, 4)), external_data_dir)
+                if _input_at(reader, 4)
+                else None
+            )
+            if starts_arr is None or ends_arr is None or starts_arr.size != 1 or ends_arr.size != 1:
+                return None
+            if axes_arr is not None and (axes_arr.size != 1 or int(axes_arr.reshape(-1)[0]) not in (-1, 2)):
+                return None
+            if steps_arr is not None and (steps_arr.size != 1 or int(steps_arr.reshape(-1)[0]) != 1):
+                return None
+            k_start = int(starts_arr.reshape(-1)[0])
+            k_stop = min(int(ends_arr.reshape(-1)[0]), int(width))
+            if k_start < 0 or k_stop <= k_start or k_stop > int(width):
+                return None
+            slice_out = _output_at(reader, 0)
+            sub_readers = consumers_by_tensor.get(slice_out, []) if slice_out else []
+            if not sub_readers:
+                return None
+            for sub_reader, sub_pos in sub_readers:
+                if (
+                    sub_reader.op_type != "MatMulNBits"
+                    or sub_reader.domain != "com.microsoft"
+                    or sub_pos != 0
+                    or _required_int_attr(sub_reader, "K") != (k_stop - k_start)
+                ):
+                    return None
+                resolved.append((sub_reader, k_start, k_stop))
+            continue
+        return None
+    return resolved if resolved else None
+
+
+def _power_of_two_block_scale(
+    num_vec: np.ndarray,
+    den_vec: np.ndarray,
+    *,
+    block_len: int = 8,
+    max_exp: int = 3,
+) -> np.ndarray:
+    """Compute exact power-of-two per-channel scales ``2^k`` within each ``block_len`` window.
+
+    Multiplying IEEE float32/bfloat16 values by an exact power of two shifts only
+    exponent bits without altering mantissa bits, while equilibrating dynamic range
+    inside each 8-element ``bfp16ebs8`` shared-exponent block.
+    """
+    width = int(num_vec.size)
+    s = np.ones((width,), dtype=np.float32)
+    for start in range(0, width, int(block_len)):
+        end = min(start + int(block_len), width)
+        n_blk = np.maximum(np.abs(num_vec[start:end].astype(np.float32)), 1e-6)
+        d_blk = np.maximum(np.abs(den_vec[start:end].astype(np.float32)), 1e-6)
+        ratio_raw = np.sqrt(n_blk / d_blk)
+        g_med = float(np.exp(np.mean(np.log(np.maximum(ratio_raw, 1e-6)))))
+        if g_med <= 1e-6:
+            continue
+        exp_int = np.clip(np.rint(np.log2(np.maximum(ratio_raw / g_med, 1e-6))), -int(max_exp), int(max_exp))
+        s[start:end] = np.ldexp(np.ones_like(exp_int, dtype=np.float32), exp_int.astype(np.int32))
+    return s
+
+
+def _matmul_nbits_row_amplitude(
+    targets: List[tuple],
+    by_name: Dict[str, object],
+    external_data_dir: Optional[str],
+    width: int,
+) -> np.ndarray:
+    """Compute per-row RMS scale amplitude across ``(matmul_node, k_start, k_stop)`` consumers."""
+    row_amp = np.zeros((int(width),), dtype=np.float32)
+    for reader, k_start, k_stop in targets:
+        chunk_len = int(k_stop) - int(k_start)
+        s_name = _input_at(reader, 2)
+        block_sz = _required_int_attr(reader, "block_size") or 32
+        s_item = by_name.get(s_name)
+        s_arr = _initializer_array(s_item, external_data_dir) if s_item is not None else None
+        if s_arr is not None:
+            flat_s = np.nan_to_num(s_arr.astype(np.float32).reshape(-1), nan=0.0, posinf=0.0, neginf=0.0)
+            flat_s = np.clip(flat_s, -1e6, 1e6)
+            n_col = _required_int_attr(reader, "N") or 0
+            n_blocks = chunk_len // int(block_sz)
+            if n_col > 0 and n_blocks > 0 and flat_s.size == n_col * n_blocks:
+                grid = flat_s.reshape(n_col, n_blocks)
+                col_rms = np.sqrt(np.mean(np.square(grid, dtype=np.float64), axis=0)).astype(np.float32)
+                row_amp[int(k_start) : int(k_stop)] = np.maximum(
+                    row_amp[int(k_start) : int(k_stop)],
+                    np.repeat(col_rms, int(block_sz)),
+                )
+    if not np.any(row_amp > 1e-8):
+        row_amp = np.ones((int(width),), dtype=np.float32)
+    return row_amp
+
+
+def _matmul_nbits_col_amplitude(
+    nodes: List[object],
+    by_name: Dict[str, object],
+    external_data_dir: Optional[str],
+) -> Optional[np.ndarray]:
+    """Compute per-column RMS scale amplitude across ``MatMulNBits`` K-chunks."""
+    if not nodes:
+        return None
+    n_col = _required_int_attr(nodes[0], "N")
+    if not n_col or n_col < 1:
+        return None
+    sum_sq = np.zeros((int(n_col),), dtype=np.float64)
+    total_blocks = 0
+    for node in nodes:
+        if _required_int_attr(node, "N") != int(n_col):
+            return None
+        k_dim = _required_int_attr(node, "K")
+        block_sz = _required_int_attr(node, "block_size") or 32
+        if not k_dim or int(k_dim) % int(block_sz) != 0:
+            return None
+        s_name = _input_at(node, 2)
+        s_item = by_name.get(s_name) if s_name else None
+        s_arr = _initializer_array(s_item, external_data_dir) if s_item is not None else None
+        if s_arr is None:
+            continue
+        flat_s = np.nan_to_num(s_arr.astype(np.float32).reshape(-1), nan=0.0, posinf=0.0, neginf=0.0)
+        flat_s = np.clip(flat_s, -1e6, 1e6)
+        n_blocks = int(k_dim) // int(block_sz)
+        if flat_s.size != int(n_col) * n_blocks:
+            continue
+        grid = flat_s.reshape(int(n_col), n_blocks)
+        sum_sq += np.sum(np.square(grid, dtype=np.float64), axis=1)
+        total_blocks += n_blocks
+    if total_blocks <= 0 or not np.any(sum_sq > 1e-16):
+        return np.ones((int(n_col),), dtype=np.float32)
+    col_rms = np.sqrt(sum_sq / float(total_blocks)).astype(np.float32)
+    return np.maximum(col_rms, 1e-6)
+
+
+def _trace_unbiased_matmul_nbits_group(
+    tensor_name: str,
+    producer_by_tensor: Dict[str, object],
+    consumers_by_tensor: Dict[str, List[tuple]],
+) -> Optional[List[object]]:
+    """Return the ``MatMulNBits`` leaf nodes whose K-split ``Add`` tree produces ``tensor_name``."""
+    if not tensor_name or len(consumers_by_tensor.get(tensor_name, [])) != 1:
+        return None
+    prod = producer_by_tensor.get(tensor_name)
+    if prod is None:
+        return None
+    if prod.op_type == "MatMulNBits" and prod.domain == "com.microsoft":
+        return [prod] if not _input_at(prod, 5) else None
+    if prod.op_type == "Add":
+        left = _trace_unbiased_matmul_nbits_group(
+            _input_at(prod, 0), producer_by_tensor, consumers_by_tensor
+        )
+        right = _trace_unbiased_matmul_nbits_group(
+            _input_at(prod, 1), producer_by_tensor, consumers_by_tensor
+        )
+        if left and right:
+            return left + right
+    return None
+
+
 def _norm_equilibration_scales(
     graph,
     by_name,
     external_data_dir: Optional[str],
-) -> Dict[str, np.ndarray]:
-    """Compute per-channel scale vectors ``s`` to fold from RMSNorm ``gamma`` into consumer ``MatMulNBits`` rows.
+) -> tuple:
+    """Compute power-of-two per-channel equilibration scales for ``MatMulNBits`` nodes.
 
-    Returns a map ``{norm_output_tensor_name: s_vector}`` and updates the
-    corresponding RMSNorm weight initializer in ``graph`` to ``gamma / s``
-    in float32. Only norms whose output is consumed exclusively by 4-bit
-    ``MatMulNBits`` nodes (with matching ``K == len(gamma)``) are equilibrated.
+    Covers:
+    1. ``RMSNorm -> (optional K-Slice ->) MatMulNBits`` (e.g. ``qkv_proj``, ``gate_proj``, ``up_proj``),
+       folding ``1/s`` into the float32 RMSNorm ``gamma`` and ``s`` into consumer ``MatMulNBits`` rows.
+    2. ``up_proj -> Mul -> (optional K-Slice ->) down_proj``, folding ``1/s_mlp`` into ``up_proj``
+       columns and ``s_mlp[k_start:k_stop]`` into ``down_proj`` rows.
+
+    Returns ``(row_scales_by_node_key, col_scales_by_node_key)``.
     """
     from onnx import TensorProto, numpy_helper
 
-    # Map every tensor to all consumer nodes and input positions.
+    def _node_key(n) -> str:
+        return n.name or _output_at(n, 0) or ""
+
     consumers_by_tensor: Dict[str, List[tuple]] = {}
+    producer_by_tensor: Dict[str, object] = {}
     for node in graph.node:
+        for out in node.output:
+            if out:
+                producer_by_tensor[out] = node
         for idx, inp in enumerate(node.input):
             if inp:
                 consumers_by_tensor.setdefault(inp, []).append((node, idx))
     graph_outputs = {out.name for out in graph.output}
 
-    # Find candidate RMSNorm outputs and their gamma weight initializer names.
     candidates: List[tuple] = []
     for node in graph.node:
         if node.op_type == "SimplifiedLayerNormalization":
@@ -2274,17 +2474,12 @@ def _norm_equilibration_scales(
             if weight_name and out_name:
                 candidates.append((out_name, weight_name))
 
-    scales_by_activation: Dict[str, np.ndarray] = {}
+    row_scales_by_node: Dict[str, np.ndarray] = {}
+    col_scales_by_node: Dict[str, np.ndarray] = {}
+
+    # 1. Equilibrate RMSNorm -> (Slice ->) MatMulNBits
     for act_name, weight_name in candidates:
         if act_name in graph_outputs:
-            continue
-        readers = consumers_by_tensor.get(act_name, [])
-        if not readers:
-            continue
-        if not all(
-            reader.op_type == "MatMulNBits" and reader.domain == "com.microsoft" and pos == 0
-            for reader, pos in readers
-        ):
             continue
         gamma_item = by_name.get(weight_name)
         if gamma_item is None or int(gamma_item.data_type) != int(TensorProto.FLOAT):
@@ -2293,45 +2488,68 @@ def _norm_equilibration_scales(
         if gamma is None or gamma.ndim != 1 or gamma.size < 1:
             continue
         width = int(gamma.size)
-        if any(_required_int_attr(reader, "K") != width for reader, _pos in readers):
+        targets = _resolve_matmul_nbits_consumers(
+            act_name, consumers_by_tensor, by_name, external_data_dir, width
+        )
+        if not targets:
             continue
-        # Compute per-row weight amplitude across consumer MatMulNBits nodes so
-        # s_i balances activation block range against weight block range:
-        # s_i = sqrt(|gamma_i| / w_row_rms_i) normalized per 8-element BFP16 block.
-        row_amp = np.zeros((width,), dtype=np.float32)
-        for reader, _pos in readers:
-            s_name = _input_at(reader, 2)
-            block_sz = _required_int_attr(reader, "block_size") or 32
-            s_item = by_name.get(s_name)
-            s_arr = _initializer_array(s_item, external_data_dir) if s_item is not None else None
-            if s_arr is not None and s_arr.ndim == 2 and s_arr.shape[1] * int(block_sz) == width:
-                # Mean absolute scale across N columns for each K-block, repeated to K
-                col_rms = np.sqrt(np.mean(np.square(s_arr.astype(np.float32)), axis=0))
-                row_amp = np.maximum(row_amp, np.repeat(col_rms, int(block_sz)))
-        if not np.any(row_amp > 1e-8):
-            row_amp = np.ones((width,), dtype=np.float32)
-
-        abs_gamma = np.abs(gamma.astype(np.float32))
-        s = np.ones((width,), dtype=np.float32)
-        # Equilibrate within each 8-element BFP16 block (bfp16ebs8) using
-        # SmoothQuant-style alpha=0.5 so neither activation nor weight has an
-        # 8-element shared-exponent spike.
-        block_len = 8
-        for start in range(0, width, block_len):
-            end = min(start + block_len, width)
-            g_blk = abs_gamma[start:end]
-            w_blk = row_amp[start:end]
-            ratio_raw = np.sqrt(np.maximum(g_blk, 1e-6) / np.maximum(w_blk, 1e-6))
-            g_med = float(np.exp(np.mean(np.log(np.maximum(ratio_raw, 1e-6)))))
-            if g_med <= 1e-6:
-                continue
-            s[start:end] = np.clip(ratio_raw / g_med, 0.125, 8.0).astype(np.float32)
+        row_amp = _matmul_nbits_row_amplitude(targets, by_name, external_data_dir, width)
+        s = _power_of_two_block_scale(gamma, row_amp, block_len=8, max_exp=3)
         new_gamma = np.ascontiguousarray(gamma.astype(np.float32) / s, dtype=np.float32)
         new_tensor = numpy_helper.from_array(new_gamma, name=weight_name)
         _replace_initializer(graph, new_tensor)
         by_name[weight_name] = new_tensor
-        scales_by_activation[act_name] = s
-    return scales_by_activation
+        for reader, k_start, k_stop in targets:
+            key = _node_key(reader)
+            if key:
+                row_scales_by_node[key] = np.ascontiguousarray(
+                    s[int(k_start) : int(k_stop)], dtype=np.float32
+                )
+
+    # 2. Equilibrate up_proj -> Mul(SwiGLU) -> (Slice ->) down_proj
+    for node in graph.node:
+        if node.op_type != "Mul" or node.name.endswith("/Mul_weight"):
+            continue
+        mul_out = _output_at(node, 0)
+        if not mul_out or mul_out in graph_outputs:
+            continue
+        in0 = _input_at(node, 0)
+        in1 = _input_at(node, 1)
+        grp0 = _trace_unbiased_matmul_nbits_group(in0, producer_by_tensor, consumers_by_tensor)
+        grp1 = _trace_unbiased_matmul_nbits_group(in1, producer_by_tensor, consumers_by_tensor)
+        # Prefer the right-hand Mul input when both sides are linear MatMulNBits
+        # groups (e.g. synthetic test without Silu), or the sole linear branch on
+        # real SwiGLU graphs where in0 is Silu(gate_proj) and in1 is up_proj.
+        up_nodes = grp1 if grp1 else grp0
+        if not up_nodes:
+            continue
+        inter_width = _required_int_attr(up_nodes[0], "N")
+        if not inter_width or inter_width < 8:
+            continue
+        down_targets = _resolve_matmul_nbits_consumers(
+            mul_out, consumers_by_tensor, by_name, external_data_dir, int(inter_width)
+        )
+        if not down_targets:
+            continue
+        up_col_amp = _matmul_nbits_col_amplitude(up_nodes, by_name, external_data_dir)
+        if up_col_amp is None or up_col_amp.size != int(inter_width):
+            continue
+        down_row_amp = _matmul_nbits_row_amplitude(
+            down_targets, by_name, external_data_dir, int(inter_width)
+        )
+        s_mlp = _power_of_two_block_scale(up_col_amp, down_row_amp, block_len=8, max_exp=3)
+        for u_node in up_nodes:
+            up_key = _node_key(u_node)
+            if up_key:
+                col_scales_by_node[up_key] = np.ascontiguousarray(1.0 / s_mlp, dtype=np.float32)
+        for reader, k_start, k_stop in down_targets:
+            key = _node_key(reader)
+            if key:
+                row_scales_by_node[key] = np.ascontiguousarray(
+                    s_mlp[int(k_start) : int(k_stop)], dtype=np.float32
+                )
+
+    return row_scales_by_node, col_scales_by_node
 
 
 def _bake_matmul_nbits(
@@ -2340,38 +2558,45 @@ def _bake_matmul_nbits(
     *,
     compensate: bool = False,
     equilibrate: bool = False,
-) -> List[str]:
-    """Bake every 4-bit MatMulNBits. The external data file is not rewritten."""
+) -> tuple:
+    """Bake every 4-bit MatMulNBits. Returns ``(baked_names, equilibrated_names)``."""
     graph = model.graph
     by_name = {item.name: item for item in graph.initializer}
-    row_scales = (
+    row_scales, col_scales = (
         _norm_equilibration_scales(graph, by_name, external_data_dir)
         if equilibrate
-        else {}
+        else ({}, {})
     )
     rebuilt = []
     made = []
     dropped = []
     baked = []
+    equilibrated = []
     for node in list(graph.node):
         if node.op_type != "MatMulNBits" or node.domain != "com.microsoft":
             rebuilt.append(node)
             continue
-        act_name = _input_at(node, 0)
+        node_key = node.name or _output_at(node, 0) or ""
+        r_scale = row_scales.get(node_key)
+        c_scale = col_scales.get(node_key)
         nodes, tensors, names = _bake_one_matmul_nbits(
             graph,
             node,
             by_name,
             external_data_dir,
             compensate=bool(compensate),
-            row_scale=row_scales.get(act_name),
+            row_scale=r_scale,
+            col_scale=c_scale,
         )
         rebuilt.extend(nodes)
         made.extend(tensors)
         dropped.extend(names)
-        baked.append(node.name or _output_at(node, 0) or "MatMulNBits")
+        label = node.name or _output_at(node, 0) or "MatMulNBits"
+        baked.append(label)
+        if r_scale is not None or c_scale is not None:
+            equilibrated.append(label)
     if not baked:
-        return []
+        return [], []
     del graph.node[:]
     graph.node.extend(rebuilt)
     graph.initializer.extend(made)
@@ -2383,7 +2608,7 @@ def _bake_matmul_nbits(
         kept = [item for item in graph.initializer if item.name not in unused]
         del graph.initializer[:]
         graph.initializer.extend(kept)
-    return baked
+    return baked, equilibrated
 
 
 def _apply_bf16_activation_contract(model, external_data_dir: Optional[str] = None) -> List[str]:
@@ -2790,6 +3015,7 @@ def apply_static_contract(
     npu_bf16_fallback: bool = False,
     npu_bf16_compensate: bool = False,
     npu_bf16_equilibrate: bool = False,
+    homogenize_qdq: bool = False,
     defer_matmul_bake: bool = False,
     decompose_gqa: bool = False,
     sink_size: int = 0,
@@ -2834,9 +3060,17 @@ def apply_static_contract(
             query_len=query_len,
             max_seq_len=max_seq_len,
         )
+    qdq_report = (
+        homogenize_qdq_weights_and_split_k(
+            model, external_data_dir, chunk_k=int(matmul_chunk_k)
+        )
+        if homogenize_qdq
+        else {"converted_u8_weights": [], "split_qdq_matmuls": []}
+    )
     split = _split_large_matmul_nbits(model, external_data_dir, chunk_k=int(matmul_chunk_k))
     bf16_weights: List[str] = []
     baked: List[str] = []
+    equilibrated: List[str] = []
     activation = None
     activation_name = "float32"
     if npu_bf16_fallback and defer_matmul_bake:
@@ -2844,7 +3078,7 @@ def apply_static_contract(
             "defer_matmul_bake keeps MatMulNBits packed and cannot bake this graph"
         )
     if npu_bf16_fallback:
-        baked = _bake_matmul_nbits(
+        baked, equilibrated = _bake_matmul_nbits(
             model,
             external_data_dir,
             compensate=bool(npu_bf16_compensate),
@@ -2887,9 +3121,11 @@ def apply_static_contract(
         "matmul_chunk_k": int(matmul_chunk_k),
         "bf16_fallback": bool(npu_bf16_fallback),
         "bf16_compensate": bool(npu_bf16_compensate),
-        "bf16_equilibrate": bool(npu_bf16_equilibrate),
+        "bf16_equilibrate": bool(equilibrated),
+        "equilibrated_matmuls": equilibrated,
         "bf16_fallback_matmuls": baked,
         "matmul_bake_deferred": bool(defer_matmul_bake),
+        "homogenized_qdq": qdq_report,
     }
 
 

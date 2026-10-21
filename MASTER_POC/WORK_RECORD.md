@@ -152,7 +152,22 @@ NPU position-ids harness, report `C:\Users\antmi\qwen3-work\npu-decode-position-
 - Step 0 max abs `1.205`. Step 16 max abs `2.998`, both sides token 39088.
 - `decode_tps` `1.5858`. Session load 21.047 seconds. Split peak RSS 17948.83 MB.
 
-The gate was not widened. `1.72` tokens per second is an earlier split-loop figure, not this gate run. The 17-step gate was not rerun after the INT8 work.
+The gate was not widened. `1.72` tokens per second is an earlier split-loop figure, not this gate run.
+
+### Zero-recompile provider bisect
+
+All runs below reused the existing `fullbake_layer_XX_pos.rai` and `fullbake_lmhead_bf16.rai` caches, the same 17-token prompt, and the same gate. No compile was started and the bake was not rewritten.
+
+- All 36 layers on NPU, LM head in float32 (`C:\Users\antmi\qwen3-work\bisect_npu_layers_cpu_lmhead.json`): fail. Top-1 15/17 (same two misses at step 0 and step 9), KL peak `0.186561` at step 16 (`1.4991` tok/s, `19116.86` MB RSS). The float32 LM head upcast wrote `C:\Users\antmi\qwen3-work\split-qwen-npu-full\model.onnx\.fp32-cpu-upcast-tmp\lm_head\weights.data` (2.50 GB) without replacing `lm_head.onnx`.
+- LM head only on NPU, all 36 layers in float32 (`C:\Users\antmi\qwen3-work\bisect_cpu_layers_npu_lmhead.json`): pass. Top-1 17/17, KL peak `0.016953` at step 16.
+- Layers 18-35 on NPU, layers 0-17 and LM head in float32 (`C:\Users\antmi\qwen3-work\bisect_cpu_layers_0_17.json`): fail on the 95% top-1 rule. Top-1 16/17 (only miss at step 0: 271 vs 1124, KL `0.0104`). Every KL is under 0.05; peak is `0.0242` at step 13.
+- Layers 0-8 on NPU: fail. Top-1 16/17, KL peak `0.176922` at step 16.
+- Layers 0-1 on NPU (`C:\Users\antmi\qwen3-work\bisect_npu_layers_0_1.json`): fail on one top-1 token. Top-1 16/17 (only miss at step 13: 3209 vs 17619, KL `0.0228`). Every KL is under 0.05; peak is `0.0317` at step 16.
+- Layers 2-3 on NPU (`C:\Users\antmi\qwen3-work\bisect_npu_layers_2_3.json`): fail on step 16 KL only. Top-1 17/17, KL peak `0.225108` at step 16.
+- Layer 2 only on NPU, other 35 layers in float32, `cpu_lm_head` false so `lm_head` on Vitis (`C:\Users\antmi\qwen3-work\bisect_npu_layer_2.json`): fail on step 16 KL only. Top-1 17/17 (step 16 agrees on token 39088, top-5 overlap `0.8`, max abs `2.380`), KL peak `0.222947` at step 16. Steps 0-15 are all under 0.05.
+- Layer 3 only on NPU (`C:\Users\antmi\qwen3-work\bisect_npu_layer_3.json`): pass. Top-1 17/17, KL peak `0.010874` at step 16.
+- Layer 2 in CPU float32, other 35 layers and LM head on NPU (`C:\Users\antmi\qwen3-work\bisect_cpu_only_layer_2.json`): fail (`1.6417` tok/s, `19195.07` MB RSS). Top-1 16/17 (step 0 miss: 271 vs 1124, KL `0.040559`; step 9 agrees on 264, KL `0.054854`). Step 16 KL fell from `0.182684` to `0.066903` (agrees on 39088) and stayed over 0.05 along with step 7 (`0.073764`), step 9 (`0.054854`), and step 13 (`0.079918`).
+- Layers 4-17 on NPU, with Layer 2 and the other layers in float32 (`C:\Users\antmi\qwen3-work\bisect_npu_layers_4_17.json`): pass. Top-1 17/17, step-16 KL `0.042343`.
 
 An older aligned run, before position ids, is `npu-decode-aligned-report.json`. Step 0 max abs `1.7266`. Step 16 max abs `17.6949` with the monolith past length 16 and the split window full. That step-16 gap is a different first token from the isolation prompt. It is not the position-ids result.
 

@@ -39,7 +39,7 @@ import json
 import os
 import sys
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
@@ -310,6 +310,26 @@ def _parse_layer_spec(spec: str, n_layers: int = N_LAYERS) -> set[int]:
     return chosen
 
 
+def _parse_layer_overrides(specs: Sequence[str], n_layers: int = N_LAYERS) -> Dict[int, str]:
+    """Parse ``INDEX=PATH`` overrides such as ``2=C:\\...\\layer_2_of_36.onnx``."""
+    overrides: Dict[int, str] = {}
+    for raw in specs or ():
+        item = (raw or "").strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError(f"layer override {item!r} must have the form INDEX=PATH")
+        idx_str, path_str = item.split("=", 1)
+        idx = int(idx_str.strip())
+        if idx < 0 or idx >= int(n_layers):
+            raise ValueError(f"layer override index {idx} out of 0..{n_layers - 1}")
+        path = os.path.abspath(path_str.strip())
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"layer override file does not exist: {path}")
+        overrides[idx] = path
+    return overrides
+
+
 def _cpu_upcast_session(split_dir: str, filename: str, log_severity: int):
     """Load a baked bfloat16 component on CPUExecutionProvider by upcasting its MatMuls to float32."""
     import onnx
@@ -318,11 +338,18 @@ def _cpu_upcast_session(split_dir: str, filename: str, log_severity: int):
     from onnx import TensorProto
     from benchmark_cpu_fp32_isolation import upcast_baked_matmuls
 
-    path = os.path.join(split_dir, filename)
+    if os.path.isabs(filename):
+        base_dir = os.path.dirname(filename)
+        base_name = os.path.basename(filename)
+        path = filename
+    else:
+        base_dir = split_dir
+        base_name = filename
+        path = os.path.join(split_dir, filename)
     previous = os.getcwd()
-    os.chdir(split_dir)
+    os.chdir(base_dir)
     try:
-        probe = onnx.load(filename, load_external_data=False)
+        probe = onnx.load(base_name, load_external_data=False)
         has_bf16 = any(
             int(item.data_type) == int(TensorProto.BFLOAT16)
             for item in probe.graph.initializer
@@ -330,14 +357,14 @@ def _cpu_upcast_session(split_dir: str, filename: str, log_severity: int):
         del probe
         if not has_bf16:
             return _cpu_session(path, log_severity)
-        model = onnx.load(filename, load_external_data=True)
+        model = onnx.load(base_name, load_external_data=True)
         upcast_baked_matmuls(model)
         total_bytes = sum(len(item.raw_data) for item in model.graph.initializer)
         if total_bytes >= 1_500_000_000:
             tmp_dir = os.path.join(
-                split_dir,
+                base_dir,
                 ".fp32-cpu-upcast-tmp",
-                os.path.splitext(os.path.basename(filename))[0],
+                os.path.splitext(os.path.basename(base_name))[0],
             )
             if os.path.isdir(tmp_dir):
                 shutil.rmtree(tmp_dir)
@@ -375,12 +402,19 @@ def _vitis_session(path: str, cache_dir: str, cache_key: str, log_severity: int)
     import onnxruntime as ort
 
     os.makedirs(cache_dir, exist_ok=True)
-    return ort.InferenceSession(
-        os.path.basename(path),
-        sess_options=_session_options(log_severity),
-        providers=["VitisAIExecutionProvider", "CPUExecutionProvider"],
-        provider_options=[{"cacheDir": cache_dir, "cacheKey": cache_key}, {}],
-    )
+    previous = os.getcwd()
+    target_dir = os.path.dirname(os.path.abspath(path))
+    if target_dir:
+        os.chdir(target_dir)
+    try:
+        return ort.InferenceSession(
+            os.path.basename(path),
+            sess_options=_session_options(log_severity),
+            providers=["VitisAIExecutionProvider", "CPUExecutionProvider"],
+            provider_options=[{"cacheDir": cache_dir, "cacheKey": cache_key}, {}],
+        )
+    finally:
+        os.chdir(previous)
 
 
 def _is_layer_side_input(name: str) -> bool:
@@ -407,6 +441,9 @@ class SplitDecode:
         *,
         cpu_lm_head: bool = False,
         cpu_layers: str = "",
+        layer_overrides: Optional[Dict[int, str]] = None,
+        override_cache_key_suffix: str = "override",
+        dump_layer_gap: Optional[int] = None,
     ):
         import onnxruntime as ort
 
@@ -414,6 +451,14 @@ class SplitDecode:
         self.split_dir = split_dir
         self.cpu_lm_head = bool(cpu_lm_head)
         self.cpu_layer_indices = _parse_layer_spec(cpu_layers, N_LAYERS)
+        self.layer_overrides = dict(layer_overrides or {})
+        self.override_cache_key_suffix = (override_cache_key_suffix or "override").strip()
+        self.dump_layer_gap = (
+            int(dump_layer_gap)
+            if dump_layer_gap is not None and 0 <= int(dump_layer_gap) < N_LAYERS
+            else None
+        )
+        self.layer_gap_rows: List[dict] = []
         self.components, _origin = _component_map(split_dir)
         os.chdir(split_dir)
         load_started = time.perf_counter()
@@ -425,20 +470,40 @@ class SplitDecode:
         self.layers = []
         for index in range(N_LAYERS):
             comp = self.components[f"layer_{index}"]
+            override_path = self.layer_overrides.get(index)
+            file_arg = override_path if override_path else comp["file"]
+            full_path = override_path if override_path else os.path.join(split_dir, comp["file"])
+            c_dir = (
+                os.path.join(cache_root, f"layer_{index:02d}_{self.override_cache_key_suffix}")
+                if override_path
+                else layer_cache_dir(cache_root, index)
+            )
+            c_key = (
+                f"{layer_cache_key(index)}_{self.override_cache_key_suffix}"
+                if override_path
+                else layer_cache_key(index)
+            )
             if index in self.cpu_layer_indices:
-                session = _cpu_upcast_session(split_dir, comp["file"], log_severity)
+                session = _cpu_upcast_session(split_dir, file_arg, log_severity)
             else:
                 session = _vitis_session(
-                    os.path.join(split_dir, comp["file"]),
-                    layer_cache_dir(cache_root, index),
-                    layer_cache_key(index),
+                    full_path,
+                    c_dir,
+                    c_key,
                     log_severity,
                 )
+            ref_cpu_session = (
+                _cpu_upcast_session(split_dir, file_arg, log_severity)
+                if self.dump_layer_gap == index
+                else None
+            )
             inputs = [item.name for item in session.get_inputs()]
             outputs = [item.name for item in session.get_outputs()]
             self.layers.append(
                 {
                     "session": session,
+                    "ref_cpu_session": ref_cpu_session,
+                    "file": full_path,
                     "inputs": inputs,
                     "outputs": outputs,
                     "hiddens": _hidden_inputs(inputs),
@@ -481,13 +546,64 @@ class SplitDecode:
         self.past_valid = 0
         self.token_position = 0
 
+    def _record_layer_gap(
+        self,
+        index: int,
+        ref_by_name: Dict[str, np.ndarray],
+        cand_hidden: Dict[str, np.ndarray],
+        cand_key: np.ndarray,
+        cand_value: np.ndarray,
+    ) -> None:
+        layer = self.layers[index]
+        hidden_name = layer["hidden_outs"][0]
+        h_ref = ref_by_name[hidden_name].astype(np.float32)
+        h_cand = cand_hidden[hidden_name].astype(np.float32)
+        k_ref = ref_by_name[layer["present_key"]].astype(np.float32)
+        k_cand = cand_key.astype(np.float32)
+        v_ref = ref_by_name[layer["present_value"]].astype(np.float32)
+        v_cand = cand_value.astype(np.float32)
+        h_diff = np.abs(h_ref - h_cand)
+        k_diff = np.abs(k_ref - k_cand)
+        v_diff = np.abs(v_ref - v_cand)
+        self.layer_gap_rows.append(
+            {
+                "step": int(self.token_position),
+                "layer": int(index),
+                "hidden_max_abs": float(np.max(h_diff)),
+                "hidden_mean_abs": float(np.mean(h_diff)),
+                "hidden_argmax_channel": int(np.argmax(h_diff.reshape(-1))),
+                "present_key_max_abs": float(np.max(k_diff)),
+                "present_key_new_slot_max_abs": float(np.max(k_diff[:, :, -1, :])),
+                "present_value_max_abs": float(np.max(v_diff)),
+                "present_value_new_slot_max_abs": float(np.max(v_diff[:, :, -1, :])),
+            }
+        )
+
     def _run_layer(self, index: int, values: Dict[str, np.ndarray], bias: np.ndarray, position: int) -> None:
         layer = self.layers[index]
         session = layer["session"]
         past_key, past_value = self.cache.get_past_tensors(index)
+        ref_by_name = None
+        if layer.get("ref_cpu_session") is not None:
+            ref_feeds = {
+                layer["past_key"]: past_key.copy(),
+                layer["past_value"]: past_value.copy(),
+                "attention_bias": bias,
+            }
+            if "position_ids" in layer["inputs"]:
+                ref_feeds["position_ids"] = np.asarray([[int(position)]], dtype=np.int64)
+            for name in layer["hiddens"]:
+                ref_feeds[name] = values[name].copy()
+            ref_outs = layer["ref_cpu_session"].run(None, ref_feeds)
+            ref_by_name = {
+                name: np.array(array, copy=True)
+                for name, array in zip(layer["outputs"], ref_outs)
+            }
         if self.io_binding:
             try:
-                self._run_layer_bound(index, values, bias, past_key, past_value, position)
+                self._run_layer_bound(
+                    index, values, bias, past_key, past_value, position, ref_by_name=ref_by_name
+                )
                 return
             except Exception as exc:
                 print(f"IO_BINDING_FALLBACK layer={index} error={exc}")
@@ -512,6 +628,8 @@ class SplitDecode:
         np.copyto(shadow_value, by_name[layer["present_value"]])
         for name in layer["hidden_outs"]:
             values[name] = by_name[name]
+        if ref_by_name is not None:
+            self._record_layer_gap(index, ref_by_name, values, shadow_key, shadow_value)
         self.cache.commit_present_swap(
             index,
             min(self.past_valid + 1, PAST_SLOTS),
@@ -519,7 +637,17 @@ class SplitDecode:
             rolling=True,
         )
 
-    def _run_layer_bound(self, index, values, bias, past_key, past_value, position: int) -> None:
+    def _run_layer_bound(
+        self,
+        index,
+        values,
+        bias,
+        past_key,
+        past_value,
+        position: int,
+        *,
+        ref_by_name: Optional[Dict[str, np.ndarray]] = None,
+    ) -> None:
         layer = self.layers[index]
         session = layer["session"]
         binding = session.io_binding()
@@ -559,6 +687,10 @@ class SplitDecode:
             values[name] = array
         # Keep the OrtValues alive until the run has returned.
         del shadow_key_ov, shadow_value_ov
+        if ref_by_name is not None:
+            shadow_key = self.cache._cache[index]["key_shadow"]
+            shadow_value = self.cache._cache[index]["value_shadow"]
+            self._record_layer_gap(index, ref_by_name, values, shadow_key, shadow_value)
         self.cache.commit_present_swap(
             index,
             min(self.past_valid + 1, PAST_SLOTS),
@@ -755,12 +887,24 @@ def run_decode(args: argparse.Namespace) -> int:
             del monolith
             gc.collect()
     released_rss = round(_rss_mb(), 2)
+    layer_overrides = _parse_layer_overrides(
+        getattr(args, "layer_override", None) or (), N_LAYERS
+    )
+    dump_layer_gap_arg = getattr(args, "dump_layer_gap", -1)
+    dump_layer_gap = (
+        int(dump_layer_gap_arg)
+        if dump_layer_gap_arg is not None and int(dump_layer_gap_arg) >= 0
+        else None
+    )
     pipeline = SplitDecode(
         args.split_dir,
         args.cache_root,
         args.log_severity,
         cpu_lm_head=bool(getattr(args, "cpu_lm_head", False)),
         cpu_layers=str(getattr(args, "cpu_layers", "") or ""),
+        layer_overrides=layer_overrides,
+        override_cache_key_suffix=str(getattr(args, "override_cache_key", "override") or "override"),
+        dump_layer_gap=dump_layer_gap,
     )
     split_peak = _rss_mb()
     # Session creation is outside the timed loop. Profiling is off.
@@ -823,11 +967,13 @@ def run_decode(args: argparse.Namespace) -> int:
             "layer_35": pipeline.layers[35]["providers"],
             "cpu_lm_head": bool(pipeline.cpu_lm_head),
             "cpu_layer_indices": sorted(pipeline.cpu_layer_indices),
+            "layer_overrides": {str(k): v for k, v in sorted(pipeline.layer_overrides.items())},
         },
         "monolith_error": monolith_error,
         "cold_start_gap": cold_gap,
         "aligned_gap": aligned_gap,
         "step_gaps": step_gaps,
+        "layer_gap_rows": pipeline.layer_gap_rows,
         "aligned_step": align_step,
         "cpu_fp32_floor": CPU_FP32_FLOOR,
         "quality_gate": {
@@ -867,7 +1013,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--tokens", type=int, default=8)
     parser.add_argument("--tolerance", type=float, default=0.5)
     parser.add_argument("--log-severity", type=int, default=2)
-    parser.add_argument("--output", default="")
+    parser.add_argument("--output", "--report", dest="output", default="")
     parser.add_argument("--skip-monolith", action="store_true")
     parser.add_argument("--allow-rolling", action="store_true")
     parser.add_argument("--allow-overlap", action="store_true")
@@ -880,6 +1026,23 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--cpu-layers",
         default="",
         help="Run selected layers on CPUExecutionProvider (e.g. 'all', '0,1', or '0-17') while keeping remaining layers/lm_head on Vitis.",
+    )
+    parser.add_argument(
+        "--layer-override",
+        action="append",
+        default=[],
+        help="Override one layer ONNX path using INDEX=PATH (repeatable, e.g. --layer-override 2=C:\\...\\layer_2_of_36.onnx).",
+    )
+    parser.add_argument(
+        "--override-cache-key",
+        default="override",
+        help="Vitis cache key suffix for any --layer-override layers (default: override).",
+    )
+    parser.add_argument(
+        "--dump-layer-gap",
+        type=int,
+        default=-1,
+        help="Compare layer INDEX against a side-by-side CPU float32-upcast session at every step and record hidden/KV deltas in layer_gap_rows.",
     )
     parser.add_argument("--self-check", action="store_true")
     return parser.parse_args(argv)
