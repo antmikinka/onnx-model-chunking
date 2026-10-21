@@ -537,9 +537,21 @@ python grok_inference_split_model_pipeline.py \
 **NPU Decision:**
 1. **Model fits in NPU memory?** → Use MONOLITHIC
 2. **Model too large?** → Quantize/prune to fit, OR fall back to GPU/CPU
-3. **Never** use SEQUENTIAL mode on NPU
+3. **Never** use SEQUENTIAL unload/reload on NPU
+
+On this branch, persistent layer sessions may stay resident on VitisAI. `lm_head` may stay on DirectML. Unpinned embeddings stay on CPU. Sequential unload/reload still recompiles each graph and stays rejected.
 
 For detailed explanation, see: [NPU Execution Guide](./NPU_GUIDE.md) and [Appendix: Why NPU Requires Monolithic Mode](#11-appendix-why-npu-requires-monolithic-mode).
+
+### Control-page probe
+
+The down-projection host probe is not in this repo. It lives at `C:\Users\antmi\qwen3-work\ryzen18`. `make_grouped_down.py` writes `txn\down_grouped.elf`. `probe_grouped.cpp` submits that ELF through System32 XRT 2.21.
+
+The grouped ELF uses OSABI `0x45`, ABI `0x10`, and the symbol `down`. The `.pdi` section keeps ERT opcode 22. The instruction buffer is one 8192-byte cert window: `FF FF` header, in-order length 0, `start_job`, `load_pdi` opcode `0x1A`, `end_job`, and EOF. The 4x4 overlay is not loaded with `xrtDeviceLoadXclbinFile`.
+
+Measured on the Ryzen AI 9 HX 370: wait state 8 (timeout). Firmware state `0xC` is `FW_STATE_CHECK_NEWPAGE`. The health record is AIE2 (`npu_gen` 0). LX7 exception type is 9. The exception PC for the `load_pdi` page is `0x7000001a`. An aligned `.pdi` address slot patched with relocation type 8 did not move that PC. The 2048-byte output buffer stayed the host fill `0x5A`.
+
+No NPU tensor has been written. The group-128 down transaction does not match this model's block-32 weights. The first numeric proof remains one group-32 qkv, shape `1x4096x6144`, against the CPU `com.microsoft` MatMul. CPU decode on the split model remains about 7.2–7.5 tok/s.
 
 ### 6.4 Hybrid Dispatch (NPU + iGPU)
 

@@ -91,8 +91,8 @@ def _scalar_from_tensor(tensor) -> Optional[_Scalar]:
 
 def _producers(graph) -> Dict[str, onnx.NodeProto]:
     mapping: Dict[str, onnx.NodeProto] = {}
-    for node in graph.node:
-        for name in node.output:
+    for node in getattr(graph, "node", ()):
+        for name in getattr(node, "output", ()):
             if name:
                 mapping[name] = node
     return mapping
@@ -192,8 +192,8 @@ def _resolve_scalar(
 
 def _consumers(graph) -> Dict[str, List[onnx.NodeProto]]:
     mapping: Dict[str, List[onnx.NodeProto]] = {}
-    for node in graph.node:
-        for name in node.input:
+    for node in getattr(graph, "node", ()):
+        for name in getattr(node, "input", ()):
             mapping.setdefault(name, []).append(node)
     return mapping
 
@@ -299,7 +299,9 @@ def _score_dtype(sentinel_dtype: int, score_dtype: Optional[int]) -> int:
     return sentinel_dtype
 
 
-def _clone(node) -> onnx.NodeProto:
+def _clone(node):
+    if not isinstance(node, onnx.NodeProto):
+        return node
     copied = onnx.NodeProto()
     copied.CopyFrom(node)
     return copied
@@ -402,7 +404,9 @@ def _rewrite_graph(graph, dtype: int) -> int:
     direct = _direct_scalars(graph)
     producers = _producers(graph)
     resolved: Dict[str, _Scalar] = {}
-    for name in list(direct) + [output for node in graph.node for output in node.output]:
+    for name in list(direct) + [
+        output for node in getattr(graph, "node", ()) for output in getattr(node, "output", ())
+    ]:
         if name in resolved:
             continue
         scalar = _resolve_scalar(name, direct, producers, set(), 4)
@@ -415,7 +419,7 @@ def _rewrite_graph(graph, dtype: int) -> int:
     dtypes = set()
     one_dtypes = set()
     fill_seeds = set()
-    for node in graph.node:
+    for node in getattr(graph, "node", ()):
         plan = _where_plan(node, resolved, known, dtype)
         if plan is None or not _attention_where(node, consumers):
             rebuilt.append(_clone(node))
@@ -486,6 +490,8 @@ def rewrite_attention_mask_ops(model, dtype: int = TensorProto.FLOAT16) -> int:
     the lm_head, stays in the graph. Zero replacements leave the graph
     untouched.
     """
+    if not isinstance(model, onnx.ModelProto):
+        return 0
     if dtype not in _FLOAT_DTYPES:
         dtype = TensorProto.FLOAT16
     return _rewrite_graph(model.graph, dtype)

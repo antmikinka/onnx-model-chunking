@@ -42,7 +42,7 @@ try:
         SessionConfig,
         get_provider_for_device,
     )
-    from pipeline_utils.kv_cache import KVCacheManager
+    from pipeline_utils.kv_cache import KVCacheManager, KVUpdateMode
     from pipeline_utils.config_loader import load_model_config, ModelConfig
     from pipeline_utils.dtypes import get_numpy_dtype, safe_cast
     from pipeline_utils.io_binding import DeviceBuffer, IOBindingManager
@@ -604,7 +604,13 @@ class SplitModelInferenceEngine:
             kv_dtype = self.model_config.dtype
         else:
             kv_dtype = np.float16
-        cache_limit = self.config.max_seq_len if self.config.static_kv_cache else None
+        self._static_window_layers = self._detect_static_window_layers()
+        cache_limit = (
+            self.config.max_seq_len
+            if (self.config.static_kv_cache or self._static_window_layers)
+            else None
+        )
+        kv_update_mode = KVUpdateMode.CONCAT_SWAP if self._static_window_layers else None
         self.kv_cache = KVCacheManager(
             num_layers=self.model_config.num_layers,
             num_kv_heads=self.model_config.num_kv_heads,
@@ -612,6 +618,7 @@ class SplitModelInferenceEngine:
             dtype=kv_dtype,
             batch_size=1,
             max_seq_len=cache_limit,
+            update_mode=kv_update_mode,
         )
 
         self.session_manager: Optional[SessionManager] = None
@@ -694,6 +701,18 @@ class SplitModelInferenceEngine:
                 continue
             self._log(f"  Warmup {index + 1}/{count}: {time.perf_counter() - start:.3f}s")
         self._log("[Warmup] Complete")
+
+    def _detect_static_window_layers(self) -> bool:
+        """True when split layer components declare an ``attention_bias`` input."""
+        if self.is_monolith:
+            return False
+        component = self.model_info.get("components", {}).get("layer_0", {})
+        if not isinstance(component, dict):
+            return False
+        inputs = component.get("input_names")
+        if not isinstance(inputs, list):
+            return False
+        return "attention_bias" in inputs
 
     def _detect_kv_format(self) -> Tuple[str, str, str, str]:
         """Return present key, present value, past key, and past value formats."""
@@ -937,6 +956,48 @@ class SplitModelInferenceEngine:
         except (TypeError, ValueError):
             return 0.0
 
+    def _run_static_window_step(
+        self,
+        token_ids: np.ndarray,
+        registry: Dict[str, Any],
+        present_key: str,
+        present_value: str,
+        past_key: str,
+        past_value: str,
+        phase: str,
+    ) -> None:
+        """Execute one static-window forward pass across all components and swap KV buffers."""
+        q_len = int(token_ids.shape[1])
+        registry["input_ids"] = token_ids
+        registry["position_ids"] = self.kv_cache.position_ids(query_len=q_len)
+        registry["attention_bias"] = self.kv_cache.attention_bias(
+            query_len=q_len,
+            align="right",
+        )
+        registry["attention_mask"] = self.kv_cache.attention_mask()
+        for layer_idx in range(self.num_layers):
+            k_past, v_past = self.kv_cache.get_past_tensors(layer_idx)
+            registry[past_key.format(layer=layer_idx)] = k_past
+            registry[past_value.format(layer=layer_idx)] = v_past
+        for component_name in self._execution_order():
+            self._run_component(component_name, registry, phase)
+            if component_name.startswith("layer_"):
+                layer_idx = int(component_name.split("_", 1)[1])
+                pk_name = present_key.format(layer=layer_idx)
+                pv_name = present_value.format(layer=layer_idx)
+                if pk_name in registry and pv_name in registry:
+                    shadow_k = self.kv_cache._cache[layer_idx]["key_shadow"]
+                    shadow_v = self.kv_cache._cache[layer_idx]["value_shadow"]
+                    np.copyto(_as_host(shadow_k), _as_host(registry[pk_name]))
+                    np.copyto(_as_host(shadow_v), _as_host(registry[pv_name]))
+                    past_valid = self.kv_cache.layer_length(layer_idx)
+                    self.kv_cache.commit_present_swap(
+                        layer_idx,
+                        past_valid + q_len,
+                        rolling=True,
+                        query_len=q_len,
+                    )
+
     def generate(
         self,
         prompt: str,
@@ -986,32 +1047,64 @@ class SplitModelInferenceEngine:
 
         for token_idx in range(max_tokens):
             token_start = time.perf_counter()
-            if token_idx == 0:
-                current_ids = prompt_ids
-                position_ids = np.arange(prompt_len, dtype=np.int64).reshape(1, -1)
-                attention_mask = np.ones((1, prompt_len), dtype=np.int64)
-            else:
-                current_ids = np.array([[last_token_id]], dtype=np.int64)
-                past_len = int(self.kv_cache.get_sequence_length())
-                position_ids = np.array([[past_len]], dtype=np.int64)
-                attention_mask = np.ones((1, past_len + 1), dtype=np.int64)
-            phase = "prefill" if token_idx == 0 else "decode"
-            registry["input_ids"] = current_ids
-            registry["position_ids"] = position_ids
-            registry["attention_mask"] = attention_mask
-            self.kv_cache.inject_into_registry(
-                registry,
-                key_format=past_key,
-                value_format=past_value,
-            )
-            for component_name in self._execution_order():
-                self._run_component(component_name, registry, phase)
-                if self.is_monolith or component_name.startswith("layer_"):
-                    self.kv_cache.extract_from_registry(
+            if self._static_window_layers:
+                if token_idx == 0:
+                    for p_idx in range(prompt_len - 1):
+                        self._run_static_window_step(
+                            prompt_ids[:, p_idx : p_idx + 1],
+                            registry,
+                            present_key,
+                            present_value,
+                            past_key,
+                            past_value,
+                            "prefill",
+                        )
+                    self._run_static_window_step(
+                        prompt_ids[:, prompt_len - 1 : prompt_len],
                         registry,
-                        present_key_format=present_key,
-                        present_value_format=present_value,
+                        present_key,
+                        present_value,
+                        past_key,
+                        past_value,
+                        "prefill",
                     )
+                else:
+                    self._run_static_window_step(
+                        np.array([[last_token_id]], dtype=np.int64),
+                        registry,
+                        present_key,
+                        present_value,
+                        past_key,
+                        past_value,
+                        "decode",
+                    )
+            else:
+                if token_idx == 0:
+                    current_ids = prompt_ids
+                    position_ids = np.arange(prompt_len, dtype=np.int64).reshape(1, -1)
+                    attention_mask = np.ones((1, prompt_len), dtype=np.int64)
+                else:
+                    current_ids = np.array([[last_token_id]], dtype=np.int64)
+                    past_len = int(self.kv_cache.get_sequence_length())
+                    position_ids = np.array([[past_len]], dtype=np.int64)
+                    attention_mask = np.ones((1, past_len + 1), dtype=np.int64)
+                phase = "prefill" if token_idx == 0 else "decode"
+                registry["input_ids"] = current_ids
+                registry["position_ids"] = position_ids
+                registry["attention_mask"] = attention_mask
+                self.kv_cache.inject_into_registry(
+                    registry,
+                    key_format=past_key,
+                    value_format=past_value,
+                )
+                for component_name in self._execution_order():
+                    self._run_component(component_name, registry, phase)
+                    if self.is_monolith or component_name.startswith("layer_"):
+                        self.kv_cache.extract_from_registry(
+                            registry,
+                            present_key_format=present_key,
+                            present_value_format=present_value,
+                        )
             logits = _as_host(self._logits_from(registry))
             last_token_id = _sample_token(np.asarray(logits)[:, -1, :], self.config.temperature)
             generated_ids.append(last_token_id)

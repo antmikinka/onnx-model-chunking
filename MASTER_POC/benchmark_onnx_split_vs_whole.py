@@ -700,7 +700,11 @@ def main():
                 # Quality Verification
                 mono_text = mono_results.get('generated_text', "").strip()
                 split_text = split_results.get('generated_text', "").strip()
-                quality_match = (mono_text == split_text) if mono_text else True
+                quality_match = (
+                    mono_text == split_text
+                    and len(mono_text) > 0
+                    and len(split_text) > 0
+                )
                 
                 prompt_provider_results[provider] = {
                     "split": split_results,
@@ -788,7 +792,7 @@ def print_matrix_summary(prompt, provider_results):
     rows = []
     for ep, results in provider_results.items():
         v = results.get('verification', {})
-        q_match = "MATCH ✅" if v.get('quality_match', True) else "DIFF ⚠️"
+        q_match = "MATCH ✅" if v.get('quality_match', False) else "DIFF ⚠️"
         
         # Monolith
         m = results['monolith']
@@ -858,14 +862,14 @@ def generate_markdown_report(session, report_path):
             m = results['monolith']
             s = results['split']
             v = results.get('verification', {})
-            q_match = "MATCH ✅" if v.get('quality_match', True) else "DIFF ⚠️"
+            q_match = "MATCH ✅" if v.get('quality_match', False) else "DIFF ⚠️"
             
             if m:
                 lines.append(f"| Monolith | {ep} | {m.get('ttft_s',0):.4f}s | {m.get('tokens_per_second',0):.2f}/s | {m.get('memory_peak_mb',0):.1f}MB | N/A |")
             if s:
                 lines.append(f"| Split | {ep} | {s.get('ttft_s',0):.4f}s | {s.get('tokens_per_second',0):.2f}/s | {s.get('memory_peak_mb',0):.1f}MB | {q_match} |")
             
-            if not v.get('quality_match', True):
+            if not v.get('quality_match', False):
                 lines.append(f"\n> [!WARNING]")
                 lines.append(f"> Output mismatch detected for `{ep}`.")
                 lines.append(f"> **Monolith:** `{v.get('mono_sample')}`")

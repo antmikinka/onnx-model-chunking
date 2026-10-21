@@ -49,6 +49,21 @@ from .golden_attention_subgraph import (
     build_projected_attention_model,
     golden_attention_facts,
 )
+from .quark_optimize import (
+    QuarkOptimizeConfig,
+    QuarkOptimizeResult,
+    QuarkUnavailable,
+    optimize_for_npu,
+    pipeline_order,
+    prepare_model_for_split,
+)
+from .static_shapes import (
+    apply_static_contract,
+    decompose_gqa_to_npu_primitives,
+    homogenize_qdq_weights_and_split_k,
+    right_aligned_attention_bias,
+    static_attention_bias,
+)
 
 __all__ = [
     # Main operations
@@ -86,4 +101,15 @@ __all__ = [
     "build_golden_attention_model",
     "build_projected_attention_model",
     "golden_attention_facts",
+    "QuarkOptimizeConfig",
+    "QuarkOptimizeResult",
+    "QuarkUnavailable",
+    "optimize_for_npu",
+    "pipeline_order",
+    "prepare_model_for_split",
+    "apply_static_contract",
+    "decompose_gqa_to_npu_primitives",
+    "homogenize_qdq_weights_and_split_k",
+    "right_aligned_attention_bias",
+    "static_attention_bias",
 ]

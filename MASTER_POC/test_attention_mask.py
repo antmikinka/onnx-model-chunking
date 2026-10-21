@@ -291,7 +291,7 @@ def test_split_onnx_rewrites_before_shape_inference():
     graph = helper.make_graph([where, softmax], "tiny", [scores, blocked], [logits], [fill])
     model = _model(graph)
 
-    def fake_load(path):
+    def fake_load(path, **kwargs):
         return model
 
     def fake_infer(loaded, infer_shapes):
