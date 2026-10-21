@@ -168,6 +168,9 @@ All runs below reused the existing `fullbake_layer_XX_pos.rai` and `fullbake_lmh
 - Layer 3 only on NPU (`C:\Users\antmi\qwen3-work\bisect_npu_layer_3.json`): pass. Top-1 17/17, KL peak `0.010874` at step 16.
 - Layer 2 in CPU float32, other 35 layers and LM head on NPU (`C:\Users\antmi\qwen3-work\bisect_cpu_only_layer_2.json`): fail (`1.6417` tok/s, `19195.07` MB RSS). Top-1 16/17 (step 0 miss: 271 vs 1124, KL `0.040559`; step 9 agrees on 264, KL `0.054854`). Step 16 KL fell from `0.182684` to `0.066903` (agrees on 39088) and stayed over 0.05 along with step 7 (`0.073764`), step 9 (`0.054854`), and step 13 (`0.079918`).
 - Layers 4-17 on NPU, with Layer 2 and the other layers in float32 (`C:\Users\antmi\qwen3-work\bisect_npu_layers_4_17.json`): pass. Top-1 17/17, step-16 KL `0.042343`.
+- Layers 3-35 and LM head on NPU, layers 0-2 in CPU float32 (`C:\Users\antmi\qwen3-work\bisect_cpu_layers_0_2.json`): fail (`1.5909` tok/s, `21314.70` MB RSS). Top-1 16/17 (step 0 misses 271 vs 1124 at KL `0.006545`). Step 4 top-5 overlap is `0.6` at KL `0.032180`. Step 13 KL is `0.080061` (versus `0.079918` when only layer 2 is in float32). Steps 7, 9, and 16 drop under 0.05 to `0.024271`, `0.020384`, and `0.019566`.
+- Layers 4-10 and LM head on NPU, layers 0-3 and 11-35 in CPU float32 (`C:\Users\antmi\qwen3-work\bisect_npu_layers_4_10.json`): fail on step 16 KL only. Top-1 17/17, step-16 KL `0.052387`, every other step under 0.05.
+- Layers 11-17 and LM head on NPU, layers 0-10 and 18-35 in CPU float32 (`C:\Users\antmi\qwen3-work\bisect_npu_layers_11_17.json`): pass. Top-1 17/17, step-16 KL `0.016944`.
 
 An older aligned run, before position ids, is `npu-decode-aligned-report.json`. Step 0 max abs `1.7266`. Step 16 max abs `17.6949` with the monolith past length 16 and the split window full. That step-16 gap is a different first token from the isolation prompt. It is not the position-ids result.
 
